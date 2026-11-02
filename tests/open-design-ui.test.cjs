@@ -1332,6 +1332,35 @@ test('quota helpers keep nulls unknown and never coerce them to zero', () => {
   assert.equal(core.formatUSD(''), '');
   assert.equal(core.formatCredits(''), '');
   assert.equal(core.formatTime('not-a-time'), '');
+  assert.equal(core.formatUSD('0'), '$0');
+  assert.equal(core.formatUSD('not-a-balance'), '');
+  assert.equal(core.formatUSD(9007199254740993), '', 'rounded numeric amounts remain unknown');
+  assert.equal(core.formatCredits(9007199254740993), '', 'numeric credits cannot silently lose precision');
+  assert.equal(core.formatDuration(5400), '1 小时 30 分钟', 'window lengths must not round to a different hour');
+  assert.equal(core.formatDuration(90000), '1 天 1 小时');
+  assert.match(core.forecastView({ state: 'exhausted' }).text, /本次采样显示窗口额度已用尽/);
+});
+
+test('an elapsed forecast is withdrawn locally without requesting the upstream', async () => {
+  const past = new Date(Date.now() - 60000).toISOString();
+  const future = new Date(Date.now() + 3600000).toISOString();
+  const { consoleApi, view, calls } = quotaPage(async () => respond(200, quotaContract({ funding: {
+    state: 'available', fetched_at: past, error: null, data: { funding: 'coding_plan', codingPlan: {
+      tier: 'plus', windows: [{ policyId: 'p', durationSeconds: 5400, resetMode: 'anchored_recurring',
+        usedCredits: '200', limitCredits: '1000', remainingCredits: '800', resetsAt: future,
+        forecast: { state: 'estimated', seconds_to_exhaust: 3600, exhausts_at: past },
+      }],
+    } },
+  } })));
+  await consoleApi.handlers.refreshQuota(consoleApi.state.status.credentials[0]);
+  assert.match(quotaText(view), /上次估算时间或窗口已过/);
+  assert.ok(!quotaText(view).includes('按最近消费速度估算'));
+  assert.ok(!quotaText(view).includes('anchored_recurring'));
+  assert.match(quotaText(view), /窗口 1 小时 30 分钟/);
+  assert.match(quotaText(view), /资金方式：套餐额度/);
+  const count = calls.length;
+  consoleApi.render.renderAccounts();
+  assert.equal(calls.length, count, 'rendering locally never polls the quota endpoint');
 });
 
 test('creating an account can save the optional control key, and editing keeps the clear row scoped', async () => {

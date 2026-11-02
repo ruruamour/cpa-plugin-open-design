@@ -367,7 +367,34 @@
     });
   }
 
+  // Update countdown/forecast expiry locally; this timer never issues a request.
+  let quotaViewTimer = null;
+  function scheduleQuotaView() {
+    if (quotaViewTimer) clearTimeout(quotaViewTimer);
+    quotaViewTimer = null;
+    const now = Date.now();
+    let next = Infinity;
+    for (const quota of Object.values(state.quotas)) {
+      const times = [quota.next_refresh_at];
+      for (const window of quota.funding?.data?.codingPlan?.windows || []) {
+        times.push(window.resetsAt, window.forecast?.exhausts_at);
+      }
+      for (const value of times) {
+        const at = Date.parse(value);
+        if (at > now) next = Math.min(next, at);
+      }
+    }
+    if (Number.isFinite(next)) {
+      quotaViewTimer = setTimeout(() => {
+        quotaViewTimer = null;
+        renderAccounts();
+      }, Math.min(next - now + 25, 2147483647));
+      quotaViewTimer.unref?.();
+    }
+  }
+
   function renderAccounts() {
+    scheduleQuotaView();
     const list = $('accountList');
     if (!list) return;
     const items = state.status.credentials;
@@ -442,8 +469,19 @@
 
   function quotaErrorText(prefix, error) {
     if (!error) return prefix;
+    const messages = {
+      unauthorized: '额度授权无效或已过期，请编辑账户更换 controlKey',
+      forbidden: '该账户或工作区没有额度查询权限',
+      rate_limited: '上游限制查询频率，请稍后重试',
+      timeout: '上游查询超时，请稍后重试',
+      malformed: '上游响应或额度配置不符合官方格式',
+      network: '暂时无法连接 OpenDesign',
+      upstream: 'OpenDesign 额度服务暂时不可用',
+      stopped: '额度查询已停止',
+    };
     const kind = error.kind ? `（${error.kind}）` : '';
-    return `${prefix}${kind}${error.message ? `：${error.message}` : ''}`;
+    const detail = messages[error.kind] || error.message;
+    return `${prefix}${kind}${detail ? `：${detail}` : ''}`;
   }
 
   function quotaWalletCard(item, quota) {
@@ -489,7 +527,7 @@
     const title = window.durationSeconds ? `窗口 ${Core.formatDuration(window.durationSeconds)}` : '额度窗口';
     block.append(el('div', { className: 'quota-window-head' }, [
       el('span', { className: 'quota-window-title', text: title }),
-      el('span', { className: 'quota-meta', text: window.resetMode || '' }),
+      el('span', { className: 'quota-meta', text: ({ anchored_recurring: '固定窗口', activity_triggered: '活动触发窗口' })[window.resetMode] || '重置方式未知' }),
     ]));
     const used = Core.formatCredits(window.usedCredits);
     const limit = Core.formatCredits(window.limitCredits);
@@ -511,14 +549,17 @@
         el('span', { attrs: { style: `width:${meter.text}` }, text: '' }),
       ]);
       block.append(bar);
-      block.append(el('p', { className: 'quota-meta', text: `原生用量计：已用 ${meter.text}` }));
+      block.append(el('p', { className: 'quota-meta', text: `已用 ${meter.text}` }));
     }
     if (window.resetsAt) {
       block.append(el('p', { className: 'quota-meta', text: `重置于 ${Core.formatTime(window.resetsAt)}` }));
     } else {
       block.append(el('p', { className: 'quota-meta', text: '重置时间：未知' }));
     }
-    const forecast = Core.forecastView(window.forecast);
+    const resetAt = Date.parse(window.resetsAt);
+    const exhaustsAt = Date.parse(window.forecast?.exhausts_at);
+    const expired = resetAt <= Date.now() || exhaustsAt <= Date.now();
+    const forecast = Core.forecastView(expired ? { state: 'expired' } : window.forecast);
     if (forecast.text) block.append(el('p', { className: `quota-forecast${forecast.tone === 'warn' ? ' warn' : ''}`, text: forecast.text }));
     return block;
   }
@@ -561,8 +602,12 @@
       card.append(el('p', { className: 'quota-note', text: '上游没有返回套餐窗口数据。' }));
       return card;
     }
-    card.append(el('p', { className: 'quota-meta', text: `套餐：${plan.tier || '未知'}${funding.data.funding ? ` · 资金方式 ${funding.data.funding}` : ''}` }));
-    if (funding.data.fundingCheck) card.append(el('p', { className: 'quota-meta', text: `资金检查：${funding.data.fundingCheck}` }));
+    const fundingName = ({ coding_plan: '套餐额度', wallet: '钱包', gateway: '网关' })[funding.data.funding] || '未知';
+    card.append(el('p', { className: 'quota-meta', text: `套餐：${plan.tier || '未知'} · 资金方式：${fundingName}` }));
+    if (funding.data.fundingCheck) {
+      const checkName = ({ available: '可用', insufficient: '不足', unknown: '未知' })[funding.data.fundingCheck] || '未知';
+      card.append(el('p', { className: 'quota-meta', text: `资金检查：${checkName}` }));
+    }
     for (const window of plan.windows) card.append(quotaWindowBlock(window));
     card.append(el('p', { className: 'quota-note', text: `窗口数据查询时间：${Core.formatTime(funding.fetched_at) || '未知'}` }));
     return card;

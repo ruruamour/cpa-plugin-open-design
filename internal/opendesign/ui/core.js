@@ -152,9 +152,11 @@
   // do not fit a JS Number, and a rounded balance must never be shown as if it
   // were exact. null/absent means unknown, which the UI renders as such.
   function decimalText(value) {
-    if (typeof value === 'string') return value.trim();
-    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-    return '';
+    // Official amounts are decimal strings. A numeric fallback could already
+    // have lost cents/credits before the UI sees it, so keep it unknown.
+    if (typeof value !== 'string') return '';
+    const raw = value.trim();
+    return /^[0-9]+(?:\.[0-9]+)?$/.test(raw) ? raw : '';
   }
 
   function creditText(value) {
@@ -280,12 +282,16 @@
 
   function formatDuration(seconds) {
     if (!Number.isSafeInteger(seconds) || seconds < 0) return '';
-    if (seconds < 60) return `${seconds} 秒`;
-    const minutes = Math.round(seconds / 60);
-    if (minutes < 60) return `${minutes} 分钟`;
-    const hours = Math.round(minutes / 60);
-    if (hours < 48) return `${hours} 小时`;
-    return `${Math.round(hours / 24)} 天`;
+    const units = [[86400, '天'], [3600, '小时'], [60, '分钟'], [1, '秒']];
+    const parts = [];
+    let remaining = seconds;
+    for (const [size, label] of units) {
+      const count = Math.floor(remaining / size);
+      if (count) parts.push(`${count} ${label}`);
+      remaining %= size;
+      if (parts.length === 2) break;
+    }
+    return parts.join(' ') || '0 秒';
   }
 
   function formatTime(value) {
@@ -301,6 +307,10 @@
   function forecastView(forecast) {
     const value = forecast && typeof forecast === 'object' ? forecast : {};
     switch (text(value.state)) {
+      case 'exhausted':
+        return { text: '本次采样显示窗口额度已用尽，请以官方后续查询为准', tone: 'warn' };
+      case 'expired':
+        return { text: '上次估算时间或窗口已过，请刷新额度后重新预测', tone: 'muted' };
       case 'insufficient_samples':
         return { text: '样本不足，暂不预测（需至少两次间隔 60 秒以上的查询）', tone: 'muted' };
       case 'rolling_window':
@@ -309,15 +319,14 @@
         const span = formatDuration(value.seconds_to_exhaust);
         const at = formatTime(value.exhausts_at);
         const parts = ['按最近消费速度估算'];
-        if (span && at) parts.push(`约 ${span}后达到当前窗口上限（${at}）`);
-        else if (span) parts.push(`约 ${span}后达到当前窗口上限`);
-        else if (at) parts.push(`预计在 ${at} 达到当前窗口上限`);
+        if (at) parts.push(`预计在 ${at} 达到当前窗口上限${span ? `（采样时预计剩余 ${span}）` : ''}`);
+        else if (span) parts.push(`采样时预计剩余 ${span}`);
         return { text: `${parts.join('，')}；仅为估算，不改变模型调度`, tone: 'warn' };
       }
       case 'resets_before_exhaustion': {
         const span = formatDuration(value.seconds_to_exhaust);
         return { text: span
-          ? `按最近消费速度估算，预计 ${span}后耗尽，但会先到窗口重置时间；仅为估算`
+          ? `按最近消费速度估算，采样时预计 ${span}后耗尽，但会先到窗口重置时间；仅为估算`
           : '预计先到窗口重置时间，暂不给出耗尽时间', tone: 'muted' };
       }
       case 'beyond_horizon':
