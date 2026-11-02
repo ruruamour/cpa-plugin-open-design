@@ -373,9 +373,21 @@ func (s *Service) upstreamModels(r ManagementRequest) (any, error) {
 		return managementError(statusOf(err), err.Error())
 	}
 	defer s.done()
-	models, err := s.discoverModels(r.HostCallbackID, r.Query.Get("credential_id"))
+	c, err := s.credentialByID(r.Query.Get("credential_id"))
 	if err != nil {
 		return managementError(statusOf(err), err.Error(), s.allKeys()...)
+	}
+	models, err := s.discoverModels(r.HostCallbackID, c)
+	if err != nil {
+		keys := append(s.allKeys(), c.APIKey)
+		code := "upstream_error"
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && safeManagementCode(apiErr.Kind, keys) {
+			code = apiErr.Kind
+		}
+		return managementJSON(statusOf(err), map[string]any{
+			"error": redact(err.Error(), keys...), "source": "upstream", "code": code,
+		})
 	}
 	data := make([]map[string]any, 0, len(models))
 	for _, m := range models {
@@ -403,6 +415,20 @@ func (s *Service) allKeys() []string {
 		}
 	}
 	return keys
+}
+
+// safeManagementCode bounds the upstream-controlled error kind before exposing
+// it separately from the already-redacted message.
+func safeManagementCode(code string, keys []string) bool {
+	if code == "" || len(code) > 80 || redact(code, keys...) != code {
+		return false
+	}
+	for _, c := range code {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 func statusOf(err error) int {

@@ -55,11 +55,7 @@ func (s *Service) resolveModel(model string) (string, error) {
 
 // discoverModels calls GET /models with the supplied credential. The key comes
 // from the stored credential, never from the browser.
-func (s *Service) discoverModels(callbackID, credentialID string) ([]UpstreamModel, error) {
-	c, err := s.credentialByID(credentialID)
-	if err != nil {
-		return nil, err
-	}
+func (s *Service) discoverModels(callbackID string, c Credential) ([]UpstreamModel, error) {
 	cfg := s.config()
 	status, _, body, err := s.doJSON(callbackID, http.MethodGet, upstreamURL(cfg.BaseURL, "/models", nil), upstreamHeaders(c.APIKey), nil)
 	if err != nil {
