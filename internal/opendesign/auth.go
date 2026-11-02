@@ -22,8 +22,23 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 	if err := json.Unmarshal(raw, &r); err != nil {
 		return nil, err
 	}
-	// A watcher callback can arrive after a newer edit; re-read the physical file
-	// while serialized with plugin writes before trusting the payload.
+	baseName := ""
+	if r.FileName != "" {
+		baseName = filepath.Base(r.FileName)
+		if baseName != r.FileName || strings.ContainsAny(r.FileName, `/\`) {
+			baseName = ""
+		}
+	}
+	// 1. A save currently in flight. CPA re-enters auth.parse from
+	//    buildAuthsFromFileData *before* it writes the file, so disk still holds
+	//    the previous content; the pending body is the only correct source.
+	snapshot, pending := s.pendingFor(baseName, r.FileName, r.Path)
+	if pending {
+		r.RawJSON = snapshot
+	}
+	// 2. Otherwise re-read the physical file, serialized with plugin writes, so a
+	//    watcher callback queued behind a newer edit cannot apply stale content.
+	//    This is the stale-callback protection and stays even when pending exists.
 	dir := r.Host.AuthDir
 	if dir == "" {
 		s.mu.RLock()
@@ -31,8 +46,8 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 		s.mu.RUnlock()
 	}
 	resolvedFile := false
-	if dir != "" && r.FileName != "" && filepath.Base(r.FileName) == r.FileName && !strings.ContainsAny(r.FileName, `/\`) {
-		if latest, err := os.ReadFile(filepath.Join(dir, r.FileName)); err == nil {
+	if !pending && dir != "" && baseName != "" {
+		if latest, err := os.ReadFile(filepath.Join(dir, baseName)); err == nil {
 			r.RawJSON = latest
 			resolvedFile = true
 		}
@@ -167,8 +182,13 @@ func (s *Service) selectedCredential(request ExecutorRequest) (Credential, error
 
 // saveCredential writes the credential through the host so it lands in auth-dir
 // and the runtime record is upserted in one step.
+//
+// The in-flight body is published to pendingSaves first because host.auth.save
+// re-enters auth.parse before it writes the file (see pending.go).
 func (s *Service) saveCredential(c Credential, filename string) error {
 	body := jsonBytes(c)
+	s.mirrorPending(filename, body, c.ID)
+	defer s.clearPending(filename, c.ID)
 	var saved struct {
 		Name string `json:"name"`
 		Path string `json:"path"`

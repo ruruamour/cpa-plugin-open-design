@@ -3,7 +3,10 @@ package opendesign
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // modelRegistration advertises the mapped models to CPA. It is dynamic on
@@ -85,6 +88,18 @@ func (s *Service) credentialByID(id string) (Credential, error) {
 }
 
 // importModels validates and persists the submitted alias→upstream mapping.
+//
+// The whole cycle runs under configMu so two concurrent imports cannot interleave
+// persist and publish (disk would then hold B while memory held A):
+//
+//	snapshot -> validate -> persist -> publish
+//
+// importModels also has to make CPA re-run model.for_auth, otherwise a console
+// flow of "add the key first, import models second" leaves the host with the
+// empty catalog it registered when the credential appeared, and every request
+// fails with model_not_found. CPA only rebuilds a credential's catalog when the
+// auth file content changes, so the mapping revision is written into every
+// credential through host.auth.save.
 func (s *Service) importModels(raw json.RawMessage) (any, error) {
 	var in struct {
 		Models []Model `json:"models"`
@@ -92,8 +107,11 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, fail(http.StatusBadRequest, "invalid models JSON")
 	}
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
 	cfg := s.config()
-	cfg.Models = in.Models
+	cfg.Models = append([]Model(nil), in.Models...)
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -103,5 +121,67 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 	s.mu.Lock()
 	s.cfg.Models = cfg.Models
 	s.mu.Unlock()
+
+	// Publishing the mapping is enough for this plugin's own executor; the extra
+	// step below is what makes the host re-register the catalog. A failure here
+	// is reported but does not roll back the persisted mapping.
+	if err := s.refreshAuthModels(); err != nil {
+		return nil, fail(http.StatusBadGateway, "model mapping saved but the host model refresh failed: "+err.Error())
+	}
 	return map[string]any{"models": cfg.Models}, nil
+}
+
+// refreshAuthModels rewrites every live credential with a new model revision so
+// CPA treats the auth file as changed and re-runs model.for_auth for it.
+func (s *Service) refreshAuthModels() error {
+	s.credentialMu.Lock()
+	defer s.credentialMu.Unlock()
+	s.mu.RLock()
+	creds := make([]Credential, 0, len(s.creds))
+	for _, c := range s.creds {
+		creds = append(creds, c)
+	}
+	s.mu.RUnlock()
+	if len(creds) == 0 {
+		return nil
+	}
+	revision := nextModelRevision()
+	var firstErr error
+	for _, c := range creds {
+		filename := s.fileNameFor(c)
+		if filepath.Base(filename) != filename || strings.ContainsAny(filename, `/\`) {
+			continue
+		}
+		c.ModelRevision = revision
+		if err := s.saveCredential(c, filename); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		s.mu.Lock()
+		s.creds[c.ID] = c
+		s.authFiles[c.ID] = filename
+		s.mu.Unlock()
+	}
+	return firstErr
+}
+
+var modelRevisionSeq atomic.Int64
+
+// nextModelRevision returns a strictly increasing revision stamp. A wall clock
+// value keeps the file content meaningful when inspected by an operator, and the
+// atomic counter guarantees uniqueness for writes inside the same nanosecond.
+func nextModelRevision() int64 {
+	for {
+		now := time.Now().UnixNano()
+		last := modelRevisionSeq.Load()
+		next := now
+		if next <= last {
+			next = last + 1
+		}
+		if modelRevisionSeq.CompareAndSwap(last, next) {
+			return next
+		}
+	}
 }

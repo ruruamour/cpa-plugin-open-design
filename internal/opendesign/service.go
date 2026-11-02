@@ -22,6 +22,11 @@ type Service struct {
 	configMu     sync.Mutex
 	credentialMu sync.Mutex
 	authFileMu   sync.Mutex
+	// pendingMu guards pendingSaves only. It is deliberately separate from
+	// authFileMu: host.auth.save re-enters auth.parse on the same goroutine, and
+	// auth.parse takes authFileMu, so holding it across the host call deadlocks.
+	pendingMu    sync.Mutex
+	pendingSaves map[string]pendingSave
 
 	cfg       Config
 	creds     map[string]Credential
@@ -41,13 +46,14 @@ type Service struct {
 // NewService returns an unconfigured plugin instance.
 func NewService() *Service {
 	return &Service{
-		cfg:       defaultConfig(),
-		creds:     map[string]Credential{},
-		authFiles: map[string]string{},
-		revoked:   map[string]bool{},
-		streams:   map[string]struct{}{},
-		ops:       newOperationTracker(),
-		stopCh:    make(chan struct{}),
+		cfg:          defaultConfig(),
+		creds:        map[string]Credential{},
+		authFiles:    map[string]string{},
+		revoked:      map[string]bool{},
+		streams:      map[string]struct{}{},
+		pendingSaves: map[string]pendingSave{},
+		ops:          newOperationTracker(),
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -251,8 +257,18 @@ func (s *Service) saveSettings(cfg Config) error {
 		return err
 	}
 	defer os.Remove(tmp)
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if hook := testSettingsWriteHook.Load(); hook != nil {
+		(*hook)()
+	}
+	return nil
 }
+
+// testSettingsWriteHook lets a test park a writer between persist and publish to
+// prove the two steps are atomic. It is nil in production; only tests set it.
+var testSettingsWriteHook atomic.Pointer[func()]
 
 func newID() string {
 	b := make([]byte, 12)

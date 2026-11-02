@@ -118,16 +118,20 @@ func validateBaseURL(raw string) error {
 // Credential is the auth record persisted through host.auth.save. APIKey is
 // never echoed by management routes.
 type Credential struct {
-	Type        string `json:"type"`
-	ID          string `json:"id"`
-	Label       string `json:"label"`
-	APIKey      string `json:"api_key"`
-	Disabled    bool   `json:"disabled,omitempty"`
-	BaseURL     string `json:"base_url,omitempty"`
-	extraFields map[string]json.RawMessage
+	Type     string `json:"type"`
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	APIKey   string `json:"api_key"`
+	Disabled bool   `json:"disabled"`
+	BaseURL  string `json:"base_url,omitempty"`
+	// ModelRevision changes whenever the model mapping changes. CPA rebuilds a
+	// credential's model list only when the auth file content changes, so a
+	// mapping update without a revision bump would never reach the host.
+	ModelRevision int64 `json:"model_revision,omitempty"`
+	extraFields   map[string]json.RawMessage
 }
 
-var credentialJSONFields = []string{"type", "id", "label", "api_key", "disabled", "base_url"}
+var credentialJSONFields = []string{"type", "id", "label", "api_key", "disabled", "base_url", "model_revision"}
 
 // UnmarshalJSON keeps host- or operator-added fields so a rewrite through
 // host.auth.save cannot silently drop them.

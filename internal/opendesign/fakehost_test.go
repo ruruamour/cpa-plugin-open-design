@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +25,9 @@ type fakeHost struct {
 
 	savedAuths  map[string][]byte
 	saveAuthErr error
+	// saveHook runs inside host.auth.save before the file on disk is replaced,
+	// which is exactly where CPA re-enters auth.parse.
+	saveHook func(name string, raw []byte)
 
 	emitPayloads    [][]byte
 	streamCloseErrs []string
@@ -250,8 +255,14 @@ func (h *fakeHost) handleAuthSave(in, out any) error {
 		h.mu.Unlock()
 		return err
 	}
-	h.savedAuths[name] = raw
+	hook := h.saveHook
 	dir := h.authDir
+	h.mu.Unlock()
+	if hook != nil {
+		hook(name, raw)
+	}
+	h.mu.Lock()
+	h.savedAuths[name] = raw
 	h.mu.Unlock()
 	assign(out, map[string]any{"name": name, "path": dir + "/" + name})
 	return nil
@@ -359,4 +370,19 @@ func rawField(in any, key string) []byte {
 		return []byte(v)
 	}
 	return nil
+}
+
+// writeAuthFile puts raw content at <authDir>/<name>, standing in for the file a
+// previous save left on disk.
+func (h *fakeHost) writeAuthFile(t *testing.T, name string, raw []byte) string {
+	t.Helper()
+	dir := h.authDir
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir auth dir: %v", err)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	return path
 }
