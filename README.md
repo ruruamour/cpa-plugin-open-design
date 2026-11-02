@@ -103,6 +103,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 ## 文档与来源
 
 - [OpenDesign 插件说明](docs/open-design.md)
+- [验证记录与真实上游限制](docs/verification.md)
 - `docs/` 下的其他旧文档保留为上游参考，本 fork 未逐篇改写。
 - 上游：[xiao-qiu-qiu/ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge)
 - 协议参考：[AstroQore/opendesign2api](https://github.com/AstroQore/opendesign2api)（独立网关 prior art，仅参考公开协议行为，未复制源码）

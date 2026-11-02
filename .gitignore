@@ -9,3 +9,5 @@
 .env
 *credentials*.json
 *.jsonl
+__pycache__/
+*.py[cod]
