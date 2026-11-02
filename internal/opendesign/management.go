@@ -179,6 +179,7 @@ func credentialView(c Credential) map[string]any {
 	return map[string]any{
 		"id": c.ID, "label": c.Label, "disabled": c.Disabled,
 		"billing_configured": c.ControlKey != "", "workspace_id": c.WorkspaceID,
+		"billing_revision": c.billingRevision,
 	}
 }
 
@@ -270,6 +271,7 @@ func (s *Service) createCredential(in credentialInput) (any, error) {
 	}
 	s.mu.Lock()
 	s.storeCredentialLocked(c)
+	c = s.creds[c.ID]
 	s.authFiles[c.ID] = filename
 	delete(s.revoked, c.ID)
 	s.mu.Unlock()
@@ -319,6 +321,7 @@ func (s *Service) updateCredential(id string, in credentialInput) (any, error) {
 	}
 	s.mu.Lock()
 	s.storeCredentialLocked(c)
+	c = s.creds[c.ID]
 	if in.ClearBilling {
 		s.invalidateBillingLocked(c.ID)
 	}

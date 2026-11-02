@@ -37,6 +37,7 @@
           label: text(item.label) || id,
           disabled: item.disabled === true,
           billing_configured: item.billing_configured === true,
+          billing_revision: text(item.billing_revision),
           workspace_id: text(item.workspace_id),
         });
       }

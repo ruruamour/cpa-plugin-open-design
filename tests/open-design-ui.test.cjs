@@ -522,13 +522,13 @@ test('model mapping validates aliases, deduplicates, and derives a safe payload'
   const core = fakePage().context.OpenDesignCore;
   assert.deepEqual(
     JSON.parse(JSON.stringify(core.normalizeStatus(statusBody()).credentials)),
-    [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: false, workspace_id: '' }],
+    [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: false, billing_revision: '', workspace_id: '' }],
   );
   assert.deepEqual(
     JSON.parse(JSON.stringify(core.normalizeStatus(statusBody({
       credentials: [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: true, workspace_id: 'ws-1' }],
     })).credentials)),
-    [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: true, workspace_id: 'ws-1' }],
+    [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: true, billing_revision: '', workspace_id: 'ws-1' }],
   );
   assert.deepEqual(
     JSON.parse(JSON.stringify(core.normalizeUpstreamModels({ data: [{ id: 'a' }, { id: 'a' }, { id: 'b', owned_by: 'x' }, null, {}] }))),
@@ -1481,4 +1481,67 @@ test('an empty mapping can be explicitly saved to withdraw all plugin models', a
   assert.ok(request);
   assert.deepEqual(JSON.parse(request.init.body), { models: [] });
   assert.equal(api.state.savedMappings.length, 0);
+});
+
+test('an opaque credential revision invalidates only the externally replaced account', async () => {
+  const credentials = [
+    { id: 'cred-1', label: '一', billing_configured: true, workspace_id: 'ws-1', billing_revision: 'revision-1' },
+    { id: 'cred-2', label: '二', billing_configured: true, workspace_id: 'ws-2', billing_revision: 'revision-2' },
+  ];
+  const { consoleApi } = quotaPage(async url => {
+    const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+    return respond(200, quotaContract({ credential_id: id }));
+  }, credentials);
+  await consoleApi.handlers.refreshQuota(credentials[0]);
+  await consoleApi.handlers.refreshQuota(credentials[1]);
+  consoleApi.render.applyStatus(statusBody({ credentials: [
+    { ...credentials[0], billing_revision: 'revision-replaced' }, credentials[1],
+  ] }));
+  assert.equal(consoleApi.state.quotas['cred-1'], undefined, 'same public flags with a new key revision discard the old snapshot');
+  assert.ok(consoleApi.state.quotas['cred-2'], 'the other account keeps its current snapshot');
+});
+
+test('account keys are cleared even when a sent save request fails', async () => {
+  const { consoleApi, view } = twoAccountPage({ fetchImpl: async () => respond(500, { error: 'fixture save failed' }) });
+  view.document.getElementById('accountKey').value = 'inference-secret-fixture';
+  view.document.getElementById('accountControlKey').value = 'control-secret-fixture';
+  await consoleApi.handlers.addAccount({ preventDefault() {} });
+  assert.equal(view.document.getElementById('accountKey').value, '');
+  assert.equal(view.document.getElementById('accountControlKey').value, '');
+  assert.match(view.document.getElementById('accountState').textContent, /服务器结果尚未确认/);
+  assert.match(view.document.getElementById('accountState').textContent, /先刷新状态确认后再试/);
+  assert.equal(consoleApi.state.busy, false);
+});
+
+test('acknowledged account changes remain visible when the following status read fails', async () => {
+  for (const action of ['create', 'edit', 'delete', 'toggle']) {
+    const { consoleApi, view, calls } = twoAccountPage({ fetchImpl: async (url, init) => {
+      if (url.endsWith('/status')) throw new Error('fixture status connection lost');
+      if (init.method === 'DELETE') return respond(200, { deleted: true });
+      const body = JSON.parse(init.body || '{}');
+      return respond(action === 'create' ? 201 : 200, {
+        id: body.id || 'cred-created', label: body.label || '主账户', disabled: body.disabled === true,
+      });
+    } });
+    const item = consoleApi.state.status.credentials[0];
+    if (action === 'create' || action === 'edit') {
+      if (action === 'edit') consoleApi.handlers.editAccount(item);
+      view.document.getElementById('accountLabel').value = '已保存标签';
+      view.document.getElementById('accountKey').value = 'fixture-replacement-secret';
+      await consoleApi.handlers.addAccount({ preventDefault() {} });
+      assert.match(view.document.getElementById('accountState').textContent, /账户已保存，但读取最新状态失败/);
+      assert.ok(consoleApi.state.status.credentials.some(c => c.label === '已保存标签'));
+      assert.equal(view.document.getElementById('accountKey').value, '');
+      assert.equal(calls.filter(call => call.method === 'POST').length, 1);
+    } else if (action === 'delete') {
+      await consoleApi.handlers.deleteAccount(item);
+      assert.match(view.document.getElementById('accountState').textContent, /账户已删除，但读取最新状态失败/);
+      assert.ok(!consoleApi.state.status.credentials.some(c => c.id === item.id));
+    } else {
+      await consoleApi.handlers.toggleAccount(item);
+      assert.match(view.document.getElementById('accountState').textContent, /账户已停用，但读取最新状态失败/);
+      assert.equal(consoleApi.state.status.credentials.find(c => c.id === item.id).disabled, true);
+    }
+    assert.equal(consoleApi.state.busy, false);
+  }
 });

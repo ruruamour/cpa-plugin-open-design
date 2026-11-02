@@ -306,7 +306,7 @@
   // fields change elsewhere (or an account disappears), the old snapshot and any
   // in-flight refresh must be dropped instead of being shown for the new setup.
   function billingSignature(item) {
-    return `${item.billing_configured === true ? '1' : '0'}|${item.workspace_id || ''}`;
+    return `${item.billing_configured === true ? '1' : '0'}|${item.workspace_id || ''}|${item.billing_revision || ''}`;
   }
 
   function invalidateChangedQuotas(credentials) {
@@ -935,6 +935,15 @@
     message('accountState', `已取消编辑「${label}」，API key 输入已清空。`, '');
   }
 
+  // Reflect an acknowledged mutation immediately. If the following status GET
+  // fails, the page must still show what the server already confirmed.
+  function applyAccountResult(result, fallback, removed = false) {
+    const item = { ...fallback, ...(result && typeof result === 'object' ? result : {}) };
+    const credentials = state.status.credentials.filter(account => account.id !== item.id);
+    if (!removed && item.id) credentials.push(item);
+    applyStatus({ ...state.status, credentials });
+  }
+
   async function addAccount(event) {
     if (event) event.preventDefault();
     if (state.busy) return;
@@ -957,6 +966,12 @@
       return;
     }
     setBusy(true);
+    // Values are captured for this request only; every send outcome clears the
+    // DOM, including a lost response or a server error after persistence.
+    if (keyInput) keyInput.value = '';
+    if ($('accountControlKey')) $('accountControlKey').value = '';
+    if (editing) invalidateQuota(editing.id);
+    let saved = false;
     message('accountState', editing ? '正在保存账户修改…' : '正在保存账户…');
     try {
       if (editing) {
@@ -969,9 +984,10 @@
           if (billing.controlKey) body.control_key = billing.controlKey;
           if (billing.workspaceID) body.workspace_id = billing.workspaceID;
         }
-        await api().updateCredential(editing.id, body);
+        const result = await api().updateCredential(editing.id, body);
+        saved = true;
+        applyAccountResult(result, { ...state.status.credentials.find(item => item.id === editing.id), id: editing.id, label });
         const wasEditing = editing.label;
-        invalidateQuota(editing.id);
         resetAccountForm();
         const billingNote = billing.clear
           ? '已清除额度授权，推理 Key 保留。'
@@ -983,8 +999,9 @@
         const extra = {};
         if (billing.controlKey) extra.control_key = billing.controlKey;
         if (billing.workspaceID) extra.workspace_id = billing.workspaceID;
-        await api().addCredential(label, key, extra);
-        if (keyInput) keyInput.value = '';
+        const result = await api().addCredential(label, key, extra);
+        saved = true;
+        applyAccountResult(result, { label });
         if (labelInput) labelInput.value = '';
         resetAccountForm();
         message('accountState', billing.controlKey
@@ -995,9 +1012,12 @@
       renderAccounts();
     } catch (error) {
       if (isManagementAuthError(error)) {
-        showAuth(error.status === 401 ? '401：管理密钥无效或已过期，请重新验证后再保存账户。' : `403：${formatError(error)}`);
+        const prefix = saved ? '账户已保存，但读取最新状态时认证失效。' : '';
+        showAuth(prefix + (error.status === 401 ? '401：管理密钥无效或已过期，请重新验证。' : `403：${formatError(error)}`));
       } else {
-        message('accountState', `${editing ? '保存修改' : '保存'}失败：${formatError(error)}`, 'error');
+        message('accountState', saved
+          ? `账户已保存，但读取最新状态失败：${formatError(error)}。请刷新状态确认，不要重复添加。`
+          : `${editing ? '保存修改' : '保存'}请求失败，服务器结果尚未确认：${formatError(error)}。密钥输入已清空，请先刷新状态确认后再试。`, 'error');
       }
     } finally {
       setBusy(false);
@@ -1009,8 +1029,11 @@
     if (typeof confirm === 'function' && !confirm(`删除账户「${item.label}」？此操作会删除 CPA 中保存的 OpenDesign key。`)) return;
     setBusy(true);
     message('accountState', '正在删除账户…');
+    let deleted = false;
     try {
       await api().deleteCredential(item.id);
+      deleted = true;
+      applyAccountResult(null, item, true);
       invalidateQuota(item.id);
       if (state.selectedCredential === item.id) {
         state.selectedCredential = '';
@@ -1025,7 +1048,9 @@
       await refreshStatus();
     } catch (error) {
       if (isManagementAuthError(error)) {
-        showAuth(`401/403：${formatError(error)}`);
+        showAuth(`${deleted ? '账户已删除，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`);
+      } else if (deleted) {
+        message('accountState', `账户已删除，但读取最新状态失败：${formatError(error)}。请刷新状态确认。`, 'error');
       } else if (partialCompletion(formatError(error)) === 'credential-disabled') {
         // The backend already disabled the credential before the unlink failed:
         // its models are withdrawn but the record remains. Reflect that state
@@ -1045,8 +1070,11 @@
     if (state.busy) return;
     setBusy(true);
     message('accountState', item.disabled ? '正在启用账户…' : '正在停用账户…');
+    let updated = false;
     try {
-      await api().updateCredential(item.id, { disabled: !item.disabled });
+      const result = await api().updateCredential(item.id, { disabled: !item.disabled });
+      updated = true;
+      applyAccountResult(result, { ...item, disabled: !item.disabled });
       if (!item.disabled && state.selectedCredential === item.id) {
         state.selectedCredential = '';
         invalidateModelRequest();
@@ -1054,8 +1082,10 @@
       message('accountState', item.disabled ? '账户已启用。' : '账户已停用。');
       await refreshStatus();
     } catch (error) {
-      if (isManagementAuthError(error)) showAuth(`401/403：${formatError(error)}`);
-      else message('accountState', `更新失败：${formatError(error)}`, 'error');
+      if (isManagementAuthError(error)) showAuth(`${updated ? '账户状态已更新，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`);
+      else message('accountState', updated
+        ? `账户已${item.disabled ? '启用' : '停用'}，但读取最新状态失败：${formatError(error)}。请刷新状态确认。`
+        : `更新失败：${formatError(error)}`, 'error');
     } finally {
       setBusy(false);
     }
