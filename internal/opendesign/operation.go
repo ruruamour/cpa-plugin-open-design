@@ -1,6 +1,8 @@
 package opendesign
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"sync"
 )
@@ -74,6 +76,16 @@ func (o *operationTracker) release(local int) {
 	delete(o.pending, local)
 }
 
+// cancelOne removes one request without closing the tracker for unrelated work.
+// If operation_open is still pending, bind will fail and cancel the late id.
+func (o *operationTracker) cancelOne(local int) (pendingOperation, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	entry, exists := o.pending[local]
+	delete(o.pending, local)
+	return entry, exists
+}
+
 // closeAll marks the tracker closed and returns every host operation id that is
 // still outstanding.
 func (o *operationTracker) closeAll() []pendingOperation {
@@ -104,11 +116,44 @@ func (o *operationTracker) reopen() {
 // cancel it. The host binds the operation to the request's host_callback_id, so
 // the same callback id must be used for open, do, and cancel.
 func (s *Service) doOperation(callbackID, method string, payload map[string]any, out any) error {
+	return s.doOperationContext(context.Background(), callbackID, method, payload, out)
+}
+
+// doOperationContext bounds cancellable host work without adding transport ABI
+// fields. Bounded calls require the operation bridge: an uncancellable fallback
+// could block past the context deadline. Unbounded callers keep their fallback.
+func (s *Service) doOperationContext(ctx context.Context, callbackID, method string, payload map[string]any, out any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	local := s.ops.register(callbackID)
 	if local == 0 {
 		return fail(http.StatusServiceUnavailable, "OpenDesign plugin is shutting down")
 	}
 	defer s.ops.release(local)
+	if ctx.Done() != nil {
+		cancelled := make(chan struct{})
+		cancelLocal := func() {
+			if op, exists := s.ops.cancelOne(local); exists && op.operationID != "" {
+				_ = s.call("host.http.cancel", map[string]any{"host_callback_id": op.callbackID, "operation_id": op.operationID}, nil)
+			}
+		}
+		stopCancel := context.AfterFunc(ctx, func() {
+			defer close(cancelled)
+			cancelLocal()
+		})
+		// Join a cancellation already in progress so no timer callback can
+		// outlive the request and race a subsequent plugin lifecycle.
+		defer func() {
+			if !stopCancel() {
+				<-cancelled
+			} else if ctx.Err() != nil {
+				// Err can become visible just before the context schedules its
+				// callback; do not suppress the only cancellation in that race.
+				cancelLocal()
+			}
+		}()
+	}
 
 	var opened struct {
 		OperationID string `json:"operation_id"`
@@ -118,18 +163,27 @@ func (s *Service) doOperation(callbackID, method string, payload map[string]any,
 		openPayload["host_callback_id"] = callbackID
 	}
 	if err := s.call("host.http.operation_open", openPayload, &opened); err != nil {
-		// Older hosts may not expose the operation bridge. The request still runs;
-		// it just cannot be cancelled mid-flight. Do not start it at all if
-		// quiesce already ran, so shutdown stays bounded.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// Older hosts may not expose the operation bridge. Only unbounded
+		// callers retain their existing fallback.
 		if s.ops.isClosed() {
 			return fail(http.StatusServiceUnavailable, "OpenDesign plugin is shutting down")
+		}
+		if ctx.Done() != nil {
+			return errors.New("host HTTP operations are required for bounded requests")
 		}
 		return s.call(method, payload, out)
 	}
 	if opened.OperationID != "" {
 		if !s.ops.bind(local, opened.OperationID) {
-			// Quiesce already ran; do not start new work.
+			// The deadline or quiesce already ran; cancel the late id and do
+			// not start new work.
 			_ = s.call("host.http.cancel", map[string]any{"host_callback_id": callbackID, "operation_id": opened.OperationID}, nil)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fail(http.StatusServiceUnavailable, "OpenDesign plugin is shutting down")
 		}
 		payload["operation_id"] = opened.OperationID
@@ -140,8 +194,21 @@ func (s *Service) doOperation(callbackID, method string, payload map[string]any,
 		// needs to forget the id.
 	} else {
 		s.ops.release(local)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if ctx.Done() != nil {
+			return errors.New("host HTTP operation id is required for bounded requests")
+		}
 	}
-	return s.call(method, payload, out)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	err := s.call(method, payload, out)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 // cancelOperations asks the host to abort every operation still in flight.

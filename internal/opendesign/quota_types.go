@@ -5,6 +5,7 @@ import "time"
 const (
 	billingAPIURL        = "https://amr-api.open-design.ai"
 	quotaRefreshInterval = time.Minute
+	quotaRefreshBudget   = 30 * time.Second
 	maxQuotaBody         = 1 << 20
 )
 

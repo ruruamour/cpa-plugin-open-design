@@ -35,6 +35,7 @@ type Service struct {
 	quota        map[string]*quotaEntry
 	quotaSlots   chan struct{}
 	quotaNow     func() time.Time
+	quotaBudget  time.Duration
 	authFiles    map[string]string
 	revoked      map[string]bool
 	host         HostCall
@@ -57,6 +58,7 @@ func NewService() *Service {
 		quota:        map[string]*quotaEntry{},
 		quotaSlots:   make(chan struct{}, 3),
 		quotaNow:     time.Now,
+		quotaBudget:  quotaRefreshBudget,
 		authFiles:    map[string]string{},
 		revoked:      map[string]bool{},
 		streams:      map[string]struct{}{},

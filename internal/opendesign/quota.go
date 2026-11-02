@@ -120,14 +120,8 @@ func (s *Service) quotaCurrent(id string, entry *quotaEntry) bool {
 }
 
 func (s *Service) fetchQuota(callbackID string, c Credential, entry *quotaEntry, stop <-chan struct{}) *quotaResponse {
-	select {
-	case s.quotaSlots <- struct{}{}:
-		defer func() { <-s.quotaSlots }()
-	case <-entry.invalidated:
-		return nil
-	case <-stop:
-		return nil
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.quotaBudget)
+	defer cancel()
 	s.mu.Lock()
 	if s.stopped || s.quota[c.ID] != entry || entry.epoch != s.billingEpoch[c.ID] {
 		s.mu.Unlock()
@@ -140,6 +134,26 @@ func (s *Service) fetchQuota(callbackID string, c Credential, entry *quotaEntry,
 	view.NextRefreshAt = &next
 	s.mu.Unlock()
 
+	// One budget covers the queue and both official reads. A queued timeout
+	// remains a failed attempt for refresh spacing, without issuing HTTP.
+	select {
+	case s.quotaSlots <- struct{}{}:
+		defer func() { <-s.quotaSlots }()
+	case <-entry.invalidated:
+		return nil
+	case <-stop:
+		return nil
+	case <-ctx.Done():
+		view.Wallet = quotaFailed(view.Wallet, quotaFailure("timeout"))
+		if c.WorkspaceID != "" {
+			view.Funding = quotaFundingFailed(view.Funding, quotaFailure("timeout"))
+		}
+		return completeQuotaView(view)
+	}
+	if !s.quotaCurrent(c.ID, entry) {
+		return nil
+	}
+
 	// Auth files can be operator-written, so reject header/control characters
 	// here too rather than assuming every credential passed through POST.
 	if len(c.ControlKey) > 8192 || strings.IndexFunc(c.ControlKey, unicode.IsControl) >= 0 ||
@@ -150,7 +164,7 @@ func (s *Service) fetchQuota(callbackID string, c Credential, entry *quotaEntry,
 		}
 		return completeQuotaView(view)
 	}
-	body, failure := s.quotaGET(callbackID, billingAPIURL+"/api/v1/wallet/balance", c.ControlKey)
+	body, failure := s.quotaGET(ctx, callbackID, billingAPIURL+"/api/v1/wallet/balance", c.ControlKey)
 	if failure == nil {
 		data, valid := parseQuotaWallet(body)
 		if valid {
@@ -166,7 +180,7 @@ func (s *Service) fetchQuota(callbackID string, c Credential, entry *quotaEntry,
 	if c.WorkspaceID != "" && s.quotaCurrent(c.ID, entry) {
 		// The official client allows a model-less read and requires modelId:null
 		// in its response. No model selection or account scheduling is implied.
-		body, failure = s.quotaGET(callbackID, billingAPIURL+"/api/v1/workspaces/"+url.PathEscape(c.WorkspaceID)+"/billing/funding-check", c.ControlKey)
+		body, failure = s.quotaGET(ctx, callbackID, billingAPIURL+"/api/v1/workspaces/"+url.PathEscape(c.WorkspaceID)+"/billing/funding-check", c.ControlKey)
 		if failure == nil {
 			data, valid := parseQuotaFunding(body, c.WorkspaceID)
 			if valid {
@@ -221,11 +235,11 @@ func quotaFundingFailed(part quotaPart[quotaFundingData], failure *quotaError) q
 }
 
 // quotaGET uses only the documented host transport and operation callbacks.
-// The host owns the deadline and cancels the operation with the request context;
-// there is no invented timeout field or local HTTP client/background sampler.
-func (s *Service) quotaGET(callbackID, address, controlKey string) ([]byte, *quotaError) {
+// The refresh context cancels the host operation at the shared total deadline;
+// no timeout field, local HTTP client or background sampler is needed.
+func (s *Service) quotaGET(ctx context.Context, callbackID, address, controlKey string) ([]byte, *quotaError) {
 	var out upstreamCall
-	err := s.doOperation(callbackID, "host.http.do", map[string]any{
+	err := s.doOperationContext(ctx, callbackID, "host.http.do", map[string]any{
 		"host_callback_id": callbackID, "method": http.MethodGet, "url": address, "headers": upstreamHeaders(controlKey),
 	}, &out)
 	if err != nil {
