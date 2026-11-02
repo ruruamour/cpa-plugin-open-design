@@ -32,6 +32,8 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 	// 1. A save currently in flight. CPA re-enters auth.parse from
 	//    buildAuthsFromFileData *before* it writes the file, so disk still holds
 	//    the previous content; the pending body is the only correct source.
+	//    The body is used but not published (see below): host.auth.save has not
+	//    confirmed the write yet.
 	snapshot, pending := s.pendingFor(baseName, r.FileName, r.Path)
 	if pending {
 		r.RawJSON = snapshot
@@ -71,6 +73,30 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 	}
 	if c.BaseURL == "" {
 		c.BaseURL = s.config().BaseURL
+	}
+	if pending {
+		// The host parses the new body, then writes the file, then upserts its
+		// records; any of the last two steps can still fail and leave the POST
+		// answering 500. Publishing here would make the live record carry a
+		// control key / disabled flag / billing state that disk never received,
+		// so "the save failed" and "the live credential is the new one" would
+		// disagree. Answer with the AuthData the host needs and let the caller of
+		// saveCredential publish the credential only after the host confirmed the
+		// save. A failed save therefore keeps the last confirmed live state, and a
+		// watcher callback queued behind it still resolves from disk.
+		s.mu.RLock()
+		revoked := s.revoked[c.ID]
+		s.mu.RUnlock()
+		if revoked {
+			return map[string]any{"Handled": false}, nil
+		}
+		data := s.authData(c)
+		if actual := filepath.Base(r.FileName); actual != "" && actual != "." {
+			// Same shape the disk path renders: the file being written, not the
+			// fallback "<id>.json" of an authFiles entry that does not exist yet.
+			data["FileName"] = actual
+		}
+		return map[string]any{"Handled": true, "Auth": data}, nil
 	}
 	s.mu.Lock()
 	if s.revoked[c.ID] && !resolvedFile {
@@ -184,7 +210,12 @@ func (s *Service) selectedCredential(request ExecutorRequest) (Credential, error
 // and the runtime record is upserted in one step.
 //
 // The in-flight body is published to pendingSaves first because host.auth.save
-// re-enters auth.parse before it writes the file (see pending.go).
+// re-enters auth.parse before it writes the file (see pending.go). That pending
+// snapshot is only used to *answer* the reentrant parse; the live record is
+// replaced here, after the host confirmed the write. Publishing inside
+// auth.parse instead would leave the plugin's live credential ahead of disk when
+// the write or the record upsert fails (POST answers 500): a retried enable would
+// then route traffic through a control key / disabled flag disk never stored.
 func (s *Service) saveCredential(c Credential, filename string) error {
 	body := jsonBytes(c)
 	s.mirrorPending(filename, body, c.ID)
@@ -196,11 +227,24 @@ func (s *Service) saveCredential(c Credential, filename string) error {
 	if err := s.call("host.auth.save", map[string]any{"name": filename, "json": json.RawMessage(body)}, &saved); err != nil {
 		return err
 	}
+	// authFileMu orders this publish against a watcher callback that is reading
+	// the file it just wrote: parseAuth publishes what it read while still
+	// holding authFileMu, so the confirmed (newest) body always wins the race
+	// instead of being overwritten by a stale disk snapshot afterwards.
+	s.authFileMu.Lock()
+	s.mu.Lock()
 	if saved.Path != "" {
-		s.mu.Lock()
 		s.authDir = filepath.Dir(saved.Path)
-		s.mu.Unlock()
 	}
+	// The host accepted this body, so it is now what both disk and the host
+	// record hold. Publishing here also covers a save whose reentrant
+	// auth.parse never ran.
+	s.storeCredentialLocked(c)
+	if filename != "" {
+		s.authFiles[c.ID] = filepath.Base(filename)
+	}
+	s.mu.Unlock()
+	s.authFileMu.Unlock()
 	return nil
 }
 
@@ -211,6 +255,12 @@ func (s *Service) storeCredentialLocked(c Credential) {
 	previous, exists := s.creds[c.ID]
 	if !exists || previous.APIKey != c.APIKey || previous.ControlKey != c.ControlKey || previous.WorkspaceID != c.WorkspaceID {
 		s.invalidateBillingLocked(c.ID)
+		// A new random stamp, never derived from a key and never persisted: the
+		// console only compares it to know its cached quota belongs to another
+		// billing identity.
+		c.billingRevision = newID()
+	} else {
+		c.billingRevision = previous.billingRevision
 	}
 	s.creds[c.ID] = c
 }

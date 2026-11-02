@@ -118,15 +118,16 @@ func (s *Service) execute(raw json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	keys := s.redactionKeys(c.APIKey, c.ControlKey)
 	if status < 200 || status >= 300 {
-		return nil, upstreamErrorFromResponse(status, headers, respBody, c.APIKey, c.ControlKey)
+		return nil, upstreamErrorFromResponse(status, headers, respBody, keys...)
 	}
 	root, decodeErr := decodeObject(respBody)
 	if decodeErr != nil {
 		return nil, upstreamProtocolError("upstream returned a non-JSON completion body")
 	}
 	// A 200 carrying a top-level error is an upstream failure, not a completion.
-	if errBody := successBodyError(root, status, respBody, c.APIKey, c.ControlKey); errBody != nil {
+	if errBody := successBodyError(root, status, respBody, keys...); errBody != nil {
 		return nil, errBody
 	}
 	// Restore the client-facing alias so the caller sees the model it asked for.
@@ -192,7 +193,7 @@ func (s *Service) executeStream(raw json.RawMessage) (any, error) {
 	}
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
 		// Buffer the error body, then fail the RPC before any output is emitted.
-		failure := s.readStreamError(r.HostCallbackID, stream, c.APIKey, c.ControlKey)
+		failure := s.readStreamError(r.HostCallbackID, stream, s.redactionKeys(c.APIKey, c.ControlKey)...)
 		release()
 		return nil, failure
 	}
@@ -214,8 +215,11 @@ func (s *Service) executeStream(raw json.RawMessage) (any, error) {
 		defer func() {
 			_ = recover()
 		}()
-		streamErr := s.pumpSSE(r.HostCallbackID, stream, r.Model, emitter, requestChoiceCount(j))
-		s.finishOutputStream(r.StreamID, streamErr, c.APIKey, c.ControlKey)
+		// The keys are captured now so a credential replaced while the stream is
+		// open still redacts the key this request actually used.
+		keys := []string{c.APIKey, c.ControlKey}
+		streamErr := s.pumpSSE(r.HostCallbackID, stream, r.Model, emitter, requestChoiceCount(j), keys)
+		s.finishOutputStream(r.StreamID, streamErr, keys...)
 	}()
 	return map[string]any{
 		"Headers": http.Header{"Content-Type": []string{"text/event-stream"}, "Cache-Control": []string{"no-cache"}},
@@ -225,7 +229,7 @@ func (s *Service) executeStream(raw json.RawMessage) (any, error) {
 // pumpSSE decodes the upstream event stream and emits one JSON frame per event.
 // A `[DONE]` marker terminates the stream without being forwarded: the host
 // writes its own terminal marker.
-func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string, emit func([]byte) error, expectedChoices int64) error {
+func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string, emit func([]byte) error, expectedChoices int64, keys []string) error {
 	decoder := &sseDecoder{maxBytes: maxSSEFrame}
 	var sawDone bool
 	// Per-choice completion: with n>1, one finished choice does not make the
@@ -252,7 +256,10 @@ func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string
 				if status < 400 {
 					status = http.StatusBadGateway
 				}
-				return upstreamErrorFromResponse(status, nil, event.Data)
+				// The event body is upstream-controlled: parse it with both the keys
+				// this request was sent with and every key known right now, so a code
+				// that carries a secret cannot become the error kind or message.
+				return upstreamErrorFromResponse(status, nil, event.Data, s.redactionKeys(keys...)...)
 			}
 			tracker.observe(root)
 			if model, ok := root["model"].(string); ok && model != "" {
@@ -384,11 +391,14 @@ func (s *Service) readStreamError(callbackID string, stream upstreamStream, keys
 func (s *Service) finishOutputStream(streamID string, err error, keys ...string) {
 	payload := map[string]any{"stream_id": streamID}
 	if err != nil {
+		// The stream can outlive the credential snapshot it started with, so the
+		// current keys are added at close time as well.
+		keys = s.redactionKeys(keys...)
 		message, status := s.HostErrorDetails(err)
 		message = redact(message, keys...)
 		payload["error"] = message
 		detail := map[string]any{
-			"code":        streamErrorCode(err),
+			"code":        streamErrorDetailCode(err, keys),
 			"message":     message,
 			"http_status": status,
 		}
@@ -409,6 +419,33 @@ func streamErrorCode(err error) string {
 		}
 	}
 	return "upstream_error"
+}
+
+// streamErrorDetailCode is the code that actually reaches host.stream.close.
+// The kind can originate in an upstream error body, where the "code" field is
+// attacker- or misconfiguration-controlled, so it is held to the same rule as
+// the message: a known key disqualifies it and anything that is not a short
+// machine identifier is replaced. Useful upstream codes such as invalid_api_key
+// pass through unchanged; the human-readable text stays in the message.
+func streamErrorDetailCode(err error, keys []string) string {
+	code := streamErrorCode(err)
+	if !safeManagementCode(code, keys) {
+		return "upstream_error"
+	}
+	return code
+}
+
+// redactionKeys combines the keys captured when a request started with every key
+// the plugin knows now, so an error produced after a credential update cannot
+// echo either the old or the new secret.
+func (s *Service) redactionKeys(captured ...string) []string {
+	keys := make([]string, 0, len(captured)+2)
+	for _, key := range captured {
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return append(keys, s.allKeys()...)
 }
 
 // errStreamDone is an internal sentinel; it is never returned to the host.

@@ -10,12 +10,12 @@ import (
 
 const (
 	// Version is the plugin version advertised at registration.
-	Version = "0.1.0"
+	Version = "0.2.0"
 	// PluginID is the CPA plugin identifier and management path segment.
 	PluginID = "open-design"
 	// Provider is the CPA provider key for this plugin.
 	Provider = "open-design"
-	// DefaultBaseURL is the only upstream this plugin talks to.
+	// DefaultBaseURL is the fixed inference and model discovery endpoint.
 	DefaultBaseURL = "https://amr-link.open-design.ai/v1"
 	// Author and Repository keep attribution explicit for the fork.
 	Author     = "ruruamour"
@@ -130,7 +130,10 @@ type Credential struct {
 	// credential's model list only when the auth file content changes, so a
 	// mapping update without a revision bump would never reach the host.
 	ModelRevision int64 `json:"model_revision,omitempty"`
-	extraFields   map[string]json.RawMessage
+	// billingRevision is an opaque in-memory identity for UI cache invalidation.
+	// It is random, never derived from a key and never persisted in auth files.
+	billingRevision string
+	extraFields     map[string]json.RawMessage
 }
 
 var credentialJSONFields = []string{"type", "id", "label", "api_key", "control_key", "workspace_id", "disabled", "base_url", "model_revision"}
