@@ -1275,13 +1275,15 @@ test('a throttled refresh keeps the previous snapshot and explains the 60s windo
   assert.ok(!view.document.getElementById('accountState').className.includes('error'));
 });
 
-test('a quota route 401/403 never clears management auth or the account list', async () => {
-  const { view, consoleApi } = quotaPage(async () => respond(401, { error: { kind: 'unauthorized', message: 'control key rejected' } }));
-  await consoleApi.handlers.refreshQuota({ id: 'cred-1', label: '主账户', billing_configured: true, workspace_id: 'ws-1' });
-  assert.ok(consoleApi.state.verified, 'management auth is untouched');
-  assert.equal(view.document.getElementById('accountsPanel').hidden, false);
-  assert.match(view.document.getElementById('accountState').textContent, /管理登录未受影响/);
-  assert.ok(!view.document.getElementById('accountState').textContent.includes('管理密钥无效'));
+test('quota management HTTP 401/403 requires login; upstream rejection arrives in an HTTP 200 component', async () => {
+  for (const status of [401, 403]) {
+    const { view, consoleApi } = quotaPage(async () => respond(status, { error: 'management request rejected' }));
+    await consoleApi.handlers.refreshQuota({ id: 'cred-1', label: '主账户', billing_configured: true, workspace_id: 'ws-1' });
+    assert.equal(consoleApi.state.verified, null);
+    assert.equal(view.document.getElementById('accountsPanel').hidden, true);
+    assert.match(view.document.getElementById('authState').textContent, new RegExp(String(status)));
+    assert.deepEqual(Object.keys(consoleApi.state.quotas), []);
+  }
 });
 
 test('workspace missing shows the funding card as not requested instead of a fake zero', async () => {
@@ -1364,12 +1366,90 @@ test('creating an account can save the optional control key, and editing keeps t
   assert.equal(view.document.getElementById('accountWorkspaceID').value, '');
   assert.equal(view.document.getElementById('billingFields').open, false);
 
-  // A control key without a workspace is rejected before the request.
-  view.document.getElementById('accountLabel').value = '缺 workspace';
+  // Wallet-only access is valid: the workspace is optional.
+  view.document.getElementById('accountLabel').value = '仅钱包';
   view.document.getElementById('accountKey').value = 'inference-key-123456';
   view.document.getElementById('accountControlKey').value = 'control-key-123456';
   const before = calls.length;
   await consoleApi.handlers.addAccount({ preventDefault() {} });
-  assert.equal(calls.length, before, 'no request when the control key has no workspace');
-  assert.match(view.document.getElementById('accountState').textContent, /还需要 Workspace ID/);
+  const walletOnly = calls.slice(before).find(call => call.method === 'POST' && call.url.endsWith('/credentials'));
+  assert.ok(walletOnly, 'control key alone supports wallet queries');
+  assert.equal(JSON.parse(walletOnly.body).control_key, 'control-key-123456');
+  assert.ok(!('workspace_id' in JSON.parse(walletOnly.body)));
+  assert.equal(view.document.getElementById('accountControlKey').value, '');
+});
+
+
+test('editing one account does not strand a concurrent quota refresh for another account', async () => {
+  const pending = new Map();
+  const credentials = [
+    { id: 'cred-1', label: '一', billing_configured: true, workspace_id: 'ws-1' },
+    { id: 'cred-2', label: '二', billing_configured: true, workspace_id: 'ws-2' },
+  ];
+  const { consoleApi } = quotaPage(async url => {
+    const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+    const request = deferred();
+    pending.set(id, request);
+    return request.promise;
+  }, credentials);
+  const one = consoleApi.handlers.refreshQuota(credentials[0]);
+  const two = consoleApi.handlers.refreshQuota(credentials[1]);
+  await new Promise(resolve => setImmediate(resolve));
+  consoleApi.render.applyStatus(statusBody({ credentials: [
+    { ...credentials[0], workspace_id: 'ws-new' }, credentials[1],
+  ] }));
+  assert.equal(consoleApi.state.quotaBusy['cred-1'], undefined);
+  assert.equal(consoleApi.state.quotaBusy['cred-2'], true);
+  pending.get('cred-1').resolve(respond(200, quotaContract()));
+  pending.get('cred-2').resolve(respond(200, quotaContract({ credential_id: 'cred-2', workspace_id: 'ws-2' })));
+  await Promise.all([one, two]);
+  assert.equal(consoleApi.state.quotas['cred-1'], undefined, 'obsolete account configuration is discarded');
+  assert.equal(consoleApi.state.quotas['cred-2'].workspace_id, 'ws-2', 'unrelated response still applies');
+  assert.equal(consoleApi.state.quotaBusy['cred-2'], undefined, 'unrelated button is released');
+});
+
+test('transport errors mark the old snapshot stale and suppress its forecast', async () => {
+  let request = 0;
+  const { consoleApi, view } = quotaPage(async () => {
+    if (request++ === 0) return respond(200, quotaContract({ funding: {
+      state: 'available', fetched_at: '2026-11-03T00:00:00Z', error: null,
+      data: { funding: 'coding_plan', codingPlan: { tier: 'plus', windows: [{
+        policyId: 'p', durationSeconds: 18000, resetMode: 'anchored_recurring',
+        usedCredits: '200', limitCredits: '1000', remainingCredits: '800',
+        windowStart: '2026-11-03T00:00:00Z', resetsAt: '2026-11-03T05:00:00Z',
+        forecast: { state: 'estimated', seconds_to_exhaust: 3600, exhausts_at: '2026-11-03T01:00:00Z' },
+      }] } },
+    } }));
+    throw new Error('fixture connection lost');
+  });
+  const account = consoleApi.state.status.credentials[0];
+  await consoleApi.handlers.refreshQuota(account);
+  assert.match(quotaText(view), /按最近消费速度估算/);
+  await consoleApi.handlers.refreshQuota(account);
+  assert.match(quotaText(view), /上次成功查询/);
+  assert.ok(!quotaText(view).includes('按最近消费速度估算'));
+  assert.equal(consoleApi.state.quotas['cred-1'].wallet.fetched_at, '2026-11-03T00:00:00Z');
+});
+
+test('a response for a different credential cannot populate the current quota card', async () => {
+  const { consoleApi } = quotaPage(async () => respond(200, quotaContract({ credential_id: 'cred-other' })));
+  await consoleApi.handlers.refreshQuota(consoleApi.state.status.credentials[0]);
+  assert.equal(consoleApi.state.quotas['cred-1'], undefined);
+  assert.equal(consoleApi.state.quotaBusy['cred-1'], undefined);
+});
+
+test('an empty mapping can be explicitly saved to withdraw all plugin models', async () => {
+  const requests = [];
+  const view = fakePage({ fetchImpl: async (url, init) => {
+    requests.push({ url, init });
+    return respond(200, { models: [] });
+  } });
+  const api = view.context.OpenDesignConsole;
+  api.render.applyStatus(statusBody());
+  api.state.mappings = [];
+  await api.handlers.saveModels();
+  const request = requests.find(item => item.url.endsWith('/models'));
+  assert.ok(request);
+  assert.deepEqual(JSON.parse(request.init.body), { models: [] });
+  assert.equal(api.state.savedMappings.length, 0);
 });

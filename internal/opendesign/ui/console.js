@@ -44,18 +44,21 @@
     quotas: {},
     quotaBusy: {},
     quotaGeneration: 0,
+    quotaRevisions: {},
     busy: false,
   };
 
-  // Any credential change (edit, billing clear, delete) or logout bumps this
-  // generation so a late quota response can never write into the new state.
+  // Logout invalidates every request; editing one credential invalidates only
+  // its own requests so concurrent refreshes for other accounts can finish.
   function invalidateQuota(credentialID) {
-    state.quotaGeneration += 1;
     if (credentialID === undefined) {
+      state.quotaGeneration += 1;
+      state.quotaRevisions = {};
       state.quotas = {};
       state.quotaBusy = {};
       return;
     }
+    state.quotaRevisions[credentialID] = (state.quotaRevisions[credentialID] || 0) + 1;
     delete state.quotas[credentialID];
     delete state.quotaBusy[credentialID];
   }
@@ -309,24 +312,16 @@
   function invalidateChangedQuotas(credentials) {
     const previous = state.billingSignatures || {};
     const next = {};
-    let changed = false;
     for (const item of credentials) {
       next[item.id] = billingSignature(item);
       if (Object.prototype.hasOwnProperty.call(previous, item.id) && previous[item.id] !== next[item.id]) {
-        changed = true;
-        delete state.quotas[item.id];
-        delete state.quotaBusy[item.id];
+        invalidateQuota(item.id);
       }
     }
     for (const id of Object.keys(previous)) {
-      if (!Object.prototype.hasOwnProperty.call(next, id)) {
-        changed = true;
-        delete state.quotas[id];
-        delete state.quotaBusy[id];
-      }
+      if (!Object.prototype.hasOwnProperty.call(next, id)) invalidateQuota(id);
     }
     state.billingSignatures = next;
-    if (changed) state.quotaGeneration += 1;
   }
 
   function applyStatus(raw) {
@@ -916,10 +911,6 @@
       message('accountState', '已勾选「清除额度授权」，不会再保存新的 controlKey。取消勾选后再保存。', 'error');
       return;
     }
-    if (!billing.clear && billing.controlKey && !billing.workspaceID) {
-      message('accountState', '填写 controlKey 时还需要 Workspace ID 才能查询套餐额度。', 'error');
-      return;
-    }
     setBusy(true);
     message('accountState', editing ? '正在保存账户修改…' : '正在保存账户…');
     try {
@@ -1106,13 +1097,15 @@
     }
     if (state.quotaBusy[item.id]) return;
     const generation = state.quotaGeneration;
-    const stillCurrent = () => generation === state.quotaGeneration;
+    const revision = state.quotaRevisions[item.id] || 0;
+    const stillCurrent = () => generation === state.quotaGeneration && revision === (state.quotaRevisions[item.id] || 0);
     state.quotaBusy[item.id] = true;
     renderAccounts();
     try {
       const raw = await api().quota(item.id, { refresh: true });
       if (!stillCurrent()) return;
       const quota = Core.normalizeQuota(raw);
+      if (quota.credential_id !== item.id) throw new Error('额度响应与当前账户不一致，请重新查询。');
       if (quota.state === 'needs_refresh') {
         // Throttled or skipped: keep any previous snapshot, just explain it.
         const previous = state.quotas[item.id];
@@ -1128,9 +1121,22 @@
       renderAccounts();
     } catch (error) {
       if (!stillCurrent()) return;
-      // Quota failures never touch CPA login, even when they surface as 401/403:
-      // a rejected control key is not a rejected management key.
-      message('accountState', `账户「${item.label}」额度查询失败：${formatError(error)}。管理登录未受影响。`, 'error');
+      if (isManagementAuthError(error)) {
+        showAuth(error.status === 401
+          ? '401：管理密钥无效或已过期，请重新验证后再查询额度。'
+          : '403：管理请求被拒绝，请确认管理密钥和来源 IP。');
+      } else {
+        // A transport failure leaves the last snapshot uncertain too. Preserve
+        // its timestamp, but withdraw any forecast until a successful refresh.
+        const previous = state.quotas[item.id];
+        if (previous) {
+          previous.state = 'stale';
+          for (const part of [previous.wallet, previous.funding]) {
+            if (part && part.data) part.state = 'stale';
+          }
+        }
+        message('accountState', `账户「${item.label}」额度查询失败：${formatError(error)}。请稍后重试。`, 'error');
+      }
     } finally {
       if (stillCurrent()) {
         delete state.quotaBusy[item.id];
@@ -1148,10 +1154,7 @@
       message('modelState', `无法保存：${error.message}`, 'error');
       return;
     }
-    if (!models.length) {
-      message('modelState', '没有可保存的模型映射。请先勾选上游模型或手动添加一行；如需清空请先删除所有行。', 'error');
-      return;
-    }
+    if (!models.length && typeof confirm === 'function' && !confirm('清空所有模型映射？保存后将从 CPA 撤回本插件的模型。')) return;
     setBusy(true);
     message('modelState', '正在保存模型映射…');
     try {
@@ -1277,6 +1280,7 @@
       state.candidate = null;
       if (keyInput) keyInput.value = '';
       applyStatus(status);
+      setAuthCollapsed(true);
       markConnected('manual');
       message('modelState', '');
       message('accountState', '');
