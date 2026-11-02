@@ -1,0 +1,86 @@
+# OpenDesign 额度查询与预测
+
+额度查询使用 OpenDesign 官方客户端公开的只读协议，通过原版 CPA 的 host HTTP 接口发起请求。此功能需要单独配置官方账号控制 Key；原有推理 API key 可继续用于模型发现和推理。
+
+## 凭据与查询范围
+
+| 数据 | 官方地址 | 所需凭据 | 显示单位 |
+| --- | --- | --- | --- |
+| 账号钱包 | `https://amr-api.open-design.ai/api/v1/wallet/balance` | control Key | USD |
+| 工作区套餐窗口 | `https://amr-api.open-design.ai/api/v1/workspaces/{workspace_id}/billing/funding-check` | control Key、明确的工作区 ID | credits |
+| 模型发现、推理 | `https://amr-link.open-design.ai/v1` | 原有推理 API key | 上游响应的 token usage |
+
+这些路径来自官方客户端的实际请求代码，服务端未提供随本仓库分发的 OpenAPI。账号权限和上游版本仍可能影响接口可用性。2026-11-02 用现有生产推理 Key 只读访问钱包和账单汇总接口，均返回 HTTP 401；没有有效 control Key 的真实额度成功验收记录。
+
+在账户编辑中展开可选额度配置，输入 control Key；需要套餐窗口时再填写工作区 ID。编辑时密钥留空会保留原值，显式清除额度授权会同时移除 control Key 和工作区 ID。推理 Key 与额度 Key 都只经 `host.auth.save` 保存在 CPA `auth-dir` 的原账户文件中，管理列表不回显，浏览器不持久保存。
+
+账户标签只是备注。插件不根据标签合并账号，也不把“拉取模型的账户”当成客户端请求的固定调度账户。模型映射在插件范围共享。
+
+## 刷新与错误状态
+
+控制台提供手动刷新。每份凭据的查询尝试至少间隔 60 秒，相同凭据的并发刷新合并，整个插件最多同时刷新三个账户。一次刷新共用 30 秒总预算，包含排队、钱包及套餐请求；到期通过 CPA 公开 operation/cancel 接口取消宿主请求并释放刷新槽。宿主不支持可取消操作时返回错误，不启动无法取消的额度请求。普通缓存读取不请求 OpenDesign；本功能没有后台定时采样。
+
+- **未配置**：没有 control Key，不发送额度请求。
+- **等待查询**：已经配置，尚无查询数据。
+- **可用**：显示官方返回的余额、credits、重置时间及成功查询时间。
+- **部分可用**：例如钱包成功但工作区窗口失败，两部分独立展示。
+- **上次数据**：查询失败后保留最后一次成功值及原时间，移除当前预测。
+- **查询失败**：首次查询失败时显示错误类型，金额和额度保留未知；未知不显示为零。
+
+额度组件内的 `unauthorized`／`forbidden` 表示 OpenDesign control Key 或工作区权限未获许可；它们通过 HTTP 200 的额度状态返回，不注销 CPA 管理登录，也不停用推理账号。管理路由本身返回 HTTP 401／403 时，控制台要求重新验证 CPA 管理认证。429、超时、无效响应分别显示；上游响应正文、headers 和 Key 不透传到控制台。
+
+更换 Key、工作区或清除授权会使相关缓存与预测样本失效，旧请求迟到时不得恢复旧数据。状态列表提供随机生成的内存版本 `billing_revision`，供其他已打开页面在刷新状态时识别外部换 Key；该版本不由 Key 派生，也不写入 auth 文件。重启插件后需要重新查询建立样本。
+
+保存请求发送后会清空两种 Key 的输入框，即使响应丢失或服务器返回错误。账户操作已获成功确认、随后状态读取失败时，页面保留已确认的变化并提示刷新状态，避免误报为操作完全失败。
+
+## 预测的含义与计算
+
+预测回答“按最近消费速度，这个固定窗口可能何时耗尽”。它使用官方返回的 credits，保留原单位；不根据 token 数猜余额，也不套用 Cline 的金额估计、套餐时长或月／周倍数。
+
+只有同一份凭据、同一工作区、同一固定窗口的相邻两次成功采样，且间隔至少 60 秒、已用增加、剩余减少时才计算：
+
+```text
+每秒消费速度 = (本次 usedCredits − 上次 usedCredits) / 采样间隔秒数
+预计剩余秒数 = ceil(本次 remainingCredits / 每秒消费速度)
+预计耗尽时间 = 本次采样时间 + 预计剩余秒数
+```
+
+示例：12:00 已用 200、剩余 800 credits；12:05 已用 260、剩余 740 credits。速度为 `(260 − 200) / 300 = 0.2 credits/秒`，预计剩余 `740 / 0.2 = 3700 秒`，即预计在 13:06:40 耗尽。若窗口在 13:00 重置，则显示“预计先重置”，不显示跨越重置时刻的耗尽日期。此示例不改变任何余额、价格或额度。
+
+官方成功样本的 `remainingCredits` 已为零时，显示“官方返回的窗口额度已耗尽”（`forecast.state: exhausted`），无需等待第二个样本；此状态不附带估算时间或消费速度依据。到达已知重置点或后续查询失败后撤下该状态，避免把旧的零值当作当前确认。
+
+计算使用大整数与有理数，避免大 credits 被 JavaScript／浮点数四舍五入。金额只接受官方十进制字符串；数字类型或格式异常保留为未知，避免把已经舍入的金额当作精确值。
+
+界面同时标明采样时间与绝对耗尽时间，缓存中的“采样时预计剩余”不会改写为从现在起的倒计时。到达估算时间或窗口重置点后，界面会在本地撤下旧预测；这个计时器不会请求上游。以下情况不输出耗尽时间：
+
+- 样本不足、窗口身份或额度变化、重置、用量下降或数据不一致。
+- `activity_triggered` 窗口：消费过期可能释放额度，简单线性外推没有可靠含义。
+- 查询失败或数据陈旧。
+- 预计时间超过 366 天的显示上限。
+
+该估算涵盖两次官方窗口快照之间反映的消费，可能包含其他客户端的使用。它不能判断消费由哪个客户端产生，结算延迟和未来流量变化也会影响结果。界面明确标注估算依据；预测不修改 CPA 路由、冷却、启停或官方额度。
+
+## 管理 API
+
+```text
+POST /v0/management/open-design/credentials
+  {id?, label?, api_key?, disabled?, control_key?, workspace_id?, clear_billing?}
+
+GET /v0/management/open-design/quota?credential_id=<id>
+  只读缓存，不请求上游
+
+GET /v0/management/open-design/quota?credential_id=<id>&refresh=1
+  受最小间隔限制的手动查询
+```
+
+额度返回的钱包与窗口分别包含 `state`、`data`、`fetched_at`、`error`，顶层含 `next_refresh_at`。没有值时为 `null`，窗口内的 `forecast.state` 表示样本不足、滚动窗口、估算、已耗尽、先重置、已到期或超过预测上限。身份、枚举、时间和数字字段按官方客户端契约校验，只返回允许的字段。
+
+## 官方协议依据
+
+均绑定官方仓库 commit `5a0c47777975ddb91d09c1c16b423a3ef74bf572`：
+
+- [钱包请求、字段校验与错误语义](https://github.com/nexu-io/open-design/blob/5a0c47777975ddb91d09c1c16b423a3ef74bf572/apps/daemon/src/integrations/vela-wallet.ts#L148-L203)
+- [工作区 funding-check 请求与校验器](https://github.com/nexu-io/open-design/blob/5a0c47777975ddb91d09c1c16b423a3ef74bf572/apps/daemon/src/integrations/vela-billing.ts#L196-L270)
+- [窗口、credits 与重置模式类型](https://github.com/nexu-io/open-design/blob/5a0c47777975ddb91d09c1c16b423a3ef74bf572/packages/contracts/src/api/collab.ts#L1066-L1092)
+
+本仓库的隔离测试覆盖这些请求和字段契约；它们不代表已经用真实控制凭据查询过生产余额。

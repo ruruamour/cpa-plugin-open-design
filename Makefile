@@ -4,7 +4,7 @@
 #   make GO=/tmp/golang-go1.26.4/bin/go build
 
 GO ?= go
-VERSION ?= 0.1.0
+VERSION ?= 0.2.0
 DIST ?= dist
 LIBRARY := $(DIST)/open-design.so
 

@@ -6,7 +6,7 @@
       "name": "OpenDesign",
       "description": "将 OpenDesign 接入 CPA：管理 API key、获取并映射模型，通过 OpenAI 兼容接口发起流式与非流式请求。 / Connect OpenDesign to CPA with API key management, model discovery and mapping, plus streaming and non-streaming OpenAI-compatible requests.",
       "author": "ruruamour",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "repository": "https://github.com/ruruamour/cpa-plugin-open-design",
       "homepage": "https://github.com/ruruamour/cpa-plugin-open-design",
       "license": "MIT",

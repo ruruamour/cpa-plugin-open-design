@@ -1,13 +1,14 @@
 # OpenDesign 插件说明
 
-本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`，当前版本 `0.1.0`。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。
+本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`，当前版本 `0.2.0`。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。
 
 ## 范围
 
 - 实际 Provider 位于 `internal/opendesign`。
 - `internal/bridge` 是保留的上游参考实现，不接入本插件的新二进制。
 - 使用 CPA 公开的 host HTTP、translation 和 public RPC；不修改、不打包、不发布 CPA 宿主。
-- 不包含 Cline quota、pricing、providers、`has` 能力过滤和自动推理探测等上游专有逻辑。
+- 额度查询按 OpenDesign 官方 control API 实现，可选配置独立 control Key；不使用 Cline 的额度、价格或周期规则。详见[额度说明](quota.md)。
+- 管理页的账号选择用于模型发现，映射为插件共享；实际请求的账号选择与冷却遵循 CPA 公开接口。
 
 ## 协议
 
@@ -36,9 +37,9 @@ OpenDesign 生产接口：
 | 默认数据目录 | `plugins/open-design-data` |
 | 数据目录配置 | `data_dir` |
 
-- API key 保存在 CPA 的 `auth-dir`，通过 `host.auth.save` 写入；插件设置不保存 key，状态接口不回显 key。
-- 管理接口按 CPA 精确路由契约提供：`GET /credentials` 列出账户；`POST /credentials` 创建或更新，body 为 `{id?, label?, api_key?, disabled?}`；`DELETE /credentials?id=<id>` 按查询参数删除，不使用 `/credentials/{id}`。
-- 模型列表由管理页调用 OpenDesign `GET /models` 获取，用户选择后保存为客户端模型到上游模型的映射。
+- 推理 API key 与可选 control Key 保存在 CPA 的 `auth-dir`，通过 `host.auth.save` 写入；插件设置不保存 Key，管理接口不回显。
+- 管理接口按 CPA 精确路由契约提供：`GET /credentials` 列出账户；`POST /credentials` 创建或更新，body 为 `{id?, label?, api_key?, disabled?, control_key?, workspace_id?, clear_billing?}`；`DELETE /credentials?id=<id>` 按查询参数删除，不使用 `/credentials/{id}`。编辑时 Key 留空保留原值，`clear_billing:true` 显式清除额度授权和工作区。
+- 模型列表由管理页调用 OpenDesign `GET /models` 获取，支持搜索与可见项批量勾选。新增客户端别名默认以 `open-design-` 开头，已保存和手动编辑的别名保留。账户刷新不覆盖未保存的映射草稿。
 - 模型映射保存在插件数据目录；获取的上游模型列表不持久化。容器部署时应持久化 CPA 插件目录、CPA 的 `auth-dir` 和该数据目录。
 - 管理页沿用 CPA 管理认证。手动输入的管理密钥按 CPA 管理页的现有方式处理，不写入 OpenDesign key 存储。
 
@@ -94,15 +95,14 @@ plugins:
 
 ## 当前验证边界
 
-- 真实上游验证仍受有效凭据限制：对生产地址仅执行过两次 `GET /models`，均返回 `401 invalid_api_key`（`api key not found`）。
-- 尚未完成真实 `POST /chat/completions` 推理验证，因此不能标记“真实推理通过”。
-- `go test -race ./...` 和 `go vet ./...` 已通过；Node 测试 79 项通过，含新管理页 16 项。
-- 使用本地 CPA 8.0.48 和 loopback CONNECT/TLS 假上游验证插件加载、模型发现、JSON/SSE、工具调用及 usage；临时 CA 只传入测试子进程，不修改系统信任库或 hosts。控制台两条路径另有 146 项临时 Edge 浏览器检查。
-- [验证脚本说明](../scripts/README.md) 区分 ctypes 假宿主、真实 CPA 管理路径、真实 CPA 配合本地假上游三种模式。它们验证宿主兼容性，真实 OpenDesign 的模型与推理仍需有效凭据。
+- 2026-11-02 已用有效推理 Key 发现 13 个真实上游模型。官方直连和生产 CPA 插件各完成一次最小非流式请求，均返回 `OK`；生产路径使用 `open-design-minimax-m3.1-flash`，usage 219／3／222。未逐个调用全部模型。
+- 新增额度使用官方 control API，现有推理 Key 查询钱包和账单汇总均返回 401。可选额度功能的成功与异常分支、缓存、预测使用隔离假上游验证，真实 control Key 尚未提供。
+- 本地测试使用原版 CPA 8.0.48 与 loopback CONNECT/TLS 假上游，不修改系统信任库或 hosts；只允许推理、控制面与重定向测试主机。
+- 具体 Go／Node、Edge、真实宿主回归结果见[验证记录](verification.md)；[验证脚本说明](../scripts/README.md)区分 ctypes、原版宿主与假上游的边界。
 
 ## 发布 tag
 
-- 发布 tag 使用 `open-design-v0.1.0`，不创建或覆盖上游 `v*` tag。
+- 发布 tag 使用 `open-design-v0.2.0`，不创建或覆盖上游 `v*` tag。
 - 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定该 tag/版本。
 
