@@ -536,3 +536,130 @@ func TestModelRegistrationIsEmptyWithoutCredentials(t *testing.T) {
 		t.Fatalf("models missing although a credential exists")
 	}
 }
+
+// Regression for the P1 deadlock: host.auth.save re-enters auth.parse on the same
+// goroutine, and auth.parse takes authFileMu. Holding authFileMu across the save
+// hung the plugin for 60s under a real CPA. The delete must finish promptly.
+func TestDeleteSurvivesReentrantParseFromHostSave(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "primary", "sk-amr-deadlock-0017")
+	filename := id + ".json"
+	body, _ := json.Marshal(Credential{Type: Provider, ID: id, Label: "primary", APIKey: "sk-amr-deadlock-0017"})
+	host.writeAuthFile(t, filename, body)
+
+	// Exactly what CPA does inside host.auth.save: parse the new body before the
+	// file write, synchronously, on the calling goroutine.
+	host.mu.Lock()
+	host.saveHook = func(name string, raw []byte) {
+		if name != filename {
+			return
+		}
+		if _, err := s.parseAuth(mustJSON(t, map[string]any{
+			"Provider": Provider,
+			"FileName": name,
+			"RawJSON":  raw,
+			"Host":     map[string]any{"AuthDir": host.authDir},
+		})); err != nil {
+			t.Errorf("reentrant auth.parse from host.auth.save: %v", err)
+		}
+	}
+	host.mu.Unlock()
+
+	type result struct {
+		status int
+		raw    string
+	}
+	done := make(chan result, 1)
+	go func() {
+		status, _, raw := managementCall(t, s, http.MethodDelete, apiBase+"/credentials", map[string][]string{"id": {id}}, nil)
+		done <- result{status: status, raw: string(raw)}
+	}()
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("delete deadlocked: host.auth.save re-entered auth.parse while the plugin held a lock it needed")
+	}
+	if got.status != http.StatusOK {
+		t.Fatalf("delete status = %d, body %s", got.status, got.raw)
+	}
+	if strings.Contains(got.raw, "sk-amr-deadlock-0017") {
+		t.Fatalf("delete response leaked the key: %s", got.raw)
+	}
+}
+
+// The same re-entrancy applies to a plain enable/disable update, which also calls
+// host.auth.save while holding credentialMu.
+func TestCredentialUpdateSurvivesReentrantParse(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "primary", "sk-amr-deadlock-0018")
+	filename := id + ".json"
+	body, _ := json.Marshal(Credential{Type: Provider, ID: id, Label: "primary", APIKey: "sk-amr-deadlock-0018", Disabled: true})
+	host.writeAuthFile(t, filename, body)
+
+	host.mu.Lock()
+	host.saveHook = func(name string, raw []byte) {
+		if name != filename {
+			return
+		}
+		if _, err := s.parseAuth(mustJSON(t, map[string]any{
+			"Provider": Provider,
+			"FileName": name,
+			"RawJSON":  raw,
+			"Host":     map[string]any{"AuthDir": host.authDir},
+		})); err != nil {
+			t.Errorf("reentrant auth.parse: %v", err)
+		}
+	}
+	host.mu.Unlock()
+
+	done := make(chan int, 1)
+	go func() {
+		status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil, map[string]any{"id": id, "disabled": false})
+		done <- status
+	}()
+	select {
+	case status := <-done:
+		if status != http.StatusOK {
+			t.Fatalf("enable status = %d", status)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("credential update deadlocked on re-entrant auth.parse")
+	}
+}
+
+// An unlink failure after the host accepted disabled:true must report the real
+// state: the credential is disabled (models withdrawn), not still enabled.
+func TestDeleteUnlinkFailureReportsDisabledState(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "primary", "sk-amr-unlink-0019")
+	body, _ := json.Marshal(Credential{Type: Provider, ID: id, Label: "primary", APIKey: "sk-amr-unlink-0019"})
+	host.writeAuthFile(t, id+".json", body)
+	if err := os.Chmod(host.authDir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(host.authDir, 0o700) })
+
+	status, _, raw := managementCall(t, s, http.MethodDelete, apiBase+"/credentials", map[string][]string{"id": {id}}, nil)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body %s", status, raw)
+	}
+	message := string(raw)
+	if !strings.Contains(message, "credential removal failed") {
+		t.Fatalf("did not report the real unlink error: %s", message)
+	}
+	if !strings.Contains(message, "disabled") || strings.Contains(message, "still enabled") {
+		t.Fatalf("failure description does not match the host state: %s", message)
+	}
+	// The host was told disabled, so the live record must agree.
+	s.mu.RLock()
+	live := s.creds[id]
+	_, revoked := s.revoked[id]
+	s.mu.RUnlock()
+	if !live.Disabled {
+		t.Fatalf("host was told disabled but the record is enabled")
+	}
+	if revoked {
+		t.Fatalf("failed unlink revoked the id, which would block a later retry")
+	}
+}

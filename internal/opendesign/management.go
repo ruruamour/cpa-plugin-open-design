@@ -284,15 +284,21 @@ func (s *Service) updateCredential(id, label string, apiKey *string, disabled *b
 
 // deleteCredential removes the auth file and revokes the id so a queued watcher
 // callback cannot resurrect it.
+//
+// Locking is the delicate part. host.auth.save synchronously re-enters auth.parse
+// on this goroutine (CPA's saveAuthFile calls buildAuthsFromFileData before it
+// writes the file), and auth.parse takes authFileMu. Holding authFileMu across
+// the save therefore deadlocks the plugin. credentialMu alone serializes deletes
+// and updates; authFileMu is taken only for the unlink phase, which never calls
+// back into the host.
 func (s *Service) deleteCredential(credentialID string) (any, error) {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
-	s.authFileMu.Lock()
-	defer s.authFileMu.Unlock()
-	s.mu.Lock()
+
+	s.mu.RLock()
 	c, ok := s.creds[credentialID]
 	dir := s.authDir
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	if !ok {
 		return managementError(http.StatusNotFound, "credential not found")
 	}
@@ -307,30 +313,31 @@ func (s *Service) deleteCredential(credentialID string) (any, error) {
 		return managementError(http.StatusBadRequest, "invalid credential filename")
 	}
 	path := filepath.Join(dir, filename)
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return managementError(http.StatusConflict, "credential file missing")
-	}
-	var disk Credential
-	if json.Unmarshal(b, &disk) != nil || disk.Type != Provider || disk.ID != c.ID {
-		return managementError(http.StatusConflict, "credential file ownership mismatch")
-	}
-	// Make the host withdraw the credential's models first. CPA has no
-	// host.auth.delete (only list/get/get_runtime/save/models in 0.48), but a
-	// disabled auth re-runs model.for_auth with an empty catalog, which is the
-	// same path the console's disable action uses. Deleting the file first would
-	// leave the previously registered registry entry behind.
+
+	// Step 1 (no authFileMu): make the host withdraw the credential's models.
+	// CPA 0.48 has no host.auth.delete (only list/get/get_runtime/save/models),
+	// but a disabled auth re-runs model.for_auth and unregisters its catalog via
+	// registerModelsForAuthWithConfigAndCache -> unregisterModelsForAuthFenced.
 	disabled := c
 	disabled.Disabled = true
 	if err := s.saveCredential(disabled, filename); err != nil {
-		return managementError(http.StatusBadGateway, "credential could not be disabled before removal: "+err.Error())
+		// Nothing changed: the credential stays enabled and usable.
+		return managementError(http.StatusBadGateway, "credential could not be disabled before removal: "+redact(err.Error(), s.allKeys()...))
 	}
 	s.mu.Lock()
 	s.creds[credentialID] = disabled
 	s.mu.Unlock()
-	if err := os.Remove(path); err != nil {
-		return managementError(http.StatusInternalServerError, "credential removal failed: "+err.Error())
+
+	// Step 2 (authFileMu held, no host calls): verify ownership, then unlink.
+	// The host record is already disabled, so a failure here leaves a state that
+	// matches what the host reports: present but disabled, never "still enabled".
+	if status, message := s.unlinkCredentialFile(path, c); status != 0 {
+		if status == http.StatusInternalServerError {
+			return managementError(status, message+" (the credential is now disabled and its models are withdrawn; retry the delete)")
+		}
+		return managementError(status, message)
 	}
+
 	s.mu.Lock()
 	delete(s.creds, credentialID)
 	delete(s.authFiles, credentialID)
@@ -339,6 +346,25 @@ func (s *Service) deleteCredential(credentialID string) (any, error) {
 	s.revoked[credentialID] = true
 	s.mu.Unlock()
 	return managementJSON(http.StatusOK, map[string]any{"deleted": true})
+}
+
+// unlinkCredentialFile validates ownership and removes the auth file. A non-zero
+// status reports a failure; no host callback is made while it runs.
+func (s *Service) unlinkCredentialFile(path string, c Credential) (int, string) {
+	s.authFileMu.Lock()
+	defer s.authFileMu.Unlock()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return http.StatusConflict, "credential file missing"
+	}
+	var disk Credential
+	if json.Unmarshal(b, &disk) != nil || disk.Type != Provider || disk.ID != c.ID {
+		return http.StatusConflict, "credential file ownership mismatch"
+	}
+	if err := os.Remove(path); err != nil {
+		return http.StatusInternalServerError, "credential removal failed: " + err.Error()
+	}
+	return 0, ""
 }
 
 // upstreamModels proxies GET /models for the given credential.
