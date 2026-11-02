@@ -450,6 +450,48 @@ func TestDeleteAbortsWhenHostDisableFails(t *testing.T) {
 	}
 }
 
+// restrictDirForUnlink makes dir reject new unlinks and proves it actually does.
+//
+// The permission trick only holds where the OS enforces directory write bits: a
+// root-owned release container can delete inside a 0500 directory anyway, and
+// Windows has no unix mode bits at all. Rather than assert a platform behaviour
+// the test cannot create, probe first and skip with the real reason. The probe
+// uses its own scratch file so the credential under test is never touched, and
+// the directory mode is always restored.
+func restrictDirForUnlink(t *testing.T, dir string) {
+	t.Helper()
+	probe := filepath.Join(dir, "unlink-probe.tmp")
+	if err := os.WriteFile(probe, []byte("probe"), 0o600); err != nil {
+		t.Fatalf("write unlink probe: %v", err)
+	}
+	original, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat auth dir: %v", err)
+	}
+	mode := original.Mode().Perm()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod auth dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, mode)
+		_ = os.Remove(probe)
+	})
+	if err := os.Remove(probe); err == nil {
+		t.Skipf("unlink is not blocked by a 0500 directory here (running as root or a platform without unix mode bits), so the unlink-failure path cannot be exercised")
+	}
+	// Leave the probe behind only if it really is unremovable; the cleanup above
+	// restores the mode first, which makes it removable again.
+	if err := os.Chmod(dir, mode); err != nil {
+		t.Fatalf("restore auth dir mode: %v", err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatalf("remove unlink probe after restoring mode: %v", err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("re-apply read-only auth dir mode: %v", err)
+	}
+}
+
 // An unlink failure must be reported as such, not as success.
 func TestDeleteReportsUnlinkFailure(t *testing.T) {
 	s, host := newTestService(t)
@@ -458,11 +500,7 @@ func TestDeleteReportsUnlinkFailure(t *testing.T) {
 	host.writeAuthFile(t, id+".json", body)
 	// Read still succeeds (ownership check passes) but unlink cannot: removing an
 	// entry needs write permission on the directory.
-	dir := host.authDir
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatalf("setup chmod: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	restrictDirForUnlink(t, host.authDir)
 
 	status, _, raw := managementCall(t, s, http.MethodDelete, apiBase+"/credentials", map[string][]string{"id": {id}}, nil)
 	if status != http.StatusInternalServerError {
@@ -635,10 +673,7 @@ func TestDeleteUnlinkFailureReportsDisabledState(t *testing.T) {
 	id := addCredential(t, s, host, "primary", "sk-amr-unlink-0019")
 	body, _ := json.Marshal(Credential{Type: Provider, ID: id, Label: "primary", APIKey: "sk-amr-unlink-0019"})
 	host.writeAuthFile(t, id+".json", body)
-	if err := os.Chmod(host.authDir, 0o500); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(host.authDir, 0o700) })
+	restrictDirForUnlink(t, host.authDir)
 
 	status, _, raw := managementCall(t, s, http.MethodDelete, apiBase+"/credentials", map[string][]string{"id": {id}}, nil)
 	if status != http.StatusInternalServerError {
