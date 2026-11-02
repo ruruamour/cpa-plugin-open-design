@@ -40,16 +40,6 @@ API = "/v0/management/" + PLUGIN_ID
 CONSOLE = "/v0/resource/plugins/" + PLUGIN_ID + "/console"
 
 
-CASING_HINT = (
-    "If this reports a 502 whose body is the upstream JSON itself, the plugin is "
-    "not decoding CPA's host.http.* result casing: CPA marshals "
-    "pluginapi.HTTPResponse without json tags, so the wire keys are "
-    "StatusCode/Headers/Body (and StreamID/Payload/Done), while the plugin's "
-    "struct tags are snake_case. Re-run with --allow-snake-case-host to verify "
-    "the rest of the ABI surface while that is fixed.\n"
-)
-
-
 def require(condition, message):
     if not condition:
         raise AssertionError(message)
@@ -198,12 +188,15 @@ class PluginAPI(ctypes.Structure):
 class FakeHost:
     """Host side of the C ABI: implements the callback function table."""
 
-    def __init__(self, upstream, auth_dir, allow_snake_case=False):
+    def __init__(self, upstream, auth_dir):
         self.upstream = upstream
         self.auth_dir = Path(auth_dir)
-        self.allow_snake_case = allow_snake_case
         self.auth_dir.mkdir(parents=True, exist_ok=True)
         self.calls = []
+        self.callback_failures = []  # any exception raised inside dispatch()
+        self.operations = {}         # host.http.operation_open id -> record
+        self.cancelled_operations = []
+        self.next_operation = 0
         self.upstream_streams = {}   # host stream id -> list of byte chunks
         self.client_streams = {}     # plugin output stream id -> emitted records
         self.closed_upstreams = []
@@ -267,18 +260,24 @@ class FakeHost:
 
     # -- host callback table --
     def callback(self, _ctx, method, request, request_len, response):
-        name = ctypes.string_at(method).decode()
-        raw = bytes(bytearray(request[:request_len])) if request_len else b""
-        payload = json.loads(raw) if raw else {}
+        # ctypes swallows exceptions raised out of a CFUNCTYPE callback (it only
+        # prints "Exception ignored"), which would let a broken fake host look
+        # like a pass. Catch everything, answer with a host_error envelope, and
+        # remember the failure so the scenario can require() on it.
         try:
+            name = ctypes.string_at(method).decode()
+            raw = bytes(bytearray(request[:request_len])) if request_len else b""
+            payload = json.loads(raw) if raw else {}
             result = self.dispatch(name, payload)
             envelope = {"ok": True, "result": result}
             code = 0
-        except AssertionError as exc:
-            raise
-        except Exception as exc:  # noqa: BLE001 - surfaced to the plugin as an error
+        except Exception as exc:  # noqa: BLE001 - must not escape into ctypes
+            self.callback_failures.append({
+                "method": name if "name" in locals() else "<undecodable>",
+                "error": "%s: %s" % (type(exc).__name__, exc),
+            })
             envelope = {"ok": False, "error": {"code": "host_error",
-                                               "message": str(exc),
+                                               "message": "%s: %s" % (type(exc).__name__, exc),
                                                "http_status": 500}}
             code = 1
         data = json.dumps(envelope).encode()
@@ -288,21 +287,33 @@ class FakeHost:
         response[0].length = len(data)
         return code
 
-    def _named(self, status, headers, body=None, stream_id=None):
+    def _named(self, status, headers, body=None):
         """host.http.do result exactly as CPA marshals pluginapi.HTTPResponse.
 
         Note the asymmetry: this one has NO json tags, so the wire keys are
         PascalCase, while do_stream/stream_read use explicit snake_case tags.
         """
-        if self.allow_snake_case:
-            out = {"status_code": status, "headers": headers}
-            if body is not None:
-                out["body"] = body
-            return out
         return {"StatusCode": status, "Headers": headers, "Body": body}
 
     def dispatch(self, name, payload):
         self.calls.append({"method": name, "payload": payload})
+        if name == "host.http.operation_open":
+            # CPA binds the operation to host_callback_id and returns an opaque
+            # numeric id; quiesce later cancels through host.http.cancel.
+            self.next_operation += 1
+            operation_id = str(self.next_operation)
+            self.operations[operation_id] = {
+                "host_callback_id": payload.get("host_callback_id") or "",
+                "cancelled": False,
+            }
+            return {"operation_id": operation_id}
+        if name == "host.http.cancel":
+            operation_id = str(payload.get("operation_id") or "")
+            require(operation_id in self.operations,
+                    "host.http.cancel for unknown operation %r" % operation_id)
+            self.operations[operation_id]["cancelled"] = True
+            self.cancelled_operations.append(operation_id)
+            return {}
         if name == "host.auth.save":
             file_name = payload["name"]
             require(file_name.endswith(".json"), "host.auth.save name must end with .json")
@@ -503,9 +514,6 @@ def run_cpa(artifact, binary):
         require(not list((work / "auths").glob("*.json")),
                 "credential file survived deletion")
         evidence["host_credential_delete"] = {"auth_dir_empty": True}
-        evidence["skipped_online"] = ["upstream-models", "executor.execute",
-                                      "executor.execute_stream"]
-        evidence["status"] = "PASS"
         return evidence
     except AssertionError as exc:
         evidence.setdefault("status", "FAIL")
@@ -853,40 +861,52 @@ def run_cpa_live(artifact, binary):
         else:
             raise AssertionError("CPA never registered the plugin; log: %s" % (work / "cpa.log"))
 
-        # Model mapping first: CPA learns a plugin's models from model.for_auth
-        # when it loads the credential, so the mapping must exist beforehand.
-        status, raw, _ = request(API + "/models", {"models": [
-            {"id": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash"}]})
-        require(status == 200, "models POST returned %s: %s" % (status, raw))
+        stage_failures = []
 
+        # ---------------- standard UI flow ----------------
+        # 1. add the key first, exactly like the console does.
         status, raw, _ = request(API + "/credentials",
                                  {"label": "fixture", "api_key": FIXTURE_KEY})
         require(status == 201, "credential create returned %s: %s" % (status, raw))
         credential_id = json.loads(raw)["id"]
         require(FIXTURE_KEY not in raw.decode(), "credential response leaked the key")
+        evidence["ui_flow"] = {"credential_create": {"status": status,
+                                                     "leaked_key": False}}
 
-        def routed_model_ready(timeout=30):
-            """Wait until CPA can route the alias (model.for_auth was applied)."""
+        # 2. discover upstream models through the real host HTTP path.
+        status, raw, _ = request(API + "/upstream-models?credential_id=" + credential_id)
+        require(status == 200, "discover returned %s: %s" % (status, raw[:300]))
+        discovered = [m["id"] for m in json.loads(raw)["data"]]
+        require(discovered == ["deepseek-v4.1-flash", "glm-5.3-flash"], discovered)
+        evidence["ui_flow"]["discover"] = {"ids": discovered}
+
+        # 3. save the mapping AFTER the key exists; CPA must refresh the
+        #    registration so the alias becomes routable without a restart.
+        status, raw, _ = request(API + "/models", {"models": [
+            {"id": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash"}]})
+        require(status == 200, "models POST returned %s: %s" % (status, raw))
+
+        def client_models(timeout=30, want=("deepseek-flash",)):
+            """Poll GET /v1/models until the alias shows up (or not)."""
             deadline = time.monotonic() + timeout
+            seen = None
             while time.monotonic() < deadline:
                 status, raw, _ = request("/v1/models", method="GET")
                 if status == 200:
-                    ids = {m["id"] for m in json.loads(raw).get("data", [])}
-                    if "deepseek-flash" in ids:
-                        return sorted(ids)
+                    seen = sorted(m["id"] for m in json.loads(raw).get("data", []))
+                    if all(w in seen for w in want) or not want:
+                        return seen
                 time.sleep(0.25)
-            return None
+            return seen
 
-        routed = routed_model_ready()
-        evidence["host_model_routing"] = {
-            "alias_registered": routed is not None,
-            "client_models": routed}
-        require(routed is not None,
-                "CPA never exposed deepseek-flash via /v1/models; evidence=%s"
-                % evidence["host_model_routing"])
+        seen = client_models()
+        evidence["ui_flow"]["alias_after_mapping"] = seen
+        if not seen or "deepseek-flash" not in seen:
+            stage_failures.append(
+                "alias not routable after adding the mapping (host registration "
+                "not refreshed): /v1/models=%s" % seen)
 
         # ---- GET /models through host.http.do over the CONNECT proxy ----
-        # ---- 1. GET /models through host.http.do over the CONNECT proxy ----
         try:
             status, raw, _ = request(API + "/upstream-models?credential_id=" + credential_id)
         except urllib.error.HTTPError as exc:
@@ -984,76 +1004,244 @@ def run_cpa_live(artifact, binary):
                                             "detail": detail[:200]}
 
         # ---- 4. upstream 401 / 429 status preserved end to end ----
-        statuses = {}
-        if evidence.get("host_chat_completions", {}).get("status") != "PASS":
-            # CPA cools the credential down after the upstream failure above, so a
-            # status check now would be answered by the host ("auth_unavailable")
-            # and would prove nothing about the plugin. Re-run once the core bug is
-            # fixed; the ctypes mode covers this path today.
-            evidence["host_http_status"] = {
+        # ---- 5. upstream 401 / 429, each in its own isolated CPA process ----
+        # A real 401 or 429 makes CPA cool the credential down, so a second
+        # request in the same process would be answered by the host
+        # ("auth_unavailable") and prove nothing about the plugin. Each error
+        # case therefore gets a fresh host, credential and model mapping.
+        evidence["host_http_status"] = {}
+        for code in (429, 401):
+            case = run_cpa_live_error(binary, artifact, code)
+            evidence["host_http_status"][str(code)] = case
+
+        # ---- 6. disable -> enable must resync the runtime ----
+        # If the registration never came up there is nothing to withdraw, so these
+        # legs are reported as skipped instead of inventing a verdict.
+        registration_live = bool(seen and "deepseek-flash" in seen)
+        if registration_live:
+            status, raw, _ = request(API + "/credentials",
+                                     {"id": credential_id, "disabled": True})
+            require(status == 200, "disable returned %s: %s" % (status, raw))
+        else:
+            status = 0
+        if not registration_live:
+            evidence["ui_flow"]["disable_enable_delete"] = {
                 "status": "SKIPPED",
-                "reason": "credential cooled down by the preceding upstream failure",
-                "retry_after_core_fix": True}
-            statuses = None
-        # 429 first, then 401: a real 401 makes CPA cool the credential down, so a
-        # later request would be rejected by the host before reaching upstream and
-        # would not prove anything about plugin status handling.
-        for code, body in (([] if statuses is None else [
-                (429, {"error": {"message": "denied 429", "type": "rate_limit"}}),
-                (401, {"error": {"message": "denied 401", "type": "auth_error"}})])):
-            origin.fail = (code, json.dumps(body))
-            before = len(origin.requests)
+                "reason": "alias never became routable; see ui_flow_failures"}
+        else:
+            disabled_models = client_models(timeout=15, want=())
+            evidence["ui_flow"]["after_disable"] = {
+                "models": disabled_models,
+                "alias_withdrawn": "deepseek-flash" not in (disabled_models or []),
+            }
+            if "deepseek-flash" in (disabled_models or []):
+                stage_failures.append("disabled credential still advertises the "
+                                      "alias: %s" % disabled_models)
+
+        if registration_live:
+            status, raw, _ = request(API + "/credentials",
+                                     {"id": credential_id, "disabled": False})
+            require(status == 200, "enable returned %s: %s" % (status, raw))
+            seen = client_models()
+            evidence["ui_flow"]["after_enable"] = seen
+            if not seen or "deepseek-flash" not in seen:
+                stage_failures.append(
+                    "alias did not come back after re-enabling: %s" % seen)
             try:
-                status, raw, _ = request("/v1/chat/completions", {
+                code_, body_, _ = request("/v1/chat/completions", {
                     "model": "deepseek-flash",
                     "messages": [{"role": "user", "content": "hi"}],
-                    "stream": False,
-                })
-                statuses[str(code)] = {
-                    "surfaced_status": status, "preserved": status == code,
-                    "reached_upstream": len(origin.requests) > before,
-                    "body_head": raw.decode(errors="replace")[:120]}
+                    "stream": False})
             except urllib.error.HTTPError as exc:
-                raw = exc.read()
-                statuses[str(code)] = {
-                    "surfaced_status": exc.code, "preserved": exc.code == code,
-                    "reached_upstream": len(origin.requests) > before,
-                    "body_head": raw.decode(errors="replace")[:120]}
-        origin.fail = None
-        if statuses is not None:
-            require(all(v["reached_upstream"] for v in statuses.values()),
-                    "fake upstream was never reached for: %s" % statuses)
-            require(all(v["preserved"] for v in statuses.values()),
-                    "upstream status not preserved: %s" % statuses)
-            evidence["host_http_status"] = statuses
+                code_, body_ = exc.code, exc.read()
+            evidence["ui_flow"]["after_enable_callable"] = code_ == 200
+            if code_ != 200:
+                stage_failures.append(
+                    "after re-enable the alias is not callable: %s %s"
+                    % (code_, body_.decode(errors="replace")[:160]))
 
-        # ---- 5. host HTTP redirect behaviour: is Authorization re-sent? ----        # ---- host HTTP redirect behaviour: is Authorization re-sent? ----
-        blockers = sorted(name for name in (
-            "host_upstream_models", "host_chat_completions", "host_chat_stream")
-            if evidence.get(name, {}).get("status") == "FAIL")
+        status, raw, _ = request(API + "/credentials?id=" + credential_id, method="DELETE")
+        require(status == 200, "deleted credential returned %s: %s" % (status, raw))
+        require(not list((work / "auths").glob("*.json")), "credential file survived delete")
+        after_delete = client_models(timeout=15, want=())
+        try:
+            code_, body_, _ = request("/v1/chat/completions", {
+                "model": "deepseek-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False})
+        except urllib.error.HTTPError as exc:
+            code_, body_ = exc.code, exc.read()
+        unreachable = {"status": code_,
+                       "body_head": body_.decode(errors="replace")[:120]}
+        evidence["host_credential_delete"] = {
+            "auth_dir_empty": True,
+            "models_after_delete": after_delete,
+            "alias_withdrawn": "deepseek-flash" not in (after_delete or []),
+            "call_after_delete": unreachable,
+        }
+        if "deepseek-flash" in (after_delete or []):
+            stage_failures.append(
+                "delete_model_list: credential removed and no longer callable, but "
+                "CPA still advertises the alias in /v1/models: %s" % after_delete)
+        if unreachable["status"] == 200:
+            stage_failures.append(
+                "deleted credential is still callable: %s" % unreachable)
+
+        # ---- host HTTP redirect: is Authorization re-sent across origins? ----
         evidence["host_http_redirect"] = probe_redirect(
             request, origin, proxy, credential_id, proxy.allow_more)
 
-        status, raw, _ = request(API + "/credentials?id=" + credential_id, method="DELETE")
-        require(status == 200, "credential delete returned %s: %s" % (status, raw))
-        require(not list((work / "auths").glob("*.json")), "credential file survived delete")
-        evidence["host_credential_delete"] = {"auth_dir_empty": True}
-        evidence["loopback_only"] = {
-            "connect_allowed": sorted(set(proxy.connects)),
-            "connect_refused": sorted(set(proxy.refused)),
-            "proxy_bind": "127.0.0.1:%d" % proxy.port,
-            "origin_bind": "127.0.0.1:%d" % origin.port,
-            "hosts_file_touched": False,
-            "system_trust_touched": False,
-        }
-        evidence["status"] = "FAIL" if blockers else "PASS"
-        if blockers:
-            evidence["core_blocked_legs"] = blockers
+        # ---- final verdict: a blocked or skipped leg can never become PASS ----
+        blockers = sorted(name for name in (
+            "host_upstream_models", "host_chat_completions", "host_chat_stream")
+            if evidence.get(name, {}).get("status") == "FAIL")
+        for code, case in (evidence.get("host_http_status") or {}).items():
+            if case.get("status") != "PASS":
+                blockers.append("host_http_status." + code)
+        if not registration_live:
+            blockers.append("ui_flow.registration")
+        if stage_failures:
+            evidence["ui_flow_failures"] = stage_failures
+            blockers.append("ui_flow")
+        require(not blockers, "live legs failed: %s" % blockers)
+        evidence["status"] = "PASS"
         return evidence
     except AssertionError as exc:
         evidence.setdefault("status", "FAIL")
         evidence.setdefault("failure", str(exc)[:600])
         return evidence
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def run_cpa_live_error(binary, artifact, code):
+    """One upstream error status, in a throwaway CPA process.
+
+    CPA cools a credential down after a real 401/429, so statuses cannot share a
+    process. Each call boots its own host, credential and mapping, and asserts
+    the request actually reached the fake upstream before judging the status.
+    """
+    return _live_case(binary, artifact, fail_status=code)
+
+
+def _live_case(binary, artifact, fail_status=None):
+    work = Path(tempfile.mkdtemp(prefix="opendesign-cpa-case-"))
+    process = proxy = origin = log = None
+    result = {"status": "FAIL"}
+    try:
+        ca_crt, leaf_crt, leaf_key = make_test_ca(work)
+        origin = TlsFakeOrigin(leaf_crt, leaf_key)
+        proxy = LocalProxy()
+        origin.start()
+        proxy.origin_port = origin.port
+        proxy.start()
+        if fail_status is not None:
+            origin.fail = (fail_status, json.dumps(
+                {"error": {"message": "denied %d" % fail_status,
+                           "type": "auth_error" if fail_status == 401 else "rate_limit"}}))
+        (work / "plugins/linux/amd64").mkdir(parents=True)
+        shutil.copyfile(artifact, work / "plugins/linux/amd64/open-design.so")
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        management_key, client_key = "smoke-case-mgmt-key", "smoke-case-client-key"
+        (work / "config.yaml").write_text("\n".join([
+            "config-version: 8", "server:", "  host: 127.0.0.1", "  port: %d" % port,
+            "management:", "  secret-key: %s" % management_key,
+            "  allow-remote: false", "  disable-control-panel: true",
+            "  disable-auto-update-panel: true",
+            "requests:", "  proxy-url: http://127.0.0.1:%d" % proxy.port,
+            "access:", "  api-keys:", "    - %s" % client_key,
+            "oauth:", "  auth-dir: %s" % (work / "auths"),
+            "routing:", "  retry:", "    request-retry: 0",
+            "plugins:", "  enabled: true", "  dir: %s" % (work / "plugins"),
+            "  configs:", "    %s:" % PLUGIN_ID, "      enabled: true",
+            "      data_dir: %s" % (work / "data"), ""]))
+        (work / "config.yaml").chmod(0o600)
+        env = {k: v for k, v in os.environ.items()
+               if k.lower() not in ("http_proxy", "https_proxy", "all_proxy",
+                                    "no_proxy", "ssl_cert_file", "ssl_cert_dir")}
+        env["SSL_CERT_FILE"] = str(ca_crt)
+        env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
+        log = (work / "cpa.log").open("wb")
+        process = subprocess.Popen(
+            [str(binary), "-config", str(work / "config.yaml"), "-local-model"],
+            cwd=str(work), stdout=log, stderr=log, start_new_session=True, env=env)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def request(path, body=None, method=None, timeout=60):
+            data = json.dumps(body).encode() if body is not None else None
+            token = management_key if path.startswith("/v0/") else client_key
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d%s" % (port, path), data=data, method=method,
+                headers={"Authorization": "Bearer " + token,
+                         "Content-Type": "application/json"})
+            with opener.open(req, timeout=timeout) as resp:
+                return resp.status, resp.read(), dict(resp.headers)
+
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise AssertionError("case CPA exited early")
+            try:
+                status, raw, _ = request("/v0/management/plugins")
+                if status == 200 and any(x["id"] == PLUGIN_ID and x["registered"]
+                                         for x in json.loads(raw)["plugins"]):
+                    break
+            except Exception:  # noqa: BLE001 - startup race
+                pass
+            time.sleep(0.25)
+        else:
+            raise AssertionError("case CPA never registered the plugin")
+
+        status, raw, _ = request(API + "/credentials",
+                                 {"label": "fixture", "api_key": FIXTURE_KEY})
+        require(status == 201, "case credential create %s" % status)
+        credential_id = json.loads(raw)["id"]
+        status, raw, _ = request(API + "/models", {"models": [
+            {"id": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash"}]})
+        require(status == 200, "case models POST %s" % status)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            status, raw, _ = request("/v1/models", method="GET")
+            if status == 200 and "deepseek-flash" in {
+                    m["id"] for m in json.loads(raw).get("data", [])}:
+                break
+            time.sleep(0.25)
+
+        before = len(origin.requests)
+        try:
+            status, raw, _ = request("/v1/chat/completions", {
+                "model": "deepseek-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False})
+            body = raw
+        except urllib.error.HTTPError as exc:
+            status, body = exc.code, exc.read()
+        result = {
+            "status": "PASS" if status == fail_status else "FAIL",
+            "upstream_status": fail_status,
+            "surfaced_status": status,
+            "reached_upstream": len(origin.requests) > before,
+            "body_head": body.decode(errors="replace")[:160],
+            "isolated_process": True,
+        }
+        require(result["reached_upstream"],
+                "%d was answered by the host, not upstream" % fail_status)
+        require(status == fail_status,
+                "upstream %d surfaced as %s: %s"
+                % (fail_status, status, result["body_head"]))
+        return result
+    except AssertionError as exc:
+        result.setdefault("failure", str(exc)[:300])
+        return result
     finally:
         if process is not None and process.poll() is None:
             process.terminate()
@@ -1068,8 +1256,6 @@ def run_cpa_live(artifact, binary):
             if server is not None:
                 server.stop()
         shutil.rmtree(work, ignore_errors=True)
-
-
 
 
 def probe_redirect(request, origin, proxy, credential_id, allow_redirect_host):
@@ -1171,13 +1357,13 @@ class Plugin:
 
 
 # --------------------------------------------------------------------- scenario
-def run(artifact, allow_snake_case=False):
+def run(artifact):
     upstream = FakeUpstream().start()
     work = Path(tempfile.mkdtemp(prefix="opendesign-abi-"))
     evidence = {}
     plugin = None
     try:
-        host = FakeHost(upstream, work / "auths", allow_snake_case=allow_snake_case)
+        host = FakeHost(upstream, work / "auths")
 
         class HostAPI(ctypes.Structure):
             _fields_ = [("abi_version", ctypes.c_uint32), ("host_ctx", ctypes.c_void_p),
@@ -1245,8 +1431,7 @@ def run(artifact, allow_snake_case=False):
 
         status, raw, _ = plugin.management(API + "/upstream-models",
                                            query={"credential_id": [credential_id]})
-        require(status == 200, CASING_HINT + "upstream-models returned %s: %s"
-                % (status, raw[:400]))
+        require(status == 200, "upstream-models returned %s: %s" % (status, raw[:400]))
         models = json.loads(raw)["data"]
         evidence["upstream_models"] = [m["id"] for m in models]
         require([m["id"] for m in models] == ["deepseek-v4.1-flash", "glm-5.3-flash"], models)
@@ -1394,6 +1579,9 @@ def run(artifact, allow_snake_case=False):
         plugin.shutdown()
         plugin = None
         evidence["shutdown"] = {"host_streams_closed": bool(host.closed_upstreams)}
+        require(not host.callback_failures,
+                "fake host callback raised: %s" % host.callback_failures)
+        evidence["callback_failures"] = host.callback_failures
         evidence["status"] = "PASS"
         return evidence
     finally:
@@ -1410,10 +1598,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", help="path to dist/open-design.so")
     parser.add_argument("--json-report", default=None)
-    parser.add_argument("--allow-snake-case-host", action="store_true",
-                        help="let the fake host answer with the plugin's own "
-                             "snake_case field names instead of CPA's real "
-                             "PascalCase wire casing")
     parser.add_argument("--cpa-binary", nargs="?", const=CPA_DEFAULT, default=None,
                         help="also boot a real local CPA host (offline routes only) "
                              "from this binary; defaults to %s" % CPA_DEFAULT)
@@ -1428,7 +1612,7 @@ def main():
     evidence = {}
     failure = None
     try:
-        evidence = run(artifact, args.allow_snake_case_host)
+        evidence = run(artifact)
     except AssertionError as exc:
         failure = str(exc)
         evidence = {"ctypes": {"status": "FAIL", "failure": failure[:600]}}

@@ -34,7 +34,8 @@ python3 scripts/smoke-abi.py dist/open-design.so
 python3 scripts/smoke-abi.py dist/open-design.so --json-report /tmp/open-design-abi.json
 ```
 
-**大小写必须与 CPA 一致，否则就是自证。** CPA `sdk/pluginapi/types.go` 的 `HTTPResponse` 没有 json tag，所以 `host.http.do` 线上是 `StatusCode`/`Headers`/`Body`；而 `internal/pluginhost/host_callbacks.go` 的 `rpcHostHTTPStreamResponse`、`rpcHostHTTPStreamReadResponse` 有显式 tag，是 `status_code`/`stream_id`/`payload`/`done`。本脚本默认按真实字段发，因此能暴露字段名写错的问题；`--allow-snake-case-host` 会退回插件自己的字段名，用于在 core 修复期间继续验证 ABI 其余部分（此时结果不再代表真实宿主行为）。
+假宿主按 CPA 真实线上契约工作，不做兼容放宽：`host.http.do` 的结果是 `StatusCode`/`Headers`/`Body`（该 SDK 结构体无 json tag），`host.http.do_stream` 与 `host.http.stream_read` 是 `status_code`/`stream_id`/`payload`/`done`（有显式 tag）。假宿主还实现 `host.http.operation_open` / `host.http.cancel`，并在 `shutdown` 前要求 `callback_failures` 为空——回调里抛出的异常会被记为失败，而不是被 ctypes 静默吞掉后还报 PASS。
+
 
 退出码 0 为 PASS，非 0 为 FAIL（断言信息即失败原因）。临时 data/auth 目录用 `mkdtemp` 创建、`shutil.rmtree` 清理，不使用 `rm -rf`；不发 SSH、不读生产配置、不使用真实 Key 或真实推理。
 
@@ -77,22 +78,18 @@ python3 scripts/smoke-abi.py dist/open-design.so --cpa-live
 4. `SSL_CERT_FILE` 只设在 CPA 子进程环境里，**不动** `/etc/hosts`、系统信任库和系统代理；
 5. 发请求用 CPA 客户端 key（`/v1/*`）和管理 key（`/v0/*`），凭据仍是 `sk-amr-test-fixture`。
 
-覆盖：`GET /models` → 上游模型列表；`POST /v1/chat/completions` 非流式 200（`tools` 转发 + `usage`）；流式 SSE 多帧；上游 401/429 是否透传；以及**重定向行为**——让假上游对 `/models` 回 307 指向另一个 origin，观察宿主的跨源重定向策略。
+按控制台真实顺序跑完整用户流程，每一步都断言：
+
+1. `POST /credentials` 添加 key（响应与后续路由都不回显 key）；
+2. `GET /upstream-models` 经真实宿主 HTTP 发现上游模型；
+3. `POST /models` 保存映射后，`GET /v1/models` 必须立刻出现别名（宿主注册被刷新）；
+4. `/v1/chat/completions` 非流式（`tools` 转发 + `usage`）与流式 SSE 多帧，模型别名要还原成客户端名；
+5. `disabled:true` 后 `/v1/models` 收回别名，`disabled:false` 后恢复且可再次调用；
+6. `DELETE /credentials?id=` 后不可调用、且不应再出现在模型列表；
+7. 上游 401 与 429 **各起一个独立 CPA 进程**（401 会让 CPA 冷却凭据，同进程第二次请求会被宿主挡掉），每个用例都断言请求确实到达假上游；
+8. 跨源重定向：假上游对 `/models` 回 307，观察宿主是否把 `Authorization` 带到另一个 origin。
 
 实测结论（CPA v8.0.48）：跨源 307 **会被跟随**，但 `Authorization` **会被剥掉**（`host_http_redirect.verdict`），即宿主不会把 bearer key 带到别的 origin；`registry.npmjs.org:443` 的 CONNECT 被代理拒绝，证明没有其它出站。
 
 注意：一次 401 会让 CPA 冷却该凭据，因此 401 放在最后；如果前面的主链路被 core bug 挡住（`core_blocked_legs` 非空），状态码这一段会记为 `SKIPPED` 而不是假通过。
 
-## 当前已知的 core 问题（脚本会如实报出来）
-
-`host.http.do` 的结果被插件按 `status_code` 解码，而 CPA 实际发的是 `StatusCode`，于是状态永远为 0、`Body` 也拿不到。表现：
-
-```bash
-$ python3 scripts/smoke-abi.py dist/open-design.so
-FAIL: ... the plugin is not decoding CPA's host.http.* result casing ...
-upstream-models returned 502: b'{"error":"{\"object\": \"list\", ...}"}'
-```
-
-即上游返回的 200 正文被原样包进 502 —— 请求链路本身是通的，只是结果没解出来。真宿主模式同样复现（`--cpa-live` 的 `host_upstream_models` 记为 `BLOCKED_BY_CORE_BUG`，`origin_returned_200: true` 与 `origin_saw_bearer: true` 说明假上游确实收到并正确鉴权）。
-
-受影响的是所有走 `host.http.do` 的路径：`GET /models`（上游模型列表）和非流式的 `executor.execute`。`host.http.do_stream` 系用 snake_case 是对的，因此纯流式路径不受影响。`.so` 里 `upstreamCall` 结构需要改成 PascalCase（或同时接受两种），由 core owner 处理；本脚本不修 core。
