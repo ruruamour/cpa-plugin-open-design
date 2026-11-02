@@ -71,7 +71,7 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/xiao-qiu-qiu/ClinePassBridge/internal/bridge"
+	"github.com/ruruamour/cpa-plugin-open-design/internal/opendesign"
 )
 
 const abiVersion = 1
@@ -115,7 +115,7 @@ func (e *rpcError) Retryable() bool {
 }
 
 var (
-	service   *bridge.Service
+	service   *opendesign.Service
 	hostMu    sync.RWMutex
 	libraryMu sync.RWMutex
 )
@@ -140,7 +140,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	hostMu.Lock()
 	C.store_host_api(host)
 	hostMu.Unlock()
-	service = bridge.NewService()
+	service = opendesign.NewService()
 	service.SetHost(callHost)
 	plugin.abi_version = C.uint32_t(abiVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)

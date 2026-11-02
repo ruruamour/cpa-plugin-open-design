@@ -1,4 +1,4 @@
-module github.com/xiao-qiu-qiu/ClinePassBridge
+module github.com/ruruamour/cpa-plugin-open-design
 
 go 1.26.0
 
