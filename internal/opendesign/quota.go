@@ -34,7 +34,7 @@ func (s *Service) readQuota(id, callbackID string, refresh bool) (quotaResponse,
 		return quotaResponse{}, err
 	}
 	if !refresh || !entry.view.BillingConfigured {
-		view := entry.view
+		view := quotaViewAt(entry.view, s.quotaNow())
 		s.mu.Unlock()
 		return view, nil
 	}
@@ -52,7 +52,7 @@ func (s *Service) readQuota(id, callbackID string, refresh bool) (quotaResponse,
 		return s.cachedQuota(id)
 	}
 	if !entry.lastAttempt.IsZero() && s.quotaNow().Before(entry.lastAttempt.Add(quotaRefreshInterval)) {
-		view := entry.view
+		view := quotaViewAt(entry.view, s.quotaNow())
 		s.mu.Unlock()
 		return view, nil
 	}
@@ -64,6 +64,7 @@ func (s *Service) readQuota(id, callbackID string, refresh bool) (quotaResponse,
 	view := s.fetchQuota(callbackID, c, entry, stop)
 	s.mu.Lock()
 	if current := s.quota[id]; current == entry && current.epoch == s.billingEpoch[id] && view != nil {
+		applyQuotaForecasts(entry, view)
 		entry.view = *view
 	}
 	entry.inflight = nil
@@ -87,7 +88,7 @@ func (s *Service) quotaViewLocked(id string) (quotaResponse, error) {
 	if err != nil {
 		return quotaResponse{}, err
 	}
-	return entry.view, nil
+	return quotaViewAt(entry.view, s.quotaNow()), nil
 }
 
 func (s *Service) quotaEntryLocked(id string) (*quotaEntry, error) {
@@ -233,7 +234,8 @@ func (s *Service) quotaGET(callbackID, address, controlKey string) ([]byte, *quo
 		}
 		var timeout net.Error
 		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout() ||
-			strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") || strings.Contains(strings.ToLower(err.Error()), "timed out") {
+			strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") || strings.Contains(strings.ToLower(err.Error()), "timed out") ||
+			strings.Contains(strings.ToLower(err.Error()), "timeout") {
 			return nil, quotaFailure("timeout")
 		}
 		return nil, quotaFailure("network")

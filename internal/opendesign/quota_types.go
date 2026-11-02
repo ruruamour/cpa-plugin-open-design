@@ -78,4 +78,5 @@ type quotaEntry struct {
 	lastAttempt time.Time
 	inflight    chan struct{}
 	invalidated chan struct{}
+	samples     map[quotaWindowIdentity]quotaWindowSample
 }
