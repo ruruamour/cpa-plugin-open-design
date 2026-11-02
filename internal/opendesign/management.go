@@ -315,12 +315,27 @@ func (s *Service) deleteCredential(credentialID string) (any, error) {
 	if json.Unmarshal(b, &disk) != nil || disk.Type != Provider || disk.ID != c.ID {
 		return managementError(http.StatusConflict, "credential file ownership mismatch")
 	}
+	// Make the host withdraw the credential's models first. CPA has no
+	// host.auth.delete (only list/get/get_runtime/save/models in 0.48), but a
+	// disabled auth re-runs model.for_auth with an empty catalog, which is the
+	// same path the console's disable action uses. Deleting the file first would
+	// leave the previously registered registry entry behind.
+	disabled := c
+	disabled.Disabled = true
+	if err := s.saveCredential(disabled, filename); err != nil {
+		return managementError(http.StatusBadGateway, "credential could not be disabled before removal: "+err.Error())
+	}
+	s.mu.Lock()
+	s.creds[credentialID] = disabled
+	s.mu.Unlock()
 	if err := os.Remove(path); err != nil {
-		return managementError(http.StatusInternalServerError, "credential removal failed")
+		return managementError(http.StatusInternalServerError, "credential removal failed: "+err.Error())
 	}
 	s.mu.Lock()
 	delete(s.creds, credentialID)
 	delete(s.authFiles, credentialID)
+	// The id stays revoked so a watcher callback queued before the unlink cannot
+	// recreate the credential.
 	s.revoked[credentialID] = true
 	s.mu.Unlock()
 	return managementJSON(http.StatusOK, map[string]any{"deleted": true})

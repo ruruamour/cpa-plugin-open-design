@@ -350,3 +350,189 @@ func readSettings(path string) (Config, error) {
 	}
 	return cfg, nil
 }
+
+// Delete must first hand the host a disabled record so CPA re-runs model.for_auth
+// and withdraws the catalog, then unlink the file, then stay revoked.
+// CPA 0.48 exposes no host.auth.delete (only list/get/get_runtime/save/models).
+func TestDeleteCredentialWithdrawsHostModelsBeforeUnlink(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "primary", "sk-amr-delete-0012")
+	filename := id + ".json"
+	if status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{"models": []map[string]string{
+		{"id": "od-large", "upstream_id": "opendesign-large"},
+	}}); status != http.StatusOK {
+		t.Fatalf("seed models: %d %s", status, raw)
+	}
+	if models := s.modelRegistration().(map[string]any)["Models"].([]map[string]any); len(models) == 0 {
+		t.Fatalf("models were not registered before the delete")
+	}
+
+	// The credential file exists on disk, as after a successful create.
+	body, _ := json.Marshal(Credential{Type: Provider, ID: id, Label: "primary", APIKey: "sk-amr-delete-0012"})
+	path := host.writeAuthFile(t, filename, body)
+
+	var saves []Credential
+	host.mu.Lock()
+	host.saveHook = func(name string, raw []byte) {
+		if name != filename {
+			return
+		}
+		var c Credential
+		if err := json.Unmarshal(raw, &c); err == nil {
+			saves = append(saves, c)
+		}
+	}
+	host.mu.Unlock()
+
+	status, resp, raw := managementCall(t, s, http.MethodDelete, apiBase+"/credentials", map[string][]string{"id": {id}}, nil)
+	if status != http.StatusOK || resp["deleted"] != true {
+		t.Fatalf("delete: %d %s", status, raw)
+	}
+	// The host saw a disabled record before the unlink, which is what withdraws
+	// the models (registerModelsForAuthWithConfigAndCache -> unregister).
+	if len(saves) != 1 {
+		t.Fatalf("host.auth.save called %d times, want 1", len(saves))
+	}
+	if !saves[0].Disabled {
+		t.Fatalf("delete did not disable the record the host was given")
+	}
+	if saves[0].APIKey != "sk-amr-delete-0012" {
+		t.Fatalf("disable-before-delete lost the key")
+	}
+	// The file is gone and the id stays revoked so a queued watcher callback
+	// cannot resurrect it.
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("credential file still present: %v", err)
+	}
+	s.mu.RLock()
+	_, live := s.creds[id]
+	revoked := s.revoked[id]
+	s.mu.RUnlock()
+	if live {
+		t.Fatalf("deleted credential stayed live")
+	}
+	if !revoked {
+		t.Fatalf("deleted credential was not revoked")
+	}
+	// Nothing may be advertised once the last credential is gone.
+	if models := s.modelRegistration().(map[string]any)["Models"].([]map[string]any); len(models) != 0 {
+		t.Fatalf("models still registered after delete: %v", models)
+	}
+}
+
+// A disable that the host rejects must abort the delete and leave the key intact.
+func TestDeleteAbortsWhenHostDisableFails(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "primary", "sk-amr-abort-0013")
+	body, _ := json.Marshal(Credential{Type: Provider, ID: id, Label: "primary", APIKey: "sk-amr-abort-0013"})
+	path := host.writeAuthFile(t, id+".json", body)
+	host.mu.Lock()
+	host.saveAuthErr = errString("auth dir is read-only")
+	host.mu.Unlock()
+
+	status, _, raw := managementCall(t, s, http.MethodDelete, apiBase+"/credentials", map[string][]string{"id": {id}}, nil)
+	if status != http.StatusBadGateway {
+		t.Fatalf("delete status = %d, want 502: %s", status, raw)
+	}
+	if strings.Contains(raw, "sk-amr-abort-0013") {
+		t.Fatalf("delete error leaked the key: %s", raw)
+	}
+	// The credential must still be usable and the file untouched.
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("failed delete removed the file: %v", err)
+	}
+	s.mu.RLock()
+	c, live := s.creds[id]
+	revoked := s.revoked[id]
+	s.mu.RUnlock()
+	if !live || c.APIKey != "sk-amr-abort-0013" || revoked {
+		t.Fatalf("failed delete mutated state: live=%v revoked=%v key=%q", live, revoked, c.APIKey)
+	}
+}
+
+// An unlink failure must be reported as such, not as success.
+func TestDeleteReportsUnlinkFailure(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "primary", "sk-amr-unlink-0014")
+	body, _ := json.Marshal(Credential{Type: Provider, ID: id, Label: "primary", APIKey: "sk-amr-unlink-0014"})
+	host.writeAuthFile(t, id+".json", body)
+	// Read still succeeds (ownership check passes) but unlink cannot: removing an
+	// entry needs write permission on the directory.
+	dir := host.authDir
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("setup chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	status, _, raw := managementCall(t, s, http.MethodDelete, apiBase+"/credentials", map[string][]string{"id": {id}}, nil)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("unlink failure status = %d, want 500, body %s", status, raw)
+	}
+	if !strings.Contains(raw, "credential removal failed") {
+		t.Fatalf("unlink failure did not report the real error: %s", raw)
+	}
+	s.mu.RLock()
+	_, revoked := s.revoked[id]
+	s.mu.RUnlock()
+	if revoked {
+		t.Fatalf("failed unlink revoked the credential")
+	}
+}
+
+// A watcher callback queued before the unlink must not bring the credential back.
+func TestDeletedCredentialIsNotResurrectedByWatcher(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "primary", "sk-amr-revive-0015")
+	body, _ := json.Marshal(Credential{Type: Provider, ID: id, Label: "primary", APIKey: "sk-amr-revive-0015"})
+	host.writeAuthFile(t, id+".json", body)
+	if status, _, raw := managementCall(t, s, http.MethodDelete, apiBase+"/credentials", map[string][]string{"id": {id}}, nil); status != http.StatusOK {
+		t.Fatalf("delete: %d %s", status, raw)
+	}
+
+	// The stale payload arrives after the delete landed; disk no longer has the file.
+	out, err := s.parseAuth(mustJSON(t, map[string]any{
+		"Provider": Provider,
+		"FileName": id + ".json",
+		"RawJSON":  body,
+		"Host":     map[string]any{"AuthDir": host.authDir},
+	}))
+	if err != nil {
+		t.Fatalf("stale parse: %v", err)
+	}
+	if handled, _ := out.(map[string]any)["Handled"].(bool); handled {
+		t.Fatalf("stale watcher callback resurrected the deleted credential")
+	}
+	s.mu.RLock()
+	_, live := s.creds[id]
+	s.mu.RUnlock()
+	if live {
+		t.Fatalf("deleted credential is live again")
+	}
+	// Re-creating the same file is an operator action and must still work.
+	host.writeAuthFile(t, id+".json", body)
+	out, err = s.parseAuth(mustJSON(t, map[string]any{
+		"Provider": Provider,
+		"FileName": id + ".json",
+		"RawJSON":  body,
+		"Host":     map[string]any{"AuthDir": host.authDir},
+	}))
+	if err != nil {
+		t.Fatalf("parse after re-create: %v", err)
+	}
+	if handled, _ := out.(map[string]any)["Handled"].(bool); !handled {
+		t.Fatalf("re-created credential was not accepted")
+	}
+}
+
+// Models are only advertised while at least one live credential can serve them.
+func TestModelRegistrationIsEmptyWithoutCredentials(t *testing.T) {
+	s, host := newTestService(t)
+	if models := s.modelRegistration().(map[string]any)["Models"].([]map[string]any); len(models) != 0 {
+		t.Fatalf("fresh plugin advertised models: %v", models)
+	}
+	addCredential(t, s, host, "primary", "sk-amr-reg-0016")
+	seedModels(t, s, host)
+	if models := s.modelRegistration().(map[string]any)["Models"].([]map[string]any); len(models) == 0 {
+		t.Fatalf("models missing although a credential exists")
+	}
+}

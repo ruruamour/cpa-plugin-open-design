@@ -14,6 +14,14 @@ import (
 // that can never succeed.
 func (s *Service) modelRegistration() any {
 	cfg := s.config()
+	// Without a live credential nothing can serve these models; advertising them
+	// would keep them in /v1/models after the last credential is deleted.
+	s.mu.RLock()
+	hasCredential := len(s.creds) > 0
+	s.mu.RUnlock()
+	if !hasCredential {
+		return map[string]any{"Provider": Provider, "Models": []map[string]any{}}
+	}
 	models := make([]map[string]any, 0, len(cfg.Models))
 	for _, m := range cfg.Models {
 		models = append(models, map[string]any{
