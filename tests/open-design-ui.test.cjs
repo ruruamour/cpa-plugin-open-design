@@ -17,10 +17,34 @@ function pageHTML() {
   return page.replace('/*__OPEN_DESIGN_CONSOLE__*/', source('console.js'));
 }
 
+// `node.children` is an HTMLCollection in a browser: length, index access and
+// iteration only. Wrapping the backing array makes the fake DOM reject calls
+// like `children.find(...)`, which is exactly the class of bug a real browser
+// surfaces (FakeNode used to expose a plain Array and hid the failure).
+const ARRAY_ONLY = new Set([
+  'find', 'findIndex', 'findLast', 'findLastIndex', 'map', 'filter', 'some', 'every', 'forEach',
+  'reduce', 'reduceRight', 'slice', 'concat', 'indexOf', 'lastIndexOf', 'includes', 'join', 'sort',
+  'reverse', 'flat', 'flatMap', 'at', 'pop', 'push', 'shift', 'unshift', 'splice', 'fill', 'copyWithin',
+  'toSorted', 'toReversed', 'toSpliced', 'with',
+]);
+
+function htmlCollection(nodes) {
+  return new Proxy(nodes, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'string' && ARRAY_ONLY.has(prop)) {
+        throw new TypeError(`children.${prop} is not a function`);
+      }
+      if (prop === 'item') return index => target[index] ?? null;
+      if (prop === 'namedItem') return () => null;
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+}
+
 class FakeNode {
   constructor(tag) {
     this.tagName = String(tag || 'div').toUpperCase();
-    this.children = [];
+    this._children = [];
     this.attributes = {};
     this.listeners = new Map();
     this.value = '';
@@ -30,21 +54,24 @@ class FakeNode {
     this._text = '';
     this.className = '';
   }
+  get children() {
+    return htmlCollection(this._children);
+  }
   set textContent(value) {
     this._text = String(value ?? '');
-    this.children = [];
+    this._children = [];
   }
   get textContent() {
-    return this._text + this.children.map(child => child.textContent).join('');
+    return this._text + this._children.map(child => child.textContent).join('');
   }
   set innerHTML(value) {
     throw new Error('tests reject innerHTML rendering');
   }
   append(...nodes) {
-    for (const node of nodes) if (node) this.children.push(node);
+    for (const node of nodes) if (node) this._children.push(node);
   }
   replaceChildren(...nodes) {
-    this.children = nodes.filter(Boolean);
+    this._children = nodes.filter(Boolean);
   }
   addEventListener(type, handler) {
     if (!this.listeners.has(type)) this.listeners.set(type, []);
@@ -284,7 +311,7 @@ test('account labels are rendered as text, never as trusted HTML', () => {
   const row = list.children[0];
   assert.equal(row.children[0].children[0].textContent, label);
   assert.equal(row.children[0].children[1].textContent, '已停用');
-  assert.ok(!row.children.some(child => child.tagName === 'IMG' || child.tagName === 'B'));
+  assert.ok(!Array.from(row.children).some(child => child.tagName === 'IMG' || child.tagName === 'B'));
   assert.equal(view.context.pwned, undefined);
 });
 
@@ -341,7 +368,7 @@ test('row action buttons are wired to real click listeners', async () => {
   consoleApi.state.status = view.context.OpenDesignCore.normalizeStatus(statusBody());
   consoleApi.render.renderAccounts();
   const row = view.document.getElementById('accountList').children[0];
-  const actions = row.children[1].children;
+  const actions = Array.from(row.children[1].children);
   const toggle = actions.find(node => node.getAttribute('data-action') === 'toggle-account');
   const remove = actions.find(node => node.getAttribute('data-action') === 'delete-account');
   assert.ok(toggle && remove);
@@ -565,4 +592,368 @@ test('401 while adding or loading models explains the failure without exposing s
   await consoleApi.handlers.addAccount({ preventDefault() {} });
   assert.match(view.document.getElementById('authState').textContent, /401/);
   assert.ok(!view.document.getElementById('authState').textContent.includes(key));
+});
+
+// --- account editing, draft protection, upstream-vs-management errors ---
+
+function twoAccountPage(extra = {}) {
+  const calls = [];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, init, method: init.method || 'GET', body: init.body });
+      return extra.fetchImpl ? extra.fetchImpl(url, init, calls) : respond(200, {});
+    },
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  const accounts = [
+    { id: 'cred-1', label: '主账户', disabled: false },
+    { id: 'cred-2', label: '备用账户', disabled: false },
+  ];
+  consoleApi.render.applyStatus(statusBody({
+    credentials: accounts,
+    models: [{ id: 'flash', upstream_id: 'open-design/flash' }],
+  }));
+  return { view, consoleApi, calls, accounts };
+}
+
+const accountRows = view => [...view.document.getElementById('accountList').children];
+const actionOf = (row, action) => Array.from(row.children[1].children).find(node => node.getAttribute('data-action') === action);
+
+test('editing an account reuses POST /credentials and omits the key when left empty', async () => {
+  const updated = statusBody({
+    credentials: [{ id: 'cred-1', label: '主账户（改名）', disabled: false }],
+    models: [{ id: 'flash', upstream_id: 'open-design/flash' }],
+  });
+  const { view, consoleApi, calls } = twoAccountPage({
+    fetchImpl: (url, init) => {
+      if (url.endsWith('/credentials') && (init.method || 'GET') === 'POST') return respond(200, { id: 'cred-1', label: '主账户（改名）', disabled: false });
+      if (url.endsWith('/status')) return respond(200, updated);
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const row = accountRows(view).find(node => node.getAttribute('data-credential-id') === 'cred-1');
+  await actionOf(row, 'edit-account').emit('click');
+  assert.match(view.document.getElementById('accountFormTitle').textContent, /编辑账户/);
+  assert.equal(view.document.getElementById('accountSubmit').textContent, '保存修改');
+  assert.equal(view.document.getElementById('accountCancel').hidden, false);
+  assert.equal(view.document.getElementById('accountLabel').value, '主账户');
+  assert.equal(view.document.getElementById('accountKey').value, '', 'the original key is never read into the page');
+  assert.match(view.document.getElementById('accountKey').getAttribute('placeholder'), /留空/);
+
+  view.document.getElementById('accountLabel').value = '主账户（改名）';
+  view.document.getElementById('accountKey').value = '';
+  await consoleApi.handlers.addAccount({ preventDefault() {} });
+
+  const update = calls.find(call => call.method === 'POST' && call.url.endsWith('/credentials'));
+  const body = JSON.parse(update.body);
+  assert.equal(body.id, 'cred-1');
+  assert.equal(body.label, '主账户（改名）');
+  assert.ok(!('api_key' in body), 'an empty key must not be sent so the stored key is kept');
+  assert.equal(calls.some(call => call.url.includes(managementKey)), false);
+  assert.equal(view.document.getElementById('accountKey').value, '');
+  assert.equal(view.document.getElementById('accountFormTitle').textContent, '添加账户');
+  assert.equal(view.document.getElementById('accountCancel').hidden, true);
+  assert.match(view.document.getElementById('accountState').textContent, /原 API key 保留/);
+});
+
+test('editing with a replacement key sends api_key once and then clears the input', async () => {
+  const { view, consoleApi, calls } = twoAccountPage({
+    fetchImpl: (url, init) => {
+      if (url.endsWith('/credentials') && (init.method || 'GET') === 'POST') return respond(200, { id: 'cred-1', label: '主账户', disabled: false });
+      if (url.endsWith('/status')) return respond(200, statusBody());
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const row = accountRows(view).find(node => node.getAttribute('data-credential-id') === 'cred-1');
+  await actionOf(row, 'edit-account').emit('click');
+  view.document.getElementById('accountKey').value = 'replacement-key-abcdef';
+  await consoleApi.handlers.addAccount({ preventDefault() {} });
+  const update = calls.find(call => call.method === 'POST' && call.url.endsWith('/credentials'));
+  const body = JSON.parse(update.body);
+  assert.equal(body.api_key, 'replacement-key-abcdef');
+  assert.equal(view.document.getElementById('accountKey').value, '');
+  assert.equal(view.sessionStorage.keys().length, 0, 'an account key is never persisted');
+  assert.ok(!JSON.stringify(consoleApi.state).includes('replacement-key-abcdef'), 'the key must not stay in page state');
+});
+
+test('cancelling an edit clears the key input and editing ends when the account disappears', async () => {
+  const { view, consoleApi } = twoAccountPage();
+  let row = accountRows(view).find(node => node.getAttribute('data-credential-id') === 'cred-1');
+  await actionOf(row, 'edit-account').emit('click');
+  view.document.getElementById('accountKey').value = 'half-typed-key';
+  consoleApi.handlers.cancelAccountEdit();
+  assert.equal(view.document.getElementById('accountKey').value, '');
+  assert.equal(consoleApi.state.accountEdit, null);
+  assert.equal(view.document.getElementById('accountCancel').hidden, true);
+  assert.match(view.document.getElementById('accountState').textContent, /已取消编辑/);
+
+  row = accountRows(view).find(node => node.getAttribute('data-credential-id') === 'cred-1');
+  await actionOf(row, 'edit-account').emit('click');
+  assert.ok(consoleApi.state.accountEdit);
+  // A refresh that no longer lists the edited account (for example deleted in
+  // another tab) must cancel the edit and drop any typed key.
+  view.document.getElementById('accountKey').value = 'stale-typed-key';
+  consoleApi.render.applyStatus(statusBody({ credentials: [{ id: 'cred-2', label: '备用账户', disabled: false }] }));
+  assert.equal(consoleApi.state.accountEdit, null);
+  assert.equal(view.document.getElementById('accountKey').value, '');
+  assert.match(view.document.getElementById('accountState').textContent, /已取消编辑/);
+});
+
+test('clearing management auth also clears account form inputs and selection', async () => {
+  const { view, consoleApi } = twoAccountPage();
+  const row = accountRows(view).find(node => node.getAttribute('data-credential-id') === 'cred-1');
+  await actionOf(row, 'edit-account').emit('click');
+  view.document.getElementById('accountLabel').value = '暂存标签';
+  view.document.getElementById('accountKey').value = 'typed-secret-key';
+  consoleApi.state.selectedCredential = 'cred-1';
+  consoleApi.handlers.clearAuth();
+  assert.equal(view.document.getElementById('accountKey').value, '');
+  assert.equal(view.document.getElementById('accountLabel').value, '');
+  assert.equal(consoleApi.state.accountEdit, null);
+  assert.equal(consoleApi.state.selectedCredential, '');
+  assert.equal(consoleApi.state.verified, null);
+  assert.equal(view.sessionStorage.keys().length, 0);
+});
+
+test('a status refresh keeps unsaved mapping drafts and flags them', () => {
+  const { view, consoleApi } = twoAccountPage();
+  assert.equal(consoleApi.mappingsDirty(), false);
+  // Simulate typing in the alias field of the first mapping row.
+  const firstRow = view.document.getElementById('mappingList').children[0];
+  const alias = firstRow.children[0].children[1];
+  alias.value = 'flash-draft';
+  alias.emit('input');
+  assert.equal(consoleApi.mappingsDirty(), true);
+  assert.equal(view.document.getElementById('mappingDirty').hidden, false);
+  assert.equal(view.document.getElementById('revertMappings').hidden, false);
+
+  // Account-side refresh returns a different saved mapping set.
+  consoleApi.render.applyStatus(statusBody({
+    credentials: [
+      { id: 'cred-1', label: '主账户', disabled: false },
+      { id: 'cred-2', label: '备用账户', disabled: false },
+    ],
+    models: [{ id: 'other', upstream_id: 'open-design/other' }],
+  }));
+  assert.deepEqual(plain(consoleApi.state.mappings.map(row => row.id)), ['flash-draft'], 'the draft survives a refresh');
+  assert.deepEqual(plain(consoleApi.state.savedMappings.map(row => row.id)), ['other'], 'the saved baseline still follows the server');
+  assert.match(view.document.getElementById('modelState').textContent, /草稿已保留/);
+  assert.equal(view.document.getElementById('mappingDirty').hidden, false);
+
+  consoleApi.handlers.revertMappings();
+  assert.deepEqual(plain(consoleApi.state.mappings.map(row => row.id)), ['other']);
+  assert.equal(consoleApi.mappingsDirty(), false);
+  assert.equal(view.document.getElementById('mappingDirty').hidden, true);
+});
+
+test('a clean status refresh still replaces the mapping list', () => {
+  const { consoleApi } = twoAccountPage();
+  consoleApi.render.applyStatus(statusBody({ models: [{ id: 'fresh', upstream_id: 'open-design/fresh' }] }));
+  assert.deepEqual(plain(consoleApi.state.mappings.map(row => row.id)), ['fresh']);
+  assert.equal(consoleApi.mappingsDirty(), false);
+});
+
+async function loadedModels() {
+  const { view, consoleApi, calls } = twoAccountPage({
+    fetchImpl: async (url) => {
+      if (url.includes('/upstream-models')) {
+        return respond(200, {
+          data: [
+            { id: 'alpha-1', owned_by: 'vela' },
+            { id: 'beta-2', owned_by: 'vela' },
+            { id: 'gamma-3', owned_by: 'other' },
+          ],
+        });
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  view.document.getElementById('modelCredential').value = 'cred-1';
+  consoleApi.state.mappings = [];
+  await consoleApi.handlers.fetchModels();
+  return { view, consoleApi, calls };
+}
+
+test('upstream search filters the rendered list and all-visible selection adds default aliases', async () => {
+  const { view, consoleApi } = await loadedModels();
+  const list = () => view.document.getElementById('upstreamList');
+  assert.equal(list().children.length, 3);
+  assert.match(view.document.getElementById('upstreamCount').textContent, /3 个上游模型/);
+
+  consoleApi.handlers.filterUpstream('beta');
+  assert.equal(list().children.length, 1);
+  assert.match(list().children[0].textContent, /beta-2/);
+  assert.match(view.document.getElementById('upstreamCount').textContent, /显示 1 \/ 3/);
+  assert.equal(consoleApi.state.mappings.length, 0, 'filtering must not change the draft');
+
+  consoleApi.handlers.selectVisibleUpstream(true);
+  assert.deepEqual(plain(consoleApi.state.mappings), [{ id: 'open-design-beta-2', upstream_id: 'beta-2' }]);
+  assert.match(view.document.getElementById('modelState').textContent, /已勾选当前可见的 1 个/);
+  assert.equal(view.document.getElementById('mappingDirty').hidden, false);
+
+  consoleApi.handlers.filterUpstream('');
+  consoleApi.handlers.selectVisibleUpstream(true);
+  assert.deepEqual(plain(consoleApi.state.mappings.map(row => row.id)), [
+    'open-design-beta-2',
+    'open-design-alpha-1',
+    'open-design-gamma-3',
+  ], 'existing rows are kept and visible models are appended');
+
+  consoleApi.handlers.filterUpstream('gamma');
+  consoleApi.handlers.selectVisibleUpstream(false);
+  assert.deepEqual(plain(consoleApi.state.mappings.map(row => row.id)), ['open-design-beta-2', 'open-design-alpha-1']);
+  assert.match(view.document.getElementById('modelState').textContent, /已取消当前可见的 1 个/);
+});
+
+test('an existing alias for an upstream model is preserved when selecting it again', async () => {
+  const { view, consoleApi } = await loadedModels();
+  consoleApi.state.mappings = [{ id: 'custom-alias', upstream_id: 'alpha-1' }];
+  consoleApi.render.renderModels();
+  consoleApi.handlers.selectVisibleUpstream(true);
+  const kept = consoleApi.state.mappings.find(row => row.upstream_id === 'alpha-1');
+  assert.equal(kept.id, 'custom-alias');
+  assert.equal(view.document.getElementById('mappingList').children.length, 3);
+});
+
+test('a source=upstream 401/403 keeps management auth and blames the account key', async () => {
+  for (const [status, code, expected] of [
+    [401, 'invalid_api_key', /OpenDesign Key 被上游拒绝（invalid_api_key）/],
+    [403, 'insufficient_scope', /上游拒绝读取该账户的模型列表（403）（insufficient_scope）/],
+  ]) {
+    const { view, consoleApi } = twoAccountPage({
+      fetchImpl: async (url) => {
+        if (url.includes('/upstream-models')) {
+          return respond(status, { error: { message: 'upstream rejected the key', source: 'upstream', code } });
+        }
+        return respond(404, { error: 'not found' });
+      },
+    });
+    view.document.getElementById('modelCredential').value = 'cred-1';
+    view.document.getElementById('authBadge').textContent = '已验证';
+    await consoleApi.handlers.fetchModels();
+    const state = view.document.getElementById('modelState').textContent;
+    assert.match(state, expected, `status ${status}`);
+    assert.match(state, /管理认证仍有效/);
+    assert.ok(!state.includes('管理密钥无效'), 'an upstream rejection must not blame the management key');
+    assert.equal(view.document.getElementById('authBadge').textContent, '已验证');
+    assert.equal(view.document.getElementById('accountsPanel').hidden, false);
+    assert.ok(consoleApi.state.verified, 'management auth survives an upstream rejection');
+    assert.equal(view.context.OpenDesignAuth.resolveHeaders().source, '', 'no stored management key was cleared');
+  }
+});
+
+test('a management 401 without source (old backend) keeps the previous combined wording', async () => {
+  const { view, consoleApi } = twoAccountPage({
+    fetchImpl: async (url) => {
+      if (url.includes('/upstream-models')) return respond(401, { error: 'invalid management key' });
+      return respond(404, { error: 'not found' });
+    },
+  });
+  view.document.getElementById('modelCredential').value = 'cred-1';
+  await consoleApi.handlers.fetchModels();
+  // Old backends cannot say who rejected the key, so the original message (check
+  // management key first, then the account key) is preserved unchanged.
+  assert.match(view.document.getElementById('modelState').textContent, /管理认证失效，或该 OpenDesign API key 无效/);
+  assert.ok(!view.document.getElementById('modelState').textContent.includes('管理认证仍有效'));
+  assert.ok(consoleApi.state.verified, 'fetchModels never tears down the page on its own');
+});
+
+test('a source that is not exactly upstream is never blamed on the account key', async () => {
+  const { view, consoleApi } = twoAccountPage({
+    fetchImpl: async (url) => {
+      if (url.includes('/upstream-models')) {
+        return respond(401, { error: { message: 'management key rejected', source: 'management', code: 'unauthorized' } });
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  view.document.getElementById('modelCredential').value = 'cred-1';
+  await consoleApi.handlers.fetchModels();
+  const text = view.document.getElementById('modelState').textContent;
+  assert.ok(!text.includes('OpenDesign Key 被上游拒绝'), 'only source=upstream may blame the account key');
+  assert.match(text, /管理认证失效/);
+});
+
+test('APIError keeps source and code for new backends and stays empty for old ones', () => {
+  const api = fakePage().context.OpenDesignAPI;
+  const nested = new api.APIError(401, 'x', { error: { message: 'bad key', source: 'upstream', code: 'invalid_api_key' } });
+  assert.equal(nested.source, 'upstream');
+  assert.equal(nested.code, 'invalid_api_key');
+  const topLevel = new api.APIError(403, 'x', { error: 'denied', source: 'upstream', code: 'scope' });
+  assert.equal(topLevel.source, 'upstream');
+  assert.equal(topLevel.code, 'scope');
+  const legacy = new api.APIError(401, 'x', { error: 'invalid management key' });
+  assert.equal(legacy.source, '');
+  assert.equal(legacy.code, '');
+  const garbage = new api.APIError(401, 'x', { error: { source: 42, code: { nested: true } } });
+  assert.equal(garbage.source, '');
+  assert.equal(garbage.code, '');
+});
+
+test('a mapping save that persisted but failed the host refresh reports the partial state', async () => {
+  const { view, consoleApi } = twoAccountPage({
+    fetchImpl: async (url) => {
+      if (url.endsWith('/models')) {
+        return respond(502, { error: 'model mapping saved but the host model refresh failed: host save rejected' });
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  await consoleApi.handlers.saveModels();
+  const text = view.document.getElementById('modelState').textContent;
+  assert.match(text, /已保存/);
+  assert.match(text, /宿主刷新模型目录失败/);
+  assert.match(text, /刷新状态/);
+  assert.equal(view.document.getElementById('mappingDirty').hidden, true, 'the persisted mapping is not a draft any more');
+  assert.deepEqual(plain(consoleApi.state.savedMappings.map(row => row.id)), ['flash']);
+});
+
+test('a delete that disabled the credential but failed the unlink reports the partial state', async () => {
+  const calls = [];
+  const { view, consoleApi } = twoAccountPage({
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, method: init.method || 'GET' });
+      if ((init.method || 'GET') === 'DELETE') {
+        return respond(500, { error: 'credential removal failed: permission denied (the credential is now disabled and its models are withdrawn; retry the delete)' });
+      }
+      if (url.endsWith('/status')) {
+        return respond(200, statusBody({ credentials: [{ id: 'cred-1', label: '主账户', disabled: false }] }));
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const row = accountRows(view).find(node => node.getAttribute('data-credential-id') === 'cred-1');
+  await actionOf(row, 'delete-account').emit('click');
+  const text = view.document.getElementById('accountState').textContent;
+  assert.match(text, /删除未完成/);
+  assert.match(text, /已停用且模型已撤下/);
+  assert.match(text, /可重试删除/);
+  assert.ok(calls.some(call => call.method === 'GET' && call.url.endsWith('/status')), 'the page refreshes to show the partial state');
+});
+
+test('「获取模型」 on a row performs the fetch, and a disabled account cannot fetch', async () => {
+  const calls = [];
+  const { view, consoleApi } = twoAccountPage({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      if (url.includes('/upstream-models')) return respond(200, { data: [{ id: 'open-design/flash' }] });
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const row = accountRows(view).find(node => node.getAttribute('data-credential-id') === 'cred-1');
+  const fetchButton = actionOf(row, 'fetch-account');
+  assert.match(fetchButton.className, /\bbutton\b/, 'row buttons use the shared button style');
+  assert.match(fetchButton.className, /\bcompact\b/);
+  assert.equal(actionOf(row, 'delete-account').className.includes('button'), true);
+  await fetchButton.emit('click');
+  assert.ok(calls.some(url => url.includes('/upstream-models?credential_id=cred-1')));
+  assert.equal(consoleApi.state.upstreamFor, 'cred-1');
+
+  consoleApi.render.applyStatus(statusBody({ credentials: [{ id: 'cred-1', label: '主账户', disabled: true }] }));
+  const disabledRow = accountRows(view)[0];
+  assert.equal(actionOf(disabledRow, 'fetch-account').disabled, true, 'a disabled account cannot pull models');
+  const before = calls.length;
+  await actionOf(disabledRow, 'fetch-account').emit('click');
+  assert.equal(calls.length, before, 'no request is sent for a disabled account');
 });

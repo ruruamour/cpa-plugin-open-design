@@ -8,7 +8,32 @@
       this.name = 'APIError';
       this.status = status;
       this.body = body;
+      const meta = errorMetadata(body);
+      this.source = meta.source;
+      this.code = meta.code;
     }
+  }
+
+  // Newer backends tag an error with where it came from (for example
+  // source="upstream" when the OpenDesign key itself was rejected) and with the
+  // upstream error code. Older backends send neither, so both fields stay empty
+  // and callers keep their previous behaviour.
+  function stringField(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : '';
+  }
+
+  function errorMetadata(payload) {
+    const meta = { source: '', code: '' };
+    if (!payload || typeof payload !== 'object') return meta;
+    const error = payload.error;
+    if (error && typeof error === 'object') {
+      meta.source = stringField(error.source) || stringField(payload.source);
+      meta.code = stringField(error.code) || stringField(payload.code);
+      return meta;
+    }
+    meta.source = stringField(payload.source);
+    meta.code = stringField(payload.code);
+    return meta;
   }
 
   function buildPath(base, path, query) {
@@ -76,6 +101,6 @@
   }
 
   const api = { createClient, buildPath, APIError };
-  Object.defineProperty(api, '__test', { value: { errorMessage }, enumerable: false });
+  Object.defineProperty(api, '__test', { value: { errorMessage, errorMetadata }, enumerable: false });
   globalThis.OpenDesignAPI = api;
 })();

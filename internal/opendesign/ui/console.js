@@ -224,6 +224,34 @@
     return status === 401 || status === 403;
   }
 
+  // Newer backends tag upstream (OpenDesign key) failures with source='upstream'.
+  // Only that exact marker counts, so a management 401/403 is never mistaken for
+  // a bad account key. Older backends send no source and keep the old meaning.
+  function isUpstreamSource(error) {
+    return Boolean(error && error.source === 'upstream');
+  }
+
+  function isManagementAuthError(error) {
+    return Boolean(error) && isAuthStatus(error.status) && !isUpstreamSource(error);
+  }
+
+  function upstreamErrorDetail(error) {
+    const code = error && typeof error.code === 'string' ? error.code.trim() : '';
+    return code ? `（${code}）` : '';
+  }
+
+  // Some management failures finish part of the work before reporting an error:
+  // the mapping can be persisted while the host refresh fails, and a delete can
+  // disable the credential (withdrawing its models) before the unlink fails. The
+  // backend messages say so explicitly; keep that fact visible instead of letting
+  // the operator retry blindly.
+  function partialCompletion(text) {
+    const value = String(text || '').toLowerCase();
+    if (value.includes('saved but the host model refresh failed')) return 'mapping-persisted';
+    if (value.includes('now disabled') || value.includes('models are withdrawn')) return 'credential-disabled';
+    return '';
+  }
+
   async function loadStatus(options = {}) {
     try {
       const raw = await api().status();
@@ -235,6 +263,8 @@
       message('authState', '');
       return true;
     } catch (error) {
+      // /status is a management-only route, so a 401/403 here always means the
+      // management key, never an upstream account key.
       if (isAuthStatus(error.status)) {
         const rejected = state.verified && state.verified.headers;
         if (rejected && state.verified.source !== 'manual') {
@@ -481,10 +511,13 @@
   }
 
   function syncUpstreamChecks() {
-    for (const node of [...($('upstreamList')?.children || [])]) {
+    // children is an HTMLCollection in browsers: no Array methods, so always
+    // spread it before searching (the old code called children.find here).
+    for (const node of Array.from($('upstreamList')?.children || [])) {
       if (node.tagName !== 'LABEL') continue;
-      const model = node.children.find(child => child.tagName === 'SPAN' && child.className === 'mono');
-      const box = node.children.find(child => child.tagName === 'INPUT');
+      const kids = Array.from(node.children || []);
+      const model = kids.find(child => child.tagName === 'SPAN' && child.className === 'mono');
+      const box = kids.find(child => child.tagName === 'INPUT');
       if (model && box) box.checked = Core.hasUpstream(state.mappings, model.textContent);
     }
   }
@@ -613,7 +646,7 @@
       await refreshStatus();
       renderAccounts();
     } catch (error) {
-      if (isAuthStatus(error.status)) {
+      if (isManagementAuthError(error)) {
         showAuth(error.status === 401 ? '401：管理密钥无效或已过期，请重新验证后再保存账户。' : `403：${formatError(error)}`);
       } else {
         message('accountState', `${editing ? '保存修改' : '保存'}失败：${formatError(error)}`, 'error');
@@ -642,8 +675,18 @@
       }
       await refreshStatus();
     } catch (error) {
-      if (isAuthStatus(error.status)) showAuth(`401/403：${formatError(error)}`);
-      else message('accountState', `删除失败：${formatError(error)}`, 'error');
+      if (isManagementAuthError(error)) {
+        showAuth(`401/403：${formatError(error)}`);
+      } else if (partialCompletion(formatError(error)) === 'credential-disabled') {
+        // The backend already disabled the credential before the unlink failed:
+        // its models are withdrawn but the record remains. Reflect that state
+        // instead of implying the account is untouched.
+        if (state.accountEdit && state.accountEdit.id === item.id) resetAccountForm();
+        message('accountState', `删除未完成：账户已停用且模型已撤下，但凭据文件未删除（${formatError(error)}）。请刷新状态确认；可重试删除。`, 'error');
+        try { await refreshStatus(); } catch { /* Keep the partial-failure message visible. */ }
+      } else {
+        message('accountState', `删除失败：${formatError(error)}`, 'error');
+      }
     } finally {
       setBusy(false);
     }
@@ -662,7 +705,7 @@
       message('accountState', item.disabled ? '账户已启用。' : '账户已停用。');
       await refreshStatus();
     } catch (error) {
-      if (isAuthStatus(error.status)) showAuth(`401/403：${formatError(error)}`);
+      if (isManagementAuthError(error)) showAuth(`401/403：${formatError(error)}`);
       else message('accountState', `更新失败：${formatError(error)}`, 'error');
     } finally {
       setBusy(false);
@@ -711,10 +754,23 @@
         : '账户可用，但 OpenDesign 没有返回模型。可稍后重试或手动添加映射。');
     } catch (error) {
       if (!stillCurrent()) return;
-      if (error.status === 401) {
+      if (isUpstreamSource(error) && isAuthStatus(error.status)) {
+        // The management session is fine; the selected OpenDesign account key was
+        // rejected upstream. Keep CPA auth and any loaded list, and point at the
+        // account instead of asking for the management key again.
+        const detail = upstreamErrorDetail(error);
+        message('modelState', error.status === 401
+          ? `账户「${account ? account.label : credentialID}」的 OpenDesign Key 被上游拒绝${detail}。请编辑该账户替换 Key 后重试；管理认证仍有效。`
+          : `上游拒绝读取该账户的模型列表（403）${detail}。请确认该 OpenDesign Key 的权限；管理认证仍有效。`, 'error');
+      } else if (error.status === 401) {
+        // Older backend without source: keep the previous wording; the operator
+        // is told to check both the management key and the account key.
         message('modelState', '401：管理认证失效，或该 OpenDesign API key 无效。请先重新验证管理密钥，再检查账户 key。', 'error');
       } else if (isAuthStatus(error.status)) {
-        showAuth(`403：${formatError(error)}`);
+        // Older backend without source, or a genuinely rejected management key.
+        showAuth(error.status === 401
+          ? '401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。'
+          : `403：${formatError(error)}`);
       } else {
         message('modelState', `读取模型失败：${formatError(error)}`, 'error');
       }
@@ -754,8 +810,17 @@
       renderModels();
       message('modelState', `已保存 ${normalized.length} 个模型映射。`);
     } catch (error) {
-      if (isAuthStatus(error.status)) {
+      if (isAuthStatus(error.status) && !isUpstreamSource(error)) {
         showAuth(error.status === 401 ? '401：管理密钥无效或已过期，模型映射未保存。' : `403：${formatError(error)}`);
+      } else if (isUpstreamSource(error)) {
+        message('modelState', `保存失败（上游）：${formatError(error)}`, 'error');
+      } else if (partialCompletion(formatError(error)) === 'mapping-persisted') {
+        // The mapping is already on disk; only the host catalog refresh failed.
+        // The saved baseline moves forward so the draft badge tells the truth.
+        state.savedMappings = cloneMappings(models);
+        state.status.models = cloneMappings(models);
+        renderMappings();
+        message('modelState', `模型映射已保存，但宿主刷新模型目录失败：${formatError(error)}。可先刷新状态确认，再重试保存或启用账户触发刷新。`, 'error');
       } else {
         message('modelState', `保存失败：${formatError(error)}`, 'error');
       }
@@ -870,7 +935,7 @@
         badge.textContent = '未验证';
         badge.className = 'badge';
       }
-      message('authState', isAuthStatus(error.status)
+      message('authState', isManagementAuthError(error)
         ? `${error.status}：管理密钥未通过验证，请检查后重试。`
         : `验证失败：${formatError(error)}`, 'error');
     } finally {
@@ -882,6 +947,7 @@
     try { Auth.clearAuth(); } catch { /* Ignore blocked storage. */ }
     state.verified = null;
     state.candidate = null;
+    state.selectedCredential = '';
     resetAccountForm();
     invalidateModelRequest();
     const keyInput = $('managementKey');
