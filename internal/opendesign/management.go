@@ -48,6 +48,7 @@ func managementRoutes() []managementRoute {
 		{Method: http.MethodGet, Path: apiBase + "/status"},
 		{Method: http.MethodGet, Path: apiBase + "/credentials"},
 		{Method: http.MethodGet, Path: apiBase + "/quota"},
+		{Method: http.MethodGet, Path: apiBase + "/model-coverage"},
 		{Method: http.MethodPost, Path: apiBase + "/credentials"},
 		{Method: http.MethodDelete, Path: apiBase + "/credentials"},
 		{Method: http.MethodGet, Path: apiBase + "/upstream-models"},
@@ -119,6 +120,8 @@ func (s *Service) management(raw json.RawMessage) (any, error) {
 		return s.listCredentials()
 	case r.Method == http.MethodGet && path == apiBase+"/quota":
 		return s.quotaRequest(r)
+	case r.Method == http.MethodGet && path == apiBase+"/model-coverage":
+		return s.modelCoverageRequest(r)
 	case r.Method == http.MethodPost && path == apiBase+"/credentials":
 		return s.saveCredentialRequest(r)
 	case r.Method == http.MethodDelete && path == apiBase+"/credentials":

@@ -29,42 +29,50 @@ type Service struct {
 	pendingMu    sync.Mutex
 	pendingSaves map[string]pendingSave
 
-	cfg          Config
-	creds        map[string]Credential
-	billingEpoch map[string]uint64 // guarded by mu; changes on either key/workspace replacement or clear/delete
-	quota        map[string]*quotaEntry
-	quotaSlots   chan struct{}
-	quotaNow     func() time.Time
-	quotaBudget  time.Duration
-	authFiles    map[string]string
-	revoked      map[string]bool
-	host         HostCall
-	authDir      string
-	streams      map[string]struct{}
-	ops          *operationTracker
-	loaded       bool
-	stopped      bool
-	active       sync.WaitGroup
-	activeN      atomic.Int64
-	stopCh       chan struct{}
+	cfg                 Config
+	creds               map[string]Credential
+	billingEpoch        map[string]uint64 // guarded by mu; changes on either key/workspace replacement or clear/delete
+	quota               map[string]*quotaEntry
+	quotaSlots          chan struct{}
+	quotaNow            func() time.Time
+	quotaBudget         time.Duration
+	modelCoverage       map[modelCoverageKey]*modelCoverageEntry
+	modelCoverageSlots  chan struct{}
+	modelCoverageNow    func() time.Time
+	modelCoverageBudget time.Duration
+	authFiles           map[string]string
+	revoked             map[string]bool
+	host                HostCall
+	authDir             string
+	streams             map[string]struct{}
+	ops                 *operationTracker
+	loaded              bool
+	stopped             bool
+	active              sync.WaitGroup
+	activeN             atomic.Int64
+	stopCh              chan struct{}
 }
 
 // NewService returns an unconfigured plugin instance.
 func NewService() *Service {
 	return &Service{
-		cfg:          defaultConfig(),
-		creds:        map[string]Credential{},
-		billingEpoch: map[string]uint64{},
-		quota:        map[string]*quotaEntry{},
-		quotaSlots:   make(chan struct{}, 3),
-		quotaNow:     time.Now,
-		quotaBudget:  quotaRefreshBudget,
-		authFiles:    map[string]string{},
-		revoked:      map[string]bool{},
-		streams:      map[string]struct{}{},
-		pendingSaves: map[string]pendingSave{},
-		ops:          newOperationTracker(),
-		stopCh:       make(chan struct{}),
+		cfg:                 defaultConfig(),
+		creds:               map[string]Credential{},
+		billingEpoch:        map[string]uint64{},
+		quota:               map[string]*quotaEntry{},
+		quotaSlots:          make(chan struct{}, 3),
+		quotaNow:            time.Now,
+		quotaBudget:         quotaRefreshBudget,
+		modelCoverage:       map[modelCoverageKey]*modelCoverageEntry{},
+		modelCoverageSlots:  make(chan struct{}, 3),
+		modelCoverageNow:    time.Now,
+		modelCoverageBudget: modelCoverageBudget,
+		authFiles:           map[string]string{},
+		revoked:             map[string]bool{},
+		streams:             map[string]struct{}{},
+		pendingSaves:        map[string]pendingSave{},
+		ops:                 newOperationTracker(),
+		stopCh:              make(chan struct{}),
 	}
 }
 

@@ -106,6 +106,9 @@
       quota: (credentialID, options = {}) => request('/quota', {
         query: { credential_id: credentialID, refresh: options.refresh ? 1 : '' },
       }),
+      modelCoverage: (credentialID, modelID, options = {}) => request('/model-coverage', {
+        query: { credential_id: credentialID, model_id: modelID, refresh: options.refresh ? 1 : '' },
+      }),
       saveModels: models => request('/models', { method: 'POST', body: { models } }),
     };
   }

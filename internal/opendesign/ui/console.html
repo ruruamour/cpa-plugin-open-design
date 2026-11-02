@@ -99,7 +99,11 @@
     .mapping-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
     .mapping-status .badge.warn { background: color-mix(in srgb, #b54708 16%, var(--surface)); color: #b54708; }
     :root[data-theme="dark"] .mapping-status .badge.warn { color: #fec84b; }
-    .upstream { display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: center; gap: 6px 10px; }
+    .upstream { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 6px 10px; }
+    .upstream-detail { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 9px; }
+    .upstream-detail .muted { font-size: 12px; }
+    .upstream-coverage { grid-column: 2 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
+    .upstream-coverage .small { overflow-wrap: anywhere; }
     .billing { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--surface-2); }
     .billing > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
     .billing[open] > summary { margin-bottom: 6px; }
@@ -127,7 +131,7 @@
     :root[data-theme="dark"] .quota-forecast.warn { color: #fec84b; }
     .quota-note { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .upstream .mono { overflow-wrap: anywhere; }
-    .upstream .muted { grid-column: 2; font-size: 12px; }
+    .upstream .muted { font-size: 12px; }
     .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12.5px; }
     .muted { color: var(--muted); }
     .empty { padding: 18px 12px; text-align: center; color: var(--muted); }

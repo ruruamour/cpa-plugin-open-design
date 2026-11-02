@@ -825,6 +825,80 @@ test('an existing alias for an upstream model is preserved when selecting it aga
   assert.equal(view.document.getElementById('mappingList').children.length, 3);
 });
 
+test('model coverage is explicit, model-scoped, safe, and separate from mapping selection', async () => {
+  const calls = [];
+  const view = fakePage({
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      if (url.includes('/upstream-models')) return respond(200, { data: [{ id: 'open-design/alpha/1' }] });
+      if (url.includes('/model-coverage')) return respond(200, {
+        credential_id: 'cred-1', model_id: 'open-design/alpha/1', billing_configured: true,
+        workspace_id: 'ws-1', state: 'available', fetched_at: '2026-11-03T00:00:00Z',
+        next_refresh_at: '2026-11-03T00:01:00Z', model_covered: true,
+        funding_check: 'available', funding: 'coding_plan', error: null,
+      });
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.state.selectedCredential = 'cred-1';
+  view.document.getElementById('modelCredential').value = 'cred-1';
+  await consoleApi.handlers.fetchModels();
+  assert.equal(calls.filter(call => call.url.includes('/model-coverage')).length, 0, 'loading models must not preflight them');
+
+  const before = view.document.getElementById('upstreamList').children[0];
+  assert.equal(before.tagName, 'DIV', 'coverage action must not sit inside a checkbox label');
+  const beforeCheck = before.children[0];
+  const checkButton = Array.from(before.children).find(node => node.getAttribute('data-action') === 'check-model-coverage');
+  assert.ok(checkButton);
+  assert.equal(beforeCheck.checked, false);
+  await checkButton.emit('click', { preventDefault() {}, stopPropagation() {} });
+
+  const coverageCall = calls.find(call => call.url.includes('/model-coverage'));
+  assert.ok(coverageCall);
+  assert.match(coverageCall.url, /credential_id=cred-1/);
+  assert.match(coverageCall.url, /model_id=open-design%2Falpha%2F1/);
+  assert.match(coverageCall.url, /refresh=1/);
+  const row = view.document.getElementById('upstreamList').children[0];
+  assert.equal(row.children[0].checked, false, 'coverage click must not toggle mapping selection');
+  assert.match(row.textContent, /套餐覆盖/);
+  assert.match(row.textContent, /官方预检：可用/);
+  assert.ok(!row.textContent.includes('ws-1'), 'workspace identifiers are not displayed in the model row');
+});
+test('switching model accounts fences a late coverage response and releases its busy state', async () => {
+  let coverageStartedResolve;
+  let releaseCoverage;
+  const coverageStarted = new Promise(resolve => { coverageStartedResolve = resolve; });
+  const coverageResponse = new Promise(resolve => { releaseCoverage = () => resolve(respond(200, {
+    credential_id: 'cred-1', model_id: 'alpha-1', state: 'available', model_covered: true,
+    funding_check: 'available', funding: 'coding_plan', fetched_at: '2026-11-03T00:00:00Z',
+  })); });
+  const { view, consoleApi } = twoAccountPage({
+    fetchImpl: async (url) => {
+      if (url.includes('/upstream-models')) return respond(200, { data: [{ id: 'alpha-1' }] });
+      if (url.includes('/model-coverage')) {
+        coverageStartedResolve();
+        return coverageResponse;
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  consoleApi.state.selectedCredential = 'cred-1';
+  view.document.getElementById('modelCredential').value = 'cred-1';
+  await consoleApi.handlers.fetchModels();
+  const button = Array.from(view.document.getElementById('upstreamList').children[0].children)
+    .find(node => node.getAttribute('data-action') === 'check-model-coverage');
+  const pending = button.emit('click', { preventDefault() {}, stopPropagation() {} });
+  await coverageStarted;
+  assert.equal(Object.keys(consoleApi.state.modelCoverageBusy).length, 1);
+
+  consoleApi.handlers.selectCredential('cred-2');
+  assert.deepEqual(Object.keys(consoleApi.state.modelCoverageBusy), []);
+  releaseCoverage();
+  await pending;
+  assert.deepEqual(Object.keys(consoleApi.state.modelCoverage), [], 'late account A data must be discarded');
+});
 test('a source=upstream 401/403 keeps management auth and blames the account key', async () => {
   for (const [status, code, expected] of [
     [401, 'invalid_api_key', /OpenDesign Key 被上游拒绝（invalid_api_key）/],

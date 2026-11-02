@@ -271,6 +271,13 @@ func (s *Service) invalidateBillingLocked(id string) {
 		close(entry.invalidated)
 		delete(s.quota, id)
 	}
+	for key, entry := range s.modelCoverage {
+		if key.CredentialID != id {
+			continue
+		}
+		close(entry.invalidated)
+		delete(s.modelCoverage, key)
+	}
 }
 
 func jsonBytes(v any) []byte {

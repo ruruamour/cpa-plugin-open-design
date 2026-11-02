@@ -36,9 +36,23 @@ func parseQuotaWallet(body []byte) (*quotaWalletData, bool) {
 }
 
 func parseQuotaFunding(body []byte, workspaceID string) (*quotaFundingData, bool) {
+	return parseQuotaFundingForModel(body, workspaceID, nil)
+}
+
+func parseModelCoverageFunding(body []byte, workspaceID, modelID string) (*quotaFundingData, bool) {
+	return parseQuotaFundingForModel(body, workspaceID, &modelID)
+}
+
+func parseQuotaFundingForModel(body []byte, workspaceID string, modelID *string) (*quotaFundingData, bool) {
 	m, ok := quotaObject(body)
-	if !ok || !quotaNumberEquals(m["schemaVersion"], 1) || !quotaStringEquals(m["workspaceId"], workspaceID) ||
-		!bytes.Equal(bytes.TrimSpace(m["modelId"]), []byte("null")) {
+	if !ok || !quotaNumberEquals(m["schemaVersion"], 1) || !quotaStringEquals(m["workspaceId"], workspaceID) {
+		return nil, false
+	}
+	if modelID == nil {
+		if !bytes.Equal(bytes.TrimSpace(m["modelId"]), []byte("null")) {
+			return nil, false
+		}
+	} else if !quotaStringEquals(m["modelId"], *modelID) {
 		return nil, false
 	}
 	member, ok := quotaString(m["workspaceMemberId"])

@@ -45,22 +45,57 @@
     quotaBusy: {},
     quotaGeneration: 0,
     quotaRevisions: {},
+    // Model coverage is a separate cache. It carries only official preflight
+    // signals and never shares quota snapshots or quota busy state.
+    modelCoverage: {},
+    modelCoverageBusy: {},
+    modelCoverageGeneration: 0,
+    modelCoverageRevisions: {},
     busy: false,
   };
 
+  function modelCoverageKey(credentialID, modelID) {
+    return `${String(credentialID)}\u0000${String(modelID)}`;
+  }
+
+  function invalidateModelCoverageRequests() {
+    state.modelCoverageGeneration += 1;
+    state.modelCoverageBusy = {};
+  }
+
+  function invalidateModelCoverage(credentialID) {
+    if (credentialID === undefined) {
+      state.modelCoverageGeneration += 1;
+      state.modelCoverageRevisions = {};
+      state.modelCoverage = {};
+      state.modelCoverageBusy = {};
+      return;
+    }
+    state.modelCoverageRevisions[credentialID] = (state.modelCoverageRevisions[credentialID] || 0) + 1;
+    const prefix = `${String(credentialID)}\u0000`;
+    for (const key of Object.keys(state.modelCoverage)) {
+      if (key.startsWith(prefix)) delete state.modelCoverage[key];
+    }
+    for (const key of Object.keys(state.modelCoverageBusy)) {
+      if (key.startsWith(prefix)) delete state.modelCoverageBusy[key];
+    }
+  }
+
   // Logout invalidates every request; editing one credential invalidates only
-  // its own requests so concurrent refreshes for other accounts can finish.
+  // its own quota and model-coverage requests so other accounts can finish.
   function invalidateQuota(credentialID) {
     if (credentialID === undefined) {
       state.quotaGeneration += 1;
       state.quotaRevisions = {};
       state.quotas = {};
       state.quotaBusy = {};
+      invalidateModelCoverage();
       return;
     }
     state.quotaRevisions[credentialID] = (state.quotaRevisions[credentialID] || 0) + 1;
     delete state.quotas[credentialID];
     delete state.quotaBusy[credentialID];
+    invalidateModelCoverage(credentialID);
   }
 
   // Model-list requests are generation-checked: a slow response must never
@@ -193,6 +228,7 @@
   // operator logs out, so stale results cannot be applied to the new selection.
   function invalidateModelRequest() {
     modelRequestSeq += 1;
+    invalidateModelCoverageRequests();
     if (activeModelRequest) {
       activeModelRequest = 0;
       setBusy(false);
@@ -720,6 +756,73 @@
     return dirty;
   }
 
+  function coverageResult(item, credentialID) {
+    return state.modelCoverage[modelCoverageKey(credentialID, item.id)] || null;
+  }
+
+  function renderModelCoverage(item, credentialID) {
+    const key = modelCoverageKey(credentialID, item.id);
+    const result = coverageResult(item, credentialID);
+    const busy = Boolean(state.modelCoverageBusy[key]);
+    const status = Core.modelCoverageState(result && result.state);
+    const parts = [el('span', { className: `badge ${status.tone}`, text: busy ? '查询中…' : status.text })];
+    if (!result) {
+      parts.push(el('span', { className: 'muted small', text: '尚未查询' }));
+    } else if (result.state === 'not_configured') {
+      parts.push(el('span', { className: 'muted small', text: '需同时配置 control key 和 Workspace ID' }));
+    } else if (result.state === 'available' || result.state === 'stale') {
+      parts.push(el('span', { className: 'small', text: Core.modelCoverageSignalText(result.model_covered) }));
+      const check = Core.modelCoverageCheckText(result.funding_check);
+      if (check) parts.push(el('span', { className: 'muted small', text: check }));
+      if (result.fetched_at) parts.push(el('span', { className: 'muted small', text: `查询于 ${Core.formatTime(result.fetched_at)}` }));
+    } else if (result.error) {
+      parts.push(el('span', { className: 'muted small', text: Core.modelCoverageErrorText(result.error) }));
+    }
+    return el('div', { className: 'upstream-coverage' }, parts);
+  }
+
+  async function checkModelCoverage(item) {
+    if (!item || state.busy || !state.upstreamFor) return;
+    const credentialID = state.upstreamFor;
+    const key = modelCoverageKey(credentialID, item.id);
+    if (state.modelCoverageBusy[key]) return;
+    const generation = state.modelCoverageGeneration;
+    const revision = state.modelCoverageRevisions[credentialID] || 0;
+    const stillCurrent = () => generation === state.modelCoverageGeneration &&
+      revision === (state.modelCoverageRevisions[credentialID] || 0) &&
+      state.upstreamFor === credentialID && state.selectedCredential === credentialID;
+    state.modelCoverageBusy[key] = true;
+    renderUpstream();
+    try {
+      const raw = await api().modelCoverage(credentialID, item.id, { refresh: true });
+      if (!stillCurrent()) return;
+      const coverage = Core.normalizeModelCoverage(raw);
+      if (coverage.credential_id !== credentialID || coverage.model_id !== item.id) {
+        throw new Error('模型覆盖响应与当前账户或模型不一致，请重新查询。');
+      }
+      state.modelCoverage[key] = coverage;
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (isManagementAuthError(error)) {
+        showAuth(error.status === 401
+          ? '401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。'
+          : `403：${formatError(error)}`);
+        return;
+      }
+      state.modelCoverage[key] = Core.normalizeModelCoverage({
+        credential_id: credentialID,
+        model_id: item.id,
+        state: 'error',
+        error: { kind: error && error.code || '', message: formatError(error) },
+      });
+    } finally {
+      if (stillCurrent()) {
+        delete state.modelCoverageBusy[key];
+        renderUpstream();
+      }
+    }
+  }
+
   function renderUpstream() {
     const list = $('upstreamList');
     if (!list) return;
@@ -742,6 +845,7 @@
       syncModelTools();
       return;
     }
+    const credentialID = state.upstreamFor;
     const rows = visible.map(item => {
       const box = el('input', { type: 'checkbox', checked: Core.hasUpstream(state.mappings, item.id) });
       box.addEventListener('change', () => {
@@ -750,12 +854,23 @@
           : Core.removeUpstream(state.mappings, item.id);
         renderMappings();
       });
-      const parts = [
+      const details = [el('span', { className: 'mono', text: item.id })];
+      if (item.owned_by) details.push(el('span', { className: 'muted small', text: item.owned_by }));
+      const action = button('检查覆盖', 'check-model-coverage', {
+        className: 'button compact',
+        disabled: state.busy || Boolean(state.modelCoverageBusy[modelCoverageKey(credentialID, item.id)]),
+        on: event => {
+          if (event && typeof event.preventDefault === 'function') event.preventDefault();
+          if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+          return checkModelCoverage(item);
+        },
+      });
+      return el('div', { className: 'check upstream' }, [
         box,
-        el('span', { className: 'mono', text: item.id }),
-        item.owned_by ? el('span', { className: 'muted small', text: item.owned_by }) : null,
-      ];
-      return el('label', { className: 'check upstream' }, parts);
+        el('div', { className: 'upstream-detail' }, details),
+        action,
+        renderModelCoverage(item, credentialID),
+      ]);
     });
     list.replaceChildren(...rows);
     updateUpstreamCount();
@@ -817,9 +932,10 @@
     // children is an HTMLCollection in browsers: no Array methods, so always
     // spread it before searching (the old code called children.find here).
     for (const node of Array.from($('upstreamList')?.children || [])) {
-      if (node.tagName !== 'LABEL') continue;
+      if (node.tagName !== 'LABEL' && !String(node.className || '').split(/\s+/).includes('upstream')) continue;
       const kids = Array.from(node.children || []);
-      const model = kids.find(child => child.tagName === 'SPAN' && child.className === 'mono');
+      const detail = kids.find(child => String(child.className || '').split(/\s+/).includes('upstream-detail'));
+      const model = detail && Array.from(detail.children || []).find(child => child.tagName === 'SPAN' && child.className === 'mono');
       const box = kids.find(child => child.tagName === 'INPUT');
       if (model && box) box.checked = Core.hasUpstream(state.mappings, model.textContent);
     }
@@ -1447,6 +1563,7 @@
       addMapping,
       revertMappings,
       refreshQuota,
+      checkModelCoverage,
       filterUpstream,
       selectVisibleUpstream,
       toggleAuthPanel,
@@ -1457,6 +1574,7 @@
       renderAccounts,
       renderCredentialOptions,
       renderUpstream,
+      renderModelCoverage,
       renderMappings,
       renderModels,
       showAuth,

@@ -252,6 +252,71 @@
     };
   }
 
+  function normalizeModelCoverage(value) {
+    const data = value && typeof value === 'object' ? value : {};
+    const modelCovered = typeof data.model_covered === 'boolean' ? data.model_covered : null;
+    const rawFundingCheck = text(data.funding_check);
+    const fundingCheck = ['available', 'insufficient', 'unknown'].includes(rawFundingCheck) ? rawFundingCheck : '';
+    const rawFunding = text(data.funding);
+    const funding = ['coding_plan', 'wallet', 'gateway'].includes(rawFunding) ? rawFunding : '';
+    const rawState = text(data.state);
+    const state = ['not_configured', 'needs_refresh', 'available', 'stale', 'error'].includes(rawState) ? rawState : '';
+    return {
+      credential_id: text(data.credential_id),
+      model_id: text(data.model_id),
+      billing_configured: data.billing_configured === true,
+      workspace_id: text(data.workspace_id),
+      state,
+      fetched_at: quotaTimestamp(data.fetched_at),
+      next_refresh_at: quotaTimestamp(data.next_refresh_at),
+      model_covered: modelCovered,
+      funding_check: fundingCheck,
+      funding,
+      error: quotaError(data.error),
+    };
+  }
+
+  function modelCoverageState(value) {
+    switch (text(value)) {
+      case 'not_configured': return { text: '未配置', tone: 'muted' };
+      case 'needs_refresh': return { text: '未检查', tone: 'muted' };
+      case 'available': return { text: '已查询', tone: 'good' };
+      case 'stale': return { text: '结果可能过时', tone: 'warn' };
+      case 'error': return { text: '查询失败', tone: 'off' };
+      default: return { text: '未检查', tone: 'muted' };
+    }
+  }
+
+  function modelCoverageCheckText(value) {
+    switch (text(value)) {
+      case 'available': return '官方预检：可用';
+      case 'insufficient': return '官方预检：不足';
+      case 'unknown': return '官方预检：未知';
+      default: return '';
+    }
+  }
+
+  function modelCoverageSignalText(value) {
+    if (value === true) return '套餐覆盖';
+    if (value === false) return '套餐未覆盖';
+    return '覆盖未知';
+  }
+
+  function modelCoverageErrorText(value) {
+    const error = value && typeof value === 'object' ? value : {};
+    const messages = {
+      unauthorized: 'control key 未获官方接受',
+      forbidden: '账户或工作区无权查询',
+      rate_limited: '请求过于频繁，请稍后再试',
+      timeout: '官方查询超时',
+      malformed: '官方响应或配置无效',
+      network: '无法连接官方查询接口',
+      upstream: '官方查询暂时不可用',
+      stopped: '插件正在停止',
+    };
+    return messages[text(error.kind)] || text(error.message) || '官方查询失败';
+  }
+
   // used/limit as basis points, computed with BigInt so a credits string larger
   // than Number.MAX_SAFE_INTEGER still yields an exact meter percentage.
   function creditsPercent(used, limit) {
@@ -343,6 +408,11 @@
     normalizeStatus,
     normalizeUpstreamModels,
     normalizeQuota,
+    normalizeModelCoverage,
+    modelCoverageState,
+    modelCoverageCheckText,
+    modelCoverageSignalText,
+    modelCoverageErrorText,
     creditsPercent,
     formatCredits,
     formatUSD,
