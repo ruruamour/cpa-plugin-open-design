@@ -560,7 +560,19 @@
     const exhaustsAt = Date.parse(window.forecast?.exhausts_at);
     const expired = resetAt <= Date.now() || exhaustsAt <= Date.now();
     const forecast = Core.forecastView(expired ? { state: 'expired' } : window.forecast);
-    if (forecast.text) block.append(el('p', { className: `quota-forecast${forecast.tone === 'warn' ? ' warn' : ''}`, text: forecast.text }));
+    if (forecast.text) {
+      const description = el('p', { className: `quota-forecast${forecast.tone === 'warn' ? ' warn' : ''}`, text: forecast.text });
+      if (!expired && window.forecast?.state === 'exhausted') {
+        // An official zero remaining counter is a fact, so keep it visible.
+        block.append(description);
+      } else {
+        block.append(el('details', { className: 'quota-trend' }, [
+          el('summary', { text: '用量趋势（估算）' }),
+          description,
+          el('p', { className: 'quota-note', text: '依据此窗口的整体 credits 消耗；更换模型或用量变化会影响估算，不能换算为某个模型的剩余 token 或请求次数。' }),
+        ]));
+      }
+    }
     return block;
   }
 
@@ -603,11 +615,12 @@
       return card;
     }
     const fundingName = ({ coding_plan: '套餐额度', wallet: '钱包', gateway: '网关' })[funding.data.funding] || '未知';
-    card.append(el('p', { className: 'quota-meta', text: `套餐：${plan.tier || '未知'} · 资金方式：${fundingName}` }));
+    card.append(el('p', { className: 'quota-meta', text: `套餐：${plan.tier || '未知'} · 预检资金方式：${fundingName}` }));
     if (funding.data.fundingCheck) {
       const checkName = ({ available: '可用', insufficient: '不足', unknown: '未知' })[funding.data.fundingCheck] || '未知';
       card.append(el('p', { className: 'quota-meta', text: `资金检查：${checkName}` }));
     }
+    card.append(el('p', { className: 'quota-note', text: '本次预检未指定模型。具体模型的套餐覆盖和实际扣费以官方为准；各窗口分别生效，额度不能相加。' }));
     for (const window of plan.windows) card.append(quotaWindowBlock(window));
     card.append(el('p', { className: 'quota-note', text: `窗口数据查询时间：${Core.formatTime(funding.fetched_at) || '未知'}` }));
     return card;
@@ -643,7 +656,7 @@
     if (!item.billing_configured) {
       cards.append(el('div', { className: 'quota-card' }, [
         el('h4', { text: '额度查询未配置' }),
-        el('p', { className: 'quota-note', text: '点「编辑」填写官方 controlKey（可选 Workspace ID）后可查询余额和套餐用量。未配置不影响模型推理。' }),
+        el('p', { className: 'quota-note', text: '点「编辑」填写同一 OpenDesign 账号的 controlKey 查询钱包；再填 Workspace ID 可查询套餐窗口。两项均可选，不影响模型推理。' }),
       ]));
     } else if (!quota) {
       cards.append(el('div', { className: 'quota-card' }, [

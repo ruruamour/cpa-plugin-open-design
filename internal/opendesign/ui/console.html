@@ -121,6 +121,8 @@
     .meter > span { display: block; height: 100%; background: var(--accent); }
     .meter.warn > span { background: #b54708; }
     .quota-forecast { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+    .quota-trend { margin-top: 8px; }
+    .quota-trend > summary { cursor: pointer; font-size: 12px; color: var(--muted); }
     .quota-forecast.warn { color: #b54708; }
     :root[data-theme="dark"] .quota-forecast.warn { color: #fec84b; }
     .quota-note { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
@@ -227,16 +229,16 @@
         <details class="billing" id="billingFields">
           <summary>可选：额度查询（官方 control key）</summary>
           <p class="hint">
-            仅用于只读查询钱包余额和套餐用量，不是推理 Key，不会用于模型请求。留空表示不单独配置；
-            已保存的 control key 不会回显。
+            填写同一 OpenDesign 账号的额度授权。只填 controlKey 可查钱包；再填 Workspace ID 可查套餐窗口。
+            新增账户时两项均可留空；已保存的 controlKey 不会回显。
           </p>
           <div class="inline">
             <label class="field">
-              <span>官方 controlKey</span>
+              <span>官方 controlKey（可选，仅查询额度）</span>
               <input class="control" id="accountControlKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign 官方 control key">
             </label>
             <label class="field">
-              <span>Workspace ID</span>
+              <span>Workspace ID（可选，查询套餐时填写）</span>
               <input class="control mono" id="accountWorkspaceID" autocomplete="off" spellcheck="false" placeholder="用于查询套餐额度">
             </label>
           </div>
@@ -244,7 +246,7 @@
             <input id="accountClearBilling" type="checkbox">
             清除已保存的额度授权（保留推理 Key）
           </label>
-          <p class="hint">留空 controlKey / Workspace ID 表示保留原值；只有勾选上面的复选框并保存才会清除额度授权。</p>
+          <p class="hint">编辑时留空表示保留原值；勾选后保存可清除额度授权，推理 Key 保留。</p>
         </details>
         <p class="state" id="accountState" role="status" aria-live="polite" hidden></p>
       </form>

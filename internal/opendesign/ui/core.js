@@ -313,13 +313,13 @@
       case 'expired':
         return { text: '上次估算时间或窗口已过，请刷新额度后重新预测', tone: 'muted' };
       case 'insufficient_samples':
-        return { text: '样本不足，暂不预测（需至少两次间隔 60 秒以上的查询）', tone: 'muted' };
+        return { text: '样本不足，暂不预测（需两次间隔至少 60 秒且有消费变化的成功查询）', tone: 'muted' };
       case 'rolling_window':
         return { text: '滚动窗口，不预测耗尽时间', tone: 'muted' };
       case 'estimated': {
         const span = formatDuration(value.seconds_to_exhaust);
         const at = formatTime(value.exhausts_at);
-        const parts = ['按最近消费速度估算'];
+        const parts = ['按该窗口最近整体 credits 消耗估算'];
         if (at) parts.push(`预计在 ${at} 达到当前窗口上限${span ? `（采样时预计剩余 ${span}）` : ''}`);
         else if (span) parts.push(`采样时预计剩余 ${span}`);
         return { text: `${parts.join('，')}；仅为估算，不改变模型调度`, tone: 'warn' };
@@ -327,11 +327,11 @@
       case 'resets_before_exhaustion': {
         const span = formatDuration(value.seconds_to_exhaust);
         return { text: span
-          ? `按最近消费速度估算，采样时预计 ${span}后耗尽，但会先到窗口重置时间；仅为估算`
+          ? `按该窗口最近整体 credits 消耗估算，采样时预计 ${span}后耗尽，但会先到窗口重置时间；仅为估算`
           : '预计先到窗口重置时间，暂不给出耗尽时间', tone: 'muted' };
       }
       case 'beyond_horizon':
-        return { text: '按最近消费速度估算，预计远超一年，不显示具体耗尽时间', tone: 'muted' };
+        return { text: '按该窗口最近整体 credits 消耗估算，预计远超一年，不显示具体耗尽时间', tone: 'muted' };
       default:
         return { text: '', tone: 'muted' };
     }

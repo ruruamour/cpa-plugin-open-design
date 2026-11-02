@@ -1093,7 +1093,7 @@ test('an available quota snapshot renders balance, credits windows, meters and r
   assert.match(text, /剩余 credits/);
   assert.match(text, /99\.99%/, 'the native meter uses exact BigInt basis points');
   assert.match(text, /重置于/);
-  assert.match(text, /按最近消费速度估算/);
+  assert.match(text, /按该窗口最近整体 credits 消耗估算/);
   assert.match(text, /仅为估算/);
   assert.ok(!/还能用\s*\d+\s*天/.test(text), 'no "N days left" promise');
 });
@@ -1150,7 +1150,7 @@ test('not configured, never queried, first failure and stale snapshots are disti
   assert.match(staleText, /\$3\.5/, 'last successful balance stays visible');
   assert.match(staleText, /数据可能过时/);
   assert.match(staleText, /上次成功查询/);
-  assert.ok(!staleText.includes('按最近消费速度估算'), 'stale snapshots must not keep showing the old prediction');
+  assert.ok(!staleText.includes('按该窗口最近整体 credits 消耗估算'), 'stale snapshots must not keep showing the old prediction');
 });
 
 test('partial success shows the available half and the failing half separately', async () => {
@@ -1183,7 +1183,7 @@ test('quota editors are optional, keep secrets out of the page and never auto-qu
   // The form itself advertises the official control key, not the inference key.
   assert.match(html, /可选：额度查询（官方 control key）/);
   assert.match(html, /官方 controlKey/);
-  assert.match(html, /不是推理 Key/);
+  assert.match(html, /同一 OpenDesign 账号的额度授权/);
   assert.match(html, /清除已保存的额度授权/);
 
   view.document.getElementById('accountControlKey').value = 'control-key-secret';
@@ -1304,7 +1304,7 @@ test('forecast states map to the documented Chinese descriptions', () => {
   assert.match(core.forecastView({ state: 'insufficient_samples' }).text, /样本不足/);
   assert.match(core.forecastView({ state: 'rolling_window' }).text, /滚动窗口/);
   const estimated = core.forecastView({ state: 'estimated', seconds_to_exhaust: 7200, exhausts_at: '2026-11-03T02:00:00Z' });
-  assert.match(estimated.text, /按最近消费速度估算/);
+  assert.match(estimated.text, /按该窗口最近整体 credits 消耗估算/);
   assert.match(estimated.text, /2 小时/);
   assert.ok(/2026-11-03/.test(estimated.text), 'estimated shows the projected time');
   assert.match(estimated.text, /仅为估算/);
@@ -1354,7 +1354,7 @@ test('an elapsed forecast is withdrawn locally without requesting the upstream',
   } })));
   await consoleApi.handlers.refreshQuota(consoleApi.state.status.credentials[0]);
   assert.match(quotaText(view), /上次估算时间或窗口已过/);
-  assert.ok(!quotaText(view).includes('按最近消费速度估算'));
+  assert.ok(!quotaText(view).includes('按该窗口最近整体 credits 消耗估算'));
   assert.ok(!quotaText(view).includes('anchored_recurring'));
   assert.match(quotaText(view), /窗口 1 小时 30 分钟/);
   assert.match(quotaText(view), /资金方式：套餐额度/);
@@ -1453,10 +1453,10 @@ test('transport errors mark the old snapshot stale and suppress its forecast', a
   });
   const account = consoleApi.state.status.credentials[0];
   await consoleApi.handlers.refreshQuota(account);
-  assert.match(quotaText(view), /按最近消费速度估算/);
+  assert.match(quotaText(view), /按该窗口最近整体 credits 消耗估算/);
   await consoleApi.handlers.refreshQuota(account);
   assert.match(quotaText(view), /上次成功查询/);
-  assert.ok(!quotaText(view).includes('按最近消费速度估算'));
+  assert.ok(!quotaText(view).includes('按该窗口最近整体 credits 消耗估算'));
   assert.equal(consoleApi.state.quotas['cred-1'].wallet.fetched_at, '2026-11-03T00:00:00Z');
 });
 
