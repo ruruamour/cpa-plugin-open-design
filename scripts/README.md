@@ -85,11 +85,13 @@ python3 scripts/smoke-abi.py dist/open-design.so --cpa-live
 3. `POST /models` 保存映射后，`GET /v1/models` 必须立刻出现别名（宿主注册被刷新）；
 4. `/v1/chat/completions` 非流式（`tools` 转发 + `usage`）与流式 SSE 多帧，模型别名要还原成客户端名；
 5. `disabled:true` 后 `/v1/models` 收回别名，`disabled:false` 后恢复且可再次调用；
-6. `DELETE /credentials?id=` 后不可调用、且不应再出现在模型列表；
-7. 上游 401 与 429 **各起一个独立 CPA 进程**（401 会让 CPA 冷却凭据，同进程第二次请求会被宿主挡掉），每个用例都断言请求确实到达假上游；
-8. 跨源重定向：假上游对 `/models` 回 307，观察宿主是否把 `Authorization` 带到另一个 origin。
+6. 跨源重定向（**在删除之前**跑，凭据必须仍然可用）：假上游对 `/models` 回 307 指向另一个测试 origin，观察宿主是否把 `Authorization` 带过去；
+7. `DELETE /credentials?id=` 后不可调用、且不应再出现在模型列表；
+8. 上游 401 与 429 **各起一个独立 CPA 进程**（真实 401 会让 CPA 冷却凭据，同进程里第二个用例会被宿主以 `auth_unavailable` 挡下、证明不了插件行为），每个用例都断言请求确实到达假上游。
 
-实测结论（CPA v8.0.48）：跨源 307 **会被跟随**，但 `Authorization` **会被剥掉**（`host_http_redirect.verdict`），即宿主不会把 bearer key 带到别的 origin；`registry.npmjs.org:443` 的 CONNECT 被代理拒绝，证明没有其它出站。
+实测结论（CPA v8.0.48）：跨源 307 **会被跟随**，但 `Authorization` **会被剥掉**（`host_http_redirect.verdict = "Authorization stripped across origin"`），即宿主不会把 bearer key 带到别的 origin；`registry.npmjs.org:443` 的 CONNECT 被代理拒绝，证明没有其它出站。
 
-注意：一次 401 会让 CPA 冷却该凭据，因此 401 放在最后；如果前面的主链路被 core bug 挡住（`core_blocked_legs` 非空），状态码这一段会记为 `SKIPPED` 而不是假通过。
+重定向探针有硬前置条件：**首跳必须真的到达假 origin 且带上 bearer key**（`first_hop.authorization_present`、以及目标 origin 出现在 `proxy.connects` 里）。不满足时探针直接记 `status: "FAIL"` 并写明原因，绝不会把「本地就被拒掉」解释成「宿主拒绝跟随重定向」。探针自带 `status` 并纳入总判定，任一 leg 失败整轮即 FAIL。
+
+每个错误用例都在独立进程里跑，因此不存在「先跑 401 把凭据冷却掉、后面用例被宿主拦下」的串扰；报告里每条都带 `reached_upstream`，为 `false` 就说明该用例没测到真东西。
 

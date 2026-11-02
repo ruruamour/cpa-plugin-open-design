@@ -1060,6 +1060,13 @@ def run_cpa_live(artifact, binary):
                     "after re-enable the alias is not callable: %s %s"
                     % (code_, body_.decode(errors="replace")[:160]))
 
+        # ---- host HTTP redirect: is Authorization re-sent across origins? ----
+        # Must run BEFORE the delete: a removed credential makes the
+        # /upstream-models call fail locally, so the first hop would never reach
+        # the fake origin and "not followed" would be a false conclusion.
+        evidence["host_http_redirect"] = probe_redirect(
+            request, origin, proxy, credential_id, proxy.allow_more)
+
         status, raw, _ = request(API + "/credentials?id=" + credential_id, method="DELETE")
         require(status == 200, "deleted credential returned %s: %s" % (status, raw))
         require(not list((work / "auths").glob("*.json")), "credential file survived delete")
@@ -1087,10 +1094,6 @@ def run_cpa_live(artifact, binary):
             stage_failures.append(
                 "deleted credential is still callable: %s" % unreachable)
 
-        # ---- host HTTP redirect: is Authorization re-sent across origins? ----
-        evidence["host_http_redirect"] = probe_redirect(
-            request, origin, proxy, credential_id, proxy.allow_more)
-
         # ---- final verdict: a blocked or skipped leg can never become PASS ----
         blockers = sorted(name for name in (
             "host_upstream_models", "host_chat_completions", "host_chat_stream")
@@ -1098,6 +1101,8 @@ def run_cpa_live(artifact, binary):
         for code, case in (evidence.get("host_http_status") or {}).items():
             if case.get("status") != "PASS":
                 blockers.append("host_http_status." + code)
+        if evidence.get("host_http_redirect", {}).get("status") != "PASS":
+            blockers.append("host_http_redirect")
         if not registration_live:
             blockers.append("ui_flow.registration")
         if stage_failures:
@@ -1259,9 +1264,15 @@ def _live_case(binary, artifact, fail_status=None):
 
 
 def probe_redirect(request, origin, proxy, credential_id, allow_redirect_host):
-    """Ask the real host to follow a 307 to a *different* origin and see if the
-    bearer key is re-sent. Both hosts reach the same loopback fake origin through
-    the same CONNECT proxy, so nothing can leave the box."""
+    """Ask the real host to follow a 307 to a *different* origin and see whether
+    the bearer key is re-sent. Both hosts reach the same loopback fake origin
+    through the same CONNECT proxy, so nothing can leave the box.
+
+    The first hop is a hard precondition: if the fake origin never received the
+    307 request with the bearer token, the probe FAILS. It must never be reported
+    as "the host refused to follow the redirect", which is what a locally
+    rejected call (e.g. a deleted credential) would otherwise look like.
+    """
     target = "https://redirect-probe.example.test/v1/models"
     allow_redirect_host("redirect-probe.example.test:443")
     origin.redirect_to = target
@@ -1274,12 +1285,13 @@ def probe_redirect(request, origin, proxy, credential_id, allow_redirect_host):
         hops = origin.requests[before:]
         first = [h for h in hops if h["host"] == "amr-link.open-design.ai"]
         second = [h for h in hops if (h.get("host") or "").startswith("redirect-probe")]
+        first_hop = {
+            "host": first[0]["host"] if first else None,
+            "authorization_present": bool(first and first[0]["authorization"]),
+        }
         result = {
             "status_surfaced": status,
-            "first_hop": {
-                "host": first[0]["host"] if first else None,
-                "authorization_present": bool(first and first[0]["authorization"]),
-            },
+            "first_hop": first_hop,
             "redirected_hop": {
                 "reached": bool(second),
                 "host": second[0]["host"] if second else None,
@@ -1287,12 +1299,26 @@ def probe_redirect(request, origin, proxy, credential_id, allow_redirect_host):
             },
             "via_connect_proxy": "redirect-probe.example.test:443" in proxy.connects,
         }
+        # Precondition: the 307 request itself must have reached the fake origin
+        # with the bearer token, otherwise nothing about redirect policy is proven.
+        if not first or not first_hop["authorization_present"]:
+            result["status"] = "FAIL"
+            result["failure"] = (
+                "first hop never reached the fake origin with a bearer token "
+                "(status_surfaced=%s, host=%r); cannot judge redirect policy"
+                % (status, first_hop["host"]))
+            return result
         if second:
+            forwarded = second[0]["authorization"]
+            result["status"] = "PASS"
             result["verdict"] = ("Authorization forwarded across origin"
-                                 if second[0]["authorization"]
+                                 if forwarded
                                  else "Authorization stripped across origin")
         else:
-            result["verdict"] = "redirect not followed (host refused cross-origin 307)"
+            # The first hop provably reached upstream, so "not followed" is a real
+            # observation about the host's cross-origin redirect policy.
+            result["status"] = "PASS"
+            result["verdict"] = "cross-origin 307 not followed by the host"
         return result
     finally:
         origin.redirect_to = None
