@@ -53,6 +53,11 @@ func applyQuotaForecasts(entry *quotaEntry, view *quotaResponse) {
 	for i := range data.CodingPlan.Windows {
 		window := &data.CodingPlan.Windows[i]
 		window.Forecast = quotaForecast{State: "insufficient_samples"}
+		if quotaWindowExhausted(*window, at) {
+			// This is a reported zero counter, independent of consumption rate.
+			window.Forecast.State = "exhausted"
+			continue
+		}
 		if window.ResetMode == "activity_triggered" {
 			window.Forecast.State = "rolling_window"
 			continue
@@ -77,7 +82,33 @@ func quotaWindowContains(key quotaWindowIdentity, at time.Time) bool {
 	return startErr == nil && resetErr == nil && start.Before(reset) && !at.Before(start) && at.Before(reset)
 }
 
+// Nullable bounds cannot invalidate an official zero counter. When the bounds
+// are present, suppress a zero from a future or already-reset window.
+func quotaWindowExhausted(window quotaWindow, at time.Time) bool {
+	remaining, ok := new(big.Int).SetString(window.RemainingCredits, 10)
+	return ok && remaining.Sign() == 0 && quotaWindowCurrentIfKnown(window, at)
+}
+
+func quotaWindowCurrentIfKnown(window quotaWindow, at time.Time) bool {
+	if window.WindowStart != nil {
+		start, err := time.Parse(time.RFC3339Nano, *window.WindowStart)
+		if err != nil || at.Before(start) {
+			return false
+		}
+	}
+	if window.ResetsAt != nil {
+		reset, err := time.Parse(time.RFC3339Nano, *window.ResetsAt)
+		if err != nil || !at.Before(reset) {
+			return false
+		}
+	}
+	return true
+}
+
 func forecastQuotaWindow(window quotaWindow, previous quotaWindowSample, at time.Time) quotaForecast {
+	if quotaWindowExhausted(window, at) {
+		return quotaForecast{State: "exhausted"}
+	}
 	unknown := quotaForecast{State: "insufficient_samples"}
 	key, valid := quotaIdentity(window)
 	if !valid || window.ResetMode != "anchored_recurring" || !quotaWindowContains(key, previous.at) || !quotaWindowContains(key, at) {
@@ -151,13 +182,20 @@ func quotaViewAt(view quotaResponse, now time.Time) quotaResponse {
 		if forecast.State == "insufficient_samples" || forecast.State == "rolling_window" {
 			continue
 		}
-		key, valid := quotaIdentity(window)
-		if !valid || !quotaWindowContains(key, now) || forecast.ExhaustsAt != nil && !now.Before(*forecast.ExhaustsAt) {
-			if windows == nil {
-				windows = append([]quotaWindow{}, view.Funding.Data.CodingPlan.Windows...)
+		if forecast.State == "exhausted" {
+			if quotaWindowCurrentIfKnown(window, now) {
+				continue
 			}
-			windows[i].Forecast = quotaForecast{State: "insufficient_samples"}
+		} else {
+			key, valid := quotaIdentity(window)
+			if valid && quotaWindowContains(key, now) && (forecast.ExhaustsAt == nil || now.Before(*forecast.ExhaustsAt)) {
+				continue
+			}
 		}
+		if windows == nil {
+			windows = append([]quotaWindow{}, view.Funding.Data.CodingPlan.Windows...)
+		}
+		windows[i].Forecast = quotaForecast{State: "insufficient_samples"}
 	}
 	if windows != nil {
 		data := *view.Funding.Data

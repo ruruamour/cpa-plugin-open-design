@@ -278,7 +278,7 @@ func TestQuotaForecastResetBoundaryAndZeroRemaining(t *testing.T) {
 	}
 	window.RemainingCredits = "0"
 	f = forecastQuotaWindow(window, previous, quotaTestTime.Add(time.Minute))
-	if f.State != "estimated" || f.SecondsToExhaust == nil || *f.SecondsToExhaust != 0 {
-		t.Fatal("a validated actual zero remaining was confused with unknown data")
+	if f.State != "exhausted" || f.SecondsToExhaust != nil || f.ExhaustsAt != nil || f.Basis != "" {
+		t.Fatal("a validated zero counter must be an explicit exhausted state, without an estimated time")
 	}
 }
