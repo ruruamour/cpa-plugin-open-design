@@ -99,4 +99,4 @@ GET /v0/management/open-design/quota?credential_id=<id>&refresh=1
 - [工作区 funding-check 请求与校验器](https://github.com/nexu-io/open-design/blob/5a0c47777975ddb91d09c1c16b423a3ef74bf572/apps/daemon/src/integrations/vela-billing.ts#L196-L270)
 - [窗口、credits 与重置模式类型](https://github.com/nexu-io/open-design/blob/5a0c47777975ddb91d09c1c16b423a3ef74bf572/packages/contracts/src/api/collab.ts#L1066-L1092)
 
-本仓库的隔离测试覆盖这些请求和字段契约。2026-11-02 的两账户真实 control 授权直接读取已成功；真实消费采样和预测尚未验收，详见[验证记录](verification.md)。
+本仓库的隔离测试覆盖这些请求和字段契约。2026-11-02 的两账户真实 control 授权直接读取已成功；随后 `0.2.0` 上线，od1 授权经完整推理 Key 精确匹配后配置到现有账户，生产插件首次手动查询钱包和套餐均为 `available`。真实消费采样和趋势预测尚未验收，详见[验证记录](verification.md)。

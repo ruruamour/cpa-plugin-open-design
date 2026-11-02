@@ -1,6 +1,6 @@
 # OpenDesign 0.2.0 验证记录
 
-2026-11-02 完成本轮功能验收与修复。`0.2.0` 的本地交付库已构建，尚未 push、发布或部署；生产继续运行 `0.1.0`。本轮生产保持只读，账户写入、Key 更换、额度错误和竞态均在隔离环境验证。
+2026-11-02 完成功能验收、修复与生产升级。`0.2.0` 的提交 `9fd8351` 已推送，在对应 CI 成功后通过 ops 部署脚本上线 `nuoapi-net`；GitHub Release 尚未发布。开发阶段的账户写入、Key 更换、额度错误和竞态均在隔离环境验证；后续获准上线后，仅给与 od1 完整推理 Key 精确匹配的现有账户补充额度授权并实际查询成功。
 
 ## 环境与产物
 
@@ -32,7 +32,7 @@
 | 原版 CPA 假 TLS 全流程 | 同一最终库，`--cpa-live` PASS |
 | Edge 交互 | 两条入口共 122 项断言通过（账号 48、更新后额度 58、复审 16），见下文 |
 | 独立复审 | 原 4 项后端 P2、3 项 UI P2 均按最终源码关闭，未发现新的 P1/P2 |
-| ops 离线部署检查 | 28 项通过；脚本已准备版本 `0.2.0`，没有执行部署 |
+| ops 离线部署检查 | 28 项通过；随后通过规定脚本完成生产 `0.2.0` 升级，来源／备份／注册／版本／控制台检查通过 |
 
 2026-11-02 的补充运维展示调整通过全仓 `go test -timeout 90s ./...`、Node 115/115、Edge 额度 58 项，以及新交付库的 ctypes／原版 CPA 加载／假 TLS 全流程。未修改 Go 后端算法；后端 race 与 vet 的证据沿用前一轮验收，未把 UI 调整后的普通 Go 测试称为再次 race。新库仍为 Debian 12、Go 1.26.4、非 root、关闭网络构建。
 
@@ -97,9 +97,15 @@ Go／Node 测试包含凭据解析重入、写盘失败时不发布新凭据、�
 | 2026-11-02 首次生产交付 | 有效推理 Key 发现 13 个模型；官方直连与生产插件各完成一次最小 JSON 推理，均为 HTTP 200／`OK` | 生产模型 `open-design-minimax-m3.1-flash`，usage 219／3／222；未逐个付费调用 13 个模型 |
 | 本轮 `0.2.0` 开发验收早期 | 现有推理 Key 只读请求控制面钱包和账单汇总均为 HTTP 401 | 当时未提供 control 授权；不能否定已成功的推理授权 |
 | 2026-11-02 19:07（北京时间）control 授权补验 | 用户下载文件中的 od1／od2 两组授权，各直接 GET 钱包与指定工作区 funding-check，四次均 HTTP 200；字段契约核对和工作区匹配通过 | 两钱包各 `1.5000` USD，均 Go 套餐；5 小时均剩 `50000/50000` credits，7 天分别剩 `149998/150000`、`150000/150000`；仅直接只读查询，未配置或调用生产新版插件 |
-| 本轮生产只读复核 | 服务 active，插件 `0.1.0`，1 凭据／13 映射，全部别名带前缀，控制台标题及宿主／插件哈希与原基线一致 | 只证明旧版生产状态保持，没有部署本次新版 |
+| 升级前生产只读复核 | 服务 active，插件 `0.1.0`，1 凭据／13 映射，全部别名带前缀，控制台标题及宿主／插件哈希与原基线一致 | 旧版升级前的基线 |
+| 2026-11-02 21:52（北京时间）升级 | 已推送提交 `9fd8351`、CI `41455903714` 成功；经规定脚本安装上表交付库，插件版本 `0.2.0`、四个原有效插件及服务正常 | 宿主哈希、原 13 映射保持一致；未重复付费推理 |
+| 2026-11-02 21:56（北京时间）生产额度 | od1 完整推理 Key 与唯一现有凭据在服务器内精确匹配；通过 Management API 补 control Key／工作区后，插件 quota HTTP 200，钱包与套餐均 `available` | 钱包 `1.5000` USD，5 小时剩 `50000/50000`、7 天剩 `149998/150000` credits；首次样本为 `insufficient_samples`，od2 未新增 |
 
-额度协议绑定 OpenDesign 官方客户端 commit `5a0c47777975ddb91d09c1c16b423a3ef74bf572`，来源和预测定义见 [quota.md](quota.md)。现有推理 Key 对控制面的 401、有效 control 授权的直接读取、插件隔离成功与旧版生产推理成功分别记录。真实消费采样预测仍未验收；未为此额外发起计费推理。下载文件标签与生产凭据的身份对应关系尚未确认；预测不影响 CPA 调度、账号启停或冷却。
+额度协议绑定 OpenDesign 官方客户端 commit `5a0c47777975ddb91d09c1c16b423a3ef74bf572`，来源和预测定义见 [quota.md](quota.md)。现有推理 Key 对控制面的 401、有效 control 授权的直接读取、插件隔离成功、旧版生产推理及新版生产额度成功分别记录。真实消费采样预测仍未验收；未为此额外发起计费推理。账号匹配使用完整 Key 比对，不根据标签推断；预测不影响 CPA 调度、账号启停或冷却。
+
+本次升级 CI：[41455903714](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/41455903714)，部署源码为 `9fd8351b5f0dbd7fbe8af33483b3cf81bf87fb71`。服务器备份为 `/srv/cliproxy/_backups/open-design-20261102T135234Z`；授权保存前的原 auth 文件备份在其 `quota-authorization/` 子目录（目录 `0700`、文件 `0600`，仅留在服务器）。插件回滚恢复 so/config，额度授权需单独恢复，不能把两者视为同一范围。
+
+上线后的独立 Edge 检查通过两条控制台入口、浅／深色、1280／390 共 8 个布局：版本、两个可选字段、真实余额／窗口、折叠趋势均正确，无溢出或脚本错误。页面使用服务器实时 HTML／status／quota 缓存，GET-only SSH relay 将测试中的刷新点击映射为缓存读取，没有追加额度上游请求；真正的首次刷新证据是上表的生产 Management API 查询。
 
 ## 本地证据索引
 
@@ -115,3 +121,6 @@ Go／Node 测试包含凭据解析重入、写盘失败时不发布新凭据、�
 - `/tmp/open-design-go-ops-clarity-0.2.log`、`/tmp/open-design-node-ops-clarity-0.2.log`
 - `/tmp/open-design-visual-quota-ops-clarity/report.json`、`/tmp/open-design-edge-quota-ops-clarity.log`
 - `/tmp/open-design-bookworm-ops-clarity-0.2.log`、`/tmp/open-design-abi-ops-clarity-0.2.json`、`/tmp/open-design-abi-ops-clarity-0.2.log`
+- `/tmp/open-design-deploy-0.2-preflight.log`、`/tmp/open-design-deploy-0.2-live.log`
+- `/tmp/open-design-predeploy-match-0.2.json`、`/tmp/open-design-production-quota-0.2.json`、`/tmp/open-design-production-final-0.2.json`
+- `/tmp/open-design-visual-production-0.2/report.json`、`/tmp/open-design-edge-production-0.2.log`
