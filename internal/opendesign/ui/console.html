@@ -100,6 +100,30 @@
     .mapping-status .badge.warn { background: color-mix(in srgb, #b54708 16%, var(--surface)); color: #b54708; }
     :root[data-theme="dark"] .mapping-status .badge.warn { color: #fec84b; }
     .upstream { display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: center; gap: 6px 10px; }
+    .billing { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--surface-2); }
+    .billing > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+    .billing[open] > summary { margin-bottom: 6px; }
+    .billing .inline { margin-top: 8px; }
+    .billing .check { margin-top: 8px; background: var(--surface); }
+    .quota { flex: 1 1 100%; min-width: 0; display: grid; gap: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+    .quota-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+    .quota-head .hint { margin-left: auto; }
+    .quota-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 8px; align-items: start; }
+    .quota-card { border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; background: var(--surface-2); min-width: 0; display: grid; gap: 6px; justify-items: start; align-content: start; }
+    .quota-card h4 { margin: 0; font-size: 12.5px; color: var(--muted); font-weight: 600; }
+    .quota-value { font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
+    .quota-meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .quota-window { display: grid; gap: 4px; width: 100%; justify-items: start; }
+    .quota-window + .quota-window { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+    .quota-window-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 10px; }
+    .quota-window-title { font-weight: 600; font-size: 12.5px; }
+    .meter { width: 100%; height: 6px; border-radius: 999px; background: color-mix(in srgb, var(--ink) 12%, var(--surface)); overflow: hidden; }
+    .meter > span { display: block; height: 100%; background: var(--accent); }
+    .meter.warn > span { background: #b54708; }
+    .quota-forecast { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+    .quota-forecast.warn { color: #b54708; }
+    :root[data-theme="dark"] .quota-forecast.warn { color: #fec84b; }
+    .quota-note { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .upstream .mono { overflow-wrap: anywhere; }
     .upstream .muted { grid-column: 2; font-size: 12px; }
     .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12.5px; }
@@ -200,6 +224,28 @@
           <button class="button primary" id="accountSubmit" type="submit">添加账户</button>
           <button class="button" id="accountCancel" type="button" hidden>取消编辑</button>
         </div>
+        <details class="billing" id="billingFields">
+          <summary>可选：额度查询（官方 control key）</summary>
+          <p class="hint">
+            仅用于只读查询钱包余额和套餐用量，不是推理 Key，不会用于模型请求。留空表示不单独配置；
+            已保存的 control key 不会回显。
+          </p>
+          <div class="inline">
+            <label class="field">
+              <span>官方 controlKey</span>
+              <input class="control" id="accountControlKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign 官方 control key">
+            </label>
+            <label class="field">
+              <span>Workspace ID</span>
+              <input class="control mono" id="accountWorkspaceID" autocomplete="off" spellcheck="false" placeholder="用于查询套餐额度">
+            </label>
+          </div>
+          <label class="check" id="accountClearBillingRow" hidden>
+            <input id="accountClearBilling" type="checkbox">
+            清除已保存的额度授权（保留推理 Key）
+          </label>
+          <p class="hint">留空 controlKey / Workspace ID 表示保留原值；只有勾选上面的复选框并保存才会清除额度授权。</p>
+        </details>
         <p class="state" id="accountState" role="status" aria-live="polite" hidden></p>
       </form>
       <div class="rows" id="accountList" style="margin-top: 14px;" aria-live="polite"></div>

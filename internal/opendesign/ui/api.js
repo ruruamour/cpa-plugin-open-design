@@ -87,7 +87,12 @@
     return {
       request,
       status: () => request('/status'),
-      addCredential: (label, apiKey) => request('/credentials', { method: 'POST', body: { label, api_key: apiKey } }),
+      // extra carries the optional billing fields (control_key / workspace_id) on
+      // create; older callers pass only a label and key.
+      addCredential: (label, apiKey, extra = {}) => request('/credentials', {
+        method: 'POST',
+        body: { label, api_key: apiKey, ...extra },
+      }),
       // CPA management routes match exact METHOD + path, so credential ids travel
       // as query/body fields rather than path segments.
       deleteCredential: id => request('/credentials', { method: 'DELETE', query: { id } }),
@@ -96,6 +101,11 @@
         body: { ...body, id: String(id) },
       }),
       upstreamModels: credentialID => request('/upstream-models', { query: { credential_id: credentialID } }),
+      // Cached read unless refresh is explicitly requested: loading the page must
+      // never hit the upstream billing API on its own.
+      quota: (credentialID, options = {}) => request('/quota', {
+        query: { credential_id: credentialID, refresh: options.refresh ? 1 : '' },
+      }),
       saveModels: models => request('/models', { method: 'POST', body: { models } }),
     };
   }

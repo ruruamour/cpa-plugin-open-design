@@ -39,8 +39,26 @@
     savedMappings: [],
     accountEdit: null,
     authCollapsed: false,
+    // Quota snapshots are keyed by credential id. They are only fetched when the
+    // operator asks (no polling, no automatic per-account upstream request).
+    quotas: {},
+    quotaBusy: {},
+    quotaGeneration: 0,
     busy: false,
   };
+
+  // Any credential change (edit, billing clear, delete) or logout bumps this
+  // generation so a late quota response can never write into the new state.
+  function invalidateQuota(credentialID) {
+    state.quotaGeneration += 1;
+    if (credentialID === undefined) {
+      state.quotas = {};
+      state.quotaBusy = {};
+      return;
+    }
+    delete state.quotas[credentialID];
+    delete state.quotaBusy[credentialID];
+  }
 
   // Model-list requests are generation-checked: a slow response must never
   // overwrite the list for a credential the operator has since switched to.
@@ -203,6 +221,7 @@
     state.verified = null;
     state.candidate = null;
     invalidateModelRequest();
+    invalidateQuota();
     resetAccountForm();
     setAuthCollapsed(false);
     showPanels(false);
@@ -280,8 +299,39 @@
     }
   }
 
+  // Quota snapshots belong to one credential configuration. When the billing
+  // fields change elsewhere (or an account disappears), the old snapshot and any
+  // in-flight refresh must be dropped instead of being shown for the new setup.
+  function billingSignature(item) {
+    return `${item.billing_configured === true ? '1' : '0'}|${item.workspace_id || ''}`;
+  }
+
+  function invalidateChangedQuotas(credentials) {
+    const previous = state.billingSignatures || {};
+    const next = {};
+    let changed = false;
+    for (const item of credentials) {
+      next[item.id] = billingSignature(item);
+      if (Object.prototype.hasOwnProperty.call(previous, item.id) && previous[item.id] !== next[item.id]) {
+        changed = true;
+        delete state.quotas[item.id];
+        delete state.quotaBusy[item.id];
+      }
+    }
+    for (const id of Object.keys(previous)) {
+      if (!Object.prototype.hasOwnProperty.call(next, id)) {
+        changed = true;
+        delete state.quotas[id];
+        delete state.quotaBusy[id];
+      }
+    }
+    state.billingSignatures = next;
+    if (changed) state.quotaGeneration += 1;
+  }
+
   function applyStatus(raw) {
     const incoming = Core.normalizeStatus(raw);
+    invalidateChangedQuotas(incoming.credentials);
     const serverModels = cloneMappings(incoming.models);
     // A status refresh (account add/update, background reload) must not silently
     // discard mapping edits the operator has not saved yet. The saved baseline is
@@ -339,6 +389,7 @@
             className: `badge ${item.disabled ? 'off' : 'on'}`,
             text: item.disabled ? '已停用' : '已启用',
           }),
+          item.billing_configured ? el('span', { className: 'badge', text: '额度已配置' }) : null,
           editing ? el('span', { className: 'badge', text: '正在编辑' }) : null,
         ]);
         const actions = el('div', { className: 'row-actions' }, [
@@ -360,13 +411,212 @@
             on: () => deleteAccount(item),
           }),
         ]);
-        return el('div', { className: 'row', attrs: { 'data-credential-id': item.id } }, [detail, actions]);
+        return el('div', { className: 'row', attrs: { 'data-credential-id': item.id } }, [
+          detail,
+          actions,
+          renderQuota(item),
+        ]);
       });
       list.replaceChildren(...rows);
     }
     if (state.busy) setRowButtonsDisabled(list, true);
+    // The clear-billing checkbox only makes sense while editing an account that
+    // actually has billing credentials stored.
+    const clearRow = $('accountClearBillingRow');
+    if (clearRow) clearRow.hidden = !(state.accountEdit && state.accountEdit.billing_configured);
     renderCredentialOptions();
     syncFetchButton();
+  }
+
+  const QUOTA_STATE_TEXT = {
+    not_configured: '未配置额度查询',
+    needs_refresh: '尚未查询',
+    not_requested: '未查询（缺 Workspace ID）',
+    available: '已更新',
+    partial: '部分可用',
+    stale: '数据可能过时',
+    error: '查询失败',
+  };
+
+  function quotaStateBadge(stateName) {
+    const className = stateName === 'available' ? 'badge good'
+      : (stateName === 'stale' || stateName === 'partial' ? 'badge warn'
+        : (stateName === 'error' ? 'badge off' : 'badge'));
+    return el('span', { className, text: QUOTA_STATE_TEXT[stateName] || '未知状态' });
+  }
+
+  function quotaErrorText(prefix, error) {
+    if (!error) return prefix;
+    const kind = error.kind ? `（${error.kind}）` : '';
+    return `${prefix}${kind}${error.message ? `：${error.message}` : ''}`;
+  }
+
+  function quotaWalletCard(item, quota) {
+    const wallet = quota.wallet;
+    const configured = quota.billing_configured !== false && state.status.credentials.some(c => c.id === item.id && c.billing_configured);
+    const card = el('div', { className: 'quota-card', attrs: { 'data-quota-part': 'wallet' } }, [
+      el('h4', { text: '钱包余额（USD）' }),
+      quotaStateBadge(wallet.state || (configured ? 'needs_refresh' : 'not_configured')),
+    ]);
+    if (!configured) {
+      card.append(el('p', { className: 'quota-note', text: '未配置官方 controlKey，不查询余额。可在编辑账户中填写。' }));
+      return card;
+    }
+    if (wallet.state === 'available' && wallet.data && wallet.data.balanceUsd) {
+      card.append(el('div', { className: 'quota-value', text: Core.formatUSD(wallet.data.balanceUsd) }));
+      card.append(el('p', { className: 'quota-meta', text: `查询时间：${Core.formatTime(wallet.fetched_at) || '未知'}` }));
+      card.append(el('p', { className: 'quota-meta', text: wallet.data.updatedAt
+        ? `上游更新时间：${Core.formatTime(wallet.data.updatedAt)}`
+        : '上游未提供更新时间' }));
+      return card;
+    }
+    if (wallet.state === 'error') {
+      card.append(el('p', { className: 'quota-note', text: quotaErrorText('首次查询失败', wallet.error) }));
+      card.append(el('p', { className: 'quota-hint', text: '可稍后重试；未显示余额不代表余额为 0。' }));
+      return card;
+    }
+    if (wallet.state === 'stale') {
+      if (wallet.data && wallet.data.balanceUsd) {
+        card.append(el('div', { className: 'quota-value', text: Core.formatUSD(wallet.data.balanceUsd) }));
+        card.append(el('p', { className: 'quota-meta', text: `上次成功查询：${Core.formatTime(wallet.fetched_at) || '未知'}（当前可能已变化）` }));
+      }
+      card.append(el('p', { className: 'quota-note', text: quotaErrorText('刷新失败，保留上次数据', wallet.error) }));
+      return card;
+    }
+    card.append(el('p', { className: 'quota-note', text: wallet.state === 'needs_refresh'
+      ? '尚未查询额度，点「刷新额度」读取。'
+      : '当前没有可显示的余额数据。' }));
+    return card;
+  }
+
+  function quotaWindowBlock(window) {
+    const block = el('div', { className: 'quota-window' });
+    const title = window.durationSeconds ? `窗口 ${Core.formatDuration(window.durationSeconds)}` : '额度窗口';
+    block.append(el('div', { className: 'quota-window-head' }, [
+      el('span', { className: 'quota-window-title', text: title }),
+      el('span', { className: 'quota-meta', text: window.resetMode || '' }),
+    ]));
+    const used = Core.formatCredits(window.usedCredits);
+    const limit = Core.formatCredits(window.limitCredits);
+    const remaining = Core.formatCredits(window.remainingCredits);
+    if (used && limit) {
+      block.append(el('p', { className: 'quota-meta', text: `已用 ${used} / ${limit} credits` }));
+    } else {
+      block.append(el('p', { className: 'quota-meta', text: '已用/上限：未知' }));
+    }
+    if (remaining) {
+      block.append(el('p', { className: 'quota-value', text: `${remaining} credits` }));
+      block.append(el('p', { className: 'quota-meta', text: '剩余 credits' }));
+    } else {
+      block.append(el('p', { className: 'quota-note', text: '剩余 credits：未知' }));
+    }
+    const meter = Core.creditsPercent(window.usedCredits, window.limitCredits);
+    if (meter) {
+      const bar = el('div', { className: `meter${meter.basisPoints >= 8000 ? ' warn' : ''}` }, [
+        el('span', { attrs: { style: `width:${meter.text}` }, text: '' }),
+      ]);
+      block.append(bar);
+      block.append(el('p', { className: 'quota-meta', text: `原生用量计：已用 ${meter.text}` }));
+    }
+    if (window.resetsAt) {
+      block.append(el('p', { className: 'quota-meta', text: `重置于 ${Core.formatTime(window.resetsAt)}` }));
+    } else {
+      block.append(el('p', { className: 'quota-meta', text: '重置时间：未知' }));
+    }
+    const forecast = Core.forecastView(window.forecast);
+    if (forecast.text) block.append(el('p', { className: `quota-forecast${forecast.tone === 'warn' ? ' warn' : ''}`, text: forecast.text }));
+    return block;
+  }
+
+  function quotaFundingCard(item, quota) {
+    const funding = quota.funding;
+    const hasWorkspace = Boolean(quota.workspace_id);
+    const card = el('div', { className: 'quota-card', attrs: { 'data-quota-part': 'funding' } }, [
+      el('h4', { text: '套餐用量' }),
+      quotaStateBadge(funding.state || (hasWorkspace ? 'needs_refresh' : 'not_requested')),
+    ]);
+    if (!hasWorkspace) {
+      card.append(el('p', { className: 'quota-note', text: '未填写 Workspace ID，无法查询套餐窗口；这不影响推理。' }));
+      return card;
+    }
+    if (funding.state === 'error') {
+      card.append(el('p', { className: 'quota-note', text: quotaErrorText('首次查询失败', funding.error) }));
+      return card;
+    }
+    if (funding.state === 'stale') {
+      card.append(el('p', { className: 'quota-note', text: quotaErrorText('刷新失败，保留上次数据', funding.error) }));
+      card.append(el('p', { className: 'quota-meta', text: `上次成功查询：${Core.formatTime(funding.fetched_at) || '未知'}` }));
+      // A stale component must not keep presenting the old prediction.
+      if (funding.data && funding.data.codingPlan) {
+        const plan = funding.data.codingPlan;
+        card.append(el('p', { className: 'quota-meta', text: `套餐：${plan.tier || '未知'}` }));
+        for (const window of plan.windows) {
+          const block = quotaWindowBlock({ ...window, forecast: { state: '' } });
+          card.append(block);
+        }
+      }
+      return card;
+    }
+    if (funding.state === 'needs_refresh') {
+      card.append(el('p', { className: 'quota-note', text: '尚未查询套餐用量，点「刷新额度」读取。' }));
+      return card;
+    }
+    const plan = funding.data && funding.data.codingPlan ? funding.data.codingPlan : null;
+    if (!plan || !plan.windows.length) {
+      card.append(el('p', { className: 'quota-note', text: '上游没有返回套餐窗口数据。' }));
+      return card;
+    }
+    card.append(el('p', { className: 'quota-meta', text: `套餐：${plan.tier || '未知'}${funding.data.funding ? ` · 资金方式 ${funding.data.funding}` : ''}` }));
+    if (funding.data.fundingCheck) card.append(el('p', { className: 'quota-meta', text: `资金检查：${funding.data.fundingCheck}` }));
+    for (const window of plan.windows) card.append(quotaWindowBlock(window));
+    card.append(el('p', { className: 'quota-note', text: `窗口数据查询时间：${Core.formatTime(funding.fetched_at) || '未知'}` }));
+    return card;
+  }
+
+  function quotaRefreshHint(quota) {
+    const next = quota && quota.next_refresh_at ? Date.parse(quota.next_refresh_at) : NaN;
+    if (Number.isNaN(next)) return '额度查询不会自动轮询；只有点「刷新额度」才会向上游请求。';
+    const seconds = Math.round((next - Date.now()) / 1000);
+    if (seconds <= 0) return '可以刷新额度。';
+    return `两次上游查询至少间隔 60 秒，约 ${seconds} 秒后可再次刷新。`;
+  }
+
+  function renderQuota(item) {
+    const quota = state.quotas[item.id];
+    const busy = Boolean(state.quotaBusy[item.id]);
+    const head = el('div', { className: 'quota-head' }, [
+      el('span', { className: 'quota-window-title', text: '额度' }),
+      quota ? quotaStateBadge(quota.state) : el('span', { className: 'badge', text: item.billing_configured ? '未查询' : '未配置' }),
+      el('span', { className: 'hint', text: quota ? quotaRefreshHint(quota) : '额度查询可选，不会自动请求。' }),
+    ]);
+    const refresh = button(busy ? '刷新中…' : '刷新额度', 'refresh-quota', {
+      className: 'button compact',
+      disabled: busy || !item.billing_configured,
+      on: () => refreshQuota(item),
+    });
+    head.append(refresh);
+    const section = el('div', { className: 'quota', attrs: { 'data-quota-id': item.id } }, [head]);
+    if (quota && quota.state === 'stale') {
+      section.append(el('p', { className: 'quota-note', text: '当前显示的是上次成功查询的数据；上游暂时不可用时不显示旧预测。' }));
+    }
+    const cards = el('div', { className: 'quota-grid' });
+    if (!item.billing_configured) {
+      cards.append(el('div', { className: 'quota-card' }, [
+        el('h4', { text: '额度查询未配置' }),
+        el('p', { className: 'quota-note', text: '点「编辑」填写官方 controlKey（可选 Workspace ID）后可查询余额和套餐用量。未配置不影响模型推理。' }),
+      ]));
+    } else if (!quota) {
+      cards.append(el('div', { className: 'quota-card' }, [
+        el('h4', { text: '尚未查询' }),
+        el('p', { className: 'quota-note', text: '点「刷新额度」读取。本页不会自动向上游查询。' }),
+      ]));
+    } else {
+      cards.append(quotaWalletCard(item, quota));
+      cards.append(quotaFundingCard(item, quota));
+    }
+    section.append(cards);
+    if (quota && quota.error_note) section.append(el('p', { className: 'quota-note', text: quota.error_note }));
+    return section;
   }
 
   function renderCredentialOptions() {
@@ -563,12 +813,39 @@
       cancel: $('accountCancel'),
       label: $('accountLabel'),
       key: $('accountKey'),
+      billing: $('billingFields'),
+      controlKey: $('accountControlKey'),
+      workspaceID: $('accountWorkspaceID'),
+      clearBilling: $('accountClearBilling'),
     };
+  }
+
+  function readBillingInput() {
+    const nodes = accountFormNodes();
+    return {
+      controlKey: nodes.controlKey ? nodes.controlKey.value.trim() : '',
+      workspaceID: nodes.workspaceID ? nodes.workspaceID.value.trim() : '',
+      clear: Boolean(nodes.clearBilling && nodes.clearBilling.checked),
+    };
+  }
+
+  // The control key is written once and never read back into the page.
+  function clearBillingInputs() {
+    const nodes = accountFormNodes();
+    if (nodes.controlKey) {
+      nodes.controlKey.value = '';
+      nodes.controlKey.setAttribute('placeholder', '粘贴 OpenDesign 官方 control key');
+    }
+    if (nodes.workspaceID) nodes.workspaceID.value = '';
+    if (nodes.clearBilling) nodes.clearBilling.checked = false;
+    if (nodes.billing) nodes.billing.open = false;
   }
 
   function resetAccountForm() {
     state.accountEdit = null;
     const nodes = accountFormNodes();
+    const clearRow = $('accountClearBillingRow');
+    if (clearRow) clearRow.hidden = true;
     if (nodes.title) nodes.title.textContent = '添加账户';
     if (nodes.hint) nodes.hint.textContent = '填写标签和 API key 后添加。';
     if (nodes.submit) nodes.submit.textContent = '添加账户';
@@ -578,12 +855,13 @@
       nodes.key.value = '';
       nodes.key.setAttribute('placeholder', '粘贴 OpenDesign Cloud API key');
     }
+    clearBillingInputs();
     renderAccounts();
   }
 
   function editAccount(item) {
     if (state.busy) return;
-    state.accountEdit = { id: item.id, label: item.label };
+    state.accountEdit = { id: item.id, label: item.label, billing_configured: item.billing_configured === true };
     const nodes = accountFormNodes();
     if (nodes.title) nodes.title.textContent = `编辑账户「${item.label}」`;
     if (nodes.hint) nodes.hint.textContent = 'API key 不能回显；留空表示保留原 Key，保存后输入框会清空。';
@@ -594,6 +872,16 @@
       nodes.key.value = '';
       nodes.key.setAttribute('placeholder', '留空则保留原 Key');
     }
+    clearBillingInputs();
+    if (nodes.controlKey) {
+      nodes.controlKey.setAttribute('placeholder', item.billing_configured
+        ? '已配置：留空则保留原 controlKey'
+        : '粘贴 OpenDesign 官方 control key');
+    }
+    if (nodes.workspaceID) nodes.workspaceID.value = item.workspace_id || '';
+    const clearRow = $('accountClearBillingRow');
+    if (clearRow) clearRow.hidden = !item.billing_configured;
+    if (nodes.billing) nodes.billing.open = Boolean(item.billing_configured || item.workspace_id);
     message('accountState', `正在编辑「${item.label}」，留空 API key 将保留原 Key。`, '');
     renderAccounts();
     if (nodes.label && typeof nodes.label.focus === 'function') nodes.label.focus();
@@ -623,25 +911,49 @@
       message('accountState', '编辑账户时标签不能为空。', 'error');
       return;
     }
+    const billing = readBillingInput();
+    if (billing.clear && billing.controlKey) {
+      message('accountState', '已勾选「清除额度授权」，不会再保存新的 controlKey。取消勾选后再保存。', 'error');
+      return;
+    }
+    if (!billing.clear && billing.controlKey && !billing.workspaceID) {
+      message('accountState', '填写 controlKey 时还需要 Workspace ID 才能查询套餐额度。', 'error');
+      return;
+    }
     setBusy(true);
     message('accountState', editing ? '正在保存账户修改…' : '正在保存账户…');
     try {
       if (editing) {
-        // Reuses the existing POST /credentials contract. An empty key is omitted
-        // so the backend keeps the stored key; the API key is never read back.
+        // Reuses the existing POST /credentials contract. Empty values are omitted
+        // so the backend keeps what is stored; keys are never read back.
         const body = { label };
         if (key) body.api_key = key;
+        if (billing.clear) body.clear_billing = true;
+        else {
+          if (billing.controlKey) body.control_key = billing.controlKey;
+          if (billing.workspaceID) body.workspace_id = billing.workspaceID;
+        }
         await api().updateCredential(editing.id, body);
         const wasEditing = editing.label;
+        invalidateQuota(editing.id);
         resetAccountForm();
-        message('accountState', key
+        const billingNote = billing.clear
+          ? '已清除额度授权，推理 Key 保留。'
+          : (billing.controlKey || billing.workspaceID ? '额度查询配置已保存。' : '');
+        message('accountState', `${key
           ? `账户「${label}」已保存，API key 已更新并从页面清空。`
-          : `账户「${label}」已保存（${wasEditing} → ${label}），原 API key 保留并从页面清空。`);
+          : `账户「${label}」已保存（${wasEditing} → ${label}），原 API key 保留并从页面清空。`}${billingNote}`);
       } else {
-        await api().addCredential(label, key);
+        const extra = {};
+        if (billing.controlKey) extra.control_key = billing.controlKey;
+        if (billing.workspaceID) extra.workspace_id = billing.workspaceID;
+        await api().addCredential(label, key, extra);
         if (keyInput) keyInput.value = '';
         if (labelInput) labelInput.value = '';
-        message('accountState', '账户已保存，API key 已从页面清空。');
+        resetAccountForm();
+        message('accountState', billing.controlKey
+          ? '账户已保存，API key 与 controlKey 都已从页面清空。点「刷新额度」才会查询额度。'
+          : '账户已保存，API key 已从页面清空。额度查询配置可随后通过「编辑」添加。');
       }
       await refreshStatus();
       renderAccounts();
@@ -663,6 +975,7 @@
     message('accountState', '正在删除账户…');
     try {
       await api().deleteCredential(item.id);
+      invalidateQuota(item.id);
       if (state.selectedCredential === item.id) {
         state.selectedCredential = '';
         invalidateModelRequest();
@@ -780,6 +1093,48 @@
       if (activeModelRequest === requestToken) {
         activeModelRequest = 0;
         setBusy(false);
+      }
+    }
+  }
+
+  // Explicit refresh only. A cached GET without refresh=1 never reaches upstream,
+  // so opening/refreshing the page cannot spend quota calls.
+  async function refreshQuota(item) {
+    if (!item || !item.billing_configured) {
+      message('accountState', '该账户还没有配置官方 controlKey，无法查询额度。点「编辑」添加后再试。', 'error');
+      return;
+    }
+    if (state.quotaBusy[item.id]) return;
+    const generation = state.quotaGeneration;
+    const stillCurrent = () => generation === state.quotaGeneration;
+    state.quotaBusy[item.id] = true;
+    renderAccounts();
+    try {
+      const raw = await api().quota(item.id, { refresh: true });
+      if (!stillCurrent()) return;
+      const quota = Core.normalizeQuota(raw);
+      if (quota.state === 'needs_refresh') {
+        // Throttled or skipped: keep any previous snapshot, just explain it.
+        const previous = state.quotas[item.id];
+        if (previous) previous.next_refresh_at = quota.next_refresh_at;
+        else state.quotas[item.id] = quota;
+        message('accountState', `额度刷新已节流：${quotaRefreshHint(quota)}`, '');
+      } else {
+        state.quotas[item.id] = quota;
+        message('accountState', quota.state === 'error'
+          ? `账户「${item.label}」额度查询失败：${quotaErrorText('未取得数据', quota.error)}；管理登录未受影响。`
+          : `账户「${item.label}」额度已更新（${QUOTA_STATE_TEXT[quota.state] || quota.state}）。`, quota.state === 'error' ? 'error' : '');
+      }
+      renderAccounts();
+    } catch (error) {
+      if (!stillCurrent()) return;
+      // Quota failures never touch CPA login, even when they surface as 401/403:
+      // a rejected control key is not a rejected management key.
+      message('accountState', `账户「${item.label}」额度查询失败：${formatError(error)}。管理登录未受影响。`, 'error');
+    } finally {
+      if (stillCurrent()) {
+        delete state.quotaBusy[item.id];
+        renderAccounts();
       }
     }
   }
@@ -948,6 +1303,7 @@
     state.verified = null;
     state.candidate = null;
     state.selectedCredential = '';
+    invalidateQuota();
     resetAccountForm();
     invalidateModelRequest();
     const keyInput = $('managementKey');
@@ -961,6 +1317,7 @@
   async function bootstrap() {
     renderMeta();
     setAuthCollapsed(false);
+    resetAccountForm();
     renderAccounts();
     renderModels();
     if (Auth.rememberEnabled && Auth.rememberEnabled()) {
@@ -997,6 +1354,7 @@
       saveModels,
       addMapping,
       revertMappings,
+      refreshQuota,
       filterUpstream,
       selectVisibleUpstream,
       toggleAuthPanel,
