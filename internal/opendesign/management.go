@@ -131,7 +131,7 @@ func (s *Service) management(raw json.RawMessage) (any, error) {
 	case r.Method == http.MethodPost && path == apiBase+"/models":
 		result, err := s.importModels(r.Body)
 		if err != nil {
-			return managementError(statusOf(err), err.Error())
+			return managementError(statusOf(err), err.Error(), s.allKeys()...)
 		}
 		return managementJSON(http.StatusOK, result)
 	default:
