@@ -38,6 +38,11 @@
     busy: false,
   };
 
+  // Model-list requests are generation-checked: a slow response must never
+  // overwrite the list for a credential the operator has since switched to.
+  let modelRequestSeq = 0;
+  let activeModelRequest = 0;
+
   let client = null;
   function api() {
     if (!client) {
@@ -94,10 +99,23 @@
 
   function setBusy(value) {
     state.busy = Boolean(value);
-    for (const id of ['authSubmit', 'accountSubmit', 'fetchModels', 'saveModels', 'addMapping']) {
+    for (const id of ['authSubmit', 'accountSubmit', 'fetchModels', 'saveModels', 'addMapping', 'modelCredential']) {
       const node = $(id);
       if (node) node.disabled = state.busy;
     }
+  }
+
+  // Drops any in-flight model list (releasing its busy slot) and clears the
+  // upstream view. Called when the selection changes, credentials change or the
+  // operator logs out, so stale results cannot be applied to the new selection.
+  function invalidateModelRequest() {
+    modelRequestSeq += 1;
+    if (activeModelRequest) {
+      activeModelRequest = 0;
+      setBusy(false);
+    }
+    state.upstream = [];
+    state.upstreamFor = '';
   }
 
   function authLabel(source) {
@@ -118,6 +136,7 @@
   function showAuth(text, kind = 'error') {
     state.verified = null;
     state.candidate = null;
+    invalidateModelRequest();
     showPanels(false);
     const badge = $('authBadge');
     if (badge) {
@@ -168,8 +187,7 @@
     state.mappings = state.status.models.map(model => ({ ...model }));
     if (state.selectedCredential && !state.status.credentials.some(item => item.id === state.selectedCredential)) {
       state.selectedCredential = '';
-      state.upstream = [];
-      state.upstreamFor = '';
+      invalidateModelRequest();
     }
     renderMeta();
     renderAccounts();
@@ -312,13 +330,7 @@
   }
 
   function selectAccount(id) {
-    state.selectedCredential = id;
-    state.upstream = [];
-    state.upstreamFor = '';
-    const select = $('modelCredential');
-    if (select) select.value = id;
-    message('modelState', '');
-    renderUpstream();
+    selectCredential(id);
     const panel = $('modelsPanel');
     if (panel && typeof panel.scrollIntoView === 'function') panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
@@ -362,8 +374,7 @@
       await api().deleteCredential(item.id);
       if (state.selectedCredential === item.id) {
         state.selectedCredential = '';
-        state.upstream = [];
-        state.upstreamFor = '';
+        invalidateModelRequest();
       }
       message('accountState', '账户已删除。');
       await refreshStatus();
@@ -383,8 +394,7 @@
       await api().updateCredential(item.id, { disabled: !item.disabled });
       if (!item.disabled && state.selectedCredential === item.id) {
         state.selectedCredential = '';
-        state.upstream = [];
-        state.upstreamFor = '';
+        invalidateModelRequest();
       }
       message('accountState', item.disabled ? '账户已启用。' : '账户已停用。');
       await refreshStatus();
@@ -411,16 +421,23 @@
       message('modelState', '请先选择一个账户。', 'error');
       return;
     }
+    const requestToken = ++modelRequestSeq;
+    const stillCurrent = () => requestToken === modelRequestSeq && state.selectedCredential === credentialID;
     state.selectedCredential = credentialID;
+    activeModelRequest = requestToken;
     setBusy(true);
     message('modelState', '正在读取 OpenDesign 模型列表…');
     try {
       const raw = await api().upstreamModels(credentialID);
+      // A late response for an earlier selection (or a logged-out page) is
+      // discarded: it must not replace the list shown for the current one.
+      if (!stillCurrent()) return;
       state.upstream = Core.normalizeUpstreamModels(raw);
       state.upstreamFor = credentialID;
       renderUpstream();
       message('modelState', `已读取 ${state.upstream.length} 个上游模型。勾选后设置对外别名，再保存映射。`);
     } catch (error) {
+      if (!stillCurrent()) return;
       if (error.status === 401) {
         message('modelState', '401：管理认证失效，或该 OpenDesign API key 无效。请先重新验证管理密钥，再检查账户 key。', 'error');
       } else if (isAuthStatus(error.status)) {
@@ -429,7 +446,12 @@
         message('modelState', `读取模型失败：${formatError(error)}`, 'error');
       }
     } finally {
-      setBusy(false);
+      // Only the request that owns the busy slot may release it; an invalidated
+      // request has already handed the slot to a newer fetch.
+      if (activeModelRequest === requestToken) {
+        activeModelRequest = 0;
+        setBusy(false);
+      }
     }
   }
 
@@ -463,6 +485,16 @@
     }
   }
 
+  // Changing the picker always invalidates the in-flight model list.
+  function selectCredential(id) {
+    state.selectedCredential = id;
+    invalidateModelRequest();
+    const select = $('modelCredential');
+    if (select && select.value !== id) select.value = id;
+    renderUpstream();
+    message('modelState', '');
+  }
+
   function addMapping() {
     state.mappings.push({ id: '', upstream_id: '' });
     renderMappings();
@@ -482,12 +514,7 @@
     const addButton = $('addMapping');
     if (addButton) addButton.addEventListener('click', addMapping);
     const select = $('modelCredential');
-    if (select) select.addEventListener('change', () => {
-      state.selectedCredential = select.value;
-      state.upstream = [];
-      state.upstreamFor = '';
-      renderUpstream();
-    });
+    if (select) select.addEventListener('change', () => selectCredential(select.value));
   }
 
   async function submitAuth(event) {
@@ -539,6 +566,7 @@
     try { Auth.clearAuth(); } catch { /* Ignore blocked storage. */ }
     state.verified = null;
     state.candidate = null;
+    invalidateModelRequest();
     const keyInput = $('managementKey');
     if (keyInput) keyInput.value = '';
     const remember = $('rememberAuth');
@@ -572,6 +600,7 @@
       deleteAccount,
       toggleAccount,
       selectAccount,
+      selectCredential,
       fetchModels,
       saveModels,
       addMapping,

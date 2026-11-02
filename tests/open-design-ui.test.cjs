@@ -288,6 +288,44 @@ test('account labels are rendered as text, never as trusted HTML', () => {
   assert.equal(view.context.pwned, undefined);
 });
 
+
+const plain = value => JSON.parse(JSON.stringify(value));
+
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+function slowModelPage() {
+  const pending = [];
+  const view = fakePage({
+    fetchImpl: (url) => {
+      if (url.endsWith('/status')) return respond(200, statusBody({
+        credentials: [
+          { id: 'cred-1', label: '主账户', disabled: false },
+          { id: 'cred-2', label: '备用账户', disabled: false },
+        ],
+      }));
+      const request = deferred();
+      pending.push({ url, request });
+      return request.promise;
+    },
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.state.status = view.context.OpenDesignCore.normalizeStatus(statusBody({
+    credentials: [
+      { id: 'cred-1', label: '主账户', disabled: false },
+      { id: 'cred-2', label: '备用账户', disabled: false },
+    ],
+  }));
+  consoleApi.state.mappings = [];
+  view.document.getElementById('modelCredential').replaceChildren();
+  consoleApi.render.renderCredentialOptions();
+  return { view, consoleApi, pending };
+}
+
 test('row action buttons are wired to real click listeners', async () => {
   const calls = [];
   const view = fakePage({
@@ -315,6 +353,113 @@ test('row action buttons are wired to real click listeners', async () => {
   const before = calls.length;
   await remove.emit('click');
   assert.ok(calls.length > before, 'delete button must issue a request');
+});
+
+
+test('a slow model list for account A never overwrites the list for account B', async () => {
+  const { view, consoleApi, pending } = slowModelPage();
+  consoleApi.handlers.selectCredential('cred-1');
+  const first = consoleApi.handlers.fetchModels();
+  await new Promise(setImmediate);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].url.includes('credential_id=cred-1'), true);
+  assert.equal(consoleApi.state.busy, true);
+  assert.equal(view.document.getElementById('modelCredential').disabled, true, 'picker is disabled while a fetch is in flight');
+
+  // The operator switches to B (also reachable programmatically, bypassing the
+  // disabled control) and starts a second request.
+  consoleApi.handlers.selectCredential('cred-2');
+  assert.equal(consoleApi.state.busy, false, 'switching selection releases the old request slot');
+  const second = consoleApi.handlers.fetchModels();
+  await new Promise(setImmediate);
+  assert.equal(pending.length, 2);
+  assert.equal(pending[1].url.includes('credential_id=cred-2'), true);
+
+  // B answers first, then the late A response arrives.
+  pending[1].request.resolve(respond(200, { data: [{ id: 'open-design/b-model' }] }));
+  await second;
+  assert.equal(consoleApi.state.upstreamFor, 'cred-2');
+  assert.deepEqual(plain(consoleApi.state.upstream.map(item => item.id)), ['open-design/b-model']);
+
+  pending[0].request.resolve(respond(200, { data: [{ id: 'open-design/a-model' }] }));
+  await first;
+  assert.equal(consoleApi.state.upstreamFor, 'cred-2', 'late A response must not retarget the list');
+  assert.deepEqual(plain(consoleApi.state.upstream.map(item => item.id)), ['open-design/b-model']);
+  const rendered = [...view.document.getElementById('upstreamList').children].map(row => row.textContent).join(' ');
+  assert.ok(rendered.includes('open-design/b-model'));
+  assert.ok(!rendered.includes('open-design/a-model'), 'A models must not be shown under B');
+  assert.equal(consoleApi.state.busy, false);
+});
+
+test('a late A success does not clobber a newer A request either', async () => {
+  const { consoleApi, pending } = slowModelPage();
+  consoleApi.handlers.selectCredential('cred-1');
+  const stale = consoleApi.handlers.fetchModels();
+  await new Promise(setImmediate);
+  // Re-selecting the same credential still invalidates the older generation.
+  consoleApi.handlers.selectCredential('cred-1');
+  const fresh = consoleApi.handlers.fetchModels();
+  await new Promise(setImmediate);
+  assert.equal(pending.length, 2);
+  pending[0].request.resolve(respond(200, { data: [{ id: 'stale-model' }] }));
+  await stale;
+  assert.deepEqual(plain(consoleApi.state.upstream), [], 'stale generation result is discarded');
+  pending[1].request.resolve(respond(200, { data: [{ id: 'fresh-model' }] }));
+  await fresh;
+  assert.deepEqual(plain(consoleApi.state.upstream.map(item => item.id)), ['fresh-model']);
+});
+
+test('a late A failure never shows an error under account B', async () => {
+  const { view, consoleApi, pending } = slowModelPage();
+  consoleApi.handlers.selectCredential('cred-1');
+  const first = consoleApi.handlers.fetchModels();
+  await new Promise(setImmediate);
+  consoleApi.handlers.selectCredential('cred-2');
+  const second = consoleApi.handlers.fetchModels();
+  await new Promise(setImmediate);
+  pending[1].request.resolve(respond(200, { data: [{ id: 'open-design/b-model' }] }));
+  await second;
+  const settled = view.document.getElementById('modelState').textContent;
+  assert.match(settled, /1 个上游模型/);
+
+  pending[0].request.resolve(respond(500, { error: { message: 'A 账户上游失败' } }));
+  await first;
+  assert.equal(view.document.getElementById('modelState').textContent, settled, 'late failure must not replace B status');
+  assert.ok(!view.document.getElementById('modelState').textContent.includes('A 账户上游失败'));
+  assert.deepEqual(plain(consoleApi.state.upstream.map(item => item.id)), ['open-design/b-model']);
+  assert.equal(consoleApi.state.busy, false);
+});
+
+test('logging out, deleting or losing the selected account invalidates an in-flight fetch', async () => {
+  const invalidations = {
+    logout: (consoleApi) => consoleApi.handlers.clearAuth(),
+    // A delete cannot run while the model list owns the busy slot; the row button
+    // is disabled too. The credential then disappears through a status refresh.
+    deleteRow: async (consoleApi, view) => {
+      const before = consoleApi.state.selectedCredential;
+      await consoleApi.handlers.deleteAccount({ id: before, label: '主账户', disabled: false });
+      assert.equal(consoleApi.state.selectedCredential, before, 'delete is refused while a fetch is in flight');
+      consoleApi.render.applyStatus(statusBody({
+        credentials: [{ id: 'cred-2', label: '备用账户', disabled: false }],
+      }));
+      view.document.getElementById('modelCredential').replaceChildren();
+      consoleApi.render.renderCredentialOptions();
+    },
+  };
+  for (const [name, invalidate] of Object.entries(invalidations)) {
+    const { view, consoleApi, pending } = slowModelPage();
+    consoleApi.handlers.selectCredential('cred-1');
+    const flight = consoleApi.handlers.fetchModels();
+    await new Promise(setImmediate);
+    assert.equal(pending.length, 1);
+    await invalidate(consoleApi, view);
+    assert.equal(consoleApi.state.busy, false, `${name}: pending slot released`);
+    pending[0].request.resolve(respond(200, { data: [{ id: 'open-design/stale' }] }));
+    await flight;
+    assert.deepEqual(plain(consoleApi.state.upstream), [], `${name}: stale success discarded`);
+    assert.equal(consoleApi.state.upstreamFor, '');
+    assert.ok(!view.document.getElementById('upstreamList').textContent.includes('open-design/stale'));
+  }
 });
 
 test('the console validates management keys before storing and handles 401 feedback', async () => {
