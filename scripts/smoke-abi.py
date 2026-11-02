@@ -886,17 +886,24 @@ def run_cpa_live(artifact, binary):
             {"id": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash"}]})
         require(status == 200, "models POST returned %s: %s" % (status, raw))
 
-        def client_models(timeout=30, want=("deepseek-flash",)):
-            """Poll GET /v1/models until the alias shows up (or not)."""
+        def client_models(timeout=30, want=("deepseek-flash",), absent=()):
+            """Poll GET /v1/models until `want` are all present and `absent` are gone.
+
+            Waiting for the expected state (not just the first response) matters:
+            disable/delete are asynchronous through the host's registration
+            refresh, so sampling once would race and report a false failure.
+            """
             deadline = time.monotonic() + timeout
             seen = None
             while time.monotonic() < deadline:
                 status, raw, _ = request("/v1/models", method="GET")
                 if status == 200:
                     seen = sorted(m["id"] for m in json.loads(raw).get("data", []))
-                    if all(w in seen for w in want) or not want:
+                    if (all(w in seen for w in want)
+                            and not any(a in seen for a in absent)):
                         return seen
                 time.sleep(0.25)
+            require(seen is not None, "GET /v1/models never returned a valid model list")
             return seen
 
         seen = client_models()
@@ -1029,7 +1036,8 @@ def run_cpa_live(artifact, binary):
                 "status": "SKIPPED",
                 "reason": "alias never became routable; see ui_flow_failures"}
         else:
-            disabled_models = client_models(timeout=15, want=())
+            disabled_models = client_models(timeout=20, want=(),
+                                            absent=("deepseek-flash",))
             evidence["ui_flow"]["after_disable"] = {
                 "models": disabled_models,
                 "alias_withdrawn": "deepseek-flash" not in (disabled_models or []),
@@ -1070,7 +1078,8 @@ def run_cpa_live(artifact, binary):
         status, raw, _ = request(API + "/credentials?id=" + credential_id, method="DELETE")
         require(status == 200, "deleted credential returned %s: %s" % (status, raw))
         require(not list((work / "auths").glob("*.json")), "credential file survived delete")
-        after_delete = client_models(timeout=15, want=())
+        after_delete = client_models(timeout=20, want=(),
+                                     absent=("deepseek-flash",))
         try:
             code_, body_, _ = request("/v1/chat/completions", {
                 "model": "deepseek-flash",
