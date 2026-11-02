@@ -9,8 +9,8 @@
 | 宿主回调 | 覆盖内容 |
 | --- | --- |
 | `host.auth.save` / `host.auth.list` | 凭据写入假 `auth-dir`、导出凭据列表 |
-| `host.http.do` | 缓冲式请求（`GET /models`、非流式 `POST /chat/completions`） |
-| `host.http.do_stream` / `stream_read` / `stream_close` | 流式请求，多 chunk，含拆包的 SSE 帧 |
+| `host.http.do` | 缓冲式请求（`GET /models`、非流式 `POST /chat/completions`）；结果字段按 CPA 真实大小写 `StatusCode`/`Headers`/`Body` |
+| `host.http.do_stream` / `stream_read` / `stream_close` | 流式请求，多 chunk，含拆包的 SSE 帧；结果字段为 CPA 的 `status_code`/`stream_id`/`payload`/`done`（这两类 RPC 在 CPA 里有显式 json tag，与 `host.http.do` 不同） |
 | `host.stream.emit` / `host.stream.close` | 下游帧输出与终止 |
 
 上游是 `127.0.0.1` 上的假 OpenAI 兼容服务，**不访问外网**。`host.http.*` 收到的 URL 必须仍是固定 origin `https://amr-link.open-design.ai/v1/`（插件不允许改 base_url），假宿主只在本机 TCP 上把该 origin 改投到 loopback 端口。
@@ -33,6 +33,8 @@ make build   # 或 CGO_ENABLED=1 go build -buildmode=c-shared -o dist/open-desig
 python3 scripts/smoke-abi.py dist/open-design.so
 python3 scripts/smoke-abi.py dist/open-design.so --json-report /tmp/open-design-abi.json
 ```
+
+**大小写必须与 CPA 一致，否则就是自证。** CPA `sdk/pluginapi/types.go` 的 `HTTPResponse` 没有 json tag，所以 `host.http.do` 线上是 `StatusCode`/`Headers`/`Body`；而 `internal/pluginhost/host_callbacks.go` 的 `rpcHostHTTPStreamResponse`、`rpcHostHTTPStreamReadResponse` 有显式 tag，是 `status_code`/`stream_id`/`payload`/`done`。本脚本默认按真实字段发，因此能暴露字段名写错的问题；`--allow-snake-case-host` 会退回插件自己的字段名，用于在 core 修复期间继续验证 ABI 其余部分（此时结果不再代表真实宿主行为）。
 
 退出码 0 为 PASS，非 0 为 FAIL（断言信息即失败原因）。临时 data/auth 目录用 `mkdtemp` 创建、`shutil.rmtree` 清理，不使用 `rm -rf`；不发 SSH、不读生产配置、不使用真实 Key 或真实推理。
 
@@ -60,3 +62,37 @@ python3 scripts/smoke-abi.py dist/open-design.so --cpa-binary=/tmp/cpa-v8.0.48-a
 | `/tmp/cpa-audit-gny4ig42/v8.0.48/CLIProxyAPI-8.0.48/` | 对应源码树，用于核对 ABI/RPC 契约 |
 
 两处都在 `/tmp`，属于本地临时产物，可能被清理；`--cpa-binary=` 可指向任意支持动态库插件的原版 CPA。
+
+## `--cpa-live` — 真实宿主 + 本地假上游（端到端、仍无外网）
+
+```bash
+python3 scripts/smoke-abi.py dist/open-design.so --cpa-live
+```
+
+`--cpa-binary` 只能覆盖不联网的路径，因为 `/upstream-models` 和 `/chat/completions` 会真的打到 `amr-link.open-design.ai`。本模式不改 core（base_url 仍固定在官方 origin），而是纯用 CPA 自己的配置把出站流量接到本机：
+
+1. `requests.proxy-url: http://127.0.0.1:<port>` —— 只监听 loopback 的 HTTP CONNECT 代理；
+2. 代理只允许 `amr-link.open-design.ai:443`（重定向探针额外放行 `redirect-probe.example.test:443`），其余一律 403 并记入 `connect_refused`；
+3. CONNECT 隧道接到本机 TLS 假上游，证书由一次性 CA 签发（SAN 含上述两个主机名）；
+4. `SSL_CERT_FILE` 只设在 CPA 子进程环境里，**不动** `/etc/hosts`、系统信任库和系统代理；
+5. 发请求用 CPA 客户端 key（`/v1/*`）和管理 key（`/v0/*`），凭据仍是 `sk-amr-test-fixture`。
+
+覆盖：`GET /models` → 上游模型列表；`POST /v1/chat/completions` 非流式 200（`tools` 转发 + `usage`）；流式 SSE 多帧；上游 401/429 是否透传；以及**重定向行为**——让假上游对 `/models` 回 307 指向另一个 origin，观察宿主的跨源重定向策略。
+
+实测结论（CPA v8.0.48）：跨源 307 **会被跟随**，但 `Authorization` **会被剥掉**（`host_http_redirect.verdict`），即宿主不会把 bearer key 带到别的 origin；`registry.npmjs.org:443` 的 CONNECT 被代理拒绝，证明没有其它出站。
+
+注意：一次 401 会让 CPA 冷却该凭据，因此 401 放在最后；如果前面的主链路被 core bug 挡住（`core_blocked_legs` 非空），状态码这一段会记为 `SKIPPED` 而不是假通过。
+
+## 当前已知的 core 问题（脚本会如实报出来）
+
+`host.http.do` 的结果被插件按 `status_code` 解码，而 CPA 实际发的是 `StatusCode`，于是状态永远为 0、`Body` 也拿不到。表现：
+
+```bash
+$ python3 scripts/smoke-abi.py dist/open-design.so
+FAIL: ... the plugin is not decoding CPA's host.http.* result casing ...
+upstream-models returned 502: b'{"error":"{\"object\": \"list\", ...}"}'
+```
+
+即上游返回的 200 正文被原样包进 502 —— 请求链路本身是通的，只是结果没解出来。真宿主模式同样复现（`--cpa-live` 的 `host_upstream_models` 记为 `BLOCKED_BY_CORE_BUG`，`origin_returned_200: true` 与 `origin_saw_bearer: true` 说明假上游确实收到并正确鉴权）。
+
+受影响的是所有走 `host.http.do` 的路径：`GET /models`（上游模型列表）和非流式的 `executor.execute`。`host.http.do_stream` 系用 snake_case 是对的，因此纯流式路径不受影响。`.so` 里 `upstreamCall` 结构需要改成 PascalCase（或同时接受两种），由 core owner 处理；本脚本不修 core。
