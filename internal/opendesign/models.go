@@ -62,7 +62,7 @@ func (s *Service) discoverModels(callbackID string, c Credential) ([]UpstreamMod
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, upstreamErrorFromResponse(status, nil, body, c.APIKey)
+		return nil, upstreamErrorFromResponse(status, nil, body, c.APIKey, c.ControlKey)
 	}
 	return decodeModels(body)
 }
@@ -164,7 +164,7 @@ func (s *Service) refreshAuthModels() error {
 			continue
 		}
 		s.mu.Lock()
-		s.creds[c.ID] = c
+		s.storeCredentialLocked(c)
 		s.authFiles[c.ID] = filename
 		s.mu.Unlock()
 	}

@@ -81,7 +81,7 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 	if resolvedFile {
 		delete(s.revoked, c.ID)
 	}
-	s.creds[c.ID] = c
+	s.storeCredentialLocked(c)
 	if r.FileName != "" {
 		s.authFiles[c.ID] = filepath.Base(r.FileName)
 	}
@@ -202,6 +202,21 @@ func (s *Service) saveCredential(c Credential, filename string) error {
 		s.mu.Unlock()
 	}
 	return nil
+}
+
+// storeCredentialLocked publishes a complete credential without dropping optional
+// billing fields. Callers hold mu, including reentrant auth.parse; no host call
+// or additional lock may be taken here.
+func (s *Service) storeCredentialLocked(c Credential) {
+	previous, exists := s.creds[c.ID]
+	if !exists || previous.APIKey != c.APIKey || previous.ControlKey != c.ControlKey || previous.WorkspaceID != c.WorkspaceID {
+		s.invalidateBillingLocked(c.ID)
+	}
+	s.creds[c.ID] = c
+}
+
+func (s *Service) invalidateBillingLocked(id string) {
+	s.billingEpoch[id]++
 }
 
 func jsonBytes(v any) []byte {

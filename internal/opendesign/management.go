@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 // ManagementRequest is the CPA management RPC payload.
@@ -141,11 +142,7 @@ func (s *Service) statusResponse() (any, error) {
 	s.mu.RLock()
 	credentials := make([]map[string]any, 0, len(s.creds))
 	for _, c := range s.creds {
-		credentials = append(credentials, map[string]any{
-			"id":       c.ID,
-			"label":    c.Label,
-			"disabled": c.Disabled,
-		})
+		credentials = append(credentials, credentialView(c))
 	}
 	s.mu.RUnlock()
 	sortCredentials(credentials)
@@ -175,27 +172,39 @@ func stringOf(v any) string {
 	return s
 }
 
+func credentialView(c Credential) map[string]any {
+	return map[string]any{
+		"id": c.ID, "label": c.Label, "disabled": c.Disabled,
+		"billing_configured": c.ControlKey != "", "workspace_id": c.WorkspaceID,
+	}
+}
+
 func (s *Service) listCredentials() (any, error) {
 	s.mu.RLock()
 	items := make([]map[string]any, 0, len(s.creds))
 	for _, c := range s.creds {
-		items = append(items, map[string]any{"id": c.ID, "label": c.Label, "disabled": c.Disabled})
+		items = append(items, credentialView(c))
 	}
 	s.mu.RUnlock()
 	sortCredentials(items)
 	return managementJSON(http.StatusOK, map[string]any{"credentials": items})
 }
 
+type credentialInput struct {
+	ID           string  `json:"id"`
+	Label        string  `json:"label"`
+	APIKey       *string `json:"api_key"`
+	ControlKey   *string `json:"control_key"`
+	WorkspaceID  *string `json:"workspace_id"`
+	ClearBilling bool    `json:"clear_billing"`
+	Disabled     *bool   `json:"disabled"`
+}
+
 // saveCredentialRequest creates a credential, or updates the one named by "id".
 func (s *Service) saveCredentialRequest(r ManagementRequest) (any, error) {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
-	var in struct {
-		ID       string  `json:"id"`
-		Label    string  `json:"label"`
-		APIKey   *string `json:"api_key"`
-		Disabled *bool   `json:"disabled"`
-	}
+	var in credentialInput
 	if err := json.Unmarshal(r.Body, &in); err != nil {
 		return managementError(http.StatusBadRequest, "invalid credential JSON")
 	}
@@ -204,12 +213,35 @@ func (s *Service) saveCredentialRequest(r ManagementRequest) (any, error) {
 		id = strings.TrimSpace(r.Query.Get("id"))
 	}
 	if id == "" {
-		return s.createCredential(in.Label, in.APIKey)
+		return s.createCredential(in)
 	}
-	return s.updateCredential(id, in.Label, in.APIKey, in.Disabled)
+	return s.updateCredential(id, in)
 }
 
-func (s *Service) createCredential(label string, apiKey *string) (any, error) {
+func applyBillingInput(c *Credential, in credentialInput) error {
+	if in.ClearBilling {
+		c.ControlKey, c.WorkspaceID = "", ""
+		return nil
+	}
+	if in.ControlKey != nil && strings.TrimSpace(*in.ControlKey) != "" {
+		key := strings.TrimSpace(*in.ControlKey)
+		if len(key) > 8192 || strings.IndexFunc(key, unicode.IsControl) >= 0 {
+			return fail(http.StatusBadRequest, "invalid control_key")
+		}
+		c.ControlKey = key
+	}
+	if in.WorkspaceID != nil && strings.TrimSpace(*in.WorkspaceID) != "" {
+		id := strings.TrimSpace(*in.WorkspaceID)
+		if len(id) > 512 || strings.IndexFunc(id, unicode.IsControl) >= 0 {
+			return fail(http.StatusBadRequest, "invalid workspace_id")
+		}
+		c.WorkspaceID = id
+	}
+	return nil
+}
+
+func (s *Service) createCredential(in credentialInput) (any, error) {
+	label, apiKey := in.Label, in.APIKey
 	if apiKey == nil {
 		return managementError(http.StatusBadRequest, "api_key is required")
 	}
@@ -223,6 +255,9 @@ func (s *Service) createCredential(label string, apiKey *string) (any, error) {
 	}
 	cfg := s.config()
 	c := Credential{Type: Provider, ID: PluginID + "-" + newID(), Label: label, APIKey: key, BaseURL: cfg.BaseURL}
+	if err := applyBillingInput(&c, in); err != nil {
+		return managementError(statusOf(err), err.Error())
+	}
 	if c.Label == "" {
 		c.Label = "OpenDesign"
 	}
@@ -231,15 +266,16 @@ func (s *Service) createCredential(label string, apiKey *string) (any, error) {
 		return managementError(http.StatusInternalServerError, "credential persistence failed")
 	}
 	s.mu.Lock()
-	s.creds[c.ID] = c
+	s.storeCredentialLocked(c)
 	s.authFiles[c.ID] = filename
 	delete(s.revoked, c.ID)
 	s.mu.Unlock()
 	// The response deliberately omits the key.
-	return managementJSON(http.StatusCreated, map[string]any{"id": c.ID, "label": c.Label, "disabled": c.Disabled})
+	return managementJSON(http.StatusCreated, credentialView(c))
 }
 
-func (s *Service) updateCredential(id, label string, apiKey *string, disabled *bool) (any, error) {
+func (s *Service) updateCredential(id string, in credentialInput) (any, error) {
+	label, apiKey, disabled := in.Label, in.APIKey, in.Disabled
 	s.mu.RLock()
 	c, ok := s.creds[id]
 	s.mu.RUnlock()
@@ -259,6 +295,9 @@ func (s *Service) updateCredential(id, label string, apiKey *string, disabled *b
 		}
 		c.APIKey = key
 	}
+	if err := applyBillingInput(&c, in); err != nil {
+		return managementError(statusOf(err), err.Error())
+	}
 	if disabled != nil {
 		c.Disabled = *disabled
 	}
@@ -276,10 +315,13 @@ func (s *Service) updateCredential(id, label string, apiKey *string, disabled *b
 		return managementError(http.StatusInternalServerError, "credential persistence failed")
 	}
 	s.mu.Lock()
-	s.creds[c.ID] = c
+	s.storeCredentialLocked(c)
+	if in.ClearBilling {
+		s.invalidateBillingLocked(c.ID)
+	}
 	s.authFiles[c.ID] = filename
 	s.mu.Unlock()
-	return managementJSON(http.StatusOK, map[string]any{"id": c.ID, "label": c.Label, "disabled": c.Disabled})
+	return managementJSON(http.StatusOK, credentialView(c))
 }
 
 // deleteCredential removes the auth file and revokes the id so a queued watcher
@@ -325,7 +367,7 @@ func (s *Service) deleteCredential(credentialID string) (any, error) {
 		return managementError(http.StatusBadGateway, "credential could not be disabled before removal: "+redact(err.Error(), s.allKeys()...))
 	}
 	s.mu.Lock()
-	s.creds[credentialID] = disabled
+	s.storeCredentialLocked(disabled)
 	s.mu.Unlock()
 
 	// Step 2 (authFileMu held, no host calls): verify ownership, then unlink.
@@ -340,6 +382,7 @@ func (s *Service) deleteCredential(credentialID string) (any, error) {
 
 	s.mu.Lock()
 	delete(s.creds, credentialID)
+	s.invalidateBillingLocked(credentialID)
 	delete(s.authFiles, credentialID)
 	// The id stays revoked so a watcher callback queued before the unlink cannot
 	// recreate the credential.
@@ -379,7 +422,7 @@ func (s *Service) upstreamModels(r ManagementRequest) (any, error) {
 	}
 	models, err := s.discoverModels(r.HostCallbackID, c)
 	if err != nil {
-		keys := append(s.allKeys(), c.APIKey)
+		keys := append(s.allKeys(), c.APIKey, c.ControlKey)
 		code := "upstream_error"
 		var apiErr *APIError
 		if errors.As(err, &apiErr) && safeManagementCode(apiErr.Kind, keys) {
@@ -407,13 +450,21 @@ func (s *Service) upstreamModels(r ManagementRequest) (any, error) {
 // upstream message before it is shown to the operator.
 func (s *Service) allKeys() []string {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	keys := make([]string, 0, len(s.creds))
+	keys := make([]string, 0, 2*len(s.creds))
 	for _, c := range s.creds {
-		if c.APIKey != "" {
-			keys = append(keys, c.APIKey)
+		keys = append(keys, c.APIKey, c.ControlKey)
+	}
+	s.mu.RUnlock()
+	// The pending key may already be in a reentrant host error while the live
+	// record still holds the previous key. Never nest pendingMu with mu.
+	s.pendingMu.Lock()
+	for _, pending := range s.pendingSaves {
+		var c Credential
+		if json.Unmarshal(pending.body, &c) == nil {
+			keys = append(keys, c.APIKey, c.ControlKey)
 		}
 	}
+	s.pendingMu.Unlock()
 	return keys
 }
 

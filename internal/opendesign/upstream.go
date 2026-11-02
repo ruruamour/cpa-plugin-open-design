@@ -253,6 +253,9 @@ func upstreamErrorFromResponse(status int, headers http.Header, body []byte, key
 	if kind != "upstream_error" && !strings.Contains(message, kind) {
 		message = kind + ": " + message
 	}
+	if !safeManagementCode(kind, keys) {
+		kind = "upstream_error"
+	}
 	return &APIError{Status: status, Kind: kind, Message: redact(message, keys...)}
 }
 

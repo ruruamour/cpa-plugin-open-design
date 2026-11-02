@@ -119,14 +119,14 @@ func (s *Service) execute(raw json.RawMessage) (any, error) {
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, upstreamErrorFromResponse(status, headers, respBody, c.APIKey)
+		return nil, upstreamErrorFromResponse(status, headers, respBody, c.APIKey, c.ControlKey)
 	}
 	root, decodeErr := decodeObject(respBody)
 	if decodeErr != nil {
 		return nil, upstreamProtocolError("upstream returned a non-JSON completion body")
 	}
 	// A 200 carrying a top-level error is an upstream failure, not a completion.
-	if errBody := successBodyError(root, status, respBody, c.APIKey); errBody != nil {
+	if errBody := successBodyError(root, status, respBody, c.APIKey, c.ControlKey); errBody != nil {
 		return nil, errBody
 	}
 	// Restore the client-facing alias so the caller sees the model it asked for.
@@ -192,7 +192,7 @@ func (s *Service) executeStream(raw json.RawMessage) (any, error) {
 	}
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
 		// Buffer the error body, then fail the RPC before any output is emitted.
-		failure := s.readStreamError(r.HostCallbackID, stream, c.APIKey)
+		failure := s.readStreamError(r.HostCallbackID, stream, c.APIKey, c.ControlKey)
 		release()
 		return nil, failure
 	}
@@ -215,7 +215,7 @@ func (s *Service) executeStream(raw json.RawMessage) (any, error) {
 			_ = recover()
 		}()
 		streamErr := s.pumpSSE(r.HostCallbackID, stream, r.Model, emitter, requestChoiceCount(j))
-		s.finishOutputStream(r.StreamID, streamErr, c.APIKey)
+		s.finishOutputStream(r.StreamID, streamErr, c.APIKey, c.ControlKey)
 	}()
 	return map[string]any{
 		"Headers": http.Header{"Content-Type": []string{"text/event-stream"}, "Cache-Control": []string{"no-cache"}},

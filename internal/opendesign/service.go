@@ -28,19 +28,20 @@ type Service struct {
 	pendingMu    sync.Mutex
 	pendingSaves map[string]pendingSave
 
-	cfg       Config
-	creds     map[string]Credential
-	authFiles map[string]string
-	revoked   map[string]bool
-	host      HostCall
-	authDir   string
-	streams   map[string]struct{}
-	ops       *operationTracker
-	loaded    bool
-	stopped   bool
-	active    sync.WaitGroup
-	activeN   atomic.Int64
-	stopCh    chan struct{}
+	cfg          Config
+	creds        map[string]Credential
+	billingEpoch map[string]uint64 // guarded by mu; changes on either key/workspace replacement or clear/delete
+	authFiles    map[string]string
+	revoked      map[string]bool
+	host         HostCall
+	authDir      string
+	streams      map[string]struct{}
+	ops          *operationTracker
+	loaded       bool
+	stopped      bool
+	active       sync.WaitGroup
+	activeN      atomic.Int64
+	stopCh       chan struct{}
 }
 
 // NewService returns an unconfigured plugin instance.
@@ -48,6 +49,7 @@ func NewService() *Service {
 	return &Service{
 		cfg:          defaultConfig(),
 		creds:        map[string]Credential{},
+		billingEpoch: map[string]uint64{},
 		authFiles:    map[string]string{},
 		revoked:      map[string]bool{},
 		streams:      map[string]struct{}{},
