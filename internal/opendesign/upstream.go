@@ -10,14 +10,44 @@ import (
 	"strings"
 )
 
-// upstreamCall is one buffered request through the host transport. Streaming
-// responses go through upstreamStream instead.
+// upstreamCall is one buffered request through the host transport.
+//
+// The host marshals sdk/pluginapi.HTTPResponse directly, and that struct has no
+// JSON tags (internal/pluginhost/host_callbacks.go: `marshalRPCResult(resp)`), so
+// the wire keys are the Go field names. Streaming uses a different, snake_case
+// schema (see upstreamStream).
 type upstreamCall struct {
-	StatusCode int         `json:"status_code"`
-	Headers    http.Header `json:"headers"`
-	StreamID   string      `json:"stream_id"`
-	Error      string      `json:"error"`
-	Body       []byte      `json:"body,omitempty"`
+	StatusCode int
+	Headers    http.Header
+	Body       []byte
+}
+
+// UnmarshalJSON reads the host response. v8.0.48 marshals the untagged SDK
+// struct, so StatusCode/Headers/Body is authoritative; the snake_case aliases
+// are only a compatibility fallback.
+func (u *upstreamCall) UnmarshalJSON(raw []byte) error {
+	var wire struct {
+		StatusCode      int         `json:"StatusCode"`
+		Headers         http.Header `json:"Headers"`
+		Body            []byte      `json:"Body"`
+		StatusCodeSnake int         `json:"status_code"`
+		HeadersSnake    http.Header `json:"headers"`
+		BodySnake       []byte      `json:"body"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return err
+	}
+	u.StatusCode, u.Headers, u.Body = wire.StatusCode, wire.Headers, wire.Body
+	if u.StatusCode == 0 {
+		u.StatusCode = wire.StatusCodeSnake
+	}
+	if u.Headers == nil {
+		u.Headers = wire.HeadersSnake
+	}
+	if len(u.Body) == 0 {
+		u.Body = wire.BodySnake
+	}
+	return nil
 }
 
 // upstreamStream is the handle returned by host.http.do_stream. StreamID must be
@@ -81,11 +111,8 @@ func (s *Service) doJSON(callbackID, method, url string, headers http.Header, bo
 		payload["body"] = body
 	}
 	var out upstreamCall
-	if err := s.call("host.http.do", payload, &out); err != nil {
+	if err := s.doOperation(callbackID, "host.http.do", payload, &out); err != nil {
 		return 0, nil, nil, upstreamTransportError(err)
-	}
-	if out.Error != "" {
-		return 0, nil, nil, upstreamTransportError(errors.New(out.Error))
 	}
 	raw := out.Body
 	if len(raw) > maxBufferedResponse {
@@ -107,7 +134,7 @@ func (s *Service) openStream(callbackID, method, url string, headers http.Header
 		payload["body"] = body
 	}
 	var out upstreamStream
-	if err := s.call("host.http.do_stream", payload, &out); err != nil {
+	if err := s.doOperation(callbackID, "host.http.do_stream", payload, &out); err != nil {
 		return out, upstreamTransportError(err)
 	}
 	if out.Error != "" {

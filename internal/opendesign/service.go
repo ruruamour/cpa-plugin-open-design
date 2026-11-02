@@ -30,6 +30,7 @@ type Service struct {
 	host      HostCall
 	authDir   string
 	streams   map[string]struct{}
+	ops       *operationTracker
 	loaded    bool
 	stopped   bool
 	active    sync.WaitGroup
@@ -45,6 +46,7 @@ func NewService() *Service {
 		authFiles: map[string]string{},
 		revoked:   map[string]bool{},
 		streams:   map[string]struct{}{},
+		ops:       newOperationTracker(),
 		stopCh:    make(chan struct{}),
 	}
 }
@@ -185,6 +187,7 @@ func (s *Service) configure(raw json.RawMessage) (err error) {
 		// The host re-registers a quiesced instance when replacement fails.
 		s.stopped = false
 		s.stopCh = make(chan struct{})
+		s.ops.reopen()
 	}
 	s.cfg = cfg
 	s.loaded = true
@@ -230,6 +233,9 @@ func (s *Service) quiesce() (any, error) {
 	for _, id := range streams {
 		s.closeUpstream(id)
 	}
+	// Cancel host operations too: a buffered callback or a stream still waiting
+	// for headers blocks inside the host, where closing a stream id cannot help.
+	s.cancelOperations()
 	s.active.Wait()
 	return map[string]any{}, nil
 }

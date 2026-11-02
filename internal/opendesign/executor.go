@@ -214,7 +214,7 @@ func (s *Service) executeStream(raw json.RawMessage) (any, error) {
 		defer func() {
 			_ = recover()
 		}()
-		streamErr := s.pumpSSE(r.HostCallbackID, stream, r.Model, emitter)
+		streamErr := s.pumpSSE(r.HostCallbackID, stream, r.Model, emitter, requestChoiceCount(j))
 		s.finishOutputStream(r.StreamID, streamErr, c.APIKey)
 	}()
 	return map[string]any{
@@ -225,10 +225,12 @@ func (s *Service) executeStream(raw json.RawMessage) (any, error) {
 // pumpSSE decodes the upstream event stream and emits one JSON frame per event.
 // A `[DONE]` marker terminates the stream without being forwarded: the host
 // writes its own terminal marker.
-func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string, emit func([]byte) error) error {
+func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string, emit func([]byte) error, expectedChoices int64) error {
 	decoder := &sseDecoder{maxBytes: maxSSEFrame}
 	var sawDone bool
-	var sawFinishReason bool
+	// Per-choice completion: with n>1, one finished choice does not make the
+	// response complete, so an EOF must not be reported as success.
+	tracker := newChoiceTracker(expectedChoices)
 	err := s.readStream(callbackID, stream, func(chunk []byte) error {
 		return decoder.feed(chunk, func(event sseEvent) error {
 			data := strings.TrimSpace(string(event.Data))
@@ -252,9 +254,7 @@ func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string
 				}
 				return upstreamErrorFromResponse(status, nil, event.Data)
 			}
-			if frameHasFinishReason(root) {
-				sawFinishReason = true
-			}
+			tracker.observe(root)
 			if model, ok := root["model"].(string); ok && model != "" {
 				root["model"] = alias
 			}
@@ -274,29 +274,78 @@ func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string
 		if endErr := decoder.end(); endErr != nil {
 			return endErr
 		}
-		if !sawFinishReason {
-			return upstreamProtocolError("upstream stream closed before [DONE] or a finish_reason")
+		if !tracker.complete() {
+			return upstreamProtocolError("upstream stream closed before [DONE] and before every choice finished")
 		}
 	}
 	return nil
 }
 
-// frameHasFinishReason reports whether a stream frame terminates a choice.
-func frameHasFinishReason(root map[string]any) bool {
+// choiceTracker follows completion per stream choice index. A stream without
+// [DONE] is only accepted when every choice that appeared — and every choice the
+// caller asked for via `n` — has a finish_reason. Tracking a single boolean
+// would let choice 0 finishing mask a truncated choice 1.
+type choiceTracker struct {
+	finished        map[int64]bool
+	seen            map[int64]bool
+	expectedChoices int64
+}
+
+func newChoiceTracker(expected ...int64) *choiceTracker {
+	t := &choiceTracker{finished: map[int64]bool{}, seen: map[int64]bool{}}
+	if len(expected) > 0 && expected[0] > 0 {
+		t.expectedChoices = expected[0]
+	}
+	return t
+}
+
+// observe records the completion state carried by one stream frame.
+func (t *choiceTracker) observe(root map[string]any) {
 	choices, ok := root["choices"].([]any)
 	if !ok {
-		return false
+		return
 	}
 	for _, raw := range choices {
 		choice, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
+		index := choiceIndex(choice)
+		t.seen[index] = true
 		if reason, ok := choice["finish_reason"].(string); ok && strings.TrimSpace(reason) != "" {
-			return true
+			t.finished[index] = true
 		}
 	}
-	return false
+}
+
+// complete reports whether every observed and expected choice has finished.
+func (t *choiceTracker) complete() bool {
+	if len(t.seen) == 0 {
+		return false
+	}
+	for index := range t.seen {
+		if !t.finished[index] {
+			return false
+		}
+	}
+	for index := int64(0); index < t.expectedChoices; index++ {
+		if !t.finished[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func choiceIndex(choice map[string]any) int64 {
+	switch v := choice["index"].(type) {
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return n
+		}
+	case float64:
+		return int64(v)
+	}
+	return 0
 }
 
 // successBodyError converts a 2xx body that actually carries an error into the
@@ -368,4 +417,20 @@ var errStreamDone = errors.New("upstream stream finished")
 func stringValue(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// requestChoiceCount reads the caller's `n`. Absent or invalid means one choice,
+// which is the OpenAI default.
+func requestChoiceCount(j map[string]any) int64 {
+	switch v := j["n"].(type) {
+	case json.Number:
+		if n, err := v.Int64(); err == nil && n > 0 {
+			return n
+		}
+	case float64:
+		if v > 0 {
+			return int64(v)
+		}
+	}
+	return 1
 }

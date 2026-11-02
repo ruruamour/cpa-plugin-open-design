@@ -162,10 +162,20 @@ func TestHostHTTPPayloadUsesOnlyDocumentedFields(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 	payload := host.lastPayload("host.http.do")
-	allowed := map[string]bool{"host_callback_id": true, "method": true, "url": true, "headers": true, "body": true}
+	// operation_id is documented in rpcHostHTTPRequest (host_callbacks.go) and is
+	// how the host binds a request to a cancellable operation.
+	allowed := map[string]bool{"host_callback_id": true, "operation_id": true, "method": true, "url": true, "headers": true, "body": true}
 	for key := range payload {
 		if !allowed[key] {
 			t.Fatalf("undocumented host.http.do field %q", key)
+		}
+	}
+	if _, ok := payload["operation_id"]; !ok {
+		t.Fatalf("host.http.do was not bound to an operation, so quiesce cannot cancel it")
+	}
+	for _, forbidden := range []string{"timeout_ms", "timeout", "deadline"} {
+		if _, ok := payload[forbidden]; ok {
+			t.Fatalf("invented field %q", forbidden)
 		}
 	}
 }

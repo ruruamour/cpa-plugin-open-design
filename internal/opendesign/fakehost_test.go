@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"testing"
+	"time"
 )
 
 // fakeHost is a scripted CPA host. It records every callback so tests assert on
@@ -26,6 +28,14 @@ type fakeHost struct {
 	streamCloseErrs []string
 	streamCloseRaw  []map[string]any
 	authDir         string
+
+	// Operation bridge: every do/do_stream call is registered here so a cancel
+	// can release a blocked callback the way the real host does.
+	ops            map[string]*fakeOperation
+	nextOpID       int
+	cancelCalls    []string
+	blockNextCall  bool
+	blockedStarted chan struct{}
 }
 
 type hostCallRecord struct {
@@ -50,8 +60,49 @@ type scriptedStream struct {
 	closed  bool
 }
 
+// fakeOperation mimics the host's HTTP operation: a cancel aborts the pending
+// callback exactly like http_operation_bridge does.
+type fakeOperation struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func (o *fakeOperation) cancel() {
+	o.once.Do(func() { close(o.done) })
+}
+
 func newFakeHost() *fakeHost {
-	return &fakeHost{savedAuths: map[string][]byte{}, streams: map[string]*scriptedStream{}, authDir: "/tmp/auth"}
+	return &fakeHost{
+		savedAuths:     map[string][]byte{},
+		streams:        map[string]*scriptedStream{},
+		authDir:        "/tmp/auth",
+		ops:            map[string]*fakeOperation{},
+		blockedStarted: make(chan struct{}, 4),
+	}
+}
+
+// blockCall makes the next host.http call hang until the host cancels the
+// operation, which is what the real host does on a client disconnect.
+func (h *fakeHost) blockCall() {
+	h.mu.Lock()
+	h.blockNextCall = true
+	h.mu.Unlock()
+}
+
+// awaitBlocked waits until a scripted call is actually parked.
+func (h *fakeHost) awaitBlocked(t *testing.T) {
+	t.Helper()
+	select {
+	case <-h.blockedStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("host call never blocked")
+	}
+}
+
+func (h *fakeHost) cancels() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.cancelCalls...)
 }
 
 func (h *fakeHost) call(method string, in, out any) error {
@@ -60,10 +111,28 @@ func (h *fakeHost) call(method string, in, out any) error {
 	h.mu.Unlock()
 
 	switch method {
+	case "host.http.operation_open":
+		h.mu.Lock()
+		h.nextOpID++
+		id := fmt.Sprintf("op-%d", h.nextOpID)
+		h.ops[id] = &fakeOperation{done: make(chan struct{})}
+		h.mu.Unlock()
+		assign(out, map[string]any{"operation_id": id})
+		return nil
+	case "host.http.cancel":
+		opID := stringField(in, "operation_id")
+		h.mu.Lock()
+		h.cancelCalls = append(h.cancelCalls, opID)
+		op, ok := h.ops[opID]
+		h.mu.Unlock()
+		if ok {
+			op.cancel()
+		}
+		return nil
 	case "host.http.do":
-		return h.handleDo(out)
+		return h.handleDo(in, out)
 	case "host.http.do_stream":
-		return h.handleDoStream(out)
+		return h.handleDoStream(in, out)
 	case "host.http.stream_read":
 		return h.handleStreamRead(in, out)
 	case "host.http.stream_close":
@@ -97,7 +166,7 @@ func (h *fakeHost) call(method string, in, out any) error {
 	}
 }
 
-func (h *fakeHost) handleDo(out any) error {
+func (h *fakeHost) handleDo(in any, out any) error {
 	h.mu.Lock()
 	if len(h.doResponses) == 0 {
 		h.mu.Unlock()
@@ -105,15 +174,21 @@ func (h *fakeHost) handleDo(out any) error {
 	}
 	resp := h.doResponses[0]
 	h.doResponses = h.doResponses[1:]
+	opID := stringField(in, "operation_id")
+	op := h.ops[opID]
 	h.mu.Unlock()
+	if err := h.waitBlocked(op); err != nil {
+		return err
+	}
 	if resp.Err != nil {
 		return resp.Err
 	}
-	assign(out, map[string]any{"status_code": resp.Status, "headers": resp.Headers, "body": resp.Body})
+	// The host marshals sdk/pluginapi.HTTPResponse, which has no JSON tags.
+	assign(out, map[string]any{"StatusCode": resp.Status, "Headers": resp.Headers, "Body": resp.Body})
 	return nil
 }
 
-func (h *fakeHost) handleDoStream(out any) error {
+func (h *fakeHost) handleDoStream(in any, out any) error {
 	h.mu.Lock()
 	if len(h.doStreams) == 0 {
 		h.mu.Unlock()
@@ -121,6 +196,13 @@ func (h *fakeHost) handleDoStream(out any) error {
 	}
 	script := h.doStreams[0]
 	h.doStreams = h.doStreams[1:]
+	opID := stringField(in, "operation_id")
+	op := h.ops[opID]
+	h.mu.Unlock()
+	if err := h.waitBlocked(op); err != nil {
+		return err
+	}
+	h.mu.Lock()
 	h.nextStreamID++
 	id := fmt.Sprintf("stream-%d", h.nextStreamID)
 	h.streams[id] = &script
@@ -173,6 +255,32 @@ func (h *fakeHost) handleAuthSave(in, out any) error {
 	h.mu.Unlock()
 	assign(out, map[string]any{"name": name, "path": dir + "/" + name})
 	return nil
+}
+
+// waitBlocked stands in for a host HTTP call that has not returned yet. It
+// returns an error once the operation is cancelled.
+func (h *fakeHost) waitBlocked(op *fakeOperation) error {
+	h.mu.Lock()
+	block := h.blockNextCall
+	h.blockNextCall = false
+	h.mu.Unlock()
+	if !block {
+		return nil
+	}
+	if op == nil {
+		return errors.New("fakeHost: blocked call without an operation")
+	}
+	select {
+	case <-op.done:
+		return errors.New("host http operation was cancelled")
+	default:
+	}
+	select {
+	case h.blockedStarted <- struct{}{}:
+	default:
+	}
+	<-op.done
+	return errors.New("host http operation was cancelled")
 }
 
 func (h *fakeHost) methods() []string {
