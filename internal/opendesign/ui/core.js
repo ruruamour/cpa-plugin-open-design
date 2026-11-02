@@ -87,11 +87,16 @@
     return (Array.isArray(models) ? models : []).some(model => text(model.upstream_id) === wanted);
   }
 
+  function aliasForUpstream(upstreamID) {
+    const value = text(upstreamID);
+    return value ? `open-design-${value}` : '';
+  }
+
   function addUpstream(models, upstreamID) {
     const value = text(upstreamID);
     const rows = (Array.isArray(models) ? models : []).map(model => ({ ...model }));
     if (!value || hasUpstream(rows, value)) return rows;
-    rows.push({ id: value, upstream_id: value });
+    rows.push({ id: aliasForUpstream(value), upstream_id: value });
     return rows;
   }
 
@@ -102,6 +107,32 @@
       .map(model => ({ ...model }));
   }
 
+  function filterUpstream(models, query) {
+    const rows = (Array.isArray(models) ? models : []).map(model => ({ ...model }));
+    const needle = text(query).toLowerCase();
+    if (!needle) return rows;
+    return rows.filter(model =>
+      text(model.id).toLowerCase().includes(needle) ||
+      text(model.owned_by).toLowerCase().includes(needle)
+    );
+  }
+
+  function addUpstreams(models, upstreamIDs) {
+    let rows = Array.isArray(models) ? models : [];
+    for (const upstreamID of Array.isArray(upstreamIDs) ? upstreamIDs : []) {
+      rows = addUpstream(rows, upstreamID);
+    }
+    return rows;
+  }
+
+  function removeUpstreams(models, upstreamIDs) {
+    let rows = Array.isArray(models) ? models : [];
+    for (const upstreamID of Array.isArray(upstreamIDs) ? upstreamIDs : []) {
+      rows = removeUpstream(rows, upstreamID);
+    }
+    return rows;
+  }
+
   const api = {
     DEFAULT_BASE_URL,
     parseAPIError,
@@ -109,8 +140,12 @@
     normalizeUpstreamModels,
     buildModelsPayload,
     hasUpstream,
+    aliasForUpstream,
     addUpstream,
     removeUpstream,
+    filterUpstream,
+    addUpstreams,
+    removeUpstreams,
   };
   Object.defineProperty(api, '__test', { value: { text }, enumerable: false });
   globalThis.OpenDesignCore = api;

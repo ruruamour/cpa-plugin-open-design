@@ -504,7 +504,13 @@ test('model mapping validates aliases, deduplicates, and derives a safe payload'
   );
   assert.throws(() => core.buildModelsPayload([{ id: 'alias', upstream_id: '' }]), /不能为空/);
   assert.throws(() => core.buildModelsPayload([{ id: 'a', upstream_id: 'x' }, { id: 'a', upstream_id: 'y' }]), /重复/);
-  assert.deepEqual(JSON.parse(JSON.stringify(core.addUpstream([], 'm'))), [{ id: 'm', upstream_id: 'm' }]);
+  assert.equal(core.aliasForUpstream('m'), 'open-design-m');
+  assert.deepEqual(JSON.parse(JSON.stringify(core.addUpstream([], 'm'))), [{ id: 'open-design-m', upstream_id: 'm' }]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(core.addUpstream([{ id: 'custom', upstream_id: 'm' }], 'm'))),
+    [{ id: 'custom', upstream_id: 'm' }],
+    'an existing alias for the upstream model is kept as-is',
+  );
   assert.deepEqual(JSON.parse(JSON.stringify(core.removeUpstream([{ id: 'a', upstream_id: 'm' }], 'm'))), []);
 });
 

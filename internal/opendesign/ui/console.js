@@ -34,7 +34,11 @@
     selectedCredential: '',
     upstream: [],
     upstreamFor: '',
+    upstreamQuery: '',
     mappings: [],
+    savedMappings: [],
+    accountEdit: null,
+    authCollapsed: false,
     busy: false,
   };
 
@@ -56,6 +60,22 @@
 
   function hasHeaders(headers) {
     return Boolean(headers && (headers.Authorization || headers['X-Management-Key']));
+  }
+
+  function mappingKey(models) {
+    return JSON.stringify((Array.isArray(models) ? models : []).map(model => [
+      String(model && model.id || '').trim(),
+      String(model && model.upstream_id || '').trim(),
+    ]));
+  }
+
+  function cloneMappings(models) {
+    return (Array.isArray(models) ? models : []).map(model => ({ id: model.id, upstream_id: model.upstream_id }));
+  }
+
+  // True while the editor holds rows that differ from what the server reports.
+  function mappingsDirty() {
+    return mappingKey(state.mappings) !== mappingKey(state.savedMappings);
   }
 
   function el(tag, options = {}, children = []) {
@@ -99,10 +119,52 @@
 
   function setBusy(value) {
     state.busy = Boolean(value);
-    for (const id of ['authSubmit', 'accountSubmit', 'fetchModels', 'saveModels', 'addMapping', 'modelCredential']) {
+    for (const id of ['authSubmit', 'accountSubmit', 'accountCancel', 'fetchModels', 'saveModels', 'addMapping', 'revertMappings', 'modelCredential', 'selectVisible', 'clearVisible']) {
       const node = $(id);
       if (node) node.disabled = state.busy;
     }
+    for (const id of ['accountList', 'upstreamList', 'mappingList']) {
+      setRowButtonsDisabled($(id), state.busy);
+    }
+    syncFetchButton();
+    syncModelTools();
+    // Rebuild account rows on release so disabled accounts keep their
+    // 「获取模型」 button disabled (the sweep above cannot know it).
+    if (!state.busy) renderAccounts();
+  }
+
+  // Row buttons are recreated on every render, so busy transitions also walk the
+  // rendered rows instead of relying on a full re-render.
+  function setRowButtonsDisabled(container, disabled) {
+    if (!container) return;
+    const stack = [...(container.children || [])];
+    while (stack.length) {
+      const node = stack.pop();
+      if (node.tagName === 'BUTTON') node.disabled = Boolean(disabled);
+      if (node.children) stack.push(...node.children);
+    }
+  }
+
+  function setDisabled(id, value) {
+    const node = $(id);
+    if (node) node.disabled = Boolean(value);
+  }
+
+  function selectedCredentialItem() {
+    const id = state.selectedCredential;
+    if (!id) return null;
+    return state.status.credentials.find(item => item.id === id) || null;
+  }
+
+  function syncFetchButton() {
+    const item = selectedCredentialItem();
+    setDisabled('fetchModels', state.busy || !state.selectedCredential || Boolean(item && item.disabled));
+  }
+
+  function syncModelTools() {
+    const hasUpstream = state.upstreamFor !== '' && state.upstream.length > 0;
+    setDisabled('selectVisible', state.busy || !hasUpstream);
+    setDisabled('clearVisible', state.busy || !hasUpstream);
   }
 
   // Drops any in-flight model list (releasing its busy slot) and clears the
@@ -116,6 +178,10 @@
     }
     state.upstream = [];
     state.upstreamFor = '';
+    state.upstreamQuery = '';
+    const search = $('upstreamSearch');
+    if (search) search.value = '';
+    syncModelTools();
   }
 
   function authLabel(source) {
@@ -137,6 +203,8 @@
     state.verified = null;
     state.candidate = null;
     invalidateModelRequest();
+    resetAccountForm();
+    setAuthCollapsed(false);
     showPanels(false);
     const badge = $('authBadge');
     if (badge) {
@@ -183,15 +251,28 @@
   }
 
   function applyStatus(raw) {
-    state.status = Core.normalizeStatus(raw);
-    state.mappings = state.status.models.map(model => ({ ...model }));
-    if (state.selectedCredential && !state.status.credentials.some(item => item.id === state.selectedCredential)) {
+    const incoming = Core.normalizeStatus(raw);
+    const serverModels = cloneMappings(incoming.models);
+    // A status refresh (account add/update, background reload) must not silently
+    // discard mapping edits the operator has not saved yet. The saved baseline is
+    // always refreshed; the draft is replaced only when it is not dirty.
+    const dirty = mappingsDirty();
+    state.status = incoming;
+    state.status.models = cloneMappings(serverModels);
+    state.savedMappings = cloneMappings(serverModels);
+    if (!dirty) state.mappings = cloneMappings(serverModels);
+    if (state.accountEdit && !incoming.credentials.some(item => item.id === state.accountEdit.id)) {
+      resetAccountForm();
+      message('accountState', '正在编辑的账户已被删除，已取消编辑。', '');
+    }
+    if (state.selectedCredential && !incoming.credentials.some(item => item.id === state.selectedCredential)) {
       state.selectedCredential = '';
       invalidateModelRequest();
     }
     renderMeta();
     renderAccounts();
     renderModels();
+    if (dirty) message('modelState', '账户信息已刷新；模型映射还有未保存的修改，草稿已保留。', '');
   }
 
   function renderMeta() {
@@ -204,7 +285,7 @@
   function button(label, action, options = {}) {
     return el('button', {
       text: label,
-      className: options.className || '',
+      className: options.className || 'button',
       attrs: { type: 'button', 'data-action': action },
       disabled: options.disabled,
       on: options.on,
@@ -221,23 +302,41 @@
       list.replaceChildren(el('p', { className: 'empty', text: '还没有账户。填写标签和 API key 后添加。' }));
     } else {
       const rows = items.map(item => {
+        const editing = Boolean(state.accountEdit && state.accountEdit.id === item.id);
         const detail = el('div', { className: 'row-main' }, [
           el('span', { className: 'name', text: item.label }),
           el('span', {
             className: `badge ${item.disabled ? 'off' : 'on'}`,
             text: item.disabled ? '已停用' : '已启用',
           }),
+          editing ? el('span', { className: 'badge', text: '正在编辑' }) : null,
         ]);
         const actions = el('div', { className: 'row-actions' }, [
-          button('获取模型', 'fetch-account', { on: () => selectAccount(item.id) }),
-          button(item.disabled ? '启用' : '停用', 'toggle-account', { on: () => toggleAccount(item) }),
-          button('删除', 'delete-account', { className: 'danger', on: () => deleteAccount(item) }),
+          button('获取模型', 'fetch-account', {
+            className: 'button compact',
+            disabled: item.disabled,
+            on: () => selectAccount(item),
+          }),
+          button('编辑', 'edit-account', {
+            className: 'button compact',
+            on: () => editAccount(item),
+          }),
+          button(item.disabled ? '启用' : '停用', 'toggle-account', {
+            className: 'button compact',
+            on: () => toggleAccount(item),
+          }),
+          button('删除', 'delete-account', {
+            className: 'button compact danger',
+            on: () => deleteAccount(item),
+          }),
         ]);
         return el('div', { className: 'row', attrs: { 'data-credential-id': item.id } }, [detail, actions]);
       });
       list.replaceChildren(...rows);
     }
+    if (state.busy) setRowButtonsDisabled(list, true);
     renderCredentialOptions();
+    syncFetchButton();
   }
 
   function renderCredentialOptions() {
@@ -261,18 +360,56 @@
     renderMappings();
   }
 
+  function visibleUpstream() {
+    return Core.filterUpstream(state.upstream, state.upstreamQuery);
+  }
+
+  function updateUpstreamCount() {
+    const node = $('upstreamCount');
+    if (!node) return;
+    if (!state.upstreamFor) {
+      node.textContent = '0 个上游模型';
+      return;
+    }
+    const visible = visibleUpstream().length;
+    const total = state.upstream.length;
+    node.textContent = state.upstreamQuery
+      ? `显示 ${visible} / ${total} 个上游模型`
+      : `${total} 个上游模型`;
+  }
+
+  function updateDirtyBadge() {
+    const dirty = mappingsDirty();
+    const badge = $('mappingDirty');
+    if (badge) badge.hidden = !dirty;
+    const revert = $('revertMappings');
+    if (revert) revert.hidden = !dirty;
+    return dirty;
+  }
+
   function renderUpstream() {
     const list = $('upstreamList');
     if (!list) return;
     if (!state.upstreamFor) {
-      list.replaceChildren(el('p', { className: 'empty', text: '选择账户后点击「获取模型列表」。' }));
+      list.replaceChildren(el('p', { className: 'empty', text: '选择账户后点击「获取模型列表」。已停用账户不能拉取。' }));
+      updateUpstreamCount();
+      syncModelTools();
       return;
     }
     if (!state.upstream.length) {
       list.replaceChildren(el('p', { className: 'empty', text: 'OpenDesign 没有返回模型。' }));
+      updateUpstreamCount();
+      syncModelTools();
       return;
     }
-    const rows = state.upstream.map(item => {
+    const visible = visibleUpstream();
+    if (!visible.length) {
+      list.replaceChildren(el('p', { className: 'empty', text: '没有匹配的上游模型，请调整搜索关键词。' }));
+      updateUpstreamCount();
+      syncModelTools();
+      return;
+    }
+    const rows = visible.map(item => {
       const box = el('input', { type: 'checkbox', checked: Core.hasUpstream(state.mappings, item.id) });
       box.addEventListener('change', () => {
         state.mappings = box.checked
@@ -288,11 +425,14 @@
       return el('label', { className: 'check upstream' }, parts);
     });
     list.replaceChildren(...rows);
+    updateUpstreamCount();
+    syncModelTools();
   }
 
   function renderMappings() {
     const list = $('mappingList');
     if (!list) return;
+    const dirty = updateDirtyBadge();
     if (!state.mappings.length) {
       list.replaceChildren(el('p', { className: 'empty', text: '还没有模型映射。可从上方勾选，或手动添加一行。' }));
       return;
@@ -302,24 +442,30 @@
         className: 'control mono',
         value: model.id,
         placeholder: '对外模型名',
-        attrs: { 'aria-label': '对外模型名' },
+        attrs: { 'aria-label': `第 ${index + 1} 行对外模型名`, autocomplete: 'off' },
       });
-      alias.addEventListener('input', () => { state.mappings[index].id = alias.value; });
+      alias.addEventListener('input', () => {
+        state.mappings[index].id = alias.value;
+        updateDirtyBadge();
+      });
       const upstream = el('input', {
         className: 'control mono',
         value: model.upstream_id,
         placeholder: '上游模型 ID',
-        attrs: { 'aria-label': '上游模型 ID' },
+        attrs: { 'aria-label': `第 ${index + 1} 行上游模型 ID`, autocomplete: 'off' },
       });
-      upstream.addEventListener('input', () => { state.mappings[index].upstream_id = upstream.value; });
+      upstream.addEventListener('input', () => {
+        state.mappings[index].upstream_id = upstream.value;
+        updateDirtyBadge();
+      });
       const remove = button('删除', 'remove-mapping', {
-        className: 'danger compact',
+        className: 'button compact danger',
         on: () => {
           state.mappings.splice(index, 1);
           renderModels();
         },
       });
-      return el('div', { className: 'mapping-row' }, [
+      return el('div', { className: 'mapping-row', attrs: { 'data-mapping-index': index } }, [
         el('label', { className: 'field' }, [el('span', { text: '对外别名' }), alias]),
         el('span', { className: 'arrow', text: '→' }),
         el('label', { className: 'field' }, [el('span', { text: '上游模型 ID' }), upstream]),
@@ -327,12 +473,105 @@
       ]);
     });
     list.replaceChildren(...rows);
+    if (state.busy) setRowButtonsDisabled(list, true);
+    // Keep checkbox state in sync after edits/removals without re-rendering the
+    // upstream list (which would drop the search field's focus).
+    syncUpstreamChecks();
+    if (dirty) updateDirtyBadge();
   }
 
-  function selectAccount(id) {
-    selectCredential(id);
+  function syncUpstreamChecks() {
+    for (const node of [...($('upstreamList')?.children || [])]) {
+      if (node.tagName !== 'LABEL') continue;
+      const model = node.children.find(child => child.tagName === 'SPAN' && child.className === 'mono');
+      const box = node.children.find(child => child.tagName === 'INPUT');
+      if (model && box) box.checked = Core.hasUpstream(state.mappings, model.textContent);
+    }
+  }
+
+  function selectVisibleUpstream(selected) {
+    const ids = visibleUpstream().map(item => item.id);
+    if (!ids.length) {
+      message('modelState', '当前没有可操作的上游模型。', 'error');
+      return;
+    }
+    state.mappings = selected
+      ? Core.addUpstreams(state.mappings, ids)
+      : Core.removeUpstreams(state.mappings, ids);
+    renderMappings();
+    message('modelState', selected
+      ? `已勾选当前可见的 ${ids.length} 个上游模型，仍在编辑中，需保存。`
+      : `已取消当前可见的 ${ids.length} 个上游模型，仍在编辑中，需保存。`, '');
+  }
+
+  function filterUpstream(query) {
+    state.upstreamQuery = String(query || '');
+    renderUpstream();
+  }
+
+  function selectAccount(item) {
+    if (state.busy) return;
+    if (item.disabled) {
+      message('modelState', `账户「${item.label}」已停用，不能拉取模型列表。请先启用。`, 'error');
+      return;
+    }
+    selectCredential(item.id);
     const panel = $('modelsPanel');
     if (panel && typeof panel.scrollIntoView === 'function') panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    // 「获取模型」 on the account row is a real fetch, not just a selection.
+    return fetchModels();
+  }
+
+  function accountFormNodes() {
+    return {
+      title: $('accountFormTitle'),
+      hint: $('accountFormHint'),
+      submit: $('accountSubmit'),
+      cancel: $('accountCancel'),
+      label: $('accountLabel'),
+      key: $('accountKey'),
+    };
+  }
+
+  function resetAccountForm() {
+    state.accountEdit = null;
+    const nodes = accountFormNodes();
+    if (nodes.title) nodes.title.textContent = '添加账户';
+    if (nodes.hint) nodes.hint.textContent = '填写标签和 API key 后添加。';
+    if (nodes.submit) nodes.submit.textContent = '添加账户';
+    if (nodes.cancel) nodes.cancel.hidden = true;
+    if (nodes.label) nodes.label.value = '';
+    if (nodes.key) {
+      nodes.key.value = '';
+      nodes.key.setAttribute('placeholder', '粘贴 OpenDesign Cloud API key');
+    }
+    renderAccounts();
+  }
+
+  function editAccount(item) {
+    if (state.busy) return;
+    state.accountEdit = { id: item.id, label: item.label };
+    const nodes = accountFormNodes();
+    if (nodes.title) nodes.title.textContent = `编辑账户「${item.label}」`;
+    if (nodes.hint) nodes.hint.textContent = 'API key 不能回显；留空表示保留原 Key，保存后输入框会清空。';
+    if (nodes.submit) nodes.submit.textContent = '保存修改';
+    if (nodes.cancel) nodes.cancel.hidden = false;
+    if (nodes.label) nodes.label.value = item.label;
+    if (nodes.key) {
+      nodes.key.value = '';
+      nodes.key.setAttribute('placeholder', '留空则保留原 Key');
+    }
+    message('accountState', `正在编辑「${item.label}」，留空 API key 将保留原 Key。`, '');
+    renderAccounts();
+    if (nodes.label && typeof nodes.label.focus === 'function') nodes.label.focus();
+  }
+
+  function cancelAccountEdit(event) {
+    if (event) event.preventDefault();
+    if (!state.accountEdit) return;
+    const label = state.accountEdit.label;
+    resetAccountForm();
+    message('accountState', `已取消编辑「${label}」，API key 输入已清空。`, '');
   }
 
   async function addAccount(event) {
@@ -342,23 +581,42 @@
     const keyInput = $('accountKey');
     const label = labelInput ? labelInput.value.trim() : '';
     const key = keyInput ? keyInput.value.trim() : '';
-    if (!key) {
+    const editing = state.accountEdit;
+    if (!editing && !key) {
       message('accountState', '请输入 OpenDesign API key。', 'error');
       return;
     }
+    if (editing && !label) {
+      message('accountState', '编辑账户时标签不能为空。', 'error');
+      return;
+    }
     setBusy(true);
-    message('accountState', '正在保存账户…');
+    message('accountState', editing ? '正在保存账户修改…' : '正在保存账户…');
     try {
-      await api().addCredential(label, key);
-      if (keyInput) keyInput.value = '';
-      if (labelInput) labelInput.value = '';
-      message('accountState', '账户已保存，API key 已从页面清空。');
+      if (editing) {
+        // Reuses the existing POST /credentials contract. An empty key is omitted
+        // so the backend keeps the stored key; the API key is never read back.
+        const body = { label };
+        if (key) body.api_key = key;
+        await api().updateCredential(editing.id, body);
+        const wasEditing = editing.label;
+        resetAccountForm();
+        message('accountState', key
+          ? `账户「${label}」已保存，API key 已更新并从页面清空。`
+          : `账户「${label}」已保存（${wasEditing} → ${label}），原 API key 保留并从页面清空。`);
+      } else {
+        await api().addCredential(label, key);
+        if (keyInput) keyInput.value = '';
+        if (labelInput) labelInput.value = '';
+        message('accountState', '账户已保存，API key 已从页面清空。');
+      }
       await refreshStatus();
+      renderAccounts();
     } catch (error) {
       if (isAuthStatus(error.status)) {
-        showAuth(error.status === 401 ? '401：管理密钥无效或已过期，请重新验证后再添加账户。' : `403：${formatError(error)}`);
+        showAuth(error.status === 401 ? '401：管理密钥无效或已过期，请重新验证后再保存账户。' : `403：${formatError(error)}`);
       } else {
-        message('accountState', `保存失败：${formatError(error)}`, 'error');
+        message('accountState', `${editing ? '保存修改' : '保存'}失败：${formatError(error)}`, 'error');
       }
     } finally {
       setBusy(false);
@@ -376,7 +634,12 @@
         state.selectedCredential = '';
         invalidateModelRequest();
       }
-      message('accountState', '账户已删除。');
+      if (state.accountEdit && state.accountEdit.id === item.id) {
+        resetAccountForm();
+        message('accountState', `账户「${item.label}」已删除，编辑已取消。`);
+      } else {
+        message('accountState', '账户已删除。');
+      }
       await refreshStatus();
     } catch (error) {
       if (isAuthStatus(error.status)) showAuth(`401/403：${formatError(error)}`);
@@ -421,12 +684,17 @@
       message('modelState', '请先选择一个账户。', 'error');
       return;
     }
+    const account = state.status.credentials.find(item => item.id === credentialID);
+    if (account && account.disabled) {
+      message('modelState', `账户「${account.label}」已停用，不能拉取模型列表。请先启用。`, 'error');
+      return;
+    }
     const requestToken = ++modelRequestSeq;
     const stillCurrent = () => requestToken === modelRequestSeq && state.selectedCredential === credentialID;
     state.selectedCredential = credentialID;
     activeModelRequest = requestToken;
     setBusy(true);
-    message('modelState', '正在读取 OpenDesign 模型列表…');
+    message('modelState', `正在通过账户「${account ? account.label : credentialID}」读取 OpenDesign 模型列表…`);
     try {
       const raw = await api().upstreamModels(credentialID);
       // A late response for an earlier selection (or a logged-out page) is
@@ -434,8 +702,13 @@
       if (!stillCurrent()) return;
       state.upstream = Core.normalizeUpstreamModels(raw);
       state.upstreamFor = credentialID;
+      state.upstreamQuery = '';
+      const search = $('upstreamSearch');
+      if (search) search.value = '';
       renderUpstream();
-      message('modelState', `已读取 ${state.upstream.length} 个上游模型。勾选后设置对外别名，再保存映射。`);
+      message('modelState', state.upstream.length
+        ? `已读取 ${state.upstream.length} 个上游模型。可搜索筛选或全选当前可见项，再设置对外别名并保存映射。`
+        : '账户可用，但 OpenDesign 没有返回模型。可稍后重试或手动添加映射。');
     } catch (error) {
       if (!stillCurrent()) return;
       if (error.status === 401) {
@@ -464,16 +737,22 @@
       message('modelState', `无法保存：${error.message}`, 'error');
       return;
     }
+    if (!models.length) {
+      message('modelState', '没有可保存的模型映射。请先勾选上游模型或手动添加一行；如需清空请先删除所有行。', 'error');
+      return;
+    }
     setBusy(true);
     message('modelState', '正在保存模型映射…');
     try {
       const raw = await api().saveModels(models);
       const saved = raw && Array.isArray(raw.models) ? raw.models : models;
-      state.status.models = saved.map(item => ({ id: String(item.id || '').trim(), upstream_id: String(item.upstream_id || '').trim() }))
+      const normalized = saved.map(item => ({ id: String(item.id || '').trim(), upstream_id: String(item.upstream_id || '').trim() }))
         .filter(item => item.id && item.upstream_id);
-      state.mappings = state.status.models.map(item => ({ ...item }));
-      renderMappings();
-      message('modelState', `已保存 ${state.status.models.length} 个模型映射。`);
+      state.status.models = cloneMappings(normalized);
+      state.savedMappings = cloneMappings(normalized);
+      state.mappings = cloneMappings(normalized);
+      renderModels();
+      message('modelState', `已保存 ${normalized.length} 个模型映射。`);
     } catch (error) {
       if (isAuthStatus(error.status)) {
         showAuth(error.status === 401 ? '401：管理密钥无效或已过期，模型映射未保存。' : `403：${formatError(error)}`);
@@ -492,12 +771,37 @@
     const select = $('modelCredential');
     if (select && select.value !== id) select.value = id;
     renderUpstream();
+    syncFetchButton();
     message('modelState', '');
   }
 
   function addMapping() {
     state.mappings.push({ id: '', upstream_id: '' });
     renderMappings();
+    message('modelState', '已手动添加一行映射，填写对外别名和上游模型 ID 后保存。', '');
+  }
+
+  // Explicitly discard the draft; status refreshes never do this on their own.
+  function revertMappings() {
+    if (state.busy || !mappingsDirty()) return;
+    state.mappings = cloneMappings(state.savedMappings);
+    renderModels();
+    message('modelState', '已还原为最近一次保存的模型映射。', '');
+  }
+
+  function setAuthCollapsed(collapsed) {
+    state.authCollapsed = Boolean(collapsed);
+    const body = $('authBody');
+    if (body) body.hidden = state.authCollapsed;
+    const toggle = $('authToggle');
+    if (toggle) {
+      toggle.textContent = state.authCollapsed ? '展开' : '收起';
+      toggle.setAttribute('aria-expanded', state.authCollapsed ? 'false' : 'true');
+    }
+  }
+
+  function toggleAuthPanel() {
+    setAuthCollapsed(!state.authCollapsed);
   }
 
   function bind() {
@@ -505,16 +809,28 @@
     if (authForm) authForm.addEventListener('submit', submitAuth);
     const clear = $('authClear');
     if (clear) clear.addEventListener('click', clearAuth);
+    const authToggle = $('authToggle');
+    if (authToggle) authToggle.addEventListener('click', toggleAuthPanel);
     const accountForm = $('accountForm');
     if (accountForm) accountForm.addEventListener('submit', addAccount);
+    const cancel = $('accountCancel');
+    if (cancel) cancel.addEventListener('click', cancelAccountEdit);
     const fetchButton = $('fetchModels');
     if (fetchButton) fetchButton.addEventListener('click', fetchModels);
     const saveButton = $('saveModels');
     if (saveButton) saveButton.addEventListener('click', saveModels);
     const addButton = $('addMapping');
     if (addButton) addButton.addEventListener('click', addMapping);
+    const revertButton = $('revertMappings');
+    if (revertButton) revertButton.addEventListener('click', revertMappings);
     const select = $('modelCredential');
     if (select) select.addEventListener('change', () => selectCredential(select.value));
+    const search = $('upstreamSearch');
+    if (search) search.addEventListener('input', () => filterUpstream(search.value));
+    const selectVisible = $('selectVisible');
+    if (selectVisible) selectVisible.addEventListener('click', () => selectVisibleUpstream(true));
+    const clearVisible = $('clearVisible');
+    if (clearVisible) clearVisible.addEventListener('click', () => selectVisibleUpstream(false));
   }
 
   async function submitAuth(event) {
@@ -566,6 +882,7 @@
     try { Auth.clearAuth(); } catch { /* Ignore blocked storage. */ }
     state.verified = null;
     state.candidate = null;
+    resetAccountForm();
     invalidateModelRequest();
     const keyInput = $('managementKey');
     if (keyInput) keyInput.value = '';
@@ -577,6 +894,9 @@
 
   async function bootstrap() {
     renderMeta();
+    setAuthCollapsed(false);
+    renderAccounts();
+    renderModels();
     if (Auth.rememberEnabled && Auth.rememberEnabled()) {
       const remember = $('rememberAuth');
       if (remember) remember.checked = true;
@@ -587,16 +907,22 @@
       return;
     }
     state.verified = { headers: resolved.headers, source: resolved.source };
-    await loadStatus({ source: resolved.source });
+    const ok = await loadStatus({ source: resolved.source });
+    // Reclaim vertical space once the reused login worked; the panel stays
+    // one click away and reopening never changes authentication behaviour.
+    if (ok) setAuthCollapsed(true);
   }
 
   const consoleAPI = {
     state,
     bootstrap,
+    mappingsDirty,
     handlers: {
       submitAuth,
       clearAuth,
       addAccount,
+      cancelAccountEdit,
+      editAccount,
       deleteAccount,
       toggleAccount,
       selectAccount,
@@ -604,6 +930,10 @@
       fetchModels,
       saveModels,
       addMapping,
+      revertMappings,
+      filterUpstream,
+      selectVisibleUpstream,
+      toggleAuthPanel,
     },
     render: {
       applyStatus,
@@ -615,6 +945,11 @@
       renderModels,
       showAuth,
       loadStatus,
+      resetAccountForm,
+      setAuthCollapsed,
+      syncFetchButton,
+      syncModelTools,
+      updateDirtyBadge,
     },
     managementBase,
   };

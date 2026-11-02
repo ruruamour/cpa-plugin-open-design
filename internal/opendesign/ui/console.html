@@ -60,7 +60,13 @@
     .lead code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
     .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 18px; }
     .panel-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 14px; margin-bottom: 14px; }
+    .panel-head h2, .panel-head h3 { min-width: 0; overflow-wrap: anywhere; }
+    .panel-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .subhead { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; }
+    .subhead h3 { margin: 0; }
     .hint { color: var(--muted); font-size: 12px; }
+    .form-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 12px; }
+    .form-head h3 { margin: 0; }
     .stack { display: grid; gap: 12px; }
     .inline { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
     .field { display: grid; gap: 5px; min-width: 0; flex: 1 1 210px; }
@@ -71,17 +77,28 @@
     .button:hover:not(:disabled) { border-color: var(--accent); }
     .button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
     .button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); background: transparent; }
-    .button.compact { min-height: 30px; padding: 3px 9px; font-size: 12px; }
+    .button.compact { min-height: 34px; padding: 4px 10px; font-size: 12px; }
     .check { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
-    .check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+    .check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); flex: none; }
     .rows { display: grid; gap: 8px; }
     .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
     .row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; min-width: 0; }
     .row-main .name { font-weight: 600; overflow-wrap: anywhere; }
     .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-    .mapping-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
-    .mapping-row .field { flex: 1 1 190px; }
-    .mapping-row .arrow { align-self: center; color: var(--muted); padding-bottom: 6px; }
+    .row-detail { flex: 1 1 100%; min-width: 0; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+    .toolbar .field { flex: 1 1 180px; }
+    .search { flex: 1 1 220px; width: auto; }
+    .upstream-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .upstream-tools .search { flex: 1 1 180px; }
+    #upstreamList { grid-template-columns: repeat(auto-fill, minmax(min(100%, 270px), 1fr)); }
+    .mapping-list { display: grid; gap: 8px; }
+    .mapping-row { display: grid; grid-template-columns: minmax(0, 1fr) 18px minmax(0, 1fr) auto; align-items: end; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
+    .mapping-row .field { flex: none; }
+    .mapping-row .arrow { align-self: end; color: var(--muted); padding-bottom: 10px; text-align: center; }
+    .mapping-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .mapping-status .badge.warn { background: color-mix(in srgb, #b54708 16%, var(--surface)); color: #b54708; }
+    :root[data-theme="dark"] .mapping-status .badge.warn { color: #fec84b; }
     .upstream { display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: center; gap: 6px 10px; }
     .upstream .mono { overflow-wrap: anywhere; }
     .upstream .muted { grid-column: 2; font-size: 12px; }
@@ -95,6 +112,11 @@
     .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
     @media (max-width: 760px) {
       .split { grid-template-columns: minmax(0, 1fr); }
+      .mapping-row { grid-template-columns: minmax(0, 1fr); }
+      .mapping-row .arrow { display: none; }
+      .mapping-row .button { justify-self: start; }
+      .panel { padding: 14px; }
+      .shell { padding: 16px 12px 36px; }
     }
   </style>
 </head>
@@ -116,46 +138,56 @@
       账户密钥只保存在 CPA 的凭据目录，本页不会持久化 OpenDesign API key。
     </p>
 
-    <section class="panel" aria-labelledby="authTitle">
+    <section class="panel" id="authPanel" aria-labelledby="authTitle">
       <div class="panel-head">
         <div>
           <h2 id="authTitle">管理密钥</h2>
           <p class="hint">用于访问 CPA 的 resource console 管理接口。可复用同源 CPA 已保存的登录，也可在下方输入当前入口的管理密钥；验证通过后才会保存。</p>
         </div>
-      </div>
-      <form class="stack" id="authForm" autocomplete="off">
-        <div class="inline">
-          <label class="field">
-            <span>请求头</span>
-            <select class="control" id="authType">
-              <option value="bearer">Authorization: Bearer</option>
-              <option value="x-management-key">X-Management-Key</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>管理密钥</span>
-            <input class="control" id="managementKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="当前 CPA 入口的管理密钥">
-          </label>
-          <button class="button primary" id="authSubmit" type="submit">验证并进入</button>
-          <button class="button" id="authClear" type="button">清除本页密钥</button>
+        <div class="panel-actions">
+          <button class="button compact" id="authToggle" type="button" aria-expanded="true" aria-controls="authBody">收起</button>
         </div>
-        <label class="check" style="max-width: 360px;">
-          <input id="rememberAuth" type="checkbox">
-          在此浏览器记住管理密钥
-        </label>
-        <p class="state" id="authState" role="status" aria-live="polite" hidden></p>
-      </form>
+      </div>
+      <div class="stack" id="authBody">
+        <form class="stack" id="authForm" autocomplete="off">
+          <div class="inline">
+            <label class="field">
+              <span>请求头</span>
+              <select class="control" id="authType">
+                <option value="bearer">Authorization: Bearer</option>
+                <option value="x-management-key">X-Management-Key</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>管理密钥</span>
+              <input class="control" id="managementKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="当前 CPA 入口的管理密钥">
+            </label>
+            <button class="button primary" id="authSubmit" type="submit">验证并进入</button>
+            <button class="button" id="authClear" type="button">清除本页密钥</button>
+          </div>
+          <label class="check" style="max-width: 360px;">
+            <input id="rememberAuth" type="checkbox">
+            在此浏览器记住管理密钥
+          </label>
+          <p class="state" id="authState" role="status" aria-live="polite" hidden></p>
+        </form>
+      </div>
     </section>
 
+    <!-- Reserved extension slot: future per-account status can render inside each row without moving the action buttons. -->
     <section class="panel" id="accountsPanel" aria-labelledby="accountsTitle" hidden>
       <div class="panel-head">
         <div>
           <h2 id="accountsTitle">账户</h2>
-          <p class="hint">账户列表只显示标签、启用状态和操作；API key 不会回显。</p>
+          <p class="hint">账户列表只显示标签、启用状态和操作；API key 不会回显，编辑时也不能读取原 key。</p>
         </div>
         <span class="badge" id="accountCount">0 个账户</span>
       </div>
       <form class="stack" id="accountForm" autocomplete="off">
+        <div class="form-head">
+          <h3 id="accountFormTitle">添加账户</h3>
+          <span class="hint" id="accountFormHint">填写标签和 API key 后添加。</span>
+        </div>
         <div class="inline">
           <label class="field">
             <span>标签</span>
@@ -166,6 +198,7 @@
             <input class="control" id="accountKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign Cloud API key">
           </label>
           <button class="button primary" id="accountSubmit" type="submit">添加账户</button>
+          <button class="button" id="accountCancel" type="button" hidden>取消编辑</button>
         </div>
         <p class="state" id="accountState" role="status" aria-live="polite" hidden></p>
       </form>
@@ -179,38 +212,47 @@
           <p class="hint">选择一个账户读取 OpenDesign 模型列表，勾选要暴露的模型，设置对外别名和上游 ID 后保存。</p>
         </div>
       </div>
-      <div class="split">
-        <div class="stack">
-          <div class="panel-head" style="margin-bottom: 0;">
-            <h3>上游模型</h3>
-            <span class="hint">来自 OpenDesign <span class="mono">GET /models</span></span>
-          </div>
-          <div class="inline">
-            <label class="field">
-              <span>账户</span>
-              <select class="control" id="modelCredential">
-                <option value="">请选择账户</option>
-              </select>
-            </label>
-            <button class="button" id="fetchModels" type="button">获取模型列表</button>
-          </div>
-          <p class="state" id="modelState" role="status" aria-live="polite" hidden></p>
-          <div class="rows" id="upstreamList" aria-live="polite">
-            <p class="empty">选择账户后点击「获取模型列表」。</p>
-          </div>
+      <div class="stack">
+        <div class="subhead">
+          <h3>上游模型</h3>
+          <span class="hint">来自 OpenDesign <span class="mono">GET /models</span></span>
         </div>
-        <div class="stack">
-          <div class="panel-head" style="margin-bottom: 0;">
-            <h3>对外模型</h3>
+        <div class="toolbar">
+          <label class="field">
+            <span>账户</span>
+            <select class="control" id="modelCredential">
+              <option value="">请选择账户</option>
+            </select>
+          </label>
+          <button class="button compact" id="fetchModels" type="button">获取模型列表</button>
+        </div>
+        <p class="state" id="modelState" role="status" aria-live="polite" hidden></p>
+        <div class="upstream-tools">
+          <input class="control search" id="upstreamSearch" type="search" placeholder="搜索上游模型或供应商" aria-label="搜索上游模型" autocomplete="off">
+          <button class="button compact" id="selectVisible" type="button">全选当前可见</button>
+          <button class="button compact" id="clearVisible" type="button">取消当前可见</button>
+          <span class="hint" id="upstreamCount">0 个上游模型</span>
+        </div>
+        <div class="rows" id="upstreamList" aria-live="polite">
+          <p class="empty">选择账户后点击「获取模型列表」。已停用账户不能拉取。</p>
+        </div>
+
+        <div class="subhead" style="margin-top: 6px;">
+          <h3>对外模型</h3>
+          <div class="panel-actions">
+            <span class="badge warn" id="mappingDirty" hidden>未保存</span>
+            <button class="button compact" id="revertMappings" type="button" hidden>还原为已保存</button>
             <button class="button compact" id="addMapping" type="button">手动添加一行</button>
           </div>
-          <div class="rows" id="mappingList" aria-live="polite">
-            <p class="empty">还没有模型映射。</p>
-          </div>
-          <div>
-            <button class="button primary" id="saveModels" type="button">保存模型映射</button>
-          </div>
         </div>
+        <div class="rows" id="mappingList" aria-live="polite">
+          <p class="empty">还没有模型映射。</p>
+        </div>
+        <div class="mapping-status">
+          <button class="button primary" id="saveModels" type="button">保存模型映射</button>
+          <span class="hint" id="mappingHint">勾选上游模型会自动生成 <span class="mono">open-design-</span> 前缀别名，可再手动修改。</span>
+        </div>
+        <!-- Reserved extension slot: future status blocks can sit beside the save action. -->
       </div>
     </section>
   </main>
