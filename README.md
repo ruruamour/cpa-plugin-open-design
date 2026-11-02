@@ -10,7 +10,7 @@
 
 - 添加、编辑、启停和删除 OpenDesign 账户，支持替换推理 API key；编辑时留空保留原 Key。
 - 一次点击获取官方 `GET /models` 列表，支持搜索、批量勾选、共享模型映射与未保存草稿保护。新增映射默认使用 `open-design-` 前缀。
-- 可选配置独立 control Key，手动查询官方账号钱包（USD）与工作区套餐窗口（credits）。区分未配置、未知、部分失败与上次数据；符合采样条件时显示明确标为估算的窗口预测。详见[额度说明](docs/quota.md)。
+- 可选配置独立 control Key，手动查询官方账号钱包（USD）与工作区套餐窗口（credits）。新增和编辑账户均可填写两个可选字段：control Key、Workspace ID。实际剩余量与重置时间直接显示；符合采样条件的整体 credits 趋势默认折叠，不换算为单模型剩余 token 或请求数。详见[额度说明](docs/quota.md)。
 - 提供管理接口 `/v0/management/open-design` 和控制台 `/v0/resource/plugins/open-design/console`。
 - 通过 CPA 公开的 host HTTP / translation / public RPC 发起请求，支持流式与非流式 Chat Completions。
 
@@ -47,7 +47,7 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 2. 在账户管理中添加 OpenDesign 推理 API key。标签仅作备注，不承诺将客户端请求固定调度到该账户。
 3. 点击账户的“获取模型”，搜索、勾选模型并保存映射；已有别名会保留，新增别名默认加 `open-design-` 前缀。
 4. 在客户端填入 CPA 的 API 地址和 CPA 客户端 API key，使用已保存的客户端模型名调用 `/v1/chat/completions`。
-5. 如需额度，在编辑账户时展开可选额度配置并填写官方 control Key；填写工作区 ID 后可查询套餐窗口。查询和预测不改变账号启停或调度。
+5. 如需额度，在新增或编辑账户时展开可选额度配置：同一账号的 control Key 用于查钱包，再填 Workspace ID 可查套餐窗口。保存后点该账户的「刷新额度」；两项都留空可照常推理。查询和趋势估算不改变账号启停或调度。
 
 管理页需要 CPA 管理认证。插件数据目录默认为 `plugins/open-design-data`，可通过 `data_dir` 修改；容器部署请持久化插件目录、CPA 的 `auth-dir` 和该数据目录。
 
@@ -103,7 +103,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 ## 当前验证边界
 
 - 2026-11-02 的真实 OpenDesign 验证已成功：发现 13 个模型；官方直连与生产 CPA 插件各完成一次最小 JSON 推理并得到 `OK`。生产插件测试使用 `open-design-minimax-m3.1-flash`，usage 为 219 输入／3 输出／222 总 token。13 个模型只验证发现、持久化与注册，没有逐个付费推理。
-- 现有推理 Key 对官方控制面钱包、账单汇总接口返回 401。新增额度能力的成功、错误、缓存和预测由官方契约与隔离假上游验证，尚无有效 control Key 的真实余额成功记录。
+- 早期现有推理 Key 对官方控制面钱包、账单汇总接口返回 401。随后，两份独立 control 授权直接查询钱包和各自工作区 funding-check，共四个 GET 均返回 200，字段契约与工作区匹配；直接读取成功不代表已上线新版或完成真实消费预测。额度成功、错误、缓存与趋势算法另有隔离测试覆盖。
 - [验证记录](docs/verification.md) 分别列出 Go／Node、Edge 交互与布局、原版 CPA 配合 loopback TLS 假上游的结果，避免把隔离测试写成真实额度成功。
 
 ## 文档与来源

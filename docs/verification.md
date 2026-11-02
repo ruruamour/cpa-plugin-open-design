@@ -8,13 +8,13 @@
 - 使用公开 C shared ABI v1 和 host HTTP / translation / public RPC，不修改、打包或发布 CPA 宿主。
 - 隔离集成使用原版 CPA 8.0.48，commit `dbb70621`；测试宿主 SHA256 为 `74adb62eb8619d2478f546945dc78f42b3e95efce66dd2fadaa41eddc7c1f32a`。
 - 最终交付库在 Debian 12（bookworm）中使用 Go 1.26.4、CGO、GCC 构建，Linux amd64；动态符号包含四个插件 ABI 入口，最高所需 GLIBC 为 **2.34**。
-- 构建所用功能代码提交为 `fbf9159`，其后仅整理版本元数据和文档。使用 `-trimpath -buildvcs=false -buildmode=c-shared -ldflags='-s -w'`。
+- 后端功能以 `fbf9159` 的验收为基线；随后 `2a1295e` 仅收紧可选配置与额度展示，折叠窗口趋势并标明未指定模型的资金预检。交付库已重新构建，使用 `-trimpath -buildvcs=false -buildmode=c-shared -ldflags='-s -w'`。
 
 | 交付项 | 值 |
 | --- | --- |
 | 动态库 | `dist/open-design-0.2.0-linux-amd64/open-design.so` |
 | 插件版本 | `0.2.0` |
-| SHA256 | `40b27e442853e49685e8f4fe3d4a0c5f97bd61050cd61b10270b6303f0a47a8a` |
+| SHA256 | `dc2c00bece347f4f6d0f1ed642efa86d904bd67349d8909559205a5619a9accc` |
 | 系统与架构 | ELF shared object / Linux amd64 |
 | 最低符号要求 | GLIBC 2.34 |
 
@@ -30,9 +30,11 @@
 | ctypes ABI | 对上表最终库运行，PASS |
 | 原版 CPA 加载 | 同一最终库，`--cpa-binary` PASS |
 | 原版 CPA 假 TLS 全流程 | 同一最终库，`--cpa-live` PASS |
-| Edge 交互 | 两条入口共 114 项断言通过，见下文 |
+| Edge 交互 | 两条入口共 122 项断言通过（账号 48、更新后额度 58、复审 16），见下文 |
 | 独立复审 | 原 4 项后端 P2、3 项 UI P2 均按最终源码关闭，未发现新的 P1/P2 |
 | ops 离线部署检查 | 28 项通过；脚本已准备版本 `0.2.0`，没有执行部署 |
+
+2026-11-02 的补充运维展示调整通过全仓 `go test -timeout 90s ./...`、Node 115/115、Edge 额度 58 项，以及新交付库的 ctypes／原版 CPA 加载／假 TLS 全流程。未修改 Go 后端算法；后端 race 与 vet 的证据沿用前一轮验收，未把 UI 调整后的普通 Go 测试称为再次 race。新库仍为 Debian 12、Go 1.26.4、非 root、关闭网络构建。
 
 最终 race 在普通用户下实际执行了 unlink 权限失败回归。Debian 12 测试也以非 root 用户运行，没有依赖 root 绕过目录权限。
 
@@ -61,7 +63,7 @@ Go／Node 测试包含凭据解析重入、写盘失败时不发布新凭据、�
 | 验收组 | 最终断言 | 主要内容 |
 | --- | --- | --- |
 | 账号与模型 | 48 | 创建、编辑、替换／保留 Key，搜索、可见项批选、默认前缀、共享映射、草稿保护、启停、删除及认证分流 |
-| 额度与预测 | 50 | 仅钱包配置、独立 control Key、无自动查询、精确大 credits、USD／credits 分离、部分成功、未知／陈旧、多账户并发、迟到响应和清除授权 |
+| 额度与预测 | 58 | 仅钱包配置、独立 control Key、无自动查询、精确大 credits、USD／credits 分离、部分成功、未知／陈旧、多账户并发、迟到响应和清除授权；补充趋势默认折叠／展开、官方零剩余直接可见、未指定模型的预检说明 |
 | 复审回归 | 16 | 失败请求清空两种 Key；操作成功但状态读取失败仍显示已确认结果；外部同字段换 Key 撤下旧额度 |
 
 账号／模型与额度两组分别保存 8 张截图，覆盖两条入口、浅／深色、1280 与 390 宽度；无横向溢出、无页面脚本错误。生产只读基线另有相同组合的 8 张截图。浏览器验收覆盖控制台本身；公开路由与宿主的衔接由原版 CPA 集成检查覆盖。
@@ -93,10 +95,11 @@ Go／Node 测试包含凭据解析重入、写盘失败时不发布新凭据、�
 | --- | --- | --- |
 | `0.1.0` 初期提供的测试 Key | 两次 `GET /v1/models` 为 `401 invalid_api_key`，`api key not found` | 当时凭据无效，不代表后续有效凭据也失败 |
 | 2026-11-02 首次生产交付 | 有效推理 Key 发现 13 个模型；官方直连与生产插件各完成一次最小 JSON 推理，均为 HTTP 200／`OK` | 生产模型 `open-design-minimax-m3.1-flash`，usage 219／3／222；未逐个付费调用 13 个模型 |
-| 本轮 `0.2.0` 开发验收 | 现有推理 Key 只读请求控制面钱包和账单汇总均为 HTTP 401 | 没有有效 control Key；不能宣布真实额度成功，未重复付费推理 |
+| 本轮 `0.2.0` 开发验收早期 | 现有推理 Key 只读请求控制面钱包和账单汇总均为 HTTP 401 | 当时未提供 control 授权；不能否定已成功的推理授权 |
+| 2026-11-02 19:07（北京时间）control 授权补验 | 用户下载文件中的 od1／od2 两组授权，各直接 GET 钱包与指定工作区 funding-check，四次均 HTTP 200；字段契约核对和工作区匹配通过 | 两钱包各 `1.5000` USD，均 Go 套餐；5 小时均剩 `50000/50000` credits，7 天分别剩 `149998/150000`、`150000/150000`；仅直接只读查询，未配置或调用生产新版插件 |
 | 本轮生产只读复核 | 服务 active，插件 `0.1.0`，1 凭据／13 映射，全部别名带前缀，控制台标题及宿主／插件哈希与原基线一致 | 只证明旧版生产状态保持，没有部署本次新版 |
 
-额度协议绑定 OpenDesign 官方客户端 commit `5a0c47777975ddb91d09c1c16b423a3ef74bf572`，来源和预测定义见 [quota.md](quota.md)。现有推理 Key 的 401、隔离成功以及旧版真实推理成功是三类不同证据。真实 control Key 的余额成功与真实消费采样预测仍未验收；预测不影响 CPA 调度、账号启停或冷却。
+额度协议绑定 OpenDesign 官方客户端 commit `5a0c47777975ddb91d09c1c16b423a3ef74bf572`，来源和预测定义见 [quota.md](quota.md)。现有推理 Key 对控制面的 401、有效 control 授权的直接读取、插件隔离成功与旧版生产推理成功分别记录。真实消费采样预测仍未验收；未为此额外发起计费推理。下载文件标签与生产凭据的身份对应关系尚未确认；预测不影响 CPA 调度、账号启停或冷却。
 
 ## 本地证据索引
 
@@ -108,3 +111,7 @@ Go／Node 测试包含凭据解析重入、写盘失败时不发布新凭据、�
 - `/tmp/open-design-edge-model-final.log`、`/tmp/open-design-edge-quota.log`、`/tmp/open-design-edge-review.log`
 - `/tmp/open-design-visual-updated/`、`/tmp/open-design-visual-quota/`、`/tmp/open-design-visual-review/report.json`
 - `/tmp/open-design-production-readonly-0.2.json`、`/tmp/open-design-ops-0.2.log`
+- `/tmp/open-design-real-quota-20261102.json`、`/tmp/open-design-real-quota-summary-20261102.json`（两账户官方直接只读查询）
+- `/tmp/open-design-go-ops-clarity-0.2.log`、`/tmp/open-design-node-ops-clarity-0.2.log`
+- `/tmp/open-design-visual-quota-ops-clarity/report.json`、`/tmp/open-design-edge-quota-ops-clarity.log`
+- `/tmp/open-design-bookworm-ops-clarity-0.2.log`、`/tmp/open-design-abi-ops-clarity-0.2.json`、`/tmp/open-design-abi-ops-clarity-0.2.log`
