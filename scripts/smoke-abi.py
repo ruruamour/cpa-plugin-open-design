@@ -9,17 +9,29 @@ stream_read/stream_close, host.stream.emit/close), and drives plugin.register,
 management, auth.parse, model.for_auth, executor.execute and
 executor.execute_stream against a loopback fake upstream.
 
-Safety: only a fake fixture key (sk-amr-test-fixture) is used; the only network
-endpoint contacted is a 127.0.0.1 fake server. Temporary data lives in a
-mkdtemp directory that is removed with shutil.rmtree (never `rm -rf`).
-No SSH, production config, real credential or real inference is touched.
+--cpa-live boots the stock local CPA binary instead, routed to the same
+loopback fake through a CONNECT proxy (inference on amr-link, billing on
+amr-api) so the whole path is exercised offline. The management quota route is
+covered by both modes: not_configured never touches the wire, a configured
+credential caches wallet/funding reads and refresh=1 fetches them once behind
+the 60s throttle, and clear_billing drops the cache while inference keeps
+working.
+
+Safety: only fixture secrets are used (sk-amr-test-fixture,
+test-od-control-key-fixture-*); the only endpoints contacted are 127.0.0.1 fake
+servers. Temporary data lives in a mkdtemp directory that is removed with
+shutil.rmtree (never `rm -rf`). No SSH, production config, real credential or
+real inference is touched, and the report records booleans for secrets rather
+than their values.
 """
 from __future__ import annotations
 
 import argparse
 import base64
 import ctypes
+import datetime as dt
 import json
+import re
 import shutil
 import os
 import select
@@ -27,6 +39,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 import tempfile
 import threading
@@ -35,14 +48,125 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 FIXTURE_KEY = "sk-amr-test-fixture"
+# Every control key / workspace is a fixture. A real production control key is
+# never read, accepted or written by this script.
+FIXTURE_CONTROL_KEY = "test-od-control-key-fixture-0123456789"
+FIXTURE_WORKSPACE_ID = "test-workspace"
+# Extra throwaway hostname used only by the cross-origin redirect probe. It is
+# deliberately *not* part of the CONNECT allowlist: that probe needs its own
+# per-probe allow() so "other origins are refused" stays provable.
+REDIRECT_PROBE_HOST = "redirect-probe.example.test"
+OPEN_DESIGN_HOSTS = ("amr-link.open-design.ai", "amr-api.open-design.ai")
+# Only these two origins may ever be tunnelled (plus the probe's own host while
+# that probe runs). Anything else must be refused by the loopback proxy.
+BASE_CONNECT_ALLOW = tuple(h + ":443" for h in OPEN_DESIGN_HOSTS)
+FIXTURE_SANS = OPEN_DESIGN_HOSTS + (REDIRECT_PROBE_HOST,)
 PLUGIN_ID = "open-design"
 API = "/v0/management/" + PLUGIN_ID
 CONSOLE = "/v0/resource/plugins/" + PLUGIN_ID + "/console"
+# Version is asserted against internal/opendesign/types.go instead of a literal,
+# so a release bump does not silently weaken the check.
+TYPES_GO = Path(__file__).resolve().parent.parent / "internal/opendesign/types.go"
 
 
 def require(condition, message):
     if not condition:
         raise AssertionError(message)
+
+
+def expected_version():
+    """Read the single `Version = "x.y.z"` constant from types.go.
+
+    The comparison below still requires metadata/status to equal this value, so a
+    stale binary against a bumped source fails instead of reporting PASS.
+    """
+    source = TYPES_GO.read_text()
+    found = re.findall(r'^\s*Version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', source, re.M)
+    require(len(found) == 1,
+            "expected exactly one Version constant in %s, found %r" % (TYPES_GO, found))
+    return found[0]
+
+
+def parse_rfc3339(value):
+    require(isinstance(value, str), "expected an RFC3339 string, got %r" % (value,))
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return dt.datetime.fromisoformat(text)
+
+
+def assert_keys(value, expected, label):
+    """Require an object to carry exactly the contract's keys.
+
+    Missing, renamed and extra keys all fail: the quota shape is fixed by the
+    published contract, so a lenient subset check would hide a regression.
+    """
+    require(isinstance(value, dict), "%s must be an object, got %r" % (label, value))
+    got, want = set(value), set(expected)
+    require(got == want,
+            "%s keys = %s, want %s" % (label, sorted(got), sorted(want)))
+
+
+def official_billing_fixture():
+    """Official wallet/funding-check payloads (vela-wallet.ts / vela-billing.ts).
+
+    Every value is a fixture. The funding document keeps schemaVersion 1, the
+    exact workspace, modelId:null (the model-less read the official client
+    requires) and real enum/null shapes; no field is guessed.
+    """
+    generated = "2026-11-02T00:00:00Z"
+    return {
+        "wallet": {"balanceUsd": "12.345", "updatedAt": None},
+        "workspace_id": FIXTURE_WORKSPACE_ID,
+        "funding": {
+            "schemaVersion": 1,
+            "workspaceId": FIXTURE_WORKSPACE_ID,
+            "workspaceMemberId": "test-workspace-member",
+            "modelId": None,
+            "generatedAt": generated,
+            "balanceUsd": "12.345",
+            "funding": "coding_plan",
+            "modelCovered": None,
+            "fundingCheck": "available",
+            "codingPlan": {
+                "workspaceId": FIXTURE_WORKSPACE_ID,
+                "generatedAt": generated,
+                "eligible": True,
+                "tier": "plus",
+                "windows": [{
+                    "policyId": "test-5h",
+                    "durationSeconds": 18000,
+                    "resetMode": "anchored_recurring",
+                    "usedCredits": "200",
+                    "limitCredits": "1000",
+                    "remainingCredits": "800",
+                    "windowStart": "2026-11-02T00:00:00Z",
+                    "resetsAt": "2026-11-02T05:00:00Z",
+                }],
+            },
+        },
+    }
+
+
+def billing_reply(billing, name):
+    """Pick (status, payload) for one fake billing route.
+
+    `<name>` is "wallet" or "funding"; the fixture may override
+    `<name>_status`, `<name>_error` (body when non-200) or `<name>_body` (body
+    that must still be sent with 200, e.g. a malformed document).
+    """
+    status = billing.get(name + "_status", 200)
+    if name + "_body" in billing:
+        return status, billing[name + "_body"]
+    if status != 200:
+        return status, billing.get(name + "_error", {"error": "upstream"})
+    return status, billing[name]
+
+
+def billing_hits(origin):
+    """Fake billing-API requests only (the inference origin is counted apart)."""
+    return [r for r in origin.requests
+            if (r.get("host") or "").split(":", 1)[0] == "amr-api.open-design.ai"]
 
 
 # ---------------------------------------------------------------- fake upstream
@@ -54,6 +178,8 @@ class FakeUpstream:
         self.fail = {}          # path suffix -> (status, body)
         self.server = None
         self.port = None
+        # Official-shape billing fixture served on the pinned amr-api host.
+        self.billing = None
 
     def start(self):
         outer = self
@@ -67,6 +193,7 @@ class FakeUpstream:
             def _record(self, body):
                 outer.requests.append({
                     "method": self.command,
+                    "host": self.headers.get("Host"),
                     "path": self.path,
                     "authorization": self.headers.get("Authorization"),
                     "content_type": self.headers.get("Content-Type"),
@@ -86,6 +213,8 @@ class FakeUpstream:
                     if self.path.endswith(suffix):
                         self._buffer(status, payload.encode())
                         return
+                if self._billing():
+                    return
                 if self.path.endswith("/models"):
                     body = {"object": "list", "data": [
                         {"id": "deepseek-v4.1-flash", "object": "model", "owned_by": "opendesign"},
@@ -94,6 +223,24 @@ class FakeUpstream:
                     self._buffer(200, json.dumps(body).encode())
                     return
                 self._buffer(404, b'{"error":{"message":"not found"}}')
+
+            def _billing(self):
+                """Official wallet/funding shapes on the pinned billing origin only."""
+                billing = outer.billing
+                host = (self.headers.get("Host") or "").split(":", 1)[0]
+                if not billing or host != "amr-api.open-design.ai":
+                    return False
+                if self.path == "/api/v1/wallet/balance":
+                    status, payload = billing_reply(billing, "wallet")
+                    self._buffer(status, json.dumps(payload).encode())
+                    return True
+                if self.path == ("/api/v1/workspaces/%s/billing/funding-check"
+                                 % billing["workspace_id"]):
+                    status, payload = billing_reply(billing, "funding")
+                    self._buffer(status, json.dumps(payload).encode())
+                    return True
+                self._buffer(404, b'{"error":{"message":"not found"}}')
+                return True
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
@@ -207,14 +354,17 @@ class FakeHost:
 
     # -- fake upstream transport (mirrors CPA host.http.* semantics) --
     def _http(self, method, url, headers, body):
-        require(url.startswith("https://amr-link.open-design.ai/v1/"),
-                "plugin must call the pinned OpenDesign origin: %s" % url)
-        path = url.split("amr-link.open-design.ai", 1)[1]
+        # Two pinned origins only: inference on amr-link, billing on amr-api.
+        parsed = urllib.parse.urlsplit(url)
+        require(parsed.scheme == "https" and parsed.hostname in OPEN_DESIGN_HOSTS,
+                "plugin must call a pinned OpenDesign origin: %s" % url)
+        origin_name = parsed.hostname
+        path = parsed.path + ("?" + parsed.query if parsed.query else "")
         # Redirect the pinned hostname to the loopback fake without touching DNS.
         # Loopback-only test: this is our own HTTP client, not the plugin's.
         conn = socket.create_connection(("127.0.0.1", self.upstream.port), timeout=5)
         try:
-            hdrs = {"Host": "amr-link.open-design.ai", "Connection": "close"}
+            hdrs = {"Host": origin_name, "Connection": "close"}
             for name, values in (headers or {}).items():
                 hdrs[name] = values[0] if isinstance(values, list) else values
             payload = body or b""
@@ -392,7 +542,7 @@ def env_text(envelope):
 CPA_DEFAULT = "/tmp/cpa-v8.0.48-audit.vMdl5Y/cli-proxy-api"
 
 
-def run_cpa(artifact, binary):
+def run_cpa(artifact, binary, version):
     import subprocess
     import urllib.request
 
@@ -483,7 +633,7 @@ def run_cpa(artifact, binary):
         status, raw, headers = request(API + "/status")
         require(status == 200, "real host status returned %s" % status)
         body = json.loads(raw)
-        require(body["version"] == "0.1.0", body)
+        require(body["version"] == version, body)
         require(FIXTURE_KEY not in raw.decode(), "status leaked the api key")
         evidence["host_status"] = {"version": body["version"],
                                    "base_url": body["base_url"],
@@ -531,17 +681,26 @@ def run_cpa(artifact, binary):
 
 
 # ------------------------------------------- real CPA host + local fake origin
-# End-to-end mode. The plugin keeps its pinned origin
-# https://amr-link.open-design.ai/v1 (no core test hook); the host is steered
-# onto a throwaway local origin purely through CPA configuration:
+# End-to-end mode. The plugin keeps its pinned origins
+# (https://amr-link.open-design.ai/v1 for inference,
+#  https://amr-api.open-design.ai for billing; no core test hook), so the host
+# is steered onto a throwaway local origin purely through CPA configuration:
 #   requests.proxy-url -> loopback HTTP CONNECT proxy -> fake TLS origin
 #   SSL_CERT_FILE      -> test CA trusted only by the CPA child process
+# The proxy's allowlist is the closed set {amr-link, amr-api}:443 plus the
+# redirect probe's own host for the duration of that probe. The leaf cert SANs
+# cover exactly those names; both are asserted in the report.
 # No /etc/hosts, no system trust store and no system proxy are touched.
 
 class LocalProxy:
-    """Loopback HTTP CONNECT proxy that only dials allow-listed destinations."""
+    """Loopback HTTP CONNECT proxy that only dials allow-listed destinations.
 
-    def __init__(self, allow=("amr-link.open-design.ai:443",)):
+    The allowlist is a closed set: the two pinned OpenDesign origins, plus a
+    per-probe host only while that probe runs. Everything else is refused and
+    recorded, which is how "no other egress" is proven.
+    """
+
+    def __init__(self, allow=BASE_CONNECT_ALLOW):
         self.allow = set(allow)
         self.connects = []
         self.refused = []
@@ -611,6 +770,9 @@ class LocalProxy:
     def allow_more(self, target):
         self.allow.add(target)
 
+    def disallow(self, target):
+        self.allow.discard(target)
+
     def stop(self):
         if self.server is not None:
             self.server.shutdown()
@@ -630,6 +792,9 @@ class TlsFakeOrigin:
         self.redirect_to = None
         # When set, /chat/completions answers this (status, body) instead.
         self.fail = None
+        # Official-shape billing fixture (wallet + funding-check). When None the
+        # billing routes answer 404, so an unexpected call is visible.
+        self.billing = None
 
     def start(self):
         outer = self
@@ -682,6 +847,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._record(b"")
+        if self._billing():
+            return
         if (self.path.endswith("/models") and self.owner.redirect_to
                 and (self.headers.get("Host") or "").startswith("amr-link")):
             self._send(307, b'{"error":{"message":"moved"}}',
@@ -694,6 +861,30 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             ]}).encode())
             return
         self._send(404, b'{"error":{"message":"not found"}}')
+
+    def _billing(self):
+        """Serve the fake billing API only on the pinned amr-api origin.
+
+        The wallet/funding responses are the official shapes from
+        vela-wallet.ts / vela-billing.ts / contracts collab.ts. There is no
+        passthrough of the request, query or headers.
+        """
+        billing = self.owner.billing
+        host = (self.headers.get("Host") or "").split(":", 1)[0]
+        if not billing or host != "amr-api.open-design.ai":
+            return False
+        if self.path == "/api/v1/wallet/balance":
+            status, payload = billing_reply(billing, "wallet")
+            self._send(status, json.dumps(payload).encode())
+            return True
+        funding_path = "/api/v1/workspaces/%s/billing/funding-check" % \
+            billing["workspace_id"]
+        if self.path == funding_path:
+            status, payload = billing_reply(billing, "funding")
+            self._send(status, json.dumps(payload).encode())
+            return True
+        self._send(404, b'{"error":{"message":"not found"}}')
+        return True
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -738,7 +929,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(body).encode())
 
 
-def make_test_ca(work, san="amr-link.open-design.ai,redirect-probe.example.test"):
+def make_test_ca(work, san=",".join(FIXTURE_SANS)):
     """Create a throwaway CA + leaf cert for the TLS fake origin (openssl only)."""
     work = Path(work)
     ca_key, ca_crt = work / "ca.key", work / "ca.crt"
@@ -754,8 +945,10 @@ def make_test_ca(work, san="amr-link.open-design.ai,redirect-probe.example.test"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
                     "-subj", "/CN=opendesign smoke test CA",
                     "-keyout", str(ca_key), "-out", str(ca_crt)], **quiet)
+    # -subj splits on commas, so the leaf CN is one hostname; the full
+    # multi-host list lives in subjectAltName where TLS actually looks.
     subprocess.run(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
-                    "-subj", "/CN=%s" % san,
+                    "-subj", "/CN=%s" % san.split(",")[0].strip(),
                     "-keyout", str(leaf_key), "-out", str(leaf_csr)], **quiet)
     subprocess.run(["openssl", "x509", "-req", "-in", str(leaf_csr), "-CA", str(ca_crt),
                     "-CAkey", str(ca_key), "-CAcreateserial", "-days", "2",
@@ -763,7 +956,46 @@ def make_test_ca(work, san="amr-link.open-design.ai,redirect-probe.example.test"
     return ca_crt, leaf_crt, leaf_key
 
 
-def run_cpa_live(artifact, binary):
+def assert_cert_sans(cert_path):
+    """Require the throwaway leaf to carry exactly the fixture SAN set.
+
+    TLS hostname verification is what makes the fake origin transparent, so the
+    cert must cover both pinned OpenDesign hosts (plus the redirect probe host).
+    """
+    text = subprocess.run(["openssl", "x509", "-in", str(cert_path), "-noout", "-text"],
+                          check=True, capture_output=True).stdout.decode()
+    match = re.search(r"X509v3 Subject Alternative Name:\s*\n\s*(.+)", text)
+    require(match is not None, "leaf certificate has no subjectAltName")
+    names = [item.strip().split(":", 1)[1]
+             for item in match.group(1).split(",") if item.strip().startswith("DNS:")]
+    require(sorted(names) == sorted(FIXTURE_SANS),
+            "leaf SAN = %r, want %r" % (names, list(FIXTURE_SANS)))
+    return names
+
+
+def probe_proxy_refusal(proxy):
+    """Prove the loopback proxy enforces its allowlist (harness self-check).
+
+    A raw CONNECT to a host that is not the pinned OpenDesign origins must be
+    answered with 403 and never tunnelled. Loopback only: this is our own client
+    talking to our own proxy, not the plugin and not the internet.
+    """
+    target = "registry.npmjs.org:443"
+    require(target not in proxy.allow, "refusal probe host is allow-listed")
+    with socket.create_connection(("127.0.0.1", proxy.port), timeout=10) as conn:
+        conn.sendall(("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n"
+                      % (target, target)).encode())
+        status_line = conn.recv(4096).split(b"\r\n", 1)[0].decode(errors="replace")
+    refused = target in proxy.refused
+    tunnelled = target in proxy.connects
+    require(refused and not tunnelled,
+            "proxy did not refuse %s (status=%r refused=%r tunnelled=%r)"
+            % (target, status_line, refused, tunnelled))
+    return {"target": target, "status_line": status_line, "refused": refused,
+            "tunnelled": tunnelled}
+
+
+def run_cpa_live(artifact, binary, version):
     """Boot real CPA against a loopback CONNECT proxy + private-CA TLS fake origin."""
     binary = Path(binary).resolve()
     require(binary.is_file(), "CPA binary not found: %s" % binary)
@@ -774,6 +1006,7 @@ def run_cpa_live(artifact, binary):
     log = None
     try:
         ca_crt, leaf_crt, leaf_key = make_test_ca(work)
+        sans = assert_cert_sans(leaf_crt)
         origin = TlsFakeOrigin(leaf_crt, leaf_key)
         proxy = LocalProxy()
         proxy.origin_port = None
@@ -862,6 +1095,14 @@ def run_cpa_live(artifact, binary):
             raise AssertionError("CPA never registered the plugin; log: %s" % (work / "cpa.log"))
 
         stage_failures = []
+
+        # The allowlist is a closed set and this proves it is enforced, so
+        # "the plugin only reached amr-link/amr-api" is evidence, not a claim.
+        evidence["proxy_allowlist"] = {
+            "allow": sorted(proxy.allow),
+            "cert_sans": sans,
+            "refusal": probe_proxy_refusal(proxy),
+        }
 
         # ---------------- standard UI flow ----------------
         # 1. add the key first, exactly like the console does.
@@ -1018,7 +1259,7 @@ def run_cpa_live(artifact, binary):
         # case therefore gets a fresh host, credential and model mapping.
         evidence["host_http_status"] = {}
         for code in (429, 401):
-            case = run_cpa_live_error(binary, artifact, code)
+            case = run_cpa_live_error(binary, artifact, code, version)
             evidence["host_http_status"][str(code)] = case
 
         # ---- 6. disable -> enable must resync the runtime ----
@@ -1068,12 +1309,27 @@ def run_cpa_live(artifact, binary):
                     "after re-enable the alias is not callable: %s %s"
                     % (code_, body_.decode(errors="replace")[:160]))
 
+        # ---- quota / billing API over the real host transport ----
+        # Placed before the redirect probe and the delete: the credential must
+        # still be live and the proxy allowlist still the steady-state set.
+        evidence["host_quota"] = run_quota_live(
+            request, origin, proxy, credential_id, client_models, work / "auths")
+
         # ---- host HTTP redirect: is Authorization re-sent across origins? ----
         # Must run BEFORE the delete: a removed credential makes the
         # /upstream-models call fail locally, so the first hop would never reach
         # the fake origin and "not followed" would be a false conclusion.
         evidence["host_http_redirect"] = probe_redirect(
-            request, origin, proxy, credential_id, proxy.allow_more)
+            request, origin, proxy, credential_id, proxy.allow_more,
+            proxy.disallow)
+        # The probe's throwaway host must be gone again: the steady-state
+        # allowlist is exactly the two pinned OpenDesign origins.
+        evidence["host_http_redirect"]["allowlist_restored"] = (
+            set(proxy.allow) == set(BASE_CONNECT_ALLOW))
+        if set(proxy.allow) != set(BASE_CONNECT_ALLOW):
+            stage_failures.append(
+                "proxy allowlist not restored after the redirect probe: %s"
+                % sorted(proxy.allow))
 
         status, raw, _ = request(API + "/credentials?id=" + credential_id, method="DELETE")
         require(status == 200, "deleted credential returned %s: %s" % (status, raw))
@@ -1103,9 +1359,23 @@ def run_cpa_live(artifact, binary):
             stage_failures.append(
                 "deleted credential is still callable: %s" % unreachable)
 
+        # Quota state must not outlive the credential either.
+        try:
+            status, raw, _ = request(API + "/quota?credential_id=" + credential_id)
+        except urllib.error.HTTPError as exc:
+            status, raw = exc.code, exc.read()
+        evidence["host_credential_delete"]["quota_after_delete"] = {
+            "status": status, "body_head": raw.decode(errors="replace")[:120]}
+        if status != 404:
+            stage_failures.append(
+                "quota for a deleted credential returned %s, want 404" % status)
+        if FIXTURE_CONTROL_KEY in raw.decode(errors="replace"):
+            stage_failures.append("deleted-credential quota response leaked the control key")
+
         # ---- final verdict: a blocked or skipped leg can never become PASS ----
         blockers = sorted(name for name in (
-            "host_upstream_models", "host_chat_completions", "host_chat_stream")
+            "host_upstream_models", "host_chat_completions", "host_chat_stream",
+            "host_quota")
             if evidence.get(name, {}).get("status") == "FAIL")
         for code, case in (evidence.get("host_http_status") or {}).items():
             if case.get("status") != "PASS":
@@ -1135,17 +1405,350 @@ def run_cpa_live(artifact, binary):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def run_cpa_live_error(binary, artifact, code):
+def run_quota_live(request, origin, proxy, credential_id, client_models, auth_dir):
+    """Optional billing/quota flow against the real host and the fake billing API.
+
+    Every value here is a fixture. No production control key is read; the only
+    control key that exists is FIXTURE_CONTROL_KEY, and it must never come back
+    in a status/list/model/console/client/quota response, only as a boolean fact.
+
+    Network expectations are asserted as deltas of requests that actually
+    reached the fake amr-api origin, so "no network" is evidence, not a claim.
+    """
+    result = {"status": "FAIL"}
+    fixture = official_billing_fixture()
+    origin.billing = fixture
+
+    def hits():
+        return billing_hits(origin)
+
+    def call(path, body=None, method=None, timeout=90):
+        try:
+            return request(path, body=body, method=method, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read(), dict(exc.headers or {})
+
+    def no_control_key(raw, label):
+        text = raw.decode(errors="replace") if isinstance(raw, bytes) else raw
+        require(FIXTURE_CONTROL_KEY not in text,
+                "%s response leaked the control key" % label)
+
+    def quota(query, label):
+        status, raw, _ = call(API + "/quota?" + query)
+        require(status == 200, "quota %s returned %s: %s" % (label, status, raw[:300]))
+        no_control_key(raw, "quota " + label)
+        body = json.loads(raw)
+        assert_keys(body, ["credential_id", "billing_configured", "workspace_id",
+                           "state", "fetched_at", "next_refresh_at", "wallet",
+                           "funding"], "quota %s" % label)
+        for part in ("wallet", "funding"):
+            assert_keys(body[part], ["state", "fetched_at", "data", "error"],
+                        "quota %s.%s" % (label, part))
+        return body
+
+    def no_billing_network(before, label):
+        require(len(hits()) == before,
+                "%s issued %d unexpected billing request(s): %r"
+                % (label, len(hits()) - before,
+                   [(h["host"], h["path"]) for h in hits()[before:]]))
+
+    # ---- 1. legacy credential without a control key: never touches the wire ----
+    before = len(hits())
+    old = quota("credential_id=" + credential_id, "legacy")
+    require(old["state"] == "not_configured", old)
+    require(old["billing_configured"] is False, old)
+    require(old["workspace_id"] == "", old)
+    require(old["wallet"]["state"] == "not_configured", old["wallet"])
+    require(old["funding"]["state"] == "not_configured", old["funding"])
+    for part in ("wallet", "funding"):
+        require(old[part]["data"] is None and old[part]["error"] is None, old[part])
+        require(old[part]["fetched_at"] is None, old[part])
+    require(old["fetched_at"] is None and old["next_refresh_at"] is None, old)
+    old_refresh = quota("credential_id=%s&refresh=1" % credential_id, "legacy-refresh")
+    require(old_refresh["state"] == "not_configured", old_refresh)
+    no_billing_network(before, "unconfigured quota")
+    require("amr-api.open-design.ai:443" not in proxy.connects,
+            "a billing CONNECT happened without a configured control key")
+    result["not_configured"] = {
+        "state": old["state"], "billing_requests": 0,
+        "connect_to_billing_origin": False}
+
+    # ---- 2. empty label/api_key update must preserve both; then set billing ----
+    status, raw, _ = call(API + "/credentials", method="POST",
+                          body={"id": credential_id, "label": "", "api_key": ""})
+    require(status == 200, "empty-label update returned %s: %s" % (status, raw[:300]))
+    no_control_key(raw, "credential update")
+    require(json.loads(raw)["label"] == "fixture", raw.decode()[:200])
+    require(FIXTURE_KEY not in raw.decode(), "credential update leaked the api key")
+    result["empty_update"] = {"status": 200, "label_preserved": True,
+                              "api_key_echoed": False}
+
+    status, raw, _ = call(API + "/credentials", method="POST", body={
+        "id": credential_id, "label": "", "api_key": "",
+        "control_key": FIXTURE_CONTROL_KEY, "workspace_id": FIXTURE_WORKSPACE_ID})
+    require(status == 200, "billing configure returned %s: %s" % (status, raw[:300]))
+    no_control_key(raw, "billing configure")
+    configured = json.loads(raw)
+    require(configured["billing_configured"] is True, configured)
+    require(configured["workspace_id"] == FIXTURE_WORKSPACE_ID, configured)
+    require(configured["label"] == "fixture", configured)
+
+    # Secrets live only in the CPA auth-dir behind host.auth.save; nothing that
+    # a browser or client can reach may carry them.
+    stored = [f.read_text() for f in sorted(Path(auth_dir).glob("*.json"))]
+    require(stored and any(FIXTURE_CONTROL_KEY in text for text in stored),
+            "control key did not land in the CPA auth-dir")
+    require(any(FIXTURE_KEY in text for text in stored),
+            "empty api_key update dropped the inference key")
+    for label, path in (("status", API + "/status"),
+                        ("credentials", API + "/credentials"),
+                        ("models", API + "/models"),
+                        ("console", CONSOLE)):
+        status, raw, _ = call(path)
+        require(status == 200, "%s returned %s" % (label, status))
+        no_control_key(raw, label)
+    status, raw, _ = call("/v1/models")
+    require(status == 200, "client model list returned %s" % status)
+    no_control_key(raw, "client model list")
+
+    # A newly configured credential is needs_refresh, not a guessed balance, and
+    # an ordinary GET still must not open a connection.
+    before = len(hits())
+    pending = quota("credential_id=" + credential_id, "configured")
+    require(pending["state"] == "needs_refresh", pending)
+    require(pending["billing_configured"] is True, pending)
+    require(pending["wallet"]["state"] == "needs_refresh", pending["wallet"])
+    require(pending["funding"]["state"] == "needs_refresh", pending["funding"])
+    require(pending["wallet"]["data"] is None, pending["wallet"])
+    no_billing_network(before, "plain GET before refresh")
+    result["configure"] = {"billing_configured": True, "workspace_id_set": True,
+                           "control_key_in_auth_dir": True,
+                           "control_key_in_responses": False,
+                           "initial_state": pending["state"]}
+
+    # ---- 3. first refresh=1 is the only place that hits the fake billing API --
+    before = len(hits())
+    first = quota("credential_id=%s&refresh=1" % credential_id, "first-refresh")
+    require(first["state"] == "available", first)
+    require(first["wallet"]["state"] == "available", first["wallet"])
+    require(first["funding"]["state"] == "available", first["funding"])
+    wallet = first["wallet"]["data"]
+    assert_keys(wallet, ["balanceUsd", "updatedAt"], "wallet.data")
+    require(wallet["balanceUsd"] == "12.345", wallet)
+    require(wallet["updatedAt"] is None, wallet)
+    funding = first["funding"]["data"]
+    assert_keys(funding, ["balanceUsd", "funding", "modelCovered", "fundingCheck",
+                          "codingPlan"], "funding.data")
+    assert_keys(funding["codingPlan"], ["tier", "windows"], "funding.codingPlan")
+    require(funding["balanceUsd"] == "12.345", funding)
+    require(funding["funding"] == "coding_plan", funding)
+    require(funding["modelCovered"] is None, funding)
+    require(funding["fundingCheck"] == "available", funding)
+    require(funding["codingPlan"]["tier"] == "plus", funding)
+    windows = funding["codingPlan"]["windows"]
+    require(len(windows) == 1, windows)
+    window = windows[0]
+    assert_keys(window, ["policyId", "durationSeconds", "resetMode", "usedCredits",
+                         "limitCredits", "remainingCredits", "windowStart",
+                         "resetsAt", "forecast"], "funding window")
+    require(window["policyId"] == "test-5h", window)
+    require(window["durationSeconds"] == 18000, window)
+    require(window["resetMode"] == "anchored_recurring", window)
+    require(window["usedCredits"] == "200", window)
+    require(window["limitCredits"] == "1000", window)
+    require(window["remainingCredits"] == "800", window)
+    require(window["windowStart"] == "2026-11-02T00:00:00Z", window)
+    require(window["resetsAt"] == "2026-11-02T05:00:00Z", window)
+    assert_keys(window["forecast"], ["state"], "funding window forecast")
+    require(window["forecast"]["state"] == "insufficient_samples", window["forecast"])
+    require(first["fetched_at"] is not None and first["next_refresh_at"] is not None,
+            first)
+    require(parse_rfc3339(first["fetched_at"]) <= parse_rfc3339(first["next_refresh_at"]),
+            first)
+    require(first["wallet"]["fetched_at"] == first["fetched_at"], first)
+    require(first["funding"]["fetched_at"] is not None, first["funding"])
+    require(first["wallet"]["error"] is None and first["funding"]["error"] is None, first)
+    # The refresh interval is the contract's 60 seconds. fetched_at is stamped
+    # after the read, so only a bounded window can be asserted without sleeping.
+    refresh_window = (parse_rfc3339(first["next_refresh_at"])
+                      - parse_rfc3339(first["wallet"]["fetched_at"])).total_seconds()
+    require(55 <= refresh_window <= 60,
+            "next_refresh_at is %.1fs after fetched_at, want the 60s throttle window"
+            % refresh_window)
+
+    # A billing read that only half-succeeded would show up as a partial state.
+    require(first["state"] == "available",
+            "wallet+funding were both expected available, got %r" % first["state"])
+    fresh = hits()[before:]
+    require(len(fresh) == 2,
+            "first refresh issued %d billing request(s), want 2: %r"
+            % (len(fresh), [(h["host"], h["path"]) for h in fresh]))
+    wallet_hits = [h for h in fresh if h["path"] == "/api/v1/wallet/balance"]
+    funding_hits = [h for h in fresh
+                    if h["path"] == "/api/v1/workspaces/%s/billing/funding-check"
+                    % FIXTURE_WORKSPACE_ID]
+    require(len(wallet_hits) == 1 and len(funding_hits) == 1, fresh)
+    for hit in fresh:
+        require(hit["host"].split(":", 1)[0] == "amr-api.open-design.ai", hit)
+        require(hit["tls"], "billing request was not TLS: %r" % hit)
+        require(hit["method"] == "GET", hit)
+        require(hit["authorization"] == "Bearer " + FIXTURE_CONTROL_KEY,
+                "billing request did not carry the control bearer (header redacted)")
+        require("modelId=" not in hit["path"],
+                "model-less funding read must not send modelId: %r" % hit["path"])
+    require("amr-api.open-design.ai:443" in proxy.connects,
+            "billing request did not go through the CONNECT proxy")
+    result["first_refresh"] = {
+        "state": first["state"], "wallet_balance": wallet["balanceUsd"],
+        "updated_at_null": True, "tier": funding["codingPlan"]["tier"],
+        "window_used": window["usedCredits"], "window_limit": window["limitCredits"],
+        "window_remaining": window["remainingCredits"],
+        "forecast": window["forecast"]["state"], "billing_requests": 2,
+        "control_bearer": True, "via_connect": True, "tls": True,
+        "model_id_param_sent": False}
+    first_next = first["next_refresh_at"]
+    first_fetched = first["fetched_at"]
+
+    # ---- 4. plain GET and an immediate refresh are served from cache ----
+    after_first = len(hits())
+    cached = quota("credential_id=" + credential_id, "cached")
+    require(cached["state"] == "available", cached)
+    require(cached["fetched_at"] == first_fetched, cached)
+    require(cached["wallet"]["data"] == wallet, cached["wallet"])
+    throttled = quota("credential_id=%s&refresh=1" % credential_id, "throttled")
+    require(throttled["state"] == "available", throttled)
+    require(throttled["fetched_at"] == first_fetched, throttled)
+    require(throttled["next_refresh_at"] == first_next, throttled)
+    require(throttled["wallet"]["data"] == wallet, throttled["wallet"])
+    require(throttled["funding"]["data"] == funding, throttled["funding"])
+    no_billing_network(after_first, "cached/immediate refresh")
+    result["cache"] = {"plain_get_requests": 0, "immediate_refresh_requests": 0,
+                       "next_refresh_at_present": True, "state": throttled["state"]}
+
+    # ---- 5. clear_billing drops the cache but never the inference key/alias ----
+    before = len(hits())
+    status, raw, _ = call(API + "/credentials", method="POST", body={
+        "id": credential_id, "clear_billing": True})
+    require(status == 200, "clear_billing returned %s: %s" % (status, raw[:300]))
+    no_control_key(raw, "clear_billing")
+    cleared = json.loads(raw)
+    require(cleared["billing_configured"] is False, cleared)
+    require(cleared["workspace_id"] == "", cleared)
+    require(cleared["label"] == "fixture", cleared)
+    for query in ("credential_id=" + credential_id,
+                  "credential_id=%s&refresh=1" % credential_id):
+        after_clear = quota(query, "after-clear")
+        require(after_clear["state"] == "not_configured", after_clear)
+        require(after_clear["billing_configured"] is False, after_clear)
+        for part in ("wallet", "funding"):
+            require(after_clear[part]["data"] is None, after_clear[part])
+            require(after_clear[part]["fetched_at"] is None, after_clear[part])
+        require(after_clear["fetched_at"] is None, after_clear)
+        require("12.345" not in json.dumps(after_clear),
+                "cleared quota still exposed cached billing data")
+    no_billing_network(before, "clear_billing quota")
+    stored = [f.read_text() for f in sorted(Path(auth_dir).glob("*.json"))]
+    require(any(FIXTURE_KEY in text for text in stored),
+            "clear_billing dropped the inference key")
+    require(not any(FIXTURE_CONTROL_KEY in text for text in stored),
+            "clear_billing left the control key in the auth-dir")
+    seen_after_clear = client_models(want=("deepseek-flash",))
+    require("deepseek-flash" in (seen_after_clear or []),
+            "clear_billing withdrew the alias: %s" % seen_after_clear)
+    try:
+        code_, body_, _ = request("/v1/chat/completions", {
+            "model": "deepseek-flash",
+            "messages": [{"role": "user", "content": "after clear_billing"}],
+            "stream": False})
+    except urllib.error.HTTPError as exc:
+        code_, body_ = exc.code, exc.read()
+    require(code_ == 200,
+            "inference stopped working after clear_billing: %s %s"
+            % (code_, body_.decode(errors="replace")[:160]))
+    require(json.loads(body_)["choices"][0]["message"]["content"] == "Hello",
+            "inference after clear_billing returned an unexpected body")
+    no_control_key(body_, "client chat completion after clear_billing")
+    result["clear_billing"] = {
+        "billing_configured": False, "cached_data_dropped": True,
+        "billing_requests": 0, "inference_key_retained": True,
+        "alias_retained": "deepseek-flash" in (seen_after_clear or []),
+        "inference_after_clear": code_ == 200}
+
+    # ---- 6. explicit upstream failures are classified, never accepted ----
+    # Each case needs its own credential: a first failed attempt still starts the
+    # 60s throttle, and the contract forbids treating a throttled read as a fresh
+    # query. First-error shape (state=error, data/fetched_at null) is what the
+    # live harness can prove without waiting; the stale-after-success transition
+    # needs a clock, so it is covered by the Go fake-clock tests.
+    defects = []
+
+    def scratch_credential(suffix):
+        status, raw, _ = call(API + "/credentials", method="POST",
+                              body={"label": "err-" + suffix, "api_key": FIXTURE_KEY})
+        require(status == 201, "scratch credential create returned %s" % status)
+        created = json.loads(raw)["id"]
+        control = FIXTURE_CONTROL_KEY + "-" + suffix
+        defects.append(control)
+        status, raw, _ = call(API + "/credentials", method="POST", body={
+            "id": created, "control_key": control,
+            "workspace_id": FIXTURE_WORKSPACE_ID})
+        require(status == 200, "scratch billing configure returned %s" % status)
+        return created
+
+    failure_cases = [
+        ("forbidden", {"funding_status": 403,
+                       "funding_error": {"error": "forbidden"}}, "funding", "forbidden"),
+        ("unauthorized", {"wallet_status": 401,
+                          "wallet_error": {"error": "unauthorized"}}, "wallet", "unauthorized"),
+        ("malformed", {"funding_body": {"schemaVersion": 1,
+                                        "workspaceId": FIXTURE_WORKSPACE_ID}},
+         "funding", "malformed"),
+    ]
+    error_evidence = {}
+    for name, override, component, kind in failure_cases:
+        scratch = scratch_credential(name)
+        origin.billing = dict(official_billing_fixture(), **override)
+        try:
+            body = quota("credential_id=%s&refresh=1" % scratch, "error-" + name)
+        finally:
+            origin.billing = fixture
+        part = body[component]
+        require(part["state"] == "error",
+                "%s did not surface as a component error: %s" % (name, part))
+        require(part["data"] is None and part["fetched_at"] is None,
+                "%s invented data/fetched_at on a first failure: %s" % (name, part))
+        require(part["error"] and part["error"]["kind"] == kind,
+                "%s error kind = %r, want %r" % (name, part["error"], kind))
+        assert_keys(part["error"], ["kind", "message"], "%s error" % name)
+        for secret in defects:
+            require(secret not in json.dumps(body),
+                    "%s quota leaked a control key" % name)
+        require(body["state"] in ("partial", "error"),
+                "%s top-level state = %r" % (name, body["state"]))
+        error_evidence[name] = {"component": component, "kind": part["error"]["kind"],
+                                "data_null": True, "state": body["state"]}
+        status, raw, _ = call(API + "/credentials?id=" + scratch, method="DELETE")
+        require(status == 200, "scratch credential delete returned %s" % status)
+    remaining = list(Path(auth_dir).glob("*.json"))
+    require(len(remaining) == 1,
+            "scratch credentials left behind %r" % [f.name for f in remaining])
+    result["error_classification"] = error_evidence
+
+    result["status"] = "PASS"
+    return result
+
+
+def run_cpa_live_error(binary, artifact, code, version):
     """One upstream error status, in a throwaway CPA process.
 
     CPA cools a credential down after a real 401/429, so statuses cannot share a
     process. Each call boots its own host, credential and mapping, and asserts
     the request actually reached the fake upstream before judging the status.
     """
-    return _live_case(binary, artifact, fail_status=code)
+    return _live_case(binary, artifact, version, fail_status=code)
 
 
-def _live_case(binary, artifact, fail_status=None):
+def _live_case(binary, artifact, version, fail_status=None):
     work = Path(tempfile.mkdtemp(prefix="opendesign-cpa-case-"))
     process = proxy = origin = log = None
     result = {"status": "FAIL"}
@@ -1272,7 +1875,7 @@ def _live_case(binary, artifact, fail_status=None):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def probe_redirect(request, origin, proxy, credential_id, allow_redirect_host):
+def probe_redirect(request, origin, proxy, credential_id, allow_redirect_host, disallow_host=None):
     """Ask the real host to follow a 307 to a *different* origin and see whether
     the bearer key is re-sent. Both hosts reach the same loopback fake origin
     through the same CONNECT proxy, so nothing can leave the box.
@@ -1281,6 +1884,9 @@ def probe_redirect(request, origin, proxy, credential_id, allow_redirect_host):
     307 request with the bearer token, the probe FAILS. It must never be reported
     as "the host refused to follow the redirect", which is what a locally
     rejected call (e.g. a deleted credential) would otherwise look like.
+
+    The probe host is allow-listed only for the duration of this call, so the
+    proxy's steady-state allowlist stays the two pinned OpenDesign origins.
     """
     target = "https://redirect-probe.example.test/v1/models"
     allow_redirect_host("redirect-probe.example.test:443")
@@ -1331,6 +1937,8 @@ def probe_redirect(request, origin, proxy, credential_id, allow_redirect_host):
         return result
     finally:
         origin.redirect_to = None
+        if disallow_host is not None:
+            disallow_host("redirect-probe.example.test:443")
 
 
 def _dechunk(raw):
@@ -1392,8 +2000,10 @@ class Plugin:
 
 
 # --------------------------------------------------------------------- scenario
-def run(artifact):
-    upstream = FakeUpstream().start()
+def run(artifact, version):
+    upstream = FakeUpstream()
+    upstream.billing = official_billing_fixture()
+    upstream.start()
     work = Path(tempfile.mkdtemp(prefix="opendesign-abi-"))
     evidence = {}
     plugin = None
@@ -1430,7 +2040,7 @@ def run(artifact):
         registration = plugin.call("plugin.register", {
             "schema_version": 6, "config_yaml": base64.b64encode(yaml.encode()).decode()})
         require(registration["schema_version"] == 6, registration)
-        require(registration["metadata"]["Version"] == "0.1.0", registration["metadata"])
+        require(registration["metadata"]["Version"] == version, registration["metadata"])
         evidence["registration"] = {"name": registration["metadata"]["Name"],
                                     "version": registration["metadata"]["Version"],
                                     "capabilities": sorted(registration["capabilities"])}
@@ -1441,7 +2051,7 @@ def run(artifact):
         status, raw, _ = plugin.management(API + "/status")
         require(status == 200, "status route returned %s" % status)
         body = json.loads(raw)
-        require(body["version"] == "0.1.0", body)
+        require(body["version"] == version, body)
         require(body["base_url"] == "https://amr-link.open-design.ai/v1", body)
         require(body["models"] == [] and body["credentials"] == [], body)
         evidence["status_before"] = body
@@ -1610,6 +2220,9 @@ def run(artifact):
         upstream.fail.clear()
         evidence["http_status"] = statuses
 
+        # ---- management quota through the fake ctypes host ----
+        evidence["quota_host"] = run_quota_ctypes(plugin, host, upstream, credential_id)
+
         # Shutdown must close host streams and stay idempotent.
         plugin.shutdown()
         plugin = None
@@ -1629,6 +2242,167 @@ def run(artifact):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def run_quota_ctypes(plugin, host, upstream, credential_id):
+    """Quota management routes against the ctypes fake host.
+
+    This is the engine-independent half of the quota verification: a single fake
+    credential JSON is read through host.auth.save/list, so no key ever needs to
+    reach a real account. Network effects are asserted as deltas of the requests
+    that actually reached the loopback fake origin, which mirrors CPA's
+    host.http.do schema (StatusCode/Headers/Body, base64 body).
+    """
+    result = {"status": "FAIL"}
+    ledger = []
+
+    def count():
+        return len(ledger)
+
+    # Wrap dispatch so billing requests are visible regardless of host schema.
+    original_dispatch = host.dispatch
+
+    def dispatch(name, payload):
+        before = len(upstream.requests)
+        try:
+            return original_dispatch(name, payload)
+        finally:
+            if name in ("host.http.do", "host.http.do_stream"):
+                # Only billing traffic counts; inference calls share this fake.
+                ledger.extend(r for r in upstream.requests[before:]
+                              if (r.get("host") or "").split(":", 1)[0]
+                              == "amr-api.open-design.ai")
+
+    host.dispatch = dispatch
+    try:
+        def quota(query, label, want_state):
+            # CPA dispatches by exact PATH and carries parameters separately, so
+            # the query goes through the request's Query map, not the path.
+            status, raw, _ = plugin.management(
+                API + "/quota", query={k: [v] for k, v in
+                                       urllib.parse.parse_qsl(query)})
+            require(status == 200,
+                    "quota %s returned %s: %s" % (label, status, raw[:300]))
+            text = raw.decode()
+            require(FIXTURE_CONTROL_KEY not in text,
+                    "quota %s leaked the control key" % label)
+            body = json.loads(raw)
+            assert_keys(body, ["credential_id", "billing_configured", "workspace_id",
+                               "state", "fetched_at", "next_refresh_at", "wallet",
+                               "funding"], "quota %s" % label)
+            for part in ("wallet", "funding"):
+                assert_keys(body[part], ["state", "fetched_at", "data", "error"],
+                            "quota %s.%s" % (label, part))
+            require(body["state"] == want_state,
+                    "quota %s state = %r, want %r: %s"
+                    % (label, body["state"], want_state, raw[:300]))
+            return body
+
+        # 1. not configured: no network at all, on GET and on refresh=1.
+        base = count()
+        legacy = quota("credential_id=" + credential_id, "legacy", "not_configured")
+        require(legacy["billing_configured"] is False, legacy)
+        require(legacy["wallet"]["state"] == "not_configured", legacy["wallet"])
+        require(legacy["funding"]["state"] == "not_configured", legacy["funding"])
+        require(legacy["wallet"]["data"] is None and legacy["funding"]["data"] is None,
+                legacy)
+        quota("credential_id=%s&refresh=1" % credential_id, "legacy-refresh",
+              "not_configured")
+        require(count() == base,
+                "unconfigured quota reached the upstream: %r"
+                % [(r["path"], r["authorization"]) for r in ledger[base:]])
+
+        # 2. configure billing; a plain GET must not fetch.
+        status, raw, _ = plugin.management(API + "/credentials", method="POST", body={
+            "id": credential_id, "label": "", "api_key": "",
+            "control_key": FIXTURE_CONTROL_KEY, "workspace_id": FIXTURE_WORKSPACE_ID})
+        require(status == 200, "ctypes billing configure returned %s: %s"
+                % (status, raw[:300]))
+        require(FIXTURE_CONTROL_KEY not in raw.decode(), "configure leaked the control key")
+        configured = json.loads(raw)
+        require(configured["billing_configured"] is True, configured)
+        require(json.loads(plugin.management(API + "/status")[1])
+                ["credentials"][0]["billing_configured"] is True,
+                "status did not report billing_configured")
+        pending = quota("credential_id=" + credential_id, "needs_refresh", "needs_refresh")
+        require(pending["wallet"]["state"] == "needs_refresh", pending["wallet"])
+        require(count() == base, "plain GET fetched quota without refresh=1")
+
+        # 3. refresh=1 asks wallet + funding on the pinned billing origin only.
+        first = quota("credential_id=%s&refresh=1" % credential_id, "first", "available")
+        fresh = ledger[base:]
+        require(len(fresh) == 2, "expected wallet+funding, got %r"
+                % [(r["path"], r["authorization"]) for r in fresh])
+        require(sum(1 for r in fresh if r["path"] == "/api/v1/wallet/balance") == 1, fresh)
+        require(sum(1 for r in fresh
+                    if r["path"].endswith("/billing/funding-check")) == 1, fresh)
+        for request_ in fresh:
+            require(request_["authorization"] == "Bearer " + FIXTURE_CONTROL_KEY,
+                    "billing request lost the control bearer")
+            require(not request_.get("body"),
+                    "billing GET unexpectedly carried a request body")
+        wallet = first["wallet"]["data"]
+        require(wallet["balanceUsd"] == "12.345" and wallet["updatedAt"] is None, wallet)
+        funding = first["funding"]["data"]
+        require(funding["codingPlan"]["tier"] == "plus", funding)
+        require(funding["modelCovered"] is None and funding["fundingCheck"] == "available",
+                funding)
+        window = funding["codingPlan"]["windows"][0]
+        require(window["forecast"] == {"state": "insufficient_samples"}, window)
+
+        # 4. cached GET and an immediate refresh are served without the wire.
+        after = count()
+        cache = quota("credential_id=" + credential_id, "cached", "available")
+        throttled = quota("credential_id=%s&refresh=1" % credential_id,
+                          "throttled", "available")
+        require(cache["fetched_at"] == first["fetched_at"], cache)
+        require(throttled["fetched_at"] == first["fetched_at"], throttled)
+        require(throttled["next_refresh_at"] == first["next_refresh_at"], throttled)
+        require(count() == after, "cached/throttled quota touched the upstream")
+
+        # 5. clear_billing drops cache, keeps the inference key.
+        status, raw, _ = plugin.management(API + "/credentials", method="POST", body={
+            "id": credential_id, "clear_billing": True})
+        require(status == 200, "clear_billing returned %s: %s" % (status, raw[:300]))
+        require(json.loads(raw)["billing_configured"] is False, raw.decode()[:200])
+        after = count()
+        cleared = quota("credential_id=" + credential_id, "cleared", "not_configured")
+        require("12.345" not in json.dumps(cleared), "cleared quota kept cached data")
+        quota("credential_id=%s&refresh=1" % credential_id, "cleared-refresh",
+              "not_configured")
+        require(count() == after, "cleared quota touched the upstream")
+        stored = host.auth_files[credential_id + ".json"]
+        require(stored.get("api_key") == FIXTURE_KEY, "clear_billing dropped the api key")
+        require("control_key" not in stored, "clear_billing kept the control key")
+        require(upstream.requests and any(
+            r["path"].endswith("/chat/completions") for r in upstream.requests),
+            "inference traffic vanished before the clear_billing check")
+
+        result.update({
+            "status": "PASS",
+            "not_configured_no_network": True,
+            "callback_failures": list(host.callback_failures),
+            "configured_visibility": {"billing_configured": True,
+                                      "workspace_id_set": True,
+                                      "control_key_in_responses": False},
+            "first_refresh": {
+                "wallet_balance": wallet["balanceUsd"], "updated_at_null": True,
+                "tier": funding["codingPlan"]["tier"],
+                "forecast": window["forecast"]["state"],
+                "billing_requests": 2, "control_bearer": True},
+            "cache": {"plain_get_requests": 0, "immediate_refresh_requests": 0,
+                      "next_refresh_at_present": True},
+            "clear_billing": {"cached_data_dropped": True, "billing_requests": 0,
+                              "inference_key_retained": True},
+        })
+        require(not host.callback_failures,
+                "fake host callback raised during quota: %s" % host.callback_failures)
+        return result
+    except AssertionError as exc:
+        result["failure"] = str(exc)[:400]
+        return result
+    finally:
+        host.dispatch = original_dispatch
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", help="path to dist/open-design.so")
@@ -1644,17 +2418,22 @@ def main():
     args = parser.parse_args()
     artifact = Path(args.artifact).resolve()
     require(artifact.is_file(), "artifact not found: %s" % artifact)
+    try:
+        version = expected_version()
+    except (AssertionError, OSError) as exc:
+        print("FAIL: cannot determine the expected plugin version: %s" % exc)
+        return 1
     evidence = {}
     failure = None
     try:
-        evidence = run(artifact)
+        evidence = run(artifact, version)
     except AssertionError as exc:
         failure = str(exc)
         evidence = {"ctypes": {"status": "FAIL", "failure": failure[:600]}}
     if args.cpa_binary:
-        evidence["cpa_host"] = run_cpa(artifact, args.cpa_binary)
+        evidence["cpa_host"] = run_cpa(artifact, args.cpa_binary, version)
     if args.cpa_live:
-        evidence["cpa_live"] = run_cpa_live(artifact, args.cpa_live)
+        evidence["cpa_live"] = run_cpa_live(artifact, args.cpa_live, version)
     if args.json_report:
         Path(args.json_report).write_text(json.dumps(evidence, indent=2) + "\n")
     if failure:

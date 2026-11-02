@@ -13,18 +13,21 @@
 | `host.http.do_stream` / `stream_read` / `stream_close` | 流式请求，多 chunk，含拆包的 SSE 帧；结果字段为 CPA 的 `status_code`/`stream_id`/`payload`/`done`（这两类 RPC 在 CPA 里有显式 json tag，与 `host.http.do` 不同） |
 | `host.stream.emit` / `host.stream.close` | 下游帧输出与终止 |
 
-上游是 `127.0.0.1` 上的假 OpenAI 兼容服务，**不访问外网**。`host.http.*` 收到的 URL 必须仍是固定 origin `https://amr-link.open-design.ai/v1/`（插件不允许改 base_url），假宿主只在本机 TCP 上把该 origin 改投到 loopback 端口。
+上游是 `127.0.0.1` 上的假 OpenAI 兼容服务，**不访问外网**。`host.http.*` 收到的 URL 只允许两个固定 origin：推理 `https://amr-link.open-design.ai/v1/`（插件不允许改 base_url）与额度 `https://amr-api.open-design.ai/`；假宿主只在本机 TCP 上按 `Host` 把这两个 origin 改投到 loopback 端口。
 
 断言重点：
 
-- ABI v1 初始化、`plugin.register` 身份（`OpenDesign` / `0.1.0`）、`management.register` 路由；
+- ABI v1 初始化、`plugin.register` 身份（`OpenDesign` / `0.2.0`）、`management.register` 路由；
 - 假 Key `sk-amr-test-fixture` 只经 `host.auth.save` 落到 auth-dir，`/status`、`/credentials`、错误信封都不回显；
 - `auth.parse`、`model.for_auth` 的凭据导入与模型映射；
 - `executor.execute`：上游收到 `model=deepseek-v4.1-flash`（别名映射生效）、`Authorization: Bearer <key>`、`tools` 未被丢弃，返回 JSON 含 `usage`；
 - `executor.execute_stream`：4 个多 chunk 帧、`delta`/`finish_reason`/`usage` 完整，`Metadata.request_path=/v1/chat/completions` 时输出**裸 JSON 帧**（不加 `data:` 前缀，对应 CPA Chat Completions 语义）；
 - 同一条流在 `request_path=/v1/messages` 时输出**带 `data: ...\n\n` 的 SSE 帧**（对应 CPA Claude 路由语义）；
 - 上游 401/429 经 RPC 信封保留真实 `http_status`，且不泄漏 Key；
-- 流结束后 `host.http.stream_close` 与 `host.stream.close` 都被调用，`shutdown` 幂等。
+- 流结束后 `host.http.stream_close` 与 `host.stream.close` 都被调用，`shutdown` 幂等；
+- 额度（`quota_host`）：未配置 controlKey 的凭据 GET/refresh 都是 `not_configured` 且**零**上游请求；配置后普通 GET 只读缓存，`refresh=1` 才各取一次 `wallet/balance` 与 `workspace/{id}/billing/funding-check`（带 control bearer），响应形状按官方 `WorkspaceBillingPreflight` 严格逐字段校验（含 `modelId:null`、`updatedAt:null`、窗口 `forecast=insufficient_samples`）；立即再 refresh 命中 60 秒节流、不联网；`clear_billing` 后旧缓存不可用且不再联网，推理 key 保留。
+
+额度断言只做「首次样本 = `insufficient_samples`」这类不需要等待的判断；真正的预测要两个相隔 ≥60 秒的成功样本，由 Go 侧 fake clock 单测覆盖，冒烟脚本不会为了它 sleep 一分钟。
 
 用法：
 
@@ -73,8 +76,8 @@ python3 scripts/smoke-abi.py dist/open-design.so --cpa-live
 `--cpa-binary` 只能覆盖不联网的路径，因为 `/upstream-models` 和 `/chat/completions` 会真的打到 `amr-link.open-design.ai`。本模式不改 core（base_url 仍固定在官方 origin），而是纯用 CPA 自己的配置把出站流量接到本机：
 
 1. `requests.proxy-url: http://127.0.0.1:<port>` —— 只监听 loopback 的 HTTP CONNECT 代理；
-2. 代理只允许 `amr-link.open-design.ai:443`（重定向探针额外放行 `redirect-probe.example.test:443`），其余一律 403 并记入 `connect_refused`；
-3. CONNECT 隧道接到本机 TLS 假上游，证书由一次性 CA 签发（SAN 含上述两个主机名）；
+2. 代理只允许 `amr-link.open-design.ai:443` 与 `amr-api.open-design.ai:443`，其余一律 403 并记入 `connect_refused`；重定向探针只在探针执行期间临时放行 `redirect-probe.example.test:443`，结束后恢复原 allowlist（报告里 `allowlist_restored` 为硬性要求）；
+3. CONNECT 隧道接到本机 TLS 假上游，证书由一次性 CA 签发（SAN 含两个 OpenDesign 主机名与探针主机名，脚本用 `openssl x509` 读回并逐项校验）；
 4. `SSL_CERT_FILE` 只设在 CPA 子进程环境里，**不动** `/etc/hosts`、系统信任库和系统代理；
 5. 发请求用 CPA 客户端 key（`/v1/*`）和管理 key（`/v0/*`），凭据仍是 `sk-amr-test-fixture`。
 
@@ -86,8 +89,9 @@ python3 scripts/smoke-abi.py dist/open-design.so --cpa-live
 4. `/v1/chat/completions` 非流式（`tools` 转发 + `usage`）与流式 SSE 多帧，模型别名要还原成客户端名；
 5. `disabled:true` 后 `/v1/models` 收回别名，`disabled:false` 后恢复且可再次调用；
 6. 跨源重定向（**在删除之前**跑，凭据必须仍然可用）：假上游对 `/models` 回 307 指向另一个测试 origin，观察宿主是否把 `Authorization` 带过去；
-7. `DELETE /credentials?id=` 后不可调用、且不应再出现在模型列表；
-8. 上游 401 与 429 **各起一个独立 CPA 进程**（真实 401 会让 CPA 冷却凭据，同进程里第二个用例会被宿主以 `auth_unavailable` 挡下、证明不了插件行为），每个用例都断言请求确实到达假上游。
+7. 额度流程（`host_quota`，在删除之前跑）：旧凭据 `not_configured` 零联网 → 空 `label`/`api_key` 更新保留原值 → 写入 controlKey/workspaceId（只落 auth-dir，status/credentials/models/console/`/v1/models`/quota 及客户端响应都不回显）→ 首次 `refresh=1` 校验官网形状与真实数字/窗口并断言只发生 2 次、均带 control bearer 且经 CONNECT 与 TLS、不带 `modelId` → 普通 GET 与立即 refresh 走缓存且 `next_refresh_at` 保持 → `clear_billing` 后缓存清空、不再联网，推理 key 与别名仍可用（再次真实推理返回 200）→ 另外用独立临时凭据覆盖 401/403/畸形响应被分别归类为 `unauthorized`/`forbidden`/`malformed`，`data`/`fetched_at` 保持 null，不宽松接受；
+8. `DELETE /credentials?id=` 后不可调用、且不应再出现在模型列表，`GET /quota` 对已删除凭据返回 404；
+9. 上游 401 与 429 **各起一个独立 CPA 进程**（真实 401 会让 CPA 冷却凭据，同进程里第二个用例会被宿主以 `auth_unavailable` 挡下、证明不了插件行为），每个用例都断言请求确实到达假上游。
 
 实测结论（CPA v8.0.48）：跨源 307 **会被跟随**，但 `Authorization` **会被剥掉**（`host_http_redirect.verdict = "Authorization stripped across origin"`），即宿主不会把 bearer key 带到别的 origin；`registry.npmjs.org:443` 的 CONNECT 被代理拒绝，证明没有其它出站。
 
