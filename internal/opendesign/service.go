@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -31,6 +32,9 @@ type Service struct {
 	cfg          Config
 	creds        map[string]Credential
 	billingEpoch map[string]uint64 // guarded by mu; changes on either key/workspace replacement or clear/delete
+	quota        map[string]*quotaEntry
+	quotaSlots   chan struct{}
+	quotaNow     func() time.Time
 	authFiles    map[string]string
 	revoked      map[string]bool
 	host         HostCall
@@ -50,6 +54,9 @@ func NewService() *Service {
 		cfg:          defaultConfig(),
 		creds:        map[string]Credential{},
 		billingEpoch: map[string]uint64{},
+		quota:        map[string]*quotaEntry{},
+		quotaSlots:   make(chan struct{}, 3),
+		quotaNow:     time.Now,
 		authFiles:    map[string]string{},
 		revoked:      map[string]bool{},
 		streams:      map[string]struct{}{},

@@ -217,6 +217,10 @@ func (s *Service) storeCredentialLocked(c Credential) {
 
 func (s *Service) invalidateBillingLocked(id string) {
 	s.billingEpoch[id]++
+	if entry := s.quota[id]; entry != nil {
+		close(entry.invalidated)
+		delete(s.quota, id)
+	}
 }
 
 func jsonBytes(v any) []byte {
