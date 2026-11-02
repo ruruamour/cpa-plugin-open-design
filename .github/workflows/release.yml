@@ -49,6 +49,8 @@ jobs:
             -e CGO_ENABLED=1 -e GOOS=linux -e GOARCH=amd64 \
             golang:1.26-bookworm sh -ec \
             'go test ./... && go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags="-s -w" -o dist/open-design.so ./cmd/passbridge'
+      - name: Exercise native plugin ABI with a local upstream
+        run: python3 scripts/smoke-abi.py dist/open-design.so
       - name: Package Linux amd64
         shell: bash
         run: |
@@ -77,6 +79,8 @@ jobs:
             -e CGO_ENABLED=1 -e GOOS=linux -e GOARCH=arm64 \
             golang:1.26-bookworm sh -ec \
             'go test ./... && go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags="-s -w" -o dist/open-design.so ./cmd/passbridge'
+      - name: Exercise native plugin ABI with a local upstream
+        run: python3 scripts/smoke-abi.py dist/open-design.so
       - name: Package Linux arm64
         shell: bash
         run: |

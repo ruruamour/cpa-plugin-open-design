@@ -20,7 +20,7 @@ OpenDesign 生产接口：
 | 模型列表 | `GET /models` |
 | 对话 | `POST /chat/completions` |
 
-插件默认固定上述官方 origin，避免把用户 key 导向其他域名。请求使用 OpenAI 兼容的 Chat Completions 结构。
+插件固定上述官方 origin，拒绝自定义初始请求地址；后续重定向由 CPA 宿主处理。CPA 8.0.48 本地跨域 307 测试确认跳转会被跟随、`Authorization` 会被剥离，不能据此声称插件禁止所有重定向。请求使用 OpenAI 兼容的 Chat Completions 结构。
 
 协议行为参考：
 
@@ -39,7 +39,7 @@ OpenDesign 生产接口：
 - API key 保存在 CPA 的 `auth-dir`，通过 `host.auth.save` 写入；插件设置不保存 key，状态接口不回显 key。
 - 管理接口按 CPA 精确路由契约提供：`GET /credentials` 列出账户；`POST /credentials` 创建或更新，body 为 `{id?, label?, api_key?, disabled?}`；`DELETE /credentials?id=<id>` 按查询参数删除，不使用 `/credentials/{id}`。
 - 模型列表由管理页调用 OpenDesign `GET /models` 获取，用户选择后保存为客户端模型到上游模型的映射。
-- 插件状态、映射和管理日志保存在插件数据目录。容器部署时应持久化 CPA 插件目录、CPA 的 `auth-dir` 和该数据目录。
+- 模型映射保存在插件数据目录；获取的上游模型列表不持久化。容器部署时应持久化 CPA 插件目录、CPA 的 `auth-dir` 和该数据目录。
 - 管理页沿用 CPA 管理认证。手动输入的管理密钥按 CPA 管理页的现有方式处理，不写入 OpenDesign key 存储。
 
 ## 模型映射
@@ -56,14 +56,17 @@ OpenDesign 生产接口：
 需要 Go 1.26、CGO 和 C 编译器。
 
 ```bash
-# 运行继承自上游的 Node 测试
+# 运行管理页及保留的上游 Node 测试
 make test-js
 
-# 运行 Go 测试
+# 运行 Node + Go 测试
 make test
 
 # 生成 dist/open-design.so（Linux amd64，C shared ABI v1）
 make build
+
+# 构建并运行原生 ABI、本地假上游验证
+make smoke
 
 # 或使用 Dockerfile.build
 make docker
@@ -93,8 +96,9 @@ plugins:
 
 - 真实上游验证仍受有效凭据限制：对生产地址仅执行过两次 `GET /models`，均返回 `401 invalid_api_key`（`api key not found`）。
 - 尚未完成真实 `POST /chat/completions` 推理验证，因此不能标记“真实推理通过”。
-- `internal/opendesign` 的单元测试和本地 ABI 加载验证，待 Provider 并入主线并完成最终构建后补充准确命令和结果。
-- 继承的 `tests/*.test.cjs` 和现有 Go 测试可继续运行；这些测试不等同于新 Provider 的集成或真实上游验证。
+- `go test -race ./...` 和 `go vet ./...` 已通过；Node 测试 79 项通过，含新管理页 16 项。
+- 使用本地 CPA 8.0.48 和 loopback CONNECT/TLS 假上游验证插件加载、模型发现、JSON/SSE、工具调用及 usage；临时 CA 只传入测试子进程，不修改系统信任库或 hosts。控制台两条路径另有 146 项临时 Edge 浏览器检查。
+- [验证脚本说明](../scripts/README.md) 区分 ctypes 假宿主、真实 CPA 管理路径、真实 CPA 配合本地假上游三种模式。它们验证宿主兼容性，真实 OpenDesign 的模型与推理仍需有效凭据。
 
 ## 发布 tag
 

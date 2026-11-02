@@ -59,23 +59,24 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 
 ## 安全模型
 
-- 默认固定 OpenDesign 官方生产地址 `https://amr-link.open-design.ai/v1`，避免把 Bearer key 转发到其他域名。
+- 默认固定 OpenDesign 官方生产地址 `https://amr-link.open-design.ai/v1`，不接受自定义上游地址。后续 HTTP 重定向由 CPA 宿主处理；本地 CPA 8.0.48 的跨域 307 测试确认其会跟随跳转并去掉 `Authorization`，这不等于插件禁止所有重定向。
 - API key 只保存在 CPA 的 `auth-dir`，通过 `host.auth.save` 写入；插件设置中不保存 key，状态接口不回显 key。
 - 模型列表和映射保存在插件数据目录。日志、截图和提交中不要包含 key。
 - 当前 fork 使用公开 ABI，不修改、不打包也不发布 CPA 宿主。
 
 ## 模型映射
 
-管理页从 OpenDesign `GET /models` 获取可用模型。保存映射后，客户端请求 `model` 填客户端名称，插件将其转换为已保存的上游模型 ID，再调用 `POST /chat/completions`。未保存的模型名不会自动透传。
+管理页从 OpenDesign `GET /models` 获取可用模型。保存映射后，插件同步刷新 CPA 的凭据模型注册；客户端请求 `model` 填客户端名称，插件将其转换为已保存的上游模型 ID，再调用 `POST /chat/completions`。未保存的模型名不会自动透传。
 
 ## 构建
 
 需要 Go 1.26、CGO 和 C 编译器。仓库提供 Makefile：
 
 ```bash
-make test-js   # 现有上游 Node 测试
-make test      # Go 测试
+make test-js   # 管理页与保留的上游 Node 测试
+make test      # Node + Go 测试
 make build     # 生成 dist/open-design.so
+make smoke     # 构建后运行原生 ABI 与本地假上游验证
 make docker    # 使用 Dockerfile.build 构建 Linux amd64 共享库
 ```
 
@@ -95,8 +96,9 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 - 真实上游验证仍受有效凭据限制：目前对生产地址只执行过两次 `GET /models`，均返回 `401 invalid_api_key`（`api key not found`）。
 - 尚未完成真实 `POST /chat/completions` 推理验证，不能据此标记“真实推理通过”。
-- `internal/opendesign` 的单元测试与本地 ABI 加载验证，待并入主线后补充准确命令和结果。
-- 从上游继承的 `tests/*.test.cjs` 与现有 Go 测试可继续运行；这不等于新 Provider 已通过集成验证。
+- `go test -race ./...`、`go vet ./...` 通过；Node 测试 79 项通过，其中 16 项覆盖新管理页。
+- 独立临时 Edge 浏览器对两条控制台路径完成 146 项检查，覆盖账户增删启停、模型映射、密钥输入清空、文本注入防护和迟到响应。
+- 本地 CPA 8.0.48 已加载共享库；通过仅允许测试主机的 loopback CONNECT 代理和临时 CA，验证模型发现、JSON/SSE、工具调用及 usage。所有这些请求使用假凭据和本地假上游，操作方法见 [验证脚本](scripts/README.md)。
 
 ## 文档与来源
 

@@ -8,7 +8,7 @@ VERSION ?= 0.1.0
 DIST ?= dist
 LIBRARY := $(DIST)/open-design.so
 
-.PHONY: all build test test-js test-go docker clean
+.PHONY: all build test test-js test-go smoke docker clean
 
 all: test build
 
@@ -25,6 +25,9 @@ test-js:
 
 test-go:
 	$(GO) test ./...
+
+smoke: build
+	python3 scripts/smoke-abi.py $(LIBRARY)
 
 docker:
 	docker build --platform linux/amd64 --file Dockerfile.build --output type=local,dest=$(DIST) .

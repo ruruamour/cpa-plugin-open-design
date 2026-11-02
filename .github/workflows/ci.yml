@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Run inherited management UI tests
+      - name: Run management UI tests
         run: node --test tests/*.test.cjs
       - name: Run Go tests
         run: go test ./...
@@ -42,3 +42,10 @@ jobs:
           set -euo pipefail
           test -f dist/open-design.so
           file dist/open-design.so | grep -q 'ELF 64-bit.*x86-64'
+      - name: Exercise native plugin ABI with a local upstream
+        run: python3 scripts/smoke-abi.py dist/open-design.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: open-design-linux-amd64
+          path: dist/open-design.so
+          if-no-files-found: error
