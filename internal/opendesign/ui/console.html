@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="cpa-api-base" content="/v0/management/open-design">
+  <title>OpenDesign Bridge · 管理</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f6f8;
+      --surface: #ffffff;
+      --surface-2: #f0f2f5;
+      --ink: #1d2430;
+      --muted: #667085;
+      --line: #d8dde5;
+      --accent: #1f6feb;
+      --accent-ink: #ffffff;
+      --danger: #b42318;
+      --good: #087443;
+      --radius: 10px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #151a21;
+      --surface: #1c232c;
+      --surface-2: #232b35;
+      --ink: #e8edf3;
+      --muted: #a8b3c2;
+      --line: #37414e;
+      --accent: #6ea8ff;
+      --accent-ink: #0e1520;
+      --danger: #ff9b8f;
+      --good: #6ee7b7;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: 21px; }
+    h2 { font-size: 16px; }
+    h3 { font-size: 14px; }
+    button, input, select { font: inherit; }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    [hidden] { display: none !important; }
+    .shell { max-width: 1040px; margin: 0 auto; padding: 22px clamp(14px, 3vw, 32px) 48px; }
+    .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-bottom: 8px; }
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .mark { width: 30px; height: 30px; flex: none; border-radius: 8px; background: linear-gradient(135deg, var(--accent), #7c5cff); }
+    .version { color: var(--muted); font-size: 12px; }
+    .badge { display: inline-flex; align-items: center; min-height: 22px; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .badge.good, .badge.on { background: color-mix(in srgb, var(--good) 16%, var(--surface)); color: var(--good); }
+    .badge.off { background: color-mix(in srgb, var(--danger) 14%, var(--surface)); color: var(--danger); }
+    .lead { color: var(--muted); margin: 0 0 20px; max-width: 760px; }
+    .lead code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
+    .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 18px; }
+    .panel-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 14px; margin-bottom: 14px; }
+    .hint { color: var(--muted); font-size: 12px; }
+    .stack { display: grid; gap: 12px; }
+    .inline { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
+    .field { display: grid; gap: 5px; min-width: 0; flex: 1 1 210px; }
+    .field > span { color: var(--muted); font-size: 12px; }
+    .control { width: 100%; min-height: 38px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); }
+    .control::placeholder { color: var(--muted); }
+    .button { min-height: 38px; padding: 7px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); font-weight: 600; white-space: nowrap; }
+    .button:hover:not(:disabled) { border-color: var(--accent); }
+    .button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+    .button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); background: transparent; }
+    .button.compact { min-height: 30px; padding: 3px 9px; font-size: 12px; }
+    .check { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+    .check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+    .rows { display: grid; gap: 8px; }
+    .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
+    .row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; min-width: 0; }
+    .row-main .name { font-weight: 600; overflow-wrap: anywhere; }
+    .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .mapping-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
+    .mapping-row .field { flex: 1 1 190px; }
+    .mapping-row .arrow { align-self: center; color: var(--muted); padding-bottom: 6px; }
+    .upstream { display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: center; gap: 6px 10px; }
+    .upstream .mono { overflow-wrap: anywhere; }
+    .upstream .muted { grid-column: 2; font-size: 12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12.5px; }
+    .muted { color: var(--muted); }
+    .empty { padding: 18px 12px; text-align: center; color: var(--muted); }
+    .state { margin-top: 10px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+    .state.error { color: var(--danger); }
+    .state.ok { color: var(--good); }
+    .url { overflow-wrap: anywhere; }
+    .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+    @media (max-width: 760px) {
+      .split { grid-template-columns: minmax(0, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="topbar">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <h1>OpenDesign Bridge</h1>
+          <div class="version" id="version">版本 --</div>
+        </div>
+      </div>
+      <span class="badge" id="authBadge">未验证</span>
+    </div>
+    <p class="lead">
+      通过 CPA 接入 OpenDesign Cloud 模型 API。默认上游地址为
+      <code class="url" id="baseUrl">https://amr-link.open-design.ai/v1</code>。
+      账户密钥只保存在 CPA 的凭据目录，本页不会持久化 OpenDesign API key。
+    </p>
+
+    <section class="panel" aria-labelledby="authTitle">
+      <div class="panel-head">
+        <div>
+          <h2 id="authTitle">管理密钥</h2>
+          <p class="hint">用于访问 CPA 的 resource console 管理接口。可复用同源 CPA 已保存的登录，也可在下方输入当前入口的管理密钥；验证通过后才会保存。</p>
+        </div>
+      </div>
+      <form class="stack" id="authForm" autocomplete="off">
+        <div class="inline">
+          <label class="field">
+            <span>请求头</span>
+            <select class="control" id="authType">
+              <option value="bearer">Authorization: Bearer</option>
+              <option value="x-management-key">X-Management-Key</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>管理密钥</span>
+            <input class="control" id="managementKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="当前 CPA 入口的管理密钥">
+          </label>
+          <button class="button primary" id="authSubmit" type="submit">验证并进入</button>
+          <button class="button" id="authClear" type="button">清除本页密钥</button>
+        </div>
+        <label class="check" style="max-width: 360px;">
+          <input id="rememberAuth" type="checkbox">
+          在此浏览器记住管理密钥
+        </label>
+        <p class="state" id="authState" role="status" aria-live="polite" hidden></p>
+      </form>
+    </section>
+
+    <section class="panel" id="accountsPanel" aria-labelledby="accountsTitle" hidden>
+      <div class="panel-head">
+        <div>
+          <h2 id="accountsTitle">账户</h2>
+          <p class="hint">账户列表只显示标签、启用状态和操作；API key 不会回显。</p>
+        </div>
+        <span class="badge" id="accountCount">0 个账户</span>
+      </div>
+      <form class="stack" id="accountForm" autocomplete="off">
+        <div class="inline">
+          <label class="field">
+            <span>标签</span>
+            <input class="control" id="accountLabel" maxlength="100" placeholder="例如：主账户" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>OpenDesign API key</span>
+            <input class="control" id="accountKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign Cloud API key">
+          </label>
+          <button class="button primary" id="accountSubmit" type="submit">添加账户</button>
+        </div>
+        <p class="state" id="accountState" role="status" aria-live="polite" hidden></p>
+      </form>
+      <div class="rows" id="accountList" style="margin-top: 14px;" aria-live="polite"></div>
+    </section>
+
+    <section class="panel" id="modelsPanel" aria-labelledby="modelsTitle" hidden>
+      <div class="panel-head">
+        <div>
+          <h2 id="modelsTitle">模型映射</h2>
+          <p class="hint">选择一个账户读取 OpenDesign 模型列表，勾选要暴露的模型，设置对外别名和上游 ID 后保存。</p>
+        </div>
+      </div>
+      <div class="split">
+        <div class="stack">
+          <div class="panel-head" style="margin-bottom: 0;">
+            <h3>上游模型</h3>
+            <span class="hint">来自 OpenDesign <span class="mono">GET /models</span></span>
+          </div>
+          <div class="inline">
+            <label class="field">
+              <span>账户</span>
+              <select class="control" id="modelCredential">
+                <option value="">请选择账户</option>
+              </select>
+            </label>
+            <button class="button" id="fetchModels" type="button">获取模型列表</button>
+          </div>
+          <p class="state" id="modelState" role="status" aria-live="polite" hidden></p>
+          <div class="rows" id="upstreamList" aria-live="polite">
+            <p class="empty">选择账户后点击「获取模型列表」。</p>
+          </div>
+        </div>
+        <div class="stack">
+          <div class="panel-head" style="margin-bottom: 0;">
+            <h3>对外模型</h3>
+            <button class="button compact" id="addMapping" type="button">手动添加一行</button>
+          </div>
+          <div class="rows" id="mappingList" aria-live="polite">
+            <p class="empty">还没有模型映射。</p>
+          </div>
+          <div>
+            <button class="button primary" id="saveModels" type="button">保存模型映射</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    /*__OPEN_DESIGN_AUTH__*/
+  </script>
+  <script>
+    /*__OPEN_DESIGN_CORE__*/
+  </script>
+  <script>
+    /*__OPEN_DESIGN_API__*/
+  </script>
+  <script>
+    /*__OPEN_DESIGN_CONSOLE__*/
+  </script>
+</body>
+</html>
