@@ -2,16 +2,15 @@
   "schema_version": 1,
   "plugins": [
     {
-      "id": "clinepassbridge",
-      "name": "ClinePassBridge",
-      "logo": "https://raw.githubusercontent.com/xiao-qiu-qiu/ClinePassBridge/main/logo.png",
-      "description": "将 Cline Pass 接入 CPA，支持多凭据管理、模型映射与上游选择、统一错误规则、额度耗尽自动暂停、流式与非流式调用及请求日志。实验性通用代理池默认关闭，支持标准 HTTP / HTTPS / SOCKS5 代理。 / Connect Cline Pass to CPA with multi-credential management, model mapping and provider selection, shared error rules, automatic quota pause, streaming and non-streaming requests, and request logs. The experimental general-purpose proxy pool is off by default and supports standard HTTP / HTTPS / SOCKS5 proxies.",
-      "author": "xiao-qiu-qiu",
-      "version": "0.4.3",
-      "repository": "https://github.com/xiao-qiu-qiu/ClinePassBridge",
-      "homepage": "https://github.com/xiao-qiu-qiu/ClinePassBridge",
+      "id": "open-design",
+      "name": "OpenDesign",
+      "description": "将 OpenDesign 接入 CPA：管理 API key、获取并映射模型，通过 OpenAI 兼容接口发起流式与非流式请求。 / Connect OpenDesign to CPA with API key management, model discovery and mapping, plus streaming and non-streaming OpenAI-compatible requests.",
+      "author": "ruruamour",
+      "version": "0.1.0",
+      "repository": "https://github.com/ruruamour/cpa-plugin-open-design",
+      "homepage": "https://github.com/ruruamour/cpa-plugin-open-design",
       "license": "MIT",
-      "tags": ["cline-pass", "provider", "streaming"],
+      "tags": ["open-design", "opendesign", "provider", "streaming"],
       "install": {"type": "github-release"}
     }
   ]

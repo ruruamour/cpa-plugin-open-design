@@ -1,12 +1,9 @@
-name: Build and release plugins
+name: Release OpenDesign plugin
 
 on:
   push:
-    branches:
-      - '**'
     tags:
-      - 'v*'
-  pull_request:
+      - 'open-design-v*'
 
 permissions:
   contents: read
@@ -31,10 +28,10 @@ jobs:
           version="$(jq -r '.plugins[0].version' marketplace/registry.json)"
           test -n "$version"
           test "$version" != null
-          jq -e '.schema_version == 1 and .plugins[0].id == "clinepassbridge" and .plugins[0].install.type == "github-release"' marketplace/registry.json
-          grep -Fqx "const Version = \"$version\"" internal/bridge/types.go
+          jq -e '.schema_version == 1 and .plugins[0].id == "open-design" and .plugins[0].install.type == "github-release"' marketplace/registry.json
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            test "$GITHUB_REF_NAME" = "v$version"
+            grep -Rqs -m1 -F "Version = \"$version\"" internal/opendesign
+            test "$GITHUB_REF_NAME" = "open-design-v$version"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -43,25 +40,27 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Test on Debian 12
+      - name: Test and build Debian 12 shared library
+        shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p dist
           docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src \
             -e CGO_ENABLED=1 -e GOOS=linux -e GOARCH=amd64 \
-            golang:1.26-bookworm go test ./internal/bridge
-      - name: Build Debian 12 shared library
-        run: docker build --platform linux/amd64 --file Dockerfile.build --output type=local,dest=dist .
+            golang:1.26-bookworm sh -ec \
+            'go test ./... && go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags="-s -w" -o dist/open-design.so ./cmd/passbridge'
       - name: Package Linux amd64
         shell: bash
         run: |
           set -euo pipefail
-          file dist/clinepassbridge.so | grep -q 'ELF 64-bit.*x86-64'
-          archive="dist/clinepassbridge_${{ needs.metadata.outputs.version }}_linux_amd64.zip"
-          zip -j "$archive" dist/clinepassbridge.so
-          test "$(unzip -Z1 "$archive")" = clinepassbridge.so
+          file dist/open-design.so | grep -q 'ELF 64-bit.*x86-64'
+          archive="dist/open-design_${{ needs.metadata.outputs.version }}_linux_amd64.zip"
+          zip -j "$archive" dist/open-design.so
+          test "$(unzip -Z1 "$archive")" = open-design.so
       - uses: actions/upload-artifact@v4
         with:
           name: package-linux-amd64
-          path: dist/clinepassbridge_*.zip
+          path: dist/open-design_*.zip
           if-no-files-found: error
 
   linux-arm64:
@@ -69,7 +68,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - name: Test and build on Debian 12 arm64
+      - name: Test and build Debian 12 arm64 shared library
         shell: bash
         run: |
           set -euo pipefail
@@ -77,19 +76,19 @@ jobs:
           docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src \
             -e CGO_ENABLED=1 -e GOOS=linux -e GOARCH=arm64 \
             golang:1.26-bookworm sh -ec \
-            'go test ./internal/bridge && go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags="-s -w" -o dist/clinepassbridge.so ./cmd/passbridge'
+            'go test ./... && go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags="-s -w" -o dist/open-design.so ./cmd/passbridge'
       - name: Package Linux arm64
         shell: bash
         run: |
           set -euo pipefail
-          file dist/clinepassbridge.so | grep -Eiq 'ELF 64-bit.*(aarch64|ARM)'
-          archive="dist/clinepassbridge_${{ needs.metadata.outputs.version }}_linux_arm64.zip"
-          zip -j "$archive" dist/clinepassbridge.so
-          test "$(unzip -Z1 "$archive")" = clinepassbridge.so
+          file dist/open-design.so | grep -Eiq 'ELF 64-bit.*(aarch64|ARM)'
+          archive="dist/open-design_${{ needs.metadata.outputs.version }}_linux_arm64.zip"
+          zip -j "$archive" dist/open-design.so
+          test "$(unzip -Z1 "$archive")" = open-design.so
       - uses: actions/upload-artifact@v4
         with:
           name: package-linux-arm64
-          path: dist/clinepassbridge_*.zip
+          path: dist/open-design_*.zip
           if-no-files-found: error
 
   darwin:
@@ -118,22 +117,22 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           set -euo pipefail
-          go test ./internal/bridge
+          go test ./...
           mkdir -p dist
           go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags='-s -w' \
-            -o dist/clinepassbridge.dylib ./cmd/passbridge
+            -o dist/open-design.dylib ./cmd/passbridge
       - name: Package macOS library
         shell: bash
         run: |
           set -euo pipefail
-          test "$(lipo -archs dist/clinepassbridge.dylib)" = '${{ matrix.machine }}'
-          archive="dist/clinepassbridge_${{ needs.metadata.outputs.version }}_darwin_${{ matrix.goarch }}.zip"
-          zip -j "$archive" dist/clinepassbridge.dylib
-          test "$(unzip -Z1 "$archive")" = clinepassbridge.dylib
+          test "$(lipo -archs dist/open-design.dylib)" = '${{ matrix.machine }}'
+          archive="dist/open-design_${{ needs.metadata.outputs.version }}_darwin_${{ matrix.goarch }}.zip"
+          zip -j "$archive" dist/open-design.dylib
+          test "$(unzip -Z1 "$archive")" = open-design.dylib
       - uses: actions/upload-artifact@v4
         with:
           name: package-darwin-${{ matrix.goarch }}
-          path: dist/clinepassbridge_*.zip
+          path: dist/open-design_*.zip
           if-no-files-found: error
 
   windows-amd64:
@@ -167,26 +166,26 @@ jobs:
           CC: gcc
         run: |
           gcc --version
-          go test ./internal/bridge
+          go test ./...
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags='-s -w' -o dist/clinepassbridge.dll ./cmd/passbridge
+          go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags='-s -w' -o dist/open-design.dll ./cmd/passbridge
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package Windows amd64
         shell: pwsh
         run: |
-          $library = 'dist/clinepassbridge.dll'
+          $library = 'dist/open-design.dll'
           $bytes = [IO.File]::ReadAllBytes((Resolve-Path $library).Path)
           $offset = [BitConverter]::ToInt32($bytes, 0x3c)
           if ([BitConverter]::ToUInt32($bytes, $offset) -ne 0x00004550 -or [BitConverter]::ToUInt16($bytes, $offset + 4) -ne 0x8664) {
             throw 'Library is not a Windows amd64 PE file'
           }
-          $archive = "dist/clinepassbridge_${{ needs.metadata.outputs.version }}_windows_amd64.zip"
+          $archive = "dist/open-design_${{ needs.metadata.outputs.version }}_windows_amd64.zip"
           Compress-Archive -LiteralPath $library -DestinationPath $archive
           $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $archive).Path)
           try {
-            if ($zip.Entries.Count -ne 1 -or $zip.Entries[0].FullName -ne 'clinepassbridge.dll') {
-              throw 'ZIP must contain clinepassbridge.dll at its root'
+            if ($zip.Entries.Count -ne 1 -or $zip.Entries[0].FullName -ne 'open-design.dll') {
+              throw 'ZIP must contain open-design.dll at its root'
             }
           } finally {
             $zip.Dispose()
@@ -194,11 +193,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: package-windows-amd64
-          path: dist/clinepassbridge_*.zip
+          path: dist/open-design_*.zip
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'xiao-qiu-qiu/ClinePassBridge'
+    if: startsWith(github.ref, 'refs/tags/open-design-v') && github.repository == 'ruruamour/cpa-plugin-open-design'
     needs: [metadata, linux-amd64, linux-arm64, darwin, windows-amd64]
     runs-on: ubuntu-24.04
     permissions:
@@ -219,11 +218,11 @@ jobs:
           for spec in linux_amd64:so linux_arm64:so darwin_amd64:dylib darwin_arm64:dylib windows_amd64:dll; do
             platform="${spec%%:*}"
             extension="${spec#*:}"
-            archive="clinepassbridge_${version}_${platform}.zip"
+            archive="open-design_${version}_${platform}.zip"
             test -f "$archive"
-            test "$(unzip -Z1 "$archive")" = "clinepassbridge.$extension"
+            test "$(unzip -Z1 "$archive")" = "open-design.$extension"
           done
-          sha256sum clinepassbridge_*.zip > checksums.txt
+          sha256sum open-design_*.zip > checksums.txt
           sha256sum -c checksums.txt
       - name: Publish GitHub release
         shell: bash
@@ -232,7 +231,7 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/clinepassbridge_*.zip dist/checksums.txt --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$GITHUB_REF_NAME" dist/open-design_*.zip dist/checksums.txt --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$GITHUB_REF_NAME" dist/clinepassbridge_*.zip dist/checksums.txt --draft --title "$GITHUB_REF_NAME" --generate-notes --repo "$GITHUB_REPOSITORY"
+            gh release create "$GITHUB_REF_NAME" dist/open-design_*.zip dist/checksums.txt --draft --title "$GITHUB_REF_NAME" --generate-notes --repo "$GITHUB_REPOSITORY"
           fi

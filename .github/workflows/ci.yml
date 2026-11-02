@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run inherited management UI tests
+        run: node --test tests/*.test.cjs
+      - name: Run Go tests
+        run: go test ./...
+      - name: Check marketplace metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '.schema_version == 1
+            and (.plugins | length) == 1
+            and .plugins[0].id == "open-design"
+            and .plugins[0].install.type == "github-release"
+            and (.plugins[0].version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
+            marketplace/registry.json
+      - name: Build Linux amd64 shared library
+        run: docker build --platform linux/amd64 --file Dockerfile.build --output type=local,dest=dist .
+      - name: Verify build artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/open-design.so
+          file dist/open-design.so | grep -q 'ELF 64-bit.*x86-64'
