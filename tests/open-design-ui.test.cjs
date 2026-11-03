@@ -104,9 +104,10 @@ function storage(initial = {}) {
   };
 }
 
-function fakePage({ url = 'https://cpa.example/v0/resource/plugins/open-design/console', persistent = {}, session = {}, fetchImpl } = {}) {
+function fakePage({ url = 'https://cpa.example/v0/resource/plugins/open-design/console', persistent = {}, session = {}, fetchImpl, confirmImpl } = {}) {
   const nodes = new Map();
   const document = {
+    documentElement: new FakeNode('html'),
     readyState: 'complete',
     getElementById(id) {
       if (!nodes.has(id)) nodes.set(id, new FakeNode(id === 'accountList' || id === 'upstreamList' || id === 'mappingList' ? 'div' : 'input'));
@@ -144,7 +145,7 @@ function fakePage({ url = 'https://cpa.example/v0/resource/plugins/open-design/c
     atob,
     fetch: fetchMock,
     console,
-    confirm: () => true,
+    confirm: confirmImpl || (() => true),
     setTimeout,
     clearTimeout,
     __OPEN_DESIGN_NO_BOOTSTRAP__: true,
@@ -176,9 +177,9 @@ test('page is self-contained, uses no Cline branding and renders safely with tex
   assert.ok(page.includes('OpenDesign Cloud'));
   assert.ok(!/cline/i.test(page), 'the console must not reuse Cline branding');
   // Quota display is implemented against /tmp/open-design-quota-contract.md, but
-  // pricing, exchange-rate math and success-rate claims are still out of scope.
-  assert.ok(!/price|价格|汇率|成功率|\$\s*\d+\s*(per|\/)\s*(1k|1m|million|token)|还能用\s*\d+\s*天/i.test(page),
-    'unimplemented pricing/success-rate/\"N days left\" claims must not appear');
+  // pricing and exchange-rate math are still out of scope; request statistics are implemented below.
+  assert.ok(!/price|价格|汇率|\$\s*\d+\s*(per|\/)\s*(1k|1m|million|token)|还能用\s*\d+\s*天/i.test(page),
+    'unimplemented pricing/exchange-rate/"N days left" claims must not appear');
   assert.ok(!/<script[^>]+src=/i.test(page), 'no external scripts');
   assert.ok(!/<img/i.test(page), 'no logos or remote images');
   assert.ok(!source('console.js').includes('.innerHTML'), 'console rendering must not assign HTML');
@@ -1148,8 +1149,8 @@ test('an available quota snapshot renders balance, credits windows, meters and r
               limitCredits: '9007199254740994',
               remainingCredits: '1',
               windowStart: '2026-11-03T00:00:00Z',
-              resetsAt: '2026-11-03T05:00:00Z',
-              forecast: { state: 'estimated', seconds_to_exhaust: 3600, exhausts_at: '2026-11-03T01:00:00Z', basis: 'recent_consumption' },
+              resetsAt: new Date(Date.now() + 5 * 3600000).toISOString(),
+              forecast: { state: 'estimated', seconds_to_exhaust: 3600, exhausts_at: new Date(Date.now() + 3600000).toISOString(), basis: 'recent_consumption' },
             }],
           },
         },
@@ -1519,8 +1520,8 @@ test('transport errors mark the old snapshot stale and suppress its forecast', a
       data: { funding: 'coding_plan', codingPlan: { tier: 'plus', windows: [{
         policyId: 'p', durationSeconds: 18000, resetMode: 'anchored_recurring',
         usedCredits: '200', limitCredits: '1000', remainingCredits: '800',
-        windowStart: '2026-11-03T00:00:00Z', resetsAt: '2026-11-03T05:00:00Z',
-        forecast: { state: 'estimated', seconds_to_exhaust: 3600, exhausts_at: '2026-11-03T01:00:00Z' },
+        windowStart: new Date(Date.now() - 3600000).toISOString(), resetsAt: new Date(Date.now() + 4 * 3600000).toISOString(),
+        forecast: { state: 'estimated', seconds_to_exhaust: 3600, exhausts_at: new Date(Date.now() + 3600000).toISOString() },
       }] } },
     } }));
     throw new Error('fixture connection lost');
@@ -1618,4 +1619,666 @@ test('acknowledged account changes remain visible when the following status read
     }
     assert.equal(consoleApi.state.busy, false);
   }
+});
+
+test('five tabs switch with hidden and aria state only, including keyboard navigation', () => {
+  const view = fakePage();
+  const consoleApi = view.context.OpenDesignConsole;
+  const before = view.calls.length;
+  const tabs = [
+    ['overview', 'tabOverview', 'overviewPanel'],
+    ['credentials', 'tabCredentials', 'credentialsPanel'],
+    ['models', 'tabModels', 'modelsTab'],
+    ['logs', 'tabLogs', 'logsPanel'],
+    ['config', 'tabConfig', 'configPanel'],
+  ];
+  for (const [name, button, panel] of tabs) {
+    consoleApi.handlers.activateTab(name);
+    assert.equal(consoleApi.state.activeTab, name);
+    for (const [candidate, candidateButton, candidatePanel] of tabs) {
+      const selected = candidate === name;
+      assert.equal(view.document.getElementById(candidateButton).getAttribute('aria-selected'), selected ? 'true' : 'false');
+      assert.equal(view.document.getElementById(candidateButton).getAttribute('tabindex'), selected ? '0' : '-1');
+      assert.equal(view.document.getElementById(candidatePanel).hidden, !selected);
+    }
+    assert.equal(view.document.getElementById(panel).hidden, false);
+    assert.equal(view.document.getElementById(button).getAttribute('aria-selected'), 'true');
+  }
+  let prevented = false;
+  consoleApi.handlers.handleTabKey({ key: 'ArrowRight', preventDefault() { prevented = true; } });
+  assert.equal(consoleApi.state.activeTab, 'overview', 'End-to-start keyboard navigation wraps across the tablist');
+  assert.equal(prevented, true);
+  assert.equal(view.calls.length, before, 'tab changes and rendering never fetch optional data');
+});
+
+test('request logs and stats are explicit, paged, and clearing also clears the visible stats', async () => {
+  let clearCalls = 0;
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.includes('/request-stats')) return respond(200, {
+        total: 1, success: 1, failed: 0, streams: 0, success_rate: 1,
+        tokens: { input: 2, output: 3, total: 5, requests_with_usage: 1, requests_without_usage: 0 },
+        models: [{ model: 'open-design-flash', total: 1, success: 1, failed: 0 }],
+      });
+      if (url.includes('/request-logs') && init.method === 'DELETE') {
+        clearCalls += 1;
+        return respond(200, { cleared: true });
+      }
+      if (url.includes('/request-logs')) return respond(200, {
+        logs: [{ id: 'r1', model: 'open-design-flash', status: 'success', stream: false, duration_ms: 12 }],
+        total: 2, limit: 1, offset: 0, has_more: true, next_offset: 1,
+        retention: { enabled: true, retention_days: 7, max_entries: 500, entries: 2 },
+      });
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  await consoleApi.handlers.loadRequestLogs({ reset: true });
+  await consoleApi.handlers.loadRequestStats();
+  assert.equal(consoleApi.state.requestLogs.length, 1);
+  assert.equal(consoleApi.state.logPage.has_more, true);
+  assert.equal(consoleApi.state.requestStats.total, 1);
+  assert.ok(view.calls.some(call => call.url.includes('limit=50')));
+  await consoleApi.handlers.clearRequestLogs();
+  assert.equal(clearCalls, 1);
+  assert.equal(consoleApi.state.requestLogs.length, 0);
+  assert.equal(consoleApi.state.requestStats, null);
+  assert.equal(consoleApi.state.logPage.total, 0);
+});
+
+test('a failed request-log page clears stale pagination offsets and disables both directions', async () => {
+  const view = fakePage({
+    fetchImpl: async url => url.includes('/request-logs')
+      ? respond(503, { error: 'temporary failure' })
+      : respond(404, { error: 'not found' }),
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.logQuery = { offset: 50, limit: 50, status: '', model: '', credentialID: '' };
+  consoleApi.state.requestLogs = [{ id: 'old-page' }];
+  consoleApi.state.logPage = { loaded: true, total: 99, offset: 50, limit: 50, has_more: true, next_offset: 100 };
+  await consoleApi.handlers.loadRequestLogs();
+  assert.ok(view.calls.some(call => call.url.includes('offset=50')));
+  assert.equal(consoleApi.state.logQuery.offset, 0);
+  assert.equal(consoleApi.state.logPage.offset, 0);
+  assert.equal(consoleApi.state.logPage.total, 0);
+  assert.equal(consoleApi.state.logPage.has_more, false);
+  assert.equal(view.document.getElementById('logsPrev').disabled, true);
+  assert.equal(view.document.getElementById('logsNext').disabled, true);
+  assert.match(view.document.getElementById('logsPageInfo').textContent, /显示 0-0 \/ 共 0 条/);
+});
+
+test('config and runtime are loaded only by explicit actions and preserve nullable host facts', async () => {
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/config') && init.method === 'POST') return respond(200, {
+        logs: { enabled: false, retention_days: 9, max_entries: 12, entries: 0 },
+        upstream: { origin: 'https://amr-link.open-design.ai/v1', fixed: true },
+        proxy: { owner: 'CPA', read_only: true, mode: 'host_managed' },
+        routing: { owner: 'CPA', read_only: true, mode: 'host_managed' },
+      });
+      if (url.endsWith('/config')) return respond(200, {
+        logs: { enabled: true, retention_days: 7, max_entries: 500, entries: 0 },
+        upstream: { origin: 'https://amr-link.open-design.ai/v1', fixed: true },
+        proxy: { owner: 'CPA', read_only: true, mode: 'host_managed' },
+        routing: { owner: 'CPA', read_only: true, mode: 'host_managed' },
+      });
+      if (url.endsWith('/runtime')) return respond(200, {
+        observed_at: '2026-11-03T00:00:00Z', loaded: true, stopped: false,
+        active_requests: 0, pending_operations: 0, model_count: 1,
+        host: { available: true },
+        credentials: [
+          { id: 'cred-null', label: '未知宿主', disabled: false, model_count: 0, host: null },
+          { id: 'cred-state', label: '状态宿主', disabled: false, model_count: 1, host: {
+            disabled: null, unavailable: null, status: 'cooldown', status_message: '等待宿主重试', next_retry_after: '2026-11-03T00:05:00Z',
+          } },
+        ],
+      });
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  const before = view.calls.length;
+  consoleApi.handlers.activateTab('config');
+  consoleApi.handlers.activateTab('credentials');
+  assert.equal(view.calls.length, before, 'tab navigation does not load config or runtime');
+  await consoleApi.handlers.loadConfig();
+  assert.equal(consoleApi.state.config.logs.retention_days, 7);
+  view.document.getElementById('configLogsEnabled').checked = false;
+  view.document.getElementById('configRetentionDays').value = '9';
+  view.document.getElementById('configMaxEntries').value = '12';
+  await consoleApi.handlers.saveConfig({ preventDefault() {} });
+  const save = view.calls.find(call => call.url.endsWith('/config') && call.init.method === 'POST');
+  assert.deepEqual(JSON.parse(save.init.body), { logs: { enabled: false, retention_days: 9, max_entries: 12 } });
+  await consoleApi.handlers.loadRuntime();
+  const runtimeText = view.document.getElementById('runtimeCredentials').textContent;
+  assert.match(runtimeText, /宿主状态未知/);
+  assert.match(runtimeText, /状态 cooldown/);
+  assert.match(runtimeText, /等待宿主重试/);
+  assert.match(runtimeText, /下次重试/);
+});
+
+test('model test requires confirmation and sends exactly one real request only after confirmation', async () => {
+  let confirmations = 0;
+  const view = fakePage({
+    confirmImpl: () => {
+      confirmations += 1;
+      return confirmations > 1;
+    },
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/model-test')) return respond(200, {
+        credential_id: 'cred-1', model_id: 'flash', upstream_model: 'open-design/flash',
+        status: 'success', http_status: 200, duration_ms: 8,
+        usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+        real_inference: true, streaming: false, request_kind: 'chat.completions',
+      });
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.render.applyStatus(statusBody({ credentials: [{ id: 'cred-1', label: '主账户', disabled: false }] }));
+  view.document.getElementById('modelTestCredential').value = 'cred-1';
+  view.document.getElementById('modelTestModel').value = 'flash';
+  view.document.getElementById('modelTestPrompt').value = 'Reply with OK.';
+  await consoleApi.handlers.runModelTest();
+  assert.equal(confirmations, 1);
+  assert.equal(view.calls.length, 0, 'declining confirmation sends no request');
+  await consoleApi.handlers.runModelTest();
+  assert.equal(confirmations, 2);
+  assert.equal(view.calls.length, 1);
+  assert.equal(JSON.parse(view.calls[0].init.body).model_id, 'flash');
+  assert.equal(consoleApi.state.modelTest.usage.total_tokens, 5);
+});
+
+test('model test result is discarded when its selection changes while the request is running', async () => {
+  const pending = deferred();
+  const view = fakePage({
+    fetchImpl: async url => url.includes('/model-test') ? pending.promise : respond(404, { error: 'not found' }),
+    confirmImpl: () => true,
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.render.applyStatus(statusBody({ credentials: [
+    { id: 'cred-1', label: '主账户', disabled: false },
+    { id: 'cred-2', label: '备用账户', disabled: false },
+  ] }));
+  view.document.getElementById('modelTestCredential').value = 'cred-1';
+  view.document.getElementById('modelTestModel').value = 'flash';
+  view.document.getElementById('modelTestPrompt').value = 'Reply with OK.';
+  const flight = consoleApi.handlers.runModelTest();
+  await new Promise(setImmediate);
+  assert.equal(view.document.getElementById('modelTestCredential').disabled, true);
+  assert.equal(view.document.getElementById('modelTestModel').disabled, true);
+  assert.equal(view.document.getElementById('modelTestPrompt').disabled, true);
+  assert.equal(view.document.getElementById('runModelTest').disabled, true);
+
+  // A browser cannot change a disabled select, but a stale event or automation
+  // can still mutate the value. The response must be fenced by the selection.
+  view.document.getElementById('modelTestCredential').value = 'cred-2';
+  pending.resolve(respond(200, {
+    credential_id: 'cred-1', model_id: 'flash', status: 'success', http_status: 200,
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  }));
+  await flight;
+  assert.equal(consoleApi.state.modelTest, null, 'a result for the old selection is not displayed');
+  assert.equal(view.document.getElementById('modelTestCredential').disabled, false);
+  assert.equal(view.document.getElementById('modelTestModel').disabled, false);
+  assert.equal(view.document.getElementById('modelTestPrompt').disabled, false);
+  assert.equal(view.document.getElementById('runModelTest').disabled, false);
+});
+
+test('model test discards a response whose credential or model identity does not match the request', async () => {
+  const view = fakePage({
+    confirmImpl: () => true,
+    fetchImpl: async url => url.endsWith('/model-test')
+      ? respond(200, {
+        credential_id: 'cred-other', model_id: 'different-model', status: 'success', http_status: 200,
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      })
+      : respond(404, { error: 'not found' }),
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.render.applyStatus(statusBody({ credentials: [{ id: 'cred-1', label: '主账户', disabled: false }] }));
+  view.document.getElementById('modelTestCredential').value = 'cred-1';
+  view.document.getElementById('modelTestModel').value = 'flash';
+  await consoleApi.handlers.runModelTest();
+  assert.equal(consoleApi.state.modelTest, null);
+  assert.match(view.document.getElementById('modelTestState').textContent, /响应与当前账户或模型不一致/);
+});
+
+test('status refresh invalidates a running model test and replaces the sending message', async () => {
+  const pending = deferred();
+  const view = fakePage({
+    confirmImpl: () => true,
+    fetchImpl: async url => url.endsWith('/model-test') ? pending.promise : respond(404, { error: 'not found' }),
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.render.applyStatus(statusBody({ credentials: [{ id: 'cred-1', label: '主账户', disabled: false }] }));
+  view.document.getElementById('modelTestCredential').value = 'cred-1';
+  view.document.getElementById('modelTestModel').value = 'flash';
+  const flight = consoleApi.handlers.runModelTest();
+  await new Promise(setImmediate);
+  assert.match(view.document.getElementById('modelTestState').textContent, /正在发送模型测试/);
+  consoleApi.render.applyStatus(statusBody({ credentials: [{ id: 'cred-1', label: '主账户（刷新后）', disabled: false }] }));
+  assert.match(view.document.getElementById('modelTestState').textContent, /正在发送的模型测试结果已失效/);
+  pending.resolve(respond(200, { credential_id: 'cred-1', model_id: 'flash', status: 'success', usage: {} }));
+  await flight;
+  assert.equal(consoleApi.state.modelTest, null);
+});
+
+test('config or runtime busy state preserves log pagination boundaries', async () => {
+  const pending = deferred();
+  const view = fakePage({
+    fetchImpl: async url => url.endsWith('/config') ? pending.promise : respond(404, { error: 'not found' }),
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.logPage = { loaded: true, total: 0, offset: 0, limit: 50, has_more: false, next_offset: null };
+  consoleApi.render.renderRequestLogs();
+  assert.equal(view.document.getElementById('logsPrev').disabled, true);
+  assert.equal(view.document.getElementById('logsNext').disabled, true);
+  const flight = consoleApi.handlers.loadConfig();
+  await new Promise(setImmediate);
+  assert.equal(view.document.getElementById('logsPrev').disabled, true);
+  assert.equal(view.document.getElementById('logsNext').disabled, true);
+  pending.resolve(respond(200, { logs: { enabled: true, retention_days: 7, max_entries: 500 } }));
+  await flight;
+  consoleApi.state.logPage = { loaded: true, total: 51, offset: 50, limit: 50, has_more: true, next_offset: null };
+  consoleApi.render.renderRequestLogs();
+  const runtimeFlight = consoleApi.handlers.loadRuntime();
+  await new Promise(setImmediate);
+  assert.equal(view.document.getElementById('logsPrev').disabled, false);
+  assert.equal(view.document.getElementById('logsNext').disabled, false);
+  runtimeFlight.catch(() => {});
+});
+
+test('logout clears all management data, invalidates optional responses, and restores controls for a new session', async () => {
+  const cases = [
+    {
+      name: 'logs',
+      match: '/request-logs',
+      invoke: api => api.handlers.loadRequestLogs({ reset: true }),
+      response: { logs: [], total: 0, limit: 50, offset: 0, has_more: false },
+    },
+    {
+      name: 'config',
+      match: '/config',
+      invoke: api => api.handlers.loadConfig(),
+      response: { logs: { enabled: true, retention_days: 7, max_entries: 500 } },
+    },
+    {
+      name: 'runtime',
+      match: '/runtime',
+      invoke: api => api.handlers.loadRuntime(),
+      response: { loaded: true, stopped: false, active_requests: 0, pending_operations: 0, model_count: 0, credentials: [] },
+    },
+    {
+      name: 'model-test',
+      match: '/model-test',
+      invoke: api => api.handlers.runModelTest(),
+      response: { credential_id: 'cred-1', model_id: 'flash', status: 'success', usage: {} },
+    },
+  ];
+  for (const item of cases) {
+    const pending = deferred();
+    const view = fakePage({
+      confirmImpl: () => true,
+      fetchImpl: async url => url.includes(item.match) ? pending.promise : respond(404, { error: 'not found' }),
+    });
+    const consoleApi = view.context.OpenDesignConsole;
+    consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+    consoleApi.render.applyStatus(statusBody({ credentials: [{ id: 'cred-1', label: '主账户', disabled: false }], models: [{ id: 'flash', upstream_id: 'open-design/flash' }] }));
+    consoleApi.state.mappings = [{ id: 'flash', upstream_id: 'open-design/flash' }];
+    consoleApi.state.savedMappings = [{ id: 'flash', upstream_id: 'open-design/flash' }];
+    consoleApi.state.upstreamFor = 'cred-1';
+    consoleApi.state.upstream = [{ id: 'flash' }];
+    consoleApi.state.mappings = [{ id: 'flash', upstream_id: 'open-design/flash' }];
+    consoleApi.state.requestLogs = [{ id: 'old-log' }];
+    consoleApi.state.logPage = { loaded: true, total: 1, offset: 0, limit: 50, has_more: false };
+    consoleApi.state.requestStats = { total: 1 };
+    consoleApi.state.config = {
+      logs: { enabled: true, retention_days: 7, max_entries: 500 },
+      upstream: { origin: 'https://amr-link.open-design.ai/v1', fixed: true },
+      proxy: { owner: 'CPA', read_only: true },
+      routing: { owner: 'CPA', read_only: true },
+    };
+    consoleApi.state.runtime = { loaded: true, credentials: [] };
+    consoleApi.state.modelTest = { status: 'success', model_id: 'flash', usage: {} };
+    consoleApi.state.modelCoverage = { 'cred-1\\u0000flash': { state: 'available' } };
+    consoleApi.render.renderConfig();
+    if (item.name === 'model-test') {
+      view.document.getElementById('modelTestCredential').value = 'cred-1';
+      view.document.getElementById('modelTestModel').value = 'flash';
+      view.document.getElementById('modelTestPrompt').value = 'Reply with OK.';
+    }
+    const flight = item.invoke(consoleApi);
+    await new Promise(setImmediate);
+    const busyName = item.name === 'model-test' ? 'modelTest' : item.name;
+    assert.equal(consoleApi.state.optionalBusy[busyName], true, `${item.name}: request is marked busy`);
+    consoleApi.handlers.clearAuth();
+    assert.equal(consoleApi.state.verified, null, `${item.name}: management auth is cleared`);
+    assert.deepEqual(plain(consoleApi.state.status.credentials), []);
+    assert.deepEqual(plain(consoleApi.state.requestLogs), []);
+    assert.equal(consoleApi.state.requestStats, null);
+    assert.equal(consoleApi.state.config, null);
+    assert.equal(consoleApi.state.runtime, null);
+    assert.equal(consoleApi.state.modelTest, null);
+    assert.deepEqual(Object.keys(consoleApi.state.modelCoverage), []);
+    assert.deepEqual(Object.keys(consoleApi.state.optionalBusy), []);
+    assert.equal(view.document.getElementById('refreshLogs').disabled, false);
+    assert.equal(view.document.getElementById('loadConfig').disabled, false);
+    assert.equal(view.document.getElementById('loadRuntime').disabled, false);
+    assert.equal(view.document.getElementById('runModelTest').disabled, false);
+    assert.equal(view.document.getElementById('configRetentionDays').value, '', `${item.name}: stale config is cleared`);
+    assert.equal(view.document.getElementById('configMaxEntries').value, '', `${item.name}: stale config is cleared`);
+
+    pending.resolve(respond(200, item.response));
+    await flight;
+    assert.deepEqual(plain(consoleApi.state.requestLogs), [], `${item.name}: late response cannot restore logs`);
+    assert.equal(consoleApi.state.config, null, `${item.name}: late response cannot restore config`);
+    assert.equal(consoleApi.state.runtime, null, `${item.name}: late response cannot restore runtime`);
+    assert.equal(consoleApi.state.modelTest, null, `${item.name}: late response cannot restore model test`);
+  }
+});
+
+test('optional management 401 and 403 return to the auth state for every management route', async () => {
+  const cases = [
+    ['logs', url => url.includes('/request-logs'), api => api.handlers.loadRequestLogs({ reset: true })],
+    ['stats', url => url.includes('/request-stats'), api => api.handlers.loadRequestStats()],
+    ['clear', url => url.includes('/request-logs'), api => api.handlers.clearRequestLogs()],
+    ['config', url => url.endsWith('/config'), api => api.handlers.loadConfig()],
+    ['runtime', url => url.endsWith('/runtime'), api => api.handlers.loadRuntime()],
+    ['model-test', url => url.endsWith('/model-test'), api => api.handlers.runModelTest()],
+  ];
+  for (const status of [401, 403]) {
+    for (const [name, matches, invoke] of cases) {
+      const view = fakePage({
+        confirmImpl: () => true,
+        fetchImpl: async url => matches(url) ? respond(status, { error: 'management request rejected' }) : respond(404, { error: 'not found' }),
+      });
+      const consoleApi = view.context.OpenDesignConsole;
+      consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+      consoleApi.render.applyStatus(statusBody({ credentials: [{ id: 'cred-1', label: '主账户', disabled: false }] }));
+      if (name === 'model-test') {
+        view.document.getElementById('modelTestCredential').value = 'cred-1';
+        view.document.getElementById('modelTestModel').value = 'flash';
+      }
+      await invoke(consoleApi);
+      assert.equal(consoleApi.state.verified, null, `${name} HTTP ${status}: auth is cleared`);
+      assert.equal(view.document.getElementById('accountsPanel').hidden, true, `${name} HTTP ${status}: panels are hidden`);
+      assert.match(view.document.getElementById('authState').textContent, new RegExp(String(status)));
+      assert.deepEqual(plain(consoleApi.state.status.credentials), []);
+    }
+  }
+});
+
+test('optional busy groups do not unlock each other or leave pagination disabled', async () => {
+  const pending = { logs: deferred(), config: deferred(), stats: deferred() };
+  const view = fakePage({
+    fetchImpl: async url => {
+      if (url.includes('/request-logs')) return pending.logs.promise;
+      if (url.includes('/request-stats')) return pending.stats.promise;
+      if (url.endsWith('/config')) return pending.config.promise;
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  const configFlight = consoleApi.handlers.loadConfig();
+  await new Promise(setImmediate);
+  assert.equal(view.document.getElementById('loadConfig').disabled, true);
+  assert.equal(view.document.getElementById('saveConfig').disabled, true);
+  assert.equal(view.document.getElementById('refreshLogs').disabled, false);
+
+  const logsFlight = consoleApi.handlers.loadRequestLogs({ reset: true });
+  await new Promise(setImmediate);
+  assert.equal(view.document.getElementById('refreshLogs').disabled, true);
+  assert.equal(view.document.getElementById('loadConfig').disabled, true);
+
+  pending.config.resolve(respond(200, { logs: { enabled: true, retention_days: 7, max_entries: 500 } }));
+  await configFlight;
+  assert.equal(view.document.getElementById('saveConfig').disabled, false, 'config controls recover after their own request');
+  assert.equal(view.document.getElementById('refreshLogs').disabled, true, 'log request still owns log controls');
+
+  pending.logs.resolve(respond(200, { logs: [], total: 0, limit: 50, offset: 0, has_more: true, next_offset: 50 }));
+  await logsFlight;
+  assert.equal(view.document.getElementById('refreshLogs').disabled, false);
+  assert.equal(view.document.getElementById('logsNext').disabled, false);
+
+  const statsFlight = consoleApi.handlers.loadRequestStats();
+  await new Promise(setImmediate);
+  assert.equal(view.document.getElementById('logsNext').disabled, true);
+  pending.stats.resolve(respond(200, { total: 0, success: 0, failed: 0, streams: 0, tokens: {} }));
+  await statsFlight;
+  assert.equal(view.document.getElementById('logsNext').disabled, false, 'stats completion re-renders the current page controls');
+});
+
+test('rendering an unavailable config clears stale form values and disables saving', () => {
+  const view = fakePage();
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.config = {
+    logs: { enabled: true, retention_days: 9, max_entries: 12 },
+    upstream: { origin: 'https://amr-link.open-design.ai/v1', fixed: true },
+    proxy: { owner: 'CPA', read_only: true },
+    routing: { owner: 'CPA', read_only: true },
+  };
+  consoleApi.render.renderConfig();
+  assert.equal(view.document.getElementById('configRetentionDays').value, '9');
+  assert.equal(view.document.getElementById('configMaxEntries').value, '12');
+  assert.equal(view.document.getElementById('saveConfig').disabled, false);
+  consoleApi.state.config = null;
+  consoleApi.render.renderConfig();
+  assert.equal(view.document.getElementById('configLogsEnabled').checked, false);
+  assert.equal(view.document.getElementById('configRetentionDays').value, '');
+  assert.equal(view.document.getElementById('configMaxEntries').value, '');
+  assert.equal(view.document.getElementById('saveConfig').disabled, true);
+});
+
+test('request stats render per-model rows and the retention scope from input/output tokens', async () => {
+  const view = fakePage({
+    fetchImpl: async url => url.includes('/request-stats') ? respond(200, {
+      total: 3, success: 2, failed: 1, streams: 1, success_rate: 2 / 3,
+      upstream_attempted: 2, local_rejected: 1,
+      tokens: { input: 11, output: 7, total: 18, requests_with_usage: 2, requests_without_usage: 1 },
+      models: [
+        { model: 'od-flash', total: 2, success: 2, failed: 0, upstream_attempted: 2, local_rejected: 0, input_tokens: 11, output_tokens: 7, total_tokens: 18 },
+        { model: 'od-pro', total: 1, success: 0, failed: 1, upstream_attempted: 0, local_rejected: 1, input_tokens: null, output_tokens: null, total_tokens: null },
+      ],
+      retention: { enabled: true, retention_days: 7, max_entries: 500, entries: 3, oldest: '2026-11-01T00:00:00Z', newest: '2026-11-03T00:00:00Z' },
+    }) : respond(404, { error: 'not found' }),
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  await consoleApi.handlers.loadRequestStats();
+  assert.equal(consoleApi.state.requestStats.tokens.input, 11, 'input tokens are read from tokens.input');
+  assert.equal(consoleApi.state.requestStats.tokens.output, 7, 'output tokens are read from tokens.output');
+  const facts = view.document.getElementById('requestStats').textContent;
+  assert.match(facts, /输入 Token11/);
+  assert.match(facts, /输出 Token7/);
+  assert.match(facts, /本地拒绝1/);
+  assert.match(facts, /保留 7 天，最多 500 条/);
+  assert.match(facts, /当前 3 条/);
+  const models = view.document.getElementById('requestStatsModels');
+  assert.equal(models.children.length, 2);
+  assert.match(models.children[0].textContent, /od-flash/);
+  assert.match(models.children[0].textContent, /Token 18/);
+  assert.match(models.children[1].textContent, /本地拒绝 1/);
+  assert.match(models.children[1].textContent, /有失败/);
+  assert.ok(!models.children[1].textContent.includes('Token'), 'a null token total is omitted, never zero');
+});
+
+test('runtime lists only safe last-test identity fields and unknown enums without raw text', async () => {
+  const view = fakePage({
+    fetchImpl: async () => respond(200, {
+      observed_at: '2026-11-03T00:00:00Z', loaded: true, stopped: false,
+      active_requests: 0, pending_operations: 0, model_count: 1,
+      host: { available: true },
+      credentials: [{
+        id: 'cred-1', label: '主账户', disabled: false, model_count: 1,
+        host: { disabled: null, unavailable: null, status: 'cooldown', status_message: '', next_retry_after: '0001-01-01T00:00:00Z' },
+        last_test: {
+          model_id: 'flash', upstream_model: 'open-design/flash', status: 'failed',
+          http_status: 429, duration_ms: 12, tested_at: '2026-11-03T00:00:00Z',
+          error_kind: 'upstream_error', api_key: 'leaked-fixture-key', error_message: 'raw upstream body',
+        },
+      }],
+    }),
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  await consoleApi.handlers.loadRuntime();
+  const text = view.document.getElementById('runtimeCredentials').textContent;
+  assert.match(text, /最近测试 失败/);
+  assert.match(text, /模型 flash/);
+  assert.match(text, /上游 open-design\/flash/);
+  assert.match(text, /原因 upstream_error/);
+  assert.ok(!text.includes('leaked-fixture-key'));
+  assert.ok(!text.includes('raw upstream body'));
+  assert.ok(!text.includes('0001-01-01'), 'a zero next_retry_after is not rendered');
+  const normalized = consoleApi.state.runtime.credentials[0].last_test;
+  assert.deepEqual(Object.keys(normalized).sort(), [
+    'duration_ms', 'error_kind', 'http_status', 'model_id', 'status', 'tested_at', 'upstream_model',
+  ]);
+});
+
+test('a mapping save invalidates a visible model-test result and drops its in-flight answer', async () => {
+  const pending = [];
+  const view = fakePage({
+    confirmImpl: () => true,
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/model-test')) {
+        const request = deferred();
+        pending.push(request);
+        return request.promise;
+      }
+      if (url.endsWith('/models') && init.method === 'POST') return respond(200, { models: JSON.parse(init.body).models });
+      if (url.endsWith('/status')) return respond(200, statusBody());
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.state.status = view.context.OpenDesignCore.normalizeStatus(statusBody());
+  consoleApi.handlers.activateTab('models');
+  consoleApi.state.mappings = [{ id: 'flash', upstream_id: 'open-design/flash' }];
+  consoleApi.state.savedMappings = [{ id: 'flash', upstream_id: 'open-design/flash' }];
+  consoleApi.state.upstreamFor = 'cred-1';
+  consoleApi.state.upstream = [{ id: 'open-design/flash' }];
+  view.document.getElementById('modelTestCredential').value = 'cred-1';
+  view.document.getElementById('modelTestModel').value = 'flash';
+  view.document.getElementById('modelTestPrompt').value = 'Reply with OK.';
+
+  const flight = consoleApi.handlers.runModelTest();
+  await new Promise(setImmediate);
+  assert.equal(consoleApi.state.optionalBusy.modelTest, true);
+  const generation = consoleApi.state.modelTestGeneration;
+  await consoleApi.handlers.saveModels();
+  assert.ok(consoleApi.state.modelTestGeneration > generation, 'saving mappings advances the model-test generation');
+  assert.equal(consoleApi.state.modelTest, null);
+  pending[0].resolve(respond(200, {
+    credential_id: 'cred-1', model_id: 'flash', status: 'success',
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  }));
+  await flight;
+  assert.equal(consoleApi.state.modelTest, null, 'a stale answer is not displayed after the mapping changed');
+  assert.notEqual(consoleApi.state.optionalBusy.modelTest, true, 'the busy flag is released after the stale answer');
+});
+
+test('model-test identity keeps a long alias intact and rejects one over 512 UTF-8 bytes', () => {
+  const core = fakePage().context.OpenDesignCore;
+  const alias = 'x'.repeat(400);
+  const normalized = core.normalizeModelTest({ credential_id: 'cred-1', model_id: alias, status: 'success' });
+  assert.equal(normalized.model_id, alias, 'identity is never truncated to a display width');
+  const max = '模'.repeat(170) + 'ab'; // 512 bytes
+  assert.equal(core.utf8ByteLength(max), 512);
+  assert.equal(core.normalizeModelTest({ model_id: max }).model_id, max);
+  assert.equal(core.normalizeModelTest({ model_id: `${max}x` }).model_id, '', 'over-length identities are refused');
+  assert.equal(core.normalizeModelTest({ model_id: 'a\nb' }).model_id, '', 'control characters are refused');
+  assert.equal(core.normalizeModelTest({ model_id: 42 }).model_id, '42', 'numbers are compared as text, then bounded');
+  // Every page value is trimmed at input time, so identity matches exactly what
+  // was sent upstream; only the byte bound and control-character check follow.
+  assert.equal(core.safeIdentity(' x '), 'x');
+  assert.equal(core.safeIdentity(''), '');
+  assert.equal(core.safeIdentity(alias, 512), alias);
+  assert.equal(core.safeIdentity(alias, 399), '', 'the byte budget is enforced, not the rune count');
+});
+
+test('a quota window whose reset time has passed or precedes exhaustion stops showing a forecast', () => {
+  const core = fakePage().context.OpenDesignCore;
+  assert.equal(core.quotaForecastExpired({}), false);
+  assert.equal(core.quotaForecastExpired({ resetsAt: '2026-11-03T05:00:00Z', forecast: { exhausts_at: '2026-11-03T02:00:00Z' } }, Date.parse('2026-11-03T01:00:00Z')), false);
+  assert.equal(core.quotaForecastExpired({ resetsAt: '2026-11-03T05:00:00Z', forecast: { exhausts_at: '2026-11-03T02:00:00Z' } }, Date.parse('2026-11-03T03:00:00Z')), true);
+  assert.equal(core.quotaForecastExpired({ resetsAt: '2026-11-03T01:00:00Z', forecast: { exhausts_at: '2026-11-03T02:00:00Z' } }, Date.parse('2026-11-03T00:00:00Z')), true);
+  assert.equal(core.quotaForecastExpired({ resetsAt: '2026-11-03T01:00:00Z', forecast: { exhausts_at: '2026-11-03T00:00:00Z' } }, Date.parse('2026-11-03T00:30:00Z')), true);
+});
+
+test('logout and re-login restore the log model and credential filters', async () => {
+  const view = fakePage({
+    fetchImpl: async () => respond(404, { error: 'not found' }),
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  view.document.getElementById('logsFilterModel').value = 'stale-model';
+  view.document.getElementById('logsFilterCredential').value = 'cred-1';
+  view.document.getElementById('logsFilterStatus').value = 'failed';
+  consoleApi.handlers.clearAuth();
+  assert.equal(view.document.getElementById('logsFilterModel').value, '');
+  assert.equal(view.document.getElementById('logsFilterCredential').value, '');
+  assert.equal(view.document.getElementById('logsFilterStatus').value, '');
+});
+
+test('theme preference cycles system -> light -> dark, persists, and is applied to the root', () => {
+  const view = fakePage();
+  const consoleApi = view.context.OpenDesignConsole;
+  assert.equal(consoleApi.state.themePreference, 'system');
+  assert.equal(consoleApi.handlers.cycleThemePreference(), 'light');
+  assert.equal(view.localStorage.getItem('open-design-theme'), 'light');
+  assert.equal(view.document.documentElement.getAttribute('data-theme'), 'light');
+  assert.equal(consoleApi.handlers.cycleThemePreference(), 'dark');
+  assert.equal(view.localStorage.getItem('open-design-theme'), 'dark');
+  assert.equal(view.document.documentElement.getAttribute('data-theme-resolved'), 'dark');
+  assert.equal(consoleApi.handlers.cycleThemePreference(), 'system');
+  assert.equal(view.localStorage.getItem('open-design-theme'), null, 'following the system clears the pin');
+  const label = view.document.getElementById('themeToggle').textContent;
+  assert.match(label, /^主题：/);
+  const core = view.context.OpenDesignCore;
+  assert.equal(core.nextThemePreference('bogus'), 'light', 'an unknown preference falls back to system first');
+  assert.equal(core.resolvedTheme('system', true), 'dark');
+  assert.equal(core.resolvedTheme('system', false), 'light');
+  assert.equal(core.resolvedTheme('light', true), 'light');
+  assert.match(core.themePreferenceLabel('system', 'dark'), /跟随系统（深色）/);
+});
+
+test('the console exposes an accessible theme toggle and a system-aware stylesheet default', () => {
+  const page = pageHTML();
+  assert.match(page, /id="themeToggle"[^>]*type="button"[^>]*aria-label=/);
+  assert.match(page, /prefers-color-scheme:\s*dark/);
+  assert.match(page, /:root\[data-theme="system"\]/);
+  assert.ok(!/data-theme="dark"/.test(page.split('</style>')[0].replace(/:root\[data-theme="dark"\]/g, '')), 'dark is opt-in, not the default');
+  for (const tab of ['概览', '凭据', '模型', '请求日志', '配置']) assert.ok(page.includes(tab), `tab ${tab} exists`);
+  assert.ok(page.includes('role="tablist"') && page.includes('role="tab"') && page.includes('role="tabpanel"'));
+});
+
+
+test('system color changes update the theme label and resolved value without fetching data', async () => {
+  const view = fakePage();
+  const media = { matches: false };
+  let onChange;
+  view.context.matchMedia = () => ({
+    get matches() { return media.matches; },
+    addEventListener(type, callback) { assert.equal(type, 'change'); onChange = callback; },
+  });
+  const api = view.context.OpenDesignConsole;
+  await api.bootstrap();
+  assert.equal(view.document.documentElement.getAttribute('data-theme-resolved'), 'light');
+  assert.equal(typeof onChange, 'function');
+  media.matches = true;
+  onChange();
+  assert.equal(view.document.documentElement.getAttribute('data-theme-resolved'), 'dark');
+  assert.match(view.document.getElementById('themeToggle').getAttribute('aria-label'), /跟随系统（深色）/);
+  api.handlers.applyThemePreference('light');
+  media.matches = false;
+  onChange();
+  media.matches = true;
+  onChange();
+  assert.equal(view.document.documentElement.getAttribute('data-theme-resolved'), 'light', 'system events preserve an explicit preference');
+  assert.equal(view.calls.length, 0, 'color changes do not trigger management or provider requests');
 });

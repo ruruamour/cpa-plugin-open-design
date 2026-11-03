@@ -1,6 +1,6 @@
 # OpenDesign 插件说明
 
-本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`，当前版本 `0.2.0`。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。
+本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`，当前版本 `0.3.0`。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已完成本地验收，提交、CI 与上线状态见[验证记录](verification.md)。
 
 ## 范围
 
@@ -8,6 +8,8 @@
 - `internal/bridge` 是保留的上游参考实现，不接入本插件的新二进制。
 - 使用 CPA 公开的 host HTTP、translation 和 public RPC；不修改、不打包、不发布 CPA 宿主。
 - 额度查询按 OpenDesign 官方 control API 实现，可选配置独立 control Key；不使用 Cline 的额度、价格或周期规则。详见[额度说明](quota.md)。
+- 模型级覆盖查询同样使用官方 `funding-check` 的 `modelId`，与共享额度缓存分开。
+- 请求日志只保存元数据 allowlist；模型测试与日志、统计、覆盖、配置、runtime 都由人工在控制台触发。
 - 管理页的账号选择用于模型发现，映射为插件共享；实际请求的账号选择与冷却遵循 CPA 公开接口。
 
 ## 协议
@@ -40,8 +42,72 @@ OpenDesign 生产接口：
 - 推理 API key 与可选 control Key 保存在 CPA 的 `auth-dir`，通过 `host.auth.save` 写入；插件设置不保存 Key，管理接口不回显。
 - 管理接口按 CPA 精确路由契约提供：`GET /credentials` 列出账户；`POST /credentials` 创建或更新，body 为 `{id?, label?, api_key?, disabled?, control_key?, workspace_id?, clear_billing?}`；`DELETE /credentials?id=<id>` 按查询参数删除，不使用 `/credentials/{id}`。编辑时 Key 留空保留原值，`clear_billing:true` 显式清除额度授权和工作区。
 - 模型列表由管理页调用 OpenDesign `GET /models` 获取，支持搜索与可见项批量勾选。新增客户端别名默认以 `open-design-` 开头，已保存和手动编辑的别名保留。账户刷新不覆盖未保存的映射草稿。
-- 模型映射保存在插件数据目录；获取的上游模型列表不持久化。容器部署时应持久化 CPA 插件目录、CPA 的 `auth-dir` 和该数据目录。
+- 模型映射保存在插件数据目录；获取的上游模型列表不持久化。请求日志保存在同一数据目录（`request-logs.snapshot.json` 与 `request-logs.journal.jsonl`），只含元数据。容器部署时应持久化 CPA 插件目录、CPA 的 `auth-dir` 和该数据目录。
 - 管理页沿用 CPA 管理认证。手动输入的管理密钥按 CPA 管理页的现有方式处理，不写入 OpenDesign key 存储。
+
+管理路由（均在 `/v0/management/open-design` 下）：
+
+| 方法与路径 | 用途 |
+| --- | --- |
+| `GET /status` | 插件状态与模型映射 |
+| `GET` / `POST` / `DELETE /credentials` | 账户列表、创建或更新、删除 |
+| `GET /upstream-models` | 读取 OpenDesign `GET /models` 候选 |
+| `GET` / `POST /models` | 读取或保存模型映射 |
+| `GET /quota?credential_id=<id>` | 共享钱包／套餐窗口缓存；`refresh=1` 手动查询 |
+| `GET /model-coverage?credential_id=<id>&model_id=<id>` | 模型级官方覆盖缓存；`refresh=1` 手动查询 |
+| `GET /request-logs` | 分页读取元数据日志 |
+| `GET /request-stats` | 汇总统计（含本地拒绝数） |
+| `DELETE /request-logs` | 持久化清空日志 |
+| `GET` / `POST /config` | 日志开关、保留天数与条数上限 |
+| `GET /runtime` | 插件可见运行时状态 |
+| `POST /model-test` | 显式单次非流式模型测试 |
+
+`/logs`、`/logs/stats`、`/logs/clear` 是日志路由的别名。
+
+## 控制台布局
+
+控制台固定为 5 个标签页，切换标签页不会自动发起请求：
+
+| 标签页 | 内容 |
+| --- | --- |
+| 概览 | 账户与映射数量 |
+| 凭据 · 额度 | 账户增删改、可选额度授权、手动刷新共享额度 |
+| 模型映射 · 覆盖 | 上游模型、映射保存、模型级覆盖、显式模型测试 |
+| 请求日志 | 元数据日志、汇总统计、筛选分页、清空 |
+| 代理池 · 配置 | 日志开关与保留设置；宿主代理／路由／冷却只读；runtime 手动读取 |
+
+## 请求日志、统计与配置
+
+日志条目只允许以下元数据：请求 ID、开始／结束时间、耗时、客户端模型、上游模型、凭据 ID、是否流式、状态、HTTP 状态、错误类型、输入／输出／总 token、`upstream_attempted`。**不保存**请求/响应正文、headers、query 字符串、API key、control key 或 Workspace ID。
+
+- 默认开启，保留 7 天、最多 500 条；可配置 1–90 天、1–500 条。超范围值在配置校验时拒绝。
+- 持久化为异步：25ms 合并写入，写失败后 2 秒重试；`plugin.quiesce`／`plugin.shutdown` 先取消延迟任务再同步 flush。
+- 清空是持久化事务：先写入 clear tombstone（同时记录保留策略），再更新内存；崩溃恢复不会让旧日志复活。
+- usage 可以是 `null`：响应没有对应 usage 时保持未知，不写成 0。
+- 统计包含总数、成功／失败、流式、成功率、token 汇总、带／不带 usage、上游已尝试与本地拒绝，并按模型聚合。`attempted=yes|no` 可筛选已尝试上游与本地拒绝。
+
+`POST /config` 只接受 `logs` 下的 `enabled`、`retention_days`、`max_entries`；上游地址、代理、路由与宿主冷却不能被插件修改。
+
+## 官方模型覆盖
+
+`GET /model-coverage?credential_id=<id>&model_id=<上游模型 ID>&refresh=1` 使用同一份 control Key 与 Workspace ID，向官方 `funding-check` 传入 `modelId`，只返回 `modelCovered`、`funding`、`fundingCheck`、`fetched_at`、`next_refresh_at` 与 `error`。
+
+- 覆盖结果与 `quota` 的共享钱包／套餐窗口缓存**完全分离**，不伪造额度快照，也不把共享 credits 当成模型余额。
+- 每份凭据与模型组合 60 秒内最多尝试一次，并发刷新合并；单次 30 秒总预算，超时通过宿主 operation/cancel 释放。
+- 官方返回的 `workspaceId`、`modelId` 必须匹配，否则按 `malformed` 返回，不宽松接受。
+
+## 显式模型测试
+
+`POST /model-test` 由插件构造极小的非流式 Chat Completions 请求：
+
+- 控制台只有点击「发送测试」并确认后才调用；一次操作只发一次请求，**不重试**。
+- 最多 3 个并发测试，超出返回 429。
+- 响应只含状态、上游 HTTP、耗时、token 计数与错误类型，**不回传 completion**，也不回显 Key。
+- 测试会消耗真实推理用量；账户 Key、映射或启停状态在测试期间变化时，结果不写入 runtime 历史。
+
+## runtime 与宿主能力
+
+`GET /runtime` 只公开插件能验证的宿主能力：插件加载状态、在飞请求、待处理操作、映射模型数，以及 `host.auth.list` 能提供的账户状态。宿主未提供该能力时，响应标记 `host.available=false` 并提示“仅插件侧状态”；插件不推断或伪造 CPA 的调度、冷却、代理池行为。
 
 ## 模型映射
 
@@ -93,18 +159,28 @@ plugins:
 
 只设置 `plugins.enabled` 不会加载本插件，`plugins.configs.open-design.enabled` 必须为 `true`。
 
+安装后的操作顺序：
+
+1. 打开控制台 `/v0/resource/plugins/open-design/console`，用 CPA 管理认证登录。
+2. 在「凭据 · 额度」添加 OpenDesign 推理 API key；如需共享额度，再填同一账号的 control Key 与 Workspace ID。
+3. 在「模型映射 · 覆盖」拉取上游模型、勾选并保存映射。
+4.（可选）在同一页对单个模型「检查覆盖」，或确认后「发送测试」。
+5.（可选）在「请求日志」手动刷新日志与统计，在「代理池 · 配置」调整日志保留策略或读取 runtime。
+
 ## 当前验证边界
 
-- 2026-11-02 已用有效推理 Key 发现 13 个真实上游模型。官方直连和生产 CPA 插件各完成一次最小非流式请求，均返回 `OK`；生产路径使用 `open-design-minimax-m3.1-flash`，usage 219／3／222。未逐个调用全部模型。
+- `0.3.0` 全仓 Go／race／vet、Node 139 项、Edge 540 项、Debian 12 构建及原版 CPA 隔离流程通过；详细产物哈希与 CI／上线状态见[验证记录](verification.md)。
+- 2026-11-02 已用有效推理 Key 发现 13 个真实上游模型。官方直连和生产 CPA 插件各完成一次最小非流式请求，均返回 `OK`；生产路径使用 `open-design-minimax-m3.1-flash`，usage 219／3／222。这是 `0.2.0` 的历史生产事实，不属于 `0.3.0` 验收。
 - 新增额度使用官方 control API。现有推理 Key 查询控制面返回 401 后，另用两份独立 control 授权直接查询钱包和对应工作区 funding-check，四次 GET 均为 200。2026-11-02 上线 `0.2.0` 后，od1 授权也已通过生产插件查询成功；账户归属以完整推理 Key 在服务器内精确匹配确认。消费趋势预测尚未实测。
 - 本地测试使用原版 CPA 8.0.48 与 loopback CONNECT/TLS 假上游，不修改系统信任库或 hosts；只允许推理、控制面与重定向测试主机。
 - 具体 Go／Node、Edge、真实宿主回归结果见[验证记录](verification.md)；[验证脚本说明](../scripts/README.md)区分 ctypes、原版宿主与假上游的边界。
 
 ## 发布 tag
 
-- 发布 tag 使用 `open-design-v0.2.0`，不创建或覆盖上游 `v*` tag。
+- 发布 tag 使用 `open-design-v0.3.0`，不创建或覆盖上游 `v*` tag。
 - 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定该 tag/版本。
+- GitHub Release 尚未发布；分支与生产交付状态见验证记录。
 
 ## 上游与许可
 

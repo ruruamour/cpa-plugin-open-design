@@ -402,6 +402,337 @@
     }
   }
 
+  // A prediction must never cross a known reset boundary. If the estimated
+  // exhaustion is at/after resetsAt, or either timestamp has already passed,
+  // the cached estimate is withdrawn until another explicit refresh.
+  function quotaForecastExpired(window, now = Date.now()) {
+    const source = window && typeof window === 'object' ? window : {};
+    const forecast = source.forecast && typeof source.forecast === 'object' ? source.forecast : {};
+    const current = Number.isFinite(now) ? now : Date.now();
+    const exhaustsAt = Date.parse(text(forecast.exhausts_at));
+    const resetsAt = Date.parse(text(source.resetsAt));
+    if (Number.isFinite(exhaustsAt) && exhaustsAt <= current) return true;
+    if (Number.isFinite(resetsAt) && resetsAt <= current) return true;
+    if (Number.isFinite(exhaustsAt) && Number.isFinite(resetsAt) && exhaustsAt >= resetsAt) return true;
+    return false;
+  }
+
+  // --- theme ---------------------------------------------------------------
+
+  const THEME_PREFERENCES = ['system', 'light', 'dark'];
+
+  function normalizeThemePreference(value) {
+    const raw = text(value).toLowerCase();
+    return THEME_PREFERENCES.includes(raw) ? raw : 'system';
+  }
+
+  function nextThemePreference(value) {
+    const current = normalizeThemePreference(value);
+    return THEME_PREFERENCES[(THEME_PREFERENCES.indexOf(current) + 1) % THEME_PREFERENCES.length];
+  }
+
+  function resolvedTheme(preference, systemDark) {
+    const wanted = normalizeThemePreference(preference);
+    if (wanted === 'system') return systemDark === true ? 'dark' : 'light';
+    return wanted;
+  }
+
+  function themePreferenceLabel(preference, resolved) {
+    const wanted = normalizeThemePreference(preference);
+    if (wanted === 'system') return `跟随系统（${resolved === 'dark' ? '深色' : '浅色'}）`;
+    return wanted === 'dark' ? '深色' : '浅色';
+  }
+
+  // --- optional observability / runtime views ------------------------------
+  //
+  // These helpers mirror the real backend shapes. They copy only an explicit
+  // allowlist of metadata: request/response bodies, completions, headers, keys,
+  // control keys and workspace ids never enter the page.
+
+  function shortText(value, max = 200) {
+    const raw = text(value).replace(/[\u0000-\u001f\u007f]+/g, ' ');
+    return raw.length > max ? `${raw.slice(0, max)}…` : raw;
+  }
+
+  function safeInteger(value, min = 0, max = Number.MAX_SAFE_INTEGER) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
+  }
+
+  function safeTimestamp(value) {
+    return quotaTimestamp(value);
+  }
+
+  function safeCode(value, max = 80) {
+    const raw = text(value);
+    return /^[A-Za-z0-9_.:-]+$/.test(raw) ? raw.slice(0, max) : '';
+  }
+
+  function safeIdentifier(value, max = 128) {
+    const raw = text(value);
+    if (!raw || raw.length > max) return '';
+    return /[\u0000-\u001f\u007f]/.test(raw) ? '' : raw;
+  }
+
+  // The backend limits model-test aliases to 512 UTF-8 bytes, not UTF-16 code
+  // units. Identity fields must survive in full: truncating an alias would make
+  // a response look like it belongs to a different model.
+  function utf8ByteLength(value) {
+    const raw = String(value ?? '');
+    let bytes = 0;
+    for (let index = 0; index < raw.length; index += 1) {
+      const code = raw.charCodeAt(index);
+      if (code < 0x80) bytes += 1;
+      else if (code < 0x800) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff) {
+        bytes += 4;
+        index += 1;
+      } else bytes += 3;
+    }
+    return bytes;
+  }
+
+  function safeIdentity(value, maxBytes = 512) {
+    const raw = text(value);
+    if (!raw || utf8ByteLength(raw) > maxBytes) return '';
+    return /[\u0000-\u001f\u007f]/.test(raw) ? '' : raw;
+  }
+
+  function safeURLText(value) {
+    const raw = text(value);
+    if (!raw) return '';
+    try {
+      const parsed = new URL(raw);
+      if (parsed.username || parsed.password || parsed.search || parsed.hash) return '';
+      return shortText(parsed.toString().replace(/\/$/, ''), 200);
+    } catch { return ''; }
+  }
+
+  function safeCounter(value) {
+    return safeInteger(value);
+  }
+
+  function normalizeRetention(value) {
+    const data = value && typeof value === 'object' ? value : {};
+    return {
+      enabled: data.enabled !== false,
+      retention_days: safeInteger(data.retention_days, 1, 90),
+      max_entries: safeInteger(data.max_entries, 1, 500),
+      entries: safeInteger(data.entries) ?? 0,
+      oldest: safeTimestamp(data.oldest),
+      newest: safeTimestamp(data.newest),
+    };
+  }
+
+  function normalizeLogStatus(value) {
+    const raw = text(value);
+    return raw === 'success' || raw === 'error' ? raw : '';
+  }
+
+  // RequestLogEntry as served by GET /request-logs. Only safe metadata survives.
+  function normalizeRequestLog(value) {
+    if (!value || typeof value !== 'object') return null;
+    const httpStatus = safeInteger(value.http_status, 100, 599);
+    const record = {
+      id: safeIdentifier(value.id, 64),
+      started_at: safeTimestamp(value.started_at),
+      finished_at: safeTimestamp(value.finished_at),
+      duration_ms: safeCounter(value.duration_ms),
+      model: shortText(value.model, 200),
+      upstream_model: shortText(value.upstream_model, 200),
+      credential_id: safeIdentifier(value.credential_id, 128),
+      stream: value.stream === true,
+      status: normalizeLogStatus(value.status),
+      http_status: httpStatus,
+      error_kind: safeCode(value.error_kind),
+      input_tokens: safeCounter(value.input_tokens),
+      output_tokens: safeCounter(value.output_tokens),
+      total_tokens: safeCounter(value.total_tokens),
+      request_id: safeIdentifier(value.request_id, 128),
+      upstream_attempted: value.upstream_attempted === undefined ? null : value.upstream_attempted === true,
+    };
+    if (!record.id && !record.started_at && !record.model && !record.status) return null;
+    return record;
+  }
+
+  function normalizeRequestLogsPage(value) {
+    const data = value && typeof value === 'object' ? value : {};
+    const source = Array.isArray(data.logs) ? data.logs : [];
+    const logs = [];
+    for (const item of source) {
+      const record = normalizeRequestLog(item);
+      if (record) logs.push(record);
+      if (logs.length >= 200) break;
+    }
+    const limit = safeInteger(data.limit, 1, 200) ?? 50;
+    const offset = safeInteger(data.offset, 0, 1_000_000) ?? 0;
+    return {
+      logs,
+      total: safeInteger(data.total) ?? logs.length,
+      limit,
+      offset,
+      has_more: data.has_more === true,
+      next_offset: safeInteger(data.next_offset),
+      retention: normalizeRetention(data.retention),
+    };
+  }
+
+  function normalizeRequestStats(value) {
+    const data = value && typeof value === 'object' ? value : {};
+    const tokens = data.tokens && typeof data.tokens === 'object' ? data.tokens : {};
+    const rate = typeof data.success_rate === 'number' && Number.isFinite(data.success_rate) && data.success_rate >= 0 && data.success_rate <= 1
+      ? data.success_rate
+      : null;
+    const models = (Array.isArray(data.models) ? data.models : []).map(item => {
+      const row = item && typeof item === 'object' ? item : {};
+      return {
+        model: shortText(row.model, 200) || 'unknown',
+        total: safeInteger(row.total) ?? 0,
+        success: safeInteger(row.success) ?? 0,
+        failed: safeInteger(row.failed) ?? 0,
+        upstream_attempted: safeInteger(row.upstream_attempted) ?? 0,
+        local_rejected: safeInteger(row.local_rejected) ?? 0,
+        input_tokens: safeInteger(row.input_tokens),
+        output_tokens: safeInteger(row.output_tokens),
+        total_tokens: safeInteger(row.total_tokens),
+      };
+    }).slice(0, 100);
+    return {
+      total: safeInteger(data.total) ?? 0,
+      success: safeInteger(data.success) ?? 0,
+      failed: safeInteger(data.failed) ?? 0,
+      streams: safeInteger(data.streams) ?? 0,
+      upstream_attempted: safeInteger(data.upstream_attempted) ?? 0,
+      local_rejected: safeInteger(data.local_rejected) ?? 0,
+      success_rate: rate,
+      tokens: {
+        input: safeInteger(tokens.input),
+        output: safeInteger(tokens.output),
+        total: safeInteger(tokens.total),
+        requests_with_usage: safeInteger(tokens.requests_with_usage) ?? 0,
+        requests_without_usage: safeInteger(tokens.requests_without_usage) ?? 0,
+      },
+      models,
+      retention: normalizeRetention(data.retention),
+    };
+  }
+
+  function normalizeConfig(value) {
+    const data = value && typeof value === 'object' ? value : {};
+    const hostPart = part => {
+      const source = part && typeof part === 'object' ? part : {};
+      return {
+        owner: safeCode(source.owner, 40),
+        read_only: source.read_only === true,
+        mode: safeCode(source.mode, 40),
+      };
+    };
+    const upstream = data.upstream && typeof data.upstream === 'object' ? data.upstream : {};
+    return {
+      logs: normalizeRetention(data.logs),
+      upstream: { origin: safeURLText(upstream.origin), fixed: upstream.fixed === true },
+      proxy: hostPart(data.proxy),
+      routing: hostPart(data.routing),
+      log_level: safeCode(data.log_level, 40),
+    };
+  }
+
+  function normalizeRuntimeTest(value) {
+    if (!value || typeof value !== 'object') return null;
+    return {
+      model_id: safeIdentity(value.model_id, 512),
+      upstream_model: shortText(value.upstream_model, 512),
+      status: normalizeLogStatus(value.status),
+      http_status: safeInteger(value.http_status, 100, 599),
+      duration_ms: safeCounter(value.duration_ms),
+      tested_at: safeTimestamp(value.tested_at),
+      error_kind: safeCode(value.error_kind),
+    };
+  }
+
+  function normalizeRuntimeHost(value) {
+    if (!value || typeof value !== 'object') return null;
+    const optionalBoolean = field => value[field] === true ? true : value[field] === false ? false : null;
+    return {
+      disabled: optionalBoolean('disabled'),
+      unavailable: optionalBoolean('unavailable'),
+      status: safeCode(value.status, 64),
+      status_message: shortText(value.status_message, 200),
+      next_retry_after: safeTimestamp(value.next_retry_after),
+    };
+  }
+
+  function normalizeRuntime(value) {
+    const data = value && typeof value === 'object' ? value : {};
+    const credentials = (Array.isArray(data.credentials) ? data.credentials : []).map(item => {
+      const row = item && typeof item === 'object' ? item : {};
+      const id = safeIdentifier(row.id, 128);
+      return {
+        id,
+        label: shortText(row.label, 100) || id,
+        disabled: row.disabled === true,
+        model_count: safeInteger(row.model_count) ?? 0,
+        models_scope: safeCode(row.models_scope, 40),
+        testing: row.testing === true,
+        last_test: normalizeRuntimeTest(row.last_test),
+        host: normalizeRuntimeHost(row.host),
+      };
+    });
+    const host = data.host && typeof data.host === 'object' ? data.host : {};
+    const capabilities = [];
+    if (data.capabilities && typeof data.capabilities === 'object') {
+      for (const [name, part] of Object.entries(data.capabilities)) {
+        const source = part && typeof part === 'object' ? part : {};
+        capabilities.push({
+          name: safeCode(name, 40),
+          owner: safeCode(source.owner, 40),
+          read_only: source.read_only === true,
+        });
+      }
+    }
+    return {
+      observed_at: safeTimestamp(data.observed_at),
+      loaded: data.loaded === true,
+      stopped: data.stopped === true,
+      active_requests: safeInteger(data.active_requests) ?? 0,
+      pending_operations: safeInteger(data.pending_operations) ?? 0,
+      model_count: safeInteger(data.model_count) ?? 0,
+      credentials,
+      host: { available: host.available === true, note: shortText(host.note, 300) },
+      capabilities,
+    };
+  }
+
+  // POST /model-test answer. The response body/completion is never part of the
+  // normalized result, only status, timing, token counters and a safe error kind.
+  function normalizeModelTest(value) {
+    const data = value && typeof value === 'object' ? value : {};
+    const usage = data.usage && typeof data.usage === 'object' ? data.usage : {};
+    return {
+      credential_id: safeIdentifier(data.credential_id, 128),
+      model_id: safeIdentity(data.model_id, 512),
+      upstream_model: shortText(data.upstream_model, 512),
+      status: normalizeLogStatus(data.status),
+      http_status: safeInteger(data.http_status, 100, 599),
+      duration_ms: safeCounter(data.duration_ms),
+      usage: {
+        prompt_tokens: safeInteger(usage.prompt_tokens),
+        completion_tokens: safeInteger(usage.completion_tokens),
+        total_tokens: safeInteger(usage.total_tokens),
+      },
+      error_kind: safeCode(data.error && typeof data.error === 'object' ? data.error.kind : ''),
+      real_inference: data.real_inference === true,
+      upstream_attempted: Object.prototype.hasOwnProperty.call(data, 'upstream_attempted') ? data.upstream_attempted === true : null,
+      streaming: data.streaming === true,
+      request_kind: safeCode(data.request_kind, 60),
+    };
+  }
+
+  function formatRatio(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1
+      ? `${(value * 100).toFixed(2)}%`
+      : '';
+  }
+
   const api = {
     DEFAULT_BASE_URL,
     parseAPIError,
@@ -427,6 +758,25 @@
     filterUpstream,
     addUpstreams,
     removeUpstreams,
+    // Optional observability/runtime helpers.
+    normalizeRequestLog,
+    normalizeRequestLogsPage,
+    normalizeRequestStats,
+    normalizeConfig,
+    normalizeRuntime,
+    normalizeModelTest,
+    normalizeRetention,
+    formatRatio,
+    safeInteger,
+    safeIdentifier,
+    safeIdentity,
+    utf8ByteLength,
+    shortText,
+    quotaForecastExpired,
+    normalizeThemePreference,
+    nextThemePreference,
+    resolvedTheme,
+    themePreferenceLabel,
   };
   Object.defineProperty(api, '__test', { value: { text }, enumerable: false });
   globalThis.OpenDesignCore = api;

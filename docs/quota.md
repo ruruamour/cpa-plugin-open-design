@@ -43,9 +43,30 @@
 
 ## 模型差异与通用预检
 
-页面优先显示官方钱包余额、每个套餐窗口的已用／剩余 credits、上限和重置时间。多个窗口分别生效，不能相加。插件请求 funding-check 时不传 `modelId`，要求返回 `modelId:null`；页面里的资金方式与资金检查均是未指定模型的通用预检，不能据此断言某个模型必然使用套餐或钱包。
+页面优先显示官方钱包余额、每个套餐窗口的已用／剩余 credits、上限和重置时间。多个窗口分别生效，不能相加。共享额度路径请求 funding-check 时不传 `modelId`，要求返回 `modelId:null`；页面里的资金方式与资金检查均是未指定模型的通用预检，不能据此断言某个模型必然使用套餐或钱包。
+
+模型级信息由单独的[官方模型覆盖](#官方模型覆盖)路由提供：它传入 `modelId`，只返回该模型的覆盖与资金检查结果，不改变也不复用上面的共享额度快照。
 
 不同模型的套餐覆盖和消耗可能不同。当前页面不维护模型价格或倍率表，不把 credits 换算成单个模型的剩余 token、请求次数，也不把套餐 credits 换算成钱包 USD。具体请求的准入和扣费遵循官方对该模型的规则。
+
+## 官方模型覆盖
+
+`GET /v0/management/open-design/model-coverage?credential_id=<id>&model_id=<上游模型 ID>` 使用与共享额度相同的 control Key 和 Workspace ID，向官方 `funding-check` **带上 `modelId`**，读取该模型的 `modelCovered`、`funding`、`fundingCheck`。
+
+- 共享额度与模型覆盖是两套独立缓存：覆盖查询不写入、不伪造钱包／套餐窗口快照；共享 credits 也不会被当成某个模型的余额。
+- 只有 `refresh=1` 才请求官方接口；普通读取只返回缓存。
+- 同一凭据与模型的组合 60 秒内最多成功请求一次，相同组合的并发刷新合并；整个插件最多同时刷新三个模型覆盖。
+- 单次覆盖刷新 30 秒总预算，包含排队与请求；超时通过 CPA 公开 operation/cancel 释放。
+- 官方返回的 `workspaceId` 和 `modelId` 必须与请求一致，否则按 `malformed` 处理；响应只含允许字段。
+- 缓存容量有上限，正在请求的条目不会被驱逐。
+
+覆盖结果状态：
+
+- **未配置**：缺少 control Key 或 Workspace ID，不发请求。
+- **等待查询**：已配置但尚未查询。
+- **可用**：显示 `model_covered`、`funding`、`funding_check` 与查询时间。
+- **上次数据**：刷新失败后保留最后一次成功值并标记 stale。
+- **查询失败**：`error.kind` 为 `unauthorized`、`forbidden`、`rate_limited`、`timeout`、`malformed`、`network`、`upstream` 或 `stopped`。
 
 ## 预测的含义与计算
 
@@ -87,9 +108,15 @@ GET /v0/management/open-design/quota?credential_id=<id>
 
 GET /v0/management/open-design/quota?credential_id=<id>&refresh=1
   受最小间隔限制的手动查询
+
+GET /v0/management/open-design/model-coverage?credential_id=<id>&model_id=<id>
+  只读模型级覆盖缓存
+
+GET /v0/management/open-design/model-coverage?credential_id=<id>&model_id=<id>&refresh=1
+  受 60 秒节流与 30 秒预算限制的手动模型覆盖查询
 ```
 
-额度返回的钱包与窗口分别包含 `state`、`data`、`fetched_at`、`error`，顶层含 `next_refresh_at`。没有值时为 `null`，窗口内的 `forecast.state` 表示样本不足、滚动窗口、估算、已耗尽、先重置、已到期或超过预测上限。身份、枚举、时间和数字字段按官方客户端契约校验，只返回允许的字段。
+额度返回的钱包与窗口分别包含 `state`、`data`、`fetched_at`、`error`，顶层含 `next_refresh_at`。没有值时为 `null`，窗口内的 `forecast.state` 表示样本不足、滚动窗口、估算、已耗尽、先重置、已到期或超过预测上限。模型覆盖返回 `credential_id`、`model_id`、`billing_configured`、`workspace_id`、`state`、`fetched_at`、`next_refresh_at`、`model_covered`、`funding_check`、`funding` 与 `error`。两类路由都按官方客户端契约校验身份、枚举、时间和数字字段，只返回允许的字段。
 
 ## 官方协议依据
 

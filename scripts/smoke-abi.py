@@ -163,6 +163,14 @@ def billing_reply(billing, name):
     return status, billing[name]
 
 
+def funding_reply(billing, path):
+    status, payload = billing_reply(billing, "funding")
+    model_ids = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query).get("modelId", [])
+    if status == 200 and model_ids and isinstance(payload, dict):
+        payload = dict(payload, modelId=model_ids[0], modelCovered=True)
+    return status, payload
+
+
 def billing_hits(origin):
     """Fake billing-API requests only (the inference origin is counted apart)."""
     return [r for r in origin.requests
@@ -234,9 +242,9 @@ class FakeUpstream:
                     status, payload = billing_reply(billing, "wallet")
                     self._buffer(status, json.dumps(payload).encode())
                     return True
-                if self.path == ("/api/v1/workspaces/%s/billing/funding-check"
-                                 % billing["workspace_id"]):
-                    status, payload = billing_reply(billing, "funding")
+                if urllib.parse.urlsplit(self.path).path == (
+                        "/api/v1/workspaces/%s/billing/funding-check" % billing["workspace_id"]):
+                    status, payload = funding_reply(billing, self.path)
                     self._buffer(status, json.dumps(payload).encode())
                     return True
                 self._buffer(404, b'{"error":{"message":"not found"}}')
@@ -879,8 +887,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             return True
         funding_path = "/api/v1/workspaces/%s/billing/funding-check" % \
             billing["workspace_id"]
-        if self.path == funding_path:
-            status, payload = billing_reply(billing, "funding")
+        if urllib.parse.urlsplit(self.path).path == funding_path:
+            status, payload = funding_reply(billing, self.path)
             self._send(status, json.dumps(payload).encode())
             return True
         self._send(404, b'{"error":{"message":"not found"}}')
@@ -1314,6 +1322,9 @@ def run_cpa_live(artifact, binary, version):
         # still be live and the proxy allowlist still the steady-state set.
         evidence["host_quota"] = run_quota_live(
             request, origin, proxy, credential_id, client_models, work / "auths")
+
+        origin.billing = official_billing_fixture()
+        evidence["host_management_v03"] = run_management_v03(request, origin, credential_id)
 
         # ---- host HTTP redirect: is Authorization re-sent across origins? ----
         # Must run BEFORE the delete: a removed credential makes the
@@ -2223,7 +2234,28 @@ def run(artifact, version):
         # ---- management quota through the fake ctypes host ----
         evidence["quota_host"] = run_quota_ctypes(plugin, host, upstream, credential_id)
 
-        # Shutdown must close host streams and stay idempotent.
+        def management_call(path, body=None, method=None):
+            parsed = urllib.parse.urlsplit(path)
+            return plugin.management(parsed.path, method=method or ("POST" if body is not None else "GET"),
+                                     query=urllib.parse.parse_qs(parsed.query), body=body)
+
+        evidence["management_v03"] = run_management_v03(management_call, upstream, credential_id)
+
+        # Quiesce gates every dynamic route while retaining static resources.
+        plugin.call("plugin.quiesce", {})
+        for route in registered["routes"]:
+            if route["Path"].endswith("/console.html"):
+                continue
+            status, _, _ = plugin.management(route["Path"], method=route["Method"])
+            require(status == 503, "shutdown did not gate %s %s: %s" % (
+                route["Method"], route["Path"], status))
+        persisted = json.loads((work / "data/request-logs.snapshot.json").read_text())
+        require(persisted["logs"] == [], "shutdown did not persist the explicit clear")
+        evidence["management_v03"]["shutdown_flush_and_routes"] = True
+        plugin.shutdown()
+        rc, envelope = plugin.raw_call("management.handle", {"Method": "GET", "Path": API + "/status"})
+        require(rc != 0 and envelope.get("error", {}).get("http_status") == 503,
+                "callback after ABI shutdown must fail safely, never panic")
         plugin.shutdown()
         plugin = None
         evidence["shutdown"] = {"host_streams_closed": bool(host.closed_upstreams)}
@@ -2240,6 +2272,101 @@ def run(artifact, version):
                 pass
         upstream.stop()
         shutil.rmtree(work, ignore_errors=True)
+
+
+def run_management_v03(request, origin, credential_id):
+    """Same management contract through ctypes and the unmodified CPA host.
+
+    All traffic is loopback-fixture traffic. Counts come from the fake origin,
+    not the HTTP status of a local route or an inferred token estimate.
+    """
+    def call(suffix, body=None, method=None, expected=200):
+        try:
+            status, raw, _ = request(API + suffix, body=body, method=method)
+        except urllib.error.HTTPError as exc:
+            status, raw = exc.code, exc.read()
+        require(status == expected, "%s returned %s, expected %s" % (suffix, status, expected))
+        text = raw.decode()
+        require(FIXTURE_KEY not in text and FIXTURE_CONTROL_KEY not in text,
+                "%s leaked a fixture key" % suffix)
+        return json.loads(raw)
+
+    config = call("/config")
+    require(config["logs"]["enabled"] is True, config)
+    require(config["logs"]["retention_days"] == 7 and config["logs"]["max_entries"] == 500, config)
+    require(config["upstream"]["fixed"] and config["proxy"]["read_only"] and
+            config["routing"]["owner"] == "CPA", config)
+    call("/config", {"proxy": "must-not-be-accepted"}, expected=400)
+    updated = call("/config", {"logs": {"retention_days": 8}})
+    require(updated["logs"]["retention_days"] == 8, updated)
+    call("/config", {"logs": {"retention_days": 7}})
+
+    before = len(origin.requests)
+    runtime = call("/runtime")
+    require(runtime["loaded"] and not runtime["stopped"] and runtime["host"]["available"], runtime)
+    require(any(row["id"] == credential_id for row in runtime["credentials"]), runtime)
+    for suffix in ("/logs?limit=1", "/logs/stats", "/request-logs?limit=1", "/request-stats"):
+        call(suffix)
+    require(len(origin.requests) == before, "metadata GETs generated upstream traffic")
+
+    # Explicit official model-level coverage is separate from shared quota.
+    call("/credentials", {"id": credential_id, "control_key": FIXTURE_CONTROL_KEY,
+                           "workspace_id": FIXTURE_WORKSPACE_ID})
+    query = urllib.parse.urlencode({"credential_id": credential_id, "model_id": "deepseek-v4.1-flash"})
+    before = len(origin.requests)
+    require(call("/model-coverage?" + query)["state"] == "needs_refresh", "coverage read auto-fetched")
+    require(len(origin.requests) == before, "coverage GET generated upstream traffic")
+    coverage = call("/model-coverage?" + query + "&refresh=1")
+    require(coverage["state"] == "available" and coverage["model_covered"] is True, coverage)
+    hits = origin.requests[before:]
+    require(len(hits) == 1 and urllib.parse.parse_qs(urllib.parse.urlsplit(
+        hits[0]["path"]).query) == {"modelId": ["deepseek-v4.1-flash"]}, "coverage lost the real modelId")
+    require(hits[0]["authorization"] == "Bearer " + FIXTURE_CONTROL_KEY, "coverage used the inference key")
+    call("/model-coverage?" + query + "&refresh=1")
+    require(len(origin.requests) == before + 1, "coverage refresh bypassed the 60-second cache")
+    require(call("/quota?credential_id=" + credential_id)["state"] == "needs_refresh",
+            "coverage populated shared quota")
+
+    before = len(origin.requests)
+    prompt = "fixture-sensitive-prompt-never-return-or-persist"
+    test = call("/model-test", {"credential_id": credential_id, "model_id": "deepseek-flash", "prompt": prompt})
+    require(len(origin.requests) == before + 1, "model-test must send exactly once")
+    sent = json.loads(origin.requests[-1]["body"])
+    require(sent["model"] == "deepseek-v4.1-flash" and sent.get("stream", False) is False and
+            sent["max_tokens"] == 16, "model-test was not a bounded buffered inference")
+    assert_keys(test, ["credential_id", "model_id", "upstream_model", "status", "http_status",
+                       "duration_ms", "usage", "real_inference", "upstream_attempted", "streaming", "request_kind"], "model-test")
+    require(test["status"] == "success" and test["http_status"] == 200 and test["upstream_attempted"], test)
+    require(test["usage"] == {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}, test)
+    call("/model-test", {"credential_id": credential_id, "model_id": "not-enabled"}, expected=400)
+    require(len(origin.requests) == before + 1, "local model-test validation contacted upstream")
+    runtime = call("/runtime")
+    row = next(row for row in runtime["credentials"] if row["id"] == credential_id)
+    require(row["last_test"]["model_id"] == "deepseek-flash" and not row["testing"], row)
+    page = call("/request-logs?limit=200&attempted=yes")
+    require(page["total"] >= 1 and page["logs"], page)
+    metadata_keys = {"id", "started_at", "finished_at", "duration_ms", "model", "upstream_model",
+                     "credential_id", "stream", "status", "http_status", "error_kind", "input_tokens",
+                     "output_tokens", "total_tokens", "request_id", "upstream_attempted"}
+    for entry in page["logs"]:
+        require(set(entry).issubset(metadata_keys), "request log grew non-metadata fields")
+        if entry["status"] != "success":
+            require(entry["total_tokens"] is None, "missing usage became zero")
+    for document in (page, runtime, test):
+        text = json.dumps(document)
+        require(FIXTURE_WORKSPACE_ID not in text and prompt not in text and "Hello" not in text,
+                "management metadata exposed workspace, prompt or completion")
+    stats = call("/request-stats")
+    require(stats["total"] == page["total"] and stats["tokens"]["input"] >= 12 and
+            stats["tokens"]["output"] >= 7 and stats["models"], stats)
+    call("/request-logs", method="DELETE")
+    require(call("/request-logs")["logs"] == [], "clear left visible entries")
+    empty = call("/request-stats")
+    require(empty["total"] == 0 and empty["tokens"]["total"] is None, empty)
+    call("/credentials", {"id": credential_id, "clear_billing": True})
+    return {"status": "PASS", "config_roundtrip": True, "runtime": True,
+            "model_test_single_buffered_request": True, "metadata_allowlist": True,
+            "coverage_modelId_and_cache": True, "stats_and_clear": True}
 
 
 def run_quota_ctypes(plugin, host, upstream, credential_id):

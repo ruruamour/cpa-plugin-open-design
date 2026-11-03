@@ -110,6 +110,34 @@
         query: { credential_id: credentialID, model_id: modelID, refresh: options.refresh ? 1 : '' },
       }),
       saveModels: models => request('/models', { method: 'POST', body: { models } }),
+      // Optional observability/runtime routes. Every one of them is called from
+      // an explicit operator action only: never while loading the page, switching
+      // tabs or rendering. Query values are constrained by the backend.
+      requestLogs: (options = {}) => request('/request-logs', {
+        query: {
+          limit: options.limit,
+          offset: options.offset,
+          status: options.status,
+          model: options.model,
+          credential_id: options.credentialID,
+          attempted: options.attempted,
+        },
+      }),
+      requestStats: () => request('/request-stats'),
+      clearRequestLogs: () => request('/request-logs', { method: 'DELETE' }),
+      config: () => request('/config'),
+      // Only plugin-owned log settings are accepted by the backend; upstream,
+      // proxy and routing stay host-owned and read-only.
+      updateConfig: logs => request('/config', { method: 'POST', body: { logs } }),
+      runtime: () => request('/runtime'),
+      modelTest: input => request('/model-test', {
+        method: 'POST',
+        body: {
+          credential_id: String(input && input.credentialID || ''),
+          model_id: String(input && input.modelID || ''),
+          prompt: input && input.prompt ? String(input.prompt) : undefined,
+        },
+      }),
     };
   }
 

@@ -112,23 +112,44 @@ func (o *operationTracker) reopen() {
 	}
 }
 
-// doOperation runs one host HTTP callback under a host operation so quiesce can
-// cancel it. The host binds the operation to the request's host_callback_id, so
-// the same callback id must be used for open, do, and cancel.
+// pendingCount reports the number of host operations still awaiting completion.
+func (o *operationTracker) pendingCount() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return len(o.pending)
+}
+
+// doOperation invokes one host operation. The host binds the operation to the
+// request's host_callback_id, so the same callback id must be used for open, do,
+// and cancel.
 func (s *Service) doOperation(callbackID, method string, payload map[string]any, out any) error {
 	return s.doOperationContext(context.Background(), callbackID, method, payload, out)
 }
 
+type hostOperationError struct {
+	err       error
+	attempted bool
+}
+
+func (e *hostOperationError) Error() string { return e.err.Error() }
+func (e *hostOperationError) Unwrap() error { return e.err }
+
 // doOperationContext bounds cancellable host work without adding transport ABI
 // fields. Bounded calls require the operation bridge: an uncancellable fallback
 // could block past the context deadline. Unbounded callers keep their fallback.
-func (s *Service) doOperationContext(ctx context.Context, callbackID, method string, payload map[string]any, out any) error {
+func (s *Service) doOperationContext(ctx context.Context, callbackID, method string, payload map[string]any, out any) (err error) {
+	attempted := false
+	defer func() {
+		if err != nil {
+			err = &hostOperationError{err: err, attempted: attempted}
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	local := s.ops.register(callbackID)
 	if local == 0 {
-		return fail(http.StatusServiceUnavailable, "OpenDesign plugin is shutting down")
+		return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
 	}
 	defer s.ops.release(local)
 	if ctx.Done() != nil {
@@ -169,11 +190,12 @@ func (s *Service) doOperationContext(ctx context.Context, callbackID, method str
 		// Older hosts may not expose the operation bridge. Only unbounded
 		// callers retain their existing fallback.
 		if s.ops.isClosed() {
-			return fail(http.StatusServiceUnavailable, "OpenDesign plugin is shutting down")
+			return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
 		}
 		if ctx.Done() != nil {
 			return errors.New("host HTTP operations are required for bounded requests")
 		}
+		attempted = true
 		return s.call(method, payload, out)
 	}
 	if opened.OperationID != "" {
@@ -184,7 +206,7 @@ func (s *Service) doOperationContext(ctx context.Context, callbackID, method str
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return fail(http.StatusServiceUnavailable, "OpenDesign plugin is shutting down")
+			return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
 		}
 		payload["operation_id"] = opened.OperationID
 		// The host finishes the operation itself when the callback returns
@@ -204,7 +226,8 @@ func (s *Service) doOperationContext(ctx context.Context, callbackID, method str
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	err := s.call(method, payload, out)
+	attempted = true
+	err = s.call(method, payload, out)
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}

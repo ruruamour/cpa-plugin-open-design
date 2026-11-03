@@ -37,6 +37,27 @@
       --danger: #ff9b8f;
       --good: #6ee7b7;
     }
+    :root[data-theme="light"] { color-scheme: light; }
+    :root[data-theme="dark"] { color-scheme: dark; }
+    /* system preference: no explicit light/dark choice stored by the page */
+    @media (prefers-color-scheme: dark) {
+      :root[data-theme="system"] {
+        color-scheme: dark;
+        --bg: #151a21;
+        --surface: #1c232c;
+        --surface-2: #232b35;
+        --ink: #e8edf3;
+        --muted: #a8b3c2;
+        --line: #37414e;
+        --accent: #6ea8ff;
+        --accent-ink: #0e1520;
+        --danger: #ff9b8f;
+        --good: #6ee7b7;
+      }
+    }
+    @media (prefers-color-scheme: light) {
+      :root[data-theme="system"] { color-scheme: light; }
+    }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--ink); }
     h1, h2, h3, p { margin: 0; }
@@ -80,12 +101,12 @@
     .button.compact { min-height: 34px; padding: 4px 10px; font-size: 12px; }
     .check { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
     .check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); flex: none; }
-    .rows { display: grid; gap: 8px; }
+    .rows { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 8px; }
     .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
     .row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; min-width: 0; }
     .row-main .name { font-weight: 600; overflow-wrap: anywhere; }
     .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-    .row-detail { flex: 1 1 100%; min-width: 0; }
+    .row-detail { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; }
     .toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
     .toolbar .field { flex: 1 1 180px; }
     .search { flex: 1 1 220px; width: auto; }
@@ -99,6 +120,9 @@
     .mapping-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
     .mapping-status .badge.warn { background: color-mix(in srgb, #b54708 16%, var(--surface)); color: #b54708; }
     :root[data-theme="dark"] .mapping-status .badge.warn { color: #fec84b; }
+    @media (prefers-color-scheme: dark) {
+      :root[data-theme="system"] .mapping-status .badge.warn { color: #fec84b; }
+    }
     .upstream { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 6px 10px; }
     .upstream-detail { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 9px; }
     .upstream-detail .muted { font-size: 12px; }
@@ -129,6 +153,9 @@
     .quota-trend > summary { cursor: pointer; font-size: 12px; color: var(--muted); }
     .quota-forecast.warn { color: #b54708; }
     :root[data-theme="dark"] .quota-forecast.warn { color: #fec84b; }
+    @media (prefers-color-scheme: dark) {
+      :root[data-theme="system"] .quota-forecast.warn { color: #fec84b; }
+    }
     .quota-note { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .upstream .mono { overflow-wrap: anywhere; }
     .upstream .muted { font-size: 12px; }
@@ -140,6 +167,19 @@
     .state.ok { color: var(--good); }
     .url { overflow-wrap: anywhere; }
     .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 16px; padding: 4px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; }
+    .tab { flex: 1 1 130px; min-height: 36px; padding: 6px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); font-weight: 600; }
+    .tab:hover { color: var(--ink); }
+    .tab[aria-selected="true"] { background: var(--surface); border-color: var(--line); color: var(--ink); }
+    .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 8px; }
+    .fact { display: grid; gap: 2px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); min-width: 0; }
+    .fact-label { color: var(--muted); font-size: 12px; }
+    .fact-value { font-weight: 600; overflow-wrap: anywhere; }
+    .log-row { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
+    .log-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; }
+    .log-detail { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .toolbar .field.narrow { flex: 0 1 150px; }
+    .read-only { min-width: 0; border: 1px dashed var(--line); border-radius: 8px; padding: 10px 12px; background: var(--surface-2); }
     @media (max-width: 760px) {
       .split { grid-template-columns: minmax(0, 1fr); }
       .mapping-row { grid-template-columns: minmax(0, 1fr); }
@@ -147,6 +187,8 @@
       .mapping-row .button { justify-self: start; }
       .panel { padding: 14px; }
       .shell { padding: 16px 12px 36px; }
+      .tabs { gap: 4px; padding: 3px; }
+      .tab { flex: 1 1 120px; padding: 6px 8px; }
     }
   </style>
 </head>
@@ -161,6 +203,9 @@
         </div>
       </div>
       <span class="badge" id="authBadge">未验证</span>
+      <div class="panel-actions" style="margin-left: auto;">
+        <button class="button compact" id="themeToggle" type="button" aria-label="切换颜色主题：跟随系统" title="颜色主题：跟随系统、浅色、深色">主题：跟随系统</button>
+      </div>
     </div>
     <p class="lead">
       通过 CPA 接入 OpenDesign Cloud 模型 API。默认上游地址为
@@ -205,6 +250,30 @@
     </section>
 
     <!-- Reserved extension slot: future per-account status can render inside each row without moving the action buttons. -->
+    <nav class="tabs" role="tablist" aria-label="OpenDesign 管理分区">
+      <button class="tab" id="tabOverview" type="button" role="tab" aria-selected="true" aria-controls="overviewPanel" data-tab="overview">概览</button>
+      <button class="tab" id="tabCredentials" type="button" role="tab" aria-selected="false" aria-controls="credentialsPanel" data-tab="credentials" tabindex="-1">凭据 · 额度</button>
+      <button class="tab" id="tabModels" type="button" role="tab" aria-selected="false" aria-controls="modelsTab" data-tab="models" tabindex="-1">模型映射 · 覆盖</button>
+      <button class="tab" id="tabLogs" type="button" role="tab" aria-selected="false" aria-controls="logsPanel" data-tab="logs" tabindex="-1">请求日志</button>
+      <button class="tab" id="tabConfig" type="button" role="tab" aria-selected="false" aria-controls="configPanel" data-tab="config" tabindex="-1">代理池 · 配置</button>
+    </nav>
+
+    <section class="tabpanel" id="overviewPanel" role="tabpanel" aria-labelledby="tabOverview">
+      <section class="panel" aria-labelledby="overviewTitle">
+        <div class="panel-head">
+          <div>
+            <h2 id="overviewTitle">运行概览</h2>
+            <p class="hint">只汇总管理接口已经返回的账户与已保存映射数量。切换标签页、打开日志或配置都不会自动发起请求。</p>
+          </div>
+          <span class="badge" id="overviewBadge">未验证</span>
+        </div>
+        <div class="facts" id="overviewFacts" aria-live="polite"></div>
+        <p class="hint" style="margin-top: 12px;">账户密钥只保存在 CPA 凭据目录，本页不回显。请求日志、配置、runtime 与模型测试都由你手动触发。</p>
+      </section>
+    </section>
+
+    <section class="tabpanel" id="credentialsPanel" role="tabpanel" aria-labelledby="tabCredentials" hidden>
+      <p class="empty" id="credentialsLocked">需要先验证管理密钥，才能查看账户和额度。</p>
     <section class="panel" id="accountsPanel" aria-labelledby="accountsTitle" hidden>
       <div class="panel-head">
         <div>
@@ -256,7 +325,10 @@
       </form>
       <div class="rows" id="accountList" style="margin-top: 14px;" aria-live="polite"></div>
     </section>
+    </section>
 
+    <section class="tabpanel" id="modelsTab" role="tabpanel" aria-labelledby="tabModels" hidden>
+      <p class="empty" id="modelsLocked">需要先验证管理密钥，才能读取上游模型并维护映射。</p>
     <section class="panel" id="modelsPanel" aria-labelledby="modelsTitle" hidden>
       <div class="panel-head">
         <div>
@@ -273,7 +345,7 @@
           <label class="field">
             <span>账户</span>
             <select class="control" id="modelCredential">
-              <option value="">请选择账户</option>
+              <option value="" disabled selected>请选择账户</option>
             </select>
           </label>
           <button class="button compact" id="fetchModels" type="button">获取模型列表</button>
@@ -306,6 +378,150 @@
         </div>
         <!-- Reserved extension slot: future status blocks can sit beside the save action. -->
       </div>
+    </section>
+
+      <section class="panel" aria-labelledby="modelTestTitle">
+        <div class="panel-head">
+          <div>
+            <h2 id="modelTestTitle">模型测试（可选）</h2>
+            <p class="hint">只有点击「发送测试」并确认后才会调用 <span class="mono">POST /model-test</span>，一次操作只发一次请求，不自动重试。结果只显示状态、耗时和 token 计数，不显示 completion 或任何密钥。</p>
+          </div>
+        </div>
+        <div class="toolbar">
+          <label class="field narrow">
+            <span>账户</span>
+            <select class="control" id="modelTestCredential">
+              <option value="" disabled selected>请选择账户</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>客户端模型名</span>
+            <input class="control mono" id="modelTestModel" autocomplete="off" spellcheck="false" placeholder="例如 open-design-flash">
+          </label>
+          <label class="field">
+            <span>提示词（可选）</span>
+            <input class="control" id="modelTestPrompt" maxlength="512" autocomplete="off" placeholder="默认使用极小的探测提示">
+          </label>
+          <button class="button primary" id="runModelTest" type="button">发送测试</button>
+        </div>
+        <p class="state" id="modelTestState" role="status" aria-live="polite" hidden></p>
+        <div class="facts" id="modelTestFacts" aria-live="polite"></div>
+      </section>
+    </section>
+
+    <section class="tabpanel" id="logsPanel" role="tabpanel" aria-labelledby="tabLogs" hidden>
+      <section class="panel" aria-labelledby="logsTitle">
+        <div class="panel-head">
+          <div>
+            <h2 id="logsTitle">请求日志</h2>
+            <p class="hint">只在点击按钮时读取。列表只展示请求元数据，不展示请求/响应正文、密钥、query 或工作区标识。</p>
+          </div>
+          <div class="panel-actions">
+            <button class="button compact" id="refreshLogs" type="button">刷新日志</button>
+            <button class="button compact" id="refreshStats" type="button">读取统计</button>
+            <button class="button compact danger" id="clearLogs" type="button">清空日志</button>
+          </div>
+        </div>
+        <div class="toolbar">
+          <label class="field narrow">
+            <span>状态</span>
+            <select class="control" id="logsFilterStatus">
+              <option value="">全部</option>
+              <option value="success">成功</option>
+              <option value="error">失败</option>
+            </select>
+          </label>
+          <label class="field narrow">
+            <span>上游</span>
+            <select class="control" id="logsFilterAttempted">
+              <option value="">全部</option>
+              <option value="yes">已尝试上游</option>
+              <option value="no">本地拒绝</option>
+            </select>
+          </label>
+          <label class="field narrow">
+            <span>账户</span>
+            <select class="control" id="logsFilterCredential">
+              <option value="">全部账户</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>模型（别名或上游 ID）</span>
+            <input class="control mono" id="logsFilterModel" autocomplete="off" spellcheck="false" placeholder="例如 open-design-flash">
+          </label>
+          <label class="field narrow">
+            <span>每页</span>
+            <select class="control" id="logsFilterLimit">
+              <option value="25">25</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+        </div>
+        <p class="state" id="logsState" role="status" aria-live="polite" hidden></p>
+        <h3 style="margin: 14px 0 8px;">汇总统计</h3>
+        <div class="facts" id="requestStats" aria-live="polite"></div>
+        <div class="rows" id="requestStatsModels" aria-live="polite"></div>
+        <h3 style="margin: 14px 0 8px;">日志条目</h3>
+        <div class="rows" id="requestLogList" aria-live="polite">
+          <p class="empty">尚未读取。点「刷新日志」后才会请求 <span class="mono">GET /request-logs</span>。</p>
+        </div>
+        <div class="mapping-status" style="margin-top: 10px;">
+          <button class="button compact" id="logsPrev" type="button" disabled>上一页</button>
+          <button class="button compact" id="logsNext" type="button" disabled>下一页</button>
+          <span class="hint" id="logsPageInfo">尚未读取日志。</span>
+        </div>
+      </section>
+    </section>
+
+    <section class="tabpanel" id="configPanel" role="tabpanel" aria-labelledby="tabConfig" hidden>
+      <section class="panel" aria-labelledby="configTitle">
+        <div class="panel-head">
+          <div>
+            <h2 id="configTitle">插件配置</h2>
+            <p class="hint">插件只拥有请求日志开关与保留设置；上游地址固定，代理池、路由、全局冷却由 CPA 宿主拥有。读取和保存都只在点击按钮时发生。</p>
+          </div>
+          <div class="panel-actions">
+            <button class="button compact" id="loadConfig" type="button">读取配置</button>
+          </div>
+        </div>
+        <p class="state" id="configState" role="status" aria-live="polite" hidden></p>
+        <div class="stack">
+          <div class="read-only">
+            <h3>请求日志</h3>
+            <form class="inline" id="logSettingsForm" autocomplete="off">
+              <label class="check" style="flex: 1 1 180px;">
+                <input id="configLogsEnabled" type="checkbox">
+                记录请求元数据
+              </label>
+              <label class="field narrow">
+                <span>保留天数（1-90）</span>
+                <input class="control" id="configRetentionDays" type="number" min="1" max="90" step="1" inputmode="numeric">
+              </label>
+              <label class="field narrow">
+                <span>最多条数（1-500）</span>
+                <input class="control" id="configMaxEntries" type="number" min="1" max="500" step="1" inputmode="numeric">
+              </label>
+              <button class="button primary" id="saveConfig" type="submit">保存日志设置</button>
+            </form>
+            <p class="hint" style="margin-top: 8px;">未读取配置前这些控件不会发送请求；保存只提交日志相关字段。</p>
+          </div>
+          <div class="read-only">
+            <h3>宿主代理 / 路由（只读）</h3>
+            <p class="hint">本插件没有私有代理池，也不提供代理、路由或全局冷却的增删改查。以下状态只用于说明边界。</p>
+            <div class="facts" id="hostOwnedFacts" aria-live="polite"></div>
+          </div>
+          <div class="read-only">
+            <h3>插件可见状态</h3>
+            <p class="hint">来自 <span class="mono">GET /runtime</span>；只显示插件可见状态，宿主拥有的调度、冷却和代理以 CPA 实际结果为准。</p>
+            <div class="facts" id="runtimeFacts" aria-live="polite"></div>
+            <div class="rows" id="runtimeCredentials" aria-live="polite"></div>
+            <div class="panel-actions" style="margin-top: 10px;">
+              <button class="button compact" id="loadRuntime" type="button">读取运行时</button>
+            </div>
+          </div>
+        </div>
+      </section>
     </section>
   </main>
 

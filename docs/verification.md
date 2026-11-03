@@ -1,8 +1,38 @@
-# OpenDesign 0.2.0 验证记录
+# OpenDesign 插件验证记录
+
+## 0.3.0 本轮验收
+
+2026-11-03 完成候选源码与离线验收。`0.3.0` 在 `0.2.0` 上新增请求日志／统计、官方模型级覆盖、显式模型测试、插件配置与 runtime，并将控制台整理为五个选项卡。
+
+| 检查 | 结果与范围 |
+| --- | --- |
+| 全仓 Go | Go 1.26.4 的 `go test ./...`、`go test -race ./... -count=1`、`go vet ./...` 全部通过 |
+| Node | `node --test tests/*.test.cjs`，139/139 通过，其中 OpenDesign 76 项 |
+| 源码 | Go 格式、三个管理 JS 的语法、`git diff --check` 通过 |
+| Debian 12 | Go 1.26.10、CGO、非 root、关闭网络，全仓 Go 测试与 Linux amd64 c-shared 构建通过 |
+| 交付候选库 | SHA256 `fa4b80e4e67ced901fa2596984bcee7c79729cb59f2aaf833a7fabe74d0262f6`，最高 GLIBC 2.34 |
+| 原生 ABI | 同一 Debian 12 库 ctypes 冒烟 PASS，注册版本严格读取源码 `Version` |
+| 原版 CPA | 8.0.48（`dbb70621`）离线加载与 loopback CONNECT／私有 CA TLS 全流程 PASS |
+| Microsoft Edge | 153.0.4234.48、隔离 profile、两入口 540/540；五选项卡 × 浅深色 × 1280/390 宽，共 40 个布局，无横向溢出／页面脚本错误，6 张代表截图 |
+| ops | 28 项离线部署回归通过，脚本语法通过；guard 版本 0.3.0 |
+
+持久化专项覆盖暂存写入／短写／同步／关闭失败、清除提交后收尾错误、损坏 snapshot／journal、超大 journal、序号间隙、并发新增、取消重试任务与 shutdown flush。管理一致性专项覆盖完整文本先脱敏再截断、旧 API／control Key 与 Workspace、runtime 换 Key 跨宿主读取、credential ABA、上游尝试事实／真实 429、关闭后动态路由 503 和阻塞保存等待。
+
+扩展 ctypes 与原版 CPA 冒烟均断言：日志／统计／runtime 普通读取不访问上游；插件配置仅日志字段；模型覆盖传官方真实 `modelId`、使用 control Bearer、与共享额度缓存隔离且节流；显式模型测试仅一次小型非流式请求、不回 completion；日志只含 allowlist、缺 usage 保持 null、清除后统计为空。ctypes 另外验证 quiesce 的动态路由门禁、关闭后安全调用与空日志快照持久化。
+
+Edge 验证包含 ARIA／键盘焦点、tab 切换零请求、主题跟随系统与切换、统计输入／输出和分模型数据、nullable usage、配置范围、长达 512 字节模型名、显式确认的取消／接受、保存映射后撤销结果、旧会话迟到响应、401 恢复及 XSS 安全文本。首轮发现的系统主题标签未更新和长 runtime 模型撑开配置页已修复，完整复跑通过。浏览器 fixture 不构成真实额度或真实付费推理证据。
+
+提交／精确 HEAD CI／生产部署证据在完成后追加于本节；此处离线结果不代表候选已上线。GitHub Release 尚未发布。旧 `0.2.0` 记录保留原日期、提交、hash 和 CI，均为历史。
+
+本轮本地证据：`/tmp/open-design-03-{go,race,vet,node,bookworm,ops}.log`、`/tmp/open-design-03-final-abi.{json,log}`、`/tmp/open-design-03-edge/report.json`。浏览器脚本为 `/tmp/open_design_03_edge_acceptance.py`，不随构建产物分发。
+
+以下为**历史**记录。
+
+## 0.2.0 验证记录（历史）
 
 2026-11-02 完成功能验收、修复与生产升级。`0.2.0` 的提交 `9fd8351` 已推送，在对应 CI 成功后通过 ops 部署脚本上线 `nuoapi-net`；GitHub Release 尚未发布。开发阶段的账户写入、Key 更换、额度错误和竞态均在隔离环境验证；后续获准上线后，仅给与 od1 完整推理 Key 精确匹配的现有账户补充额度授权并实际查询成功。
 
-## 环境与产物
+## 环境与产物（历史）
 
 - 保留 ClinePassBridge v0.4.3（`8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）历史与 MIT 版权；实际 Provider 为 `internal/opendesign`。
 - 使用公开 C shared ABI v1 和 host HTTP / translation / public RPC，不修改、打包或发布 CPA 宿主。
@@ -18,7 +48,7 @@
 | 系统与架构 | ELF shared object / Linux amd64 |
 | 最低符号要求 | GLIBC 2.34 |
 
-## 最终检查
+## 最终检查（历史）
 
 | 检查 | 结果与范围 |
 | --- | --- |
@@ -33,6 +63,8 @@
 | Edge 交互 | 两条入口共 122 项断言通过（账号 48、更新后额度 58、复审 16），见下文 |
 | 独立复审 | 原 4 项后端 P2、3 项 UI P2 均按最终源码关闭，未发现新的 P1/P2 |
 | ops 离线部署检查 | 28 项通过；随后通过规定脚本完成生产 `0.2.0` 升级，来源／备份／注册／版本／控制台检查通过 |
+
+> 上述计数、hash 与 CI 均属于 `0.2.0`（2026-11-02），不是 `0.3.0` 的验收证据。
 
 2026-11-02 的补充运维展示调整通过全仓 `go test -timeout 90s ./...`、Node 115/115、Edge 额度 58 项，以及新交付库的 ctypes／原版 CPA 加载／假 TLS 全流程。未修改 Go 后端算法；后端 race 与 vet 的证据沿用前一轮验收，未把 UI 调整后的普通 Go 测试称为再次 race。新库仍为 Debian 12、Go 1.26.4、非 root、关闭网络构建。
 
@@ -53,7 +85,7 @@ python3 scripts/smoke-abi.py dist/open-design-0.2.0-linux-amd64/open-design.so \
 
 Go／Node 测试包含凭据解析重入、写盘失败时不发布新凭据、旧 watcher 回调隔离、SSE 及结构化错误 Key 脱敏、真实阻塞 operation 超时取消、刷新槽释放、缓存 epoch、singleflight、迟到响应、精确十进制解析、预测条件、真实零剩余、窗口到期和 UI 认证兼容。两位独立复审只执行源码核对；上述测试结果由主代理执行，不计为复审者独立测试。
 
-## Edge 交互与布局
+## Edge 交互与布局（历史）
 
 使用独立临时 Microsoft Edge profile 和本地假管理 API，验证两条入口：
 
@@ -70,7 +102,7 @@ Go／Node 测试包含凭据解析重入、写盘失败时不发布新凭据、�
 
 本轮 Edge 发现并修复了真实 DOM 中 `HTMLCollection` 不支持 `.find()` 导致的保存崩溃；单元测试中的假 DOM 已同步模拟该集合类型。
 
-## 原版 CPA 隔离流程
+## 原版 CPA 隔离流程（历史）
 
 最终 `--cpa-live` 使用 loopback CONNECT 代理、一次性 CA 和本地 TLS 假上游。信任仅传给测试 CPA 子进程，不改系统信任库或 hosts。常规 allowlist 仅包括官方推理与控制面 origin；非 allowlist 的 CONNECT 实测返回 403、未建立隧道。重定向 probe 仅临时放行，完成后恢复 allowlist。
 
@@ -89,7 +121,9 @@ Go／Node 测试包含凭据解析重入、写盘失败时不发布新凭据、�
 
 30 秒总预算和官方零剩余的回归在 Go 路由／operation 测试中验证；Edge 的预测来自假 API，不能将截图当作真实账单或真实余额预测成功。
 
-## 真实服务验证，按时间区分
+## 真实服务验证，按时间区分（历史）
+
+下表中 2026-11-02 的记录均属 `0.1.0`／`0.2.0` 历史，不应被解读为 `0.3.0` 已完成验证。
 
 | 阶段 | 已获得的证据 | 结论边界 |
 | --- | --- | --- |
@@ -107,9 +141,9 @@ Go／Node 测试包含凭据解析重入、写盘失败时不发布新凭据、�
 
 上线后的独立 Edge 检查通过两条控制台入口、浅／深色、1280／390 共 8 个布局：版本、两个可选字段、真实余额／窗口、折叠趋势均正确，无溢出或脚本错误。页面使用服务器实时 HTML／status／quota 缓存，GET-only SSH relay 将测试中的刷新点击映射为缓存读取，没有追加额度上游请求；真正的首次刷新证据是上表的生产 Management API 查询。
 
-## 本地证据索引
+## 本地证据索引（历史）
 
-以下路径为本次工作环境的报告，不随源码分发，不含真实 Key：
+以下路径属于 `0.2.0` 工作环境，不随源码分发，不含真实 Key。`0.3.0` 的最终证据路径由主线在验收后补写。
 
 - `/tmp/open-design-race-0.2.log`、`/tmp/open-design-vet-0.2.log`、`/tmp/open-design-node-0.2.log`
 - `/tmp/open-design-bookworm-build-0.2.log`（测试通过；首次产物目录中的既有文件权限阻止 header 复制）、`/tmp/open-design-bookworm-artifact-0.2.log`（换用新目录后构建成功）

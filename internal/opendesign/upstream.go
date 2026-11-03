@@ -75,8 +75,12 @@ const (
 
 // upstreamProtocolError marks a response we could not interpret. It is a 502
 // because the failure is the upstream's, not the caller's.
-func upstreamProtocolError(message string) error {
-	return &APIError{Status: http.StatusBadGateway, Kind: "upstream_protocol_error", Message: message}
+func upstreamProtocolError(message string, status ...int) error {
+	upstreamStatus := 0
+	if len(status) > 0 {
+		upstreamStatus = status[0]
+	}
+	return &APIError{Status: http.StatusBadGateway, Kind: "upstream_protocol_error", Message: message, upstreamAttempted: true, upstreamStatus: upstreamStatus}
 }
 
 // upstreamHeaders is the complete outbound header set. The client's own
@@ -112,11 +116,17 @@ func (s *Service) doJSON(callbackID, method, url string, headers http.Header, bo
 	}
 	var out upstreamCall
 	if err := s.doOperation(callbackID, "host.http.do", payload, &out); err != nil {
-		return 0, nil, nil, upstreamTransportError(err)
+		return out.StatusCode, out.Headers, nil, upstreamTransportError(err, out.StatusCode)
 	}
 	raw := out.Body
 	if len(raw) > maxBufferedResponse {
-		return out.StatusCode, out.Headers, nil, &APIError{Status: http.StatusRequestEntityTooLarge, Kind: "response_limit_exceeded", Message: "upstream response exceeds plugin limit"}
+		return out.StatusCode, out.Headers, nil, &APIError{
+			Status:            http.StatusRequestEntityTooLarge,
+			Kind:              "response_limit_exceeded",
+			Message:           "upstream response exceeds plugin limit",
+			upstreamAttempted: true,
+			upstreamStatus:    out.StatusCode,
+		}
 	}
 	return out.StatusCode, out.Headers, raw, nil
 }
@@ -135,14 +145,15 @@ func (s *Service) openStream(callbackID, method, url string, headers http.Header
 	}
 	var out upstreamStream
 	if err := s.doOperation(callbackID, "host.http.do_stream", payload, &out); err != nil {
-		return out, upstreamTransportError(err)
+		s.closeUpstream(out.StreamID)
+		return out, upstreamTransportError(err, out.StatusCode)
 	}
 	if out.Error != "" {
 		s.closeUpstream(out.StreamID)
-		return out, upstreamTransportError(errors.New(out.Error))
+		return out, upstreamTransportError(errors.New(out.Error), out.StatusCode)
 	}
 	if out.StreamID == "" {
-		return out, upstreamProtocolError("host returned no upstream stream identifier")
+		return out, &APIError{Status: http.StatusBadGateway, Kind: "host_contract_error", Message: "host returned no upstream stream identifier", upstreamAttempted: true, upstreamStatus: out.StatusCode}
 	}
 	s.mu.Lock()
 	stopped := s.stopped
@@ -152,7 +163,7 @@ func (s *Service) openStream(callbackID, method, url string, headers http.Header
 	s.mu.Unlock()
 	if stopped {
 		s.closeUpstream(out.StreamID)
-		return out, fail(http.StatusServiceUnavailable, "OpenDesign plugin is shutting down")
+		return out, &APIError{Status: http.StatusServiceUnavailable, Kind: "plugin_unavailable", Message: "OpenDesign plugin is shutting down", upstreamAttempted: true, upstreamStatus: out.StatusCode}
 	}
 	return out, nil
 }
@@ -191,72 +202,80 @@ func (s *Service) closeUpstream(streamID string) {
 	s.mu.Unlock()
 }
 
-// upstreamTransportError wraps a transport failure. The message is already
-// redacted by the host error path; never include request headers here.
-func upstreamTransportError(err error) error {
-	return &APIError{Status: http.StatusBadGateway, Kind: "upstream_transport_error", Message: "upstream request failed: " + transportMessage(err)}
-}
-
-func transportMessage(err error) string {
-	if err == nil {
-		return "unknown transport error"
+// upstreamTransportError exposes a controlled summary and preserves whether the
+// host HTTP callback actually ran. Opening an operation alone is not an attempt.
+func upstreamTransportError(err error, observedStatus ...int) error {
+	var operationErr *hostOperationError
+	if errors.As(err, &operationErr) && !operationErr.attempted {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) {
+			return apiErr
+		}
+		return localFail(http.StatusBadGateway, "host_contract_error", "host could not start the upstream operation")
 	}
-	return err.Error()
+	status := 0
+	if len(observedStatus) > 0 && observedStatus[0] >= 100 && observedStatus[0] <= 599 {
+		status = observedStatus[0]
+	}
+	return &APIError{Status: http.StatusBadGateway, Kind: "upstream_transport_error", Message: "upstream request failed", upstreamAttempted: true, upstreamStatus: status}
 }
 
-// upstreamErrorFromResponse decodes an OpenAI-shaped error body and preserves the
-// upstream status. The body is summarized and scrubbed, never echoed verbatim.
+func upstreamErrorWasAttempted(err error) bool {
+	var attempted interface{ UpstreamAttempted() bool }
+	return errors.As(err, &attempted) && attempted.UpstreamAttempted()
+}
+
 func upstreamErrorFromResponse(status int, headers http.Header, body []byte, keys ...string) error {
-	if status == 0 {
+	return upstreamErrorFromResponseObserved(status, status, headers, body, keys...)
+}
+
+func upstreamErrorFromResponseObserved(status, observedStatus int, headers http.Header, body []byte, keys ...string) error {
+	if observedStatus < 100 || observedStatus > 599 {
+		observedStatus = status
+	}
+	if status < 100 || status > 599 {
 		status = http.StatusBadGateway
 	}
 	kind := "upstream_error"
-	message := ""
+	// Read only a bounded, structured error code. Upstream message text is
+	// untrusted and can contain a prompt, completion, workspace, or another
+	// credential, so it never crosses into a management response.
 	var envelope struct {
-		Error   json.RawMessage `json:"error"`
-		Message string          `json:"message"`
+		Error json.RawMessage `json:"error"`
 	}
-	if json.Unmarshal(body, &envelope) == nil {
-		if len(envelope.Error) > 0 {
-			var detail struct {
-				Message string `json:"message"`
-				Code    any    `json:"code"`
-				Type    string `json:"type"`
-			}
-			if json.Unmarshal(envelope.Error, &detail) == nil {
-				message = strings.TrimSpace(detail.Message)
-				switch code := detail.Code.(type) {
-				case string:
-					if code != "" {
-						kind = code
-					}
-				}
-			} else {
-				var text string
-				if json.Unmarshal(envelope.Error, &text) == nil {
-					message = strings.TrimSpace(text)
+	if json.Unmarshal(body, &envelope) == nil && len(envelope.Error) > 0 {
+		var detail struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(envelope.Error, &detail) == nil {
+			candidate := detail.Code
+			if candidate == "" {
+				if colon := strings.IndexByte(detail.Message, ':'); colon > 0 {
+					candidate = strings.TrimSpace(detail.Message[:colon])
 				}
 			}
+			if isKnownUpstreamCode(candidate) && safeManagementCode(candidate, keys) {
+				kind = candidate
+			}
 		}
-		if message == "" {
-			message = strings.TrimSpace(envelope.Message)
-		}
 	}
-	if message == "" {
-		message = strings.TrimSpace(string(truncate(body, 300)))
+	message := "upstream request failed"
+	if kind != "upstream_error" {
+		message = kind + ": upstream request failed"
+	} else if text := http.StatusText(observedStatus); text != "" {
+		message += ": " + strings.ToLower(text)
 	}
-	if message == "" {
-		message = http.StatusText(status)
+	return &APIError{Status: status, Kind: kind, Message: message, upstreamAttempted: true, upstreamStatus: observedStatus}
+}
+
+func isKnownUpstreamCode(code string) bool {
+	switch code {
+	case "invalid_api_key", "invalid_request", "rate_limit_exceeded", "insufficient_quota", "model_not_found", "context_length_exceeded", "server_error", "server_overloaded":
+		return true
+	default:
+		return false
 	}
-	// Keep the upstream code visible: operators grep for it, and the host only
-	// forwards the message text to the client.
-	if kind != "upstream_error" && !strings.Contains(message, kind) {
-		message = kind + ": " + message
-	}
-	if !safeManagementCode(kind, keys) {
-		kind = "upstream_error"
-	}
-	return &APIError{Status: status, Kind: kind, Message: redact(message, keys...)}
 }
 
 func truncate(b []byte, limit int) []byte {

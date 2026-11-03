@@ -180,22 +180,48 @@ func (s *Service) fileNameFor(c Credential) string {
 // the live record over a possibly stale StorageJSON snapshot.
 func (s *Service) selectedCredential(request ExecutorRequest) (Credential, error) {
 	var c Credential
-	if len(request.StorageJSON) > 0 {
-		_ = json.Unmarshal(request.StorageJSON, &c)
+	if request.CredentialOverride != nil {
+		c = *request.CredentialOverride
+		s.mu.RLock()
+		current, ok := s.creds[c.ID]
+		epoch := s.credentialEpoch[c.ID]
+		revoked := s.revoked[c.ID]
+		currentBaseURL := current.BaseURL
+		if currentBaseURL == "" {
+			currentBaseURL = s.cfg.BaseURL
+		}
+		snapshotBaseURL := c.BaseURL
+		if snapshotBaseURL == "" {
+			snapshotBaseURL = s.cfg.BaseURL
+		}
+		s.mu.RUnlock()
+		if !ok || revoked {
+			return c, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential was replaced or removed")
+		}
+		if epoch != c.runtimeEpoch || current.APIKey != c.APIKey || current.ControlKey != c.ControlKey || current.WorkspaceID != c.WorkspaceID || current.Disabled != c.Disabled || currentBaseURL != snapshotBaseURL {
+			return c, localFail(http.StatusConflict, "credential_changed", "OpenDesign credential changed while the model test was starting")
+		}
+		c.BaseURL = snapshotBaseURL
+	} else {
+		if len(request.StorageJSON) > 0 {
+			_ = json.Unmarshal(request.StorageJSON, &c)
+		}
+		s.mu.RLock()
+		if current, ok := s.creds[c.ID]; ok {
+			c = current
+		} else if current, ok := s.creds[request.AuthID]; ok {
+			c = current
+		}
+		s.mu.RUnlock()
 	}
 	s.mu.RLock()
-	if current, ok := s.creds[c.ID]; ok {
-		c = current
-	} else if current, ok := s.creds[request.AuthID]; ok {
-		c = current
-	}
 	revoked := s.revoked[c.ID] || s.revoked[request.AuthID]
 	s.mu.RUnlock()
 	if c.APIKey == "" {
-		return c, fail(http.StatusUnauthorized, "OpenDesign credential is missing")
+		return c, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential is missing")
 	}
 	if c.Disabled || revoked {
-		return c, fail(http.StatusUnauthorized, "OpenDesign credential is disabled or removed")
+		return c, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential is disabled or removed")
 	}
 	if c.BaseURL == "" {
 		c.BaseURL = s.config().BaseURL
@@ -203,6 +229,7 @@ func (s *Service) selectedCredential(request ExecutorRequest) (Credential, error
 	if err := validateBaseURL(c.BaseURL); err != nil {
 		return c, err
 	}
+	c.BaseURL = strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
 	return c, nil
 }
 
@@ -253,8 +280,12 @@ func (s *Service) saveCredential(c Credential, filename string) error {
 // or additional lock may be taken here.
 func (s *Service) storeCredentialLocked(c Credential) {
 	previous, exists := s.creds[c.ID]
-	if !exists || previous.APIKey != c.APIKey || previous.ControlKey != c.ControlKey || previous.WorkspaceID != c.WorkspaceID {
+	identityChanged := !exists || previous.APIKey != c.APIKey || previous.ControlKey != c.ControlKey ||
+		previous.WorkspaceID != c.WorkspaceID || previous.Disabled != c.Disabled || previous.BaseURL != c.BaseURL
+	if identityChanged {
+		s.credentialEpoch[c.ID]++
 		s.invalidateBillingLocked(c.ID)
+		s.clearModelTestsLocked(c.ID)
 		// A new random stamp, never derived from a key and never persisted: the
 		// console only compares it to know its cached quota belongs to another
 		// billing identity.
@@ -262,6 +293,7 @@ func (s *Service) storeCredentialLocked(c Credential) {
 	} else {
 		c.billingRevision = previous.billingRevision
 	}
+	c.runtimeEpoch = s.credentialEpoch[c.ID]
 	s.creds[c.ID] = c
 }
 

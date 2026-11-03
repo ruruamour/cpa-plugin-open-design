@@ -5,12 +5,14 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode"
 )
 
 const (
 	// Version is the plugin version advertised at registration.
-	Version = "0.2.0"
+	Version = "0.3.0"
 	// PluginID is the CPA plugin identifier and management path segment.
 	PluginID = "open-design"
 	// Provider is the CPA provider key for this plugin.
@@ -43,6 +45,12 @@ type APIError struct {
 	Status  int    `json:"-"`
 	Kind    string `json:"-"`
 	Message string `json:"-"`
+
+	// These flags distinguish a local validation failure from an error after
+	// the executor actually attempted the upstream HTTP request. They are
+	// intentionally not serialized into any management response.
+	upstreamAttempted bool
+	upstreamStatus    int
 }
 
 func (e *APIError) Error() string { return e.Message }
@@ -53,8 +61,25 @@ func (e *APIError) StatusCode() int { return e.Status }
 // Code exposes the error kind in the RPC envelope.
 func (e *APIError) Code() string { return e.Kind }
 
+// UpstreamAttempted reports whether an executor reached the host HTTP path.
+// It is used only by the explicit model-test metadata response.
+func (e *APIError) UpstreamAttempted() bool { return e != nil && e.upstreamAttempted }
+
+// UpstreamHTTPStatus returns a real status received from the upstream HTTP
+// response. A generated 502 for transport/protocol failures is returned as 0.
+func (e *APIError) UpstreamHTTPStatus() int {
+	if e == nil || e.upstreamStatus < 100 || e.upstreamStatus > 599 {
+		return 0
+	}
+	return e.upstreamStatus
+}
+
 func fail(status int, message string) error {
 	return &APIError{Status: status, Kind: "upstream_error", Message: message}
+}
+
+func localFail(status int, kind, message string) error {
+	return &APIError{Status: status, Kind: kind, Message: message}
 }
 
 // Model maps a client-facing alias onto an OpenDesign upstream model ID.
@@ -64,16 +89,42 @@ type Model struct {
 }
 
 // Config is the plugin-owned configuration. There is no field for credentials:
-// keys live only in the CPA auth directory.
+// keys live only in the CPA auth directory. Proxy/routing are deliberately
+// absent: the upstream origin is fixed and CPA owns scheduling.
 type Config struct {
-	DataDir  string  `json:"data_dir" yaml:"data_dir"`
-	BaseURL  string  `json:"base_url" yaml:"base_url"`
-	Models   []Model `json:"models" yaml:"models"`
-	LogLevel string  `json:"log_level,omitempty" yaml:"log_level,omitempty"`
+	DataDir  string    `json:"data_dir" yaml:"data_dir"`
+	BaseURL  string    `json:"base_url" yaml:"base_url"`
+	Models   []Model   `json:"models" yaml:"models"`
+	LogLevel string    `json:"log_level,omitempty" yaml:"log_level,omitempty"`
+	Logs     LogConfig `json:"logs,omitempty" yaml:"logs,omitempty"`
+}
+
+// LogConfig is the request log policy. Zero values mean "use the plugin
+// default", so an older settings.json without this object keeps the previous
+// behavior (logging on, 7 days, 500 entries).
+type LogConfig struct {
+	Enabled       *bool `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+	RetentionDays int   `json:"retention_days,omitempty" yaml:"retention_days,omitempty"`
+	MaxEntries    int   `json:"max_entries,omitempty" yaml:"max_entries,omitempty"`
 }
 
 func defaultConfig() Config {
 	return Config{DataDir: "plugins/" + PluginID + "-data", BaseURL: DefaultBaseURL}
+}
+
+// logSettings resolves the persisted policy into the effective policy.
+func (c Config) logSettings() requestLogSettings {
+	in := defaultRequestLogSettings()
+	if c.Logs.Enabled != nil {
+		in.Enabled = *c.Logs.Enabled
+	}
+	if c.Logs.RetentionDays > 0 {
+		in.RetentionDays = c.Logs.RetentionDays
+	}
+	if c.Logs.MaxEntries > 0 {
+		in.MaxEntries = c.Logs.MaxEntries
+	}
+	return normalizeRequestLogSettings(in)
 }
 
 func (c *Config) validate() error {
@@ -92,12 +143,21 @@ func (c *Config) validate() error {
 		m.ID = strings.TrimSpace(m.ID)
 		m.UpstreamID = strings.TrimSpace(m.UpstreamID)
 		if m.ID == "" || m.UpstreamID == "" {
-			return fail(http.StatusBadRequest, "model id and upstream_id must be nonempty")
+			return localFail(http.StatusBadRequest, "invalid_request", "model id and upstream_id must be nonempty")
+		}
+		if len(m.ID) > 512 || len(m.UpstreamID) > 512 || strings.IndexFunc(m.ID+m.UpstreamID, unicode.IsControl) >= 0 {
+			return localFail(http.StatusBadRequest, "invalid_request", "model id and upstream_id must be at most 512 bytes without control characters")
 		}
 		if seen[m.ID] {
-			return fail(http.StatusBadRequest, "model aliases must be unique: "+m.ID)
+			return localFail(http.StatusBadRequest, "invalid_request", "model aliases must be unique")
 		}
 		seen[m.ID] = true
+	}
+	if c.Logs.RetentionDays != 0 && (c.Logs.RetentionDays < 1 || c.Logs.RetentionDays > maxRequestLogRetentionDays) {
+		return fail(http.StatusBadRequest, "logs.retention_days must be between 1 and 90")
+	}
+	if c.Logs.MaxEntries != 0 && (c.Logs.MaxEntries < 1 || c.Logs.MaxEntries > maxRequestLogMaxEntries) {
+		return fail(http.StatusBadRequest, "logs.max_entries must be between 1 and 500")
 	}
 	return nil
 }
@@ -110,7 +170,7 @@ func validateBaseURL(raw string) error {
 	if err != nil || u.Scheme != "https" || u.Host != "amr-link.open-design.ai" ||
 		u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
 		strings.TrimRight(u.Path, "/") != "/v1" {
-		return fail(http.StatusBadRequest, "base_url must be "+DefaultBaseURL)
+		return localFail(http.StatusBadRequest, "invalid_request", "base_url must be "+DefaultBaseURL)
 	}
 	return nil
 }
@@ -132,6 +192,9 @@ type Credential struct {
 	ModelRevision int64 `json:"model_revision,omitempty"`
 	// billingRevision is an opaque in-memory identity for UI cache invalidation.
 	// It is random, never derived from a key and never persisted in auth files.
+	// runtimeEpoch fences model tests against credential identity changes, even
+	// when a key or disabled flag is changed and later restored.
+	runtimeEpoch    uint64
 	billingRevision string
 	extraFields     map[string]json.RawMessage
 }
@@ -189,16 +252,23 @@ var secretPattern = regexp.MustCompile(`(?i)(?:bearer\s+|sk[-_])[a-z0-9_.\-]+`)
 // redact strips bearer/sk- shaped tokens plus any known key value from text
 // before it can reach a client, a log line or an error envelope.
 func redact(value string, keys ...string) string {
-	for _, key := range keys {
-		if key == "" {
-			continue
-		}
-		value = strings.ReplaceAll(value, key, "[redacted]")
-	}
-	value = secretPattern.ReplaceAllString(value, "[redacted]")
-	// Bound the message without splitting a multi-byte rune.
+	value = redactComplete(value, keys...)
 	if runes := []rune(value); len(runes) > 500 {
 		value = string(runes[:500])
 	}
 	return value
+}
+
+// redactComplete examines the entire original value. Presentation limits are
+// applied only afterwards, so a secret straddling a cutoff cannot survive as a
+// prefix. Longer known secrets are replaced before overlapping shorter ones.
+func redactComplete(value string, keys ...string) string {
+	ordered := append([]string(nil), keys...)
+	sort.SliceStable(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+	for _, key := range ordered {
+		if key != "" {
+			value = strings.ReplaceAll(value, key, "[redacted]")
+		}
+	}
+	return secretPattern.ReplaceAllString(value, "[redacted]")
 }

@@ -49,6 +49,18 @@ func managementRoutes() []managementRoute {
 		{Method: http.MethodGet, Path: apiBase + "/credentials"},
 		{Method: http.MethodGet, Path: apiBase + "/quota"},
 		{Method: http.MethodGet, Path: apiBase + "/model-coverage"},
+		{Method: http.MethodGet, Path: apiBase + "/request-logs"},
+		{Method: http.MethodGet, Path: apiBase + "/request-stats"},
+		{Method: http.MethodGet, Path: apiBase + "/logs"},
+		{Method: http.MethodGet, Path: apiBase + "/logs/stats"},
+		{Method: http.MethodDelete, Path: apiBase + "/request-logs"},
+		{Method: http.MethodDelete, Path: apiBase + "/logs"},
+		{Method: http.MethodPost, Path: apiBase + "/request-logs/clear"},
+		{Method: http.MethodPost, Path: apiBase + "/logs/clear"},
+		{Method: http.MethodGet, Path: apiBase + "/config"},
+		{Method: http.MethodPost, Path: apiBase + "/config"},
+		{Method: http.MethodGet, Path: apiBase + "/runtime"},
+		{Method: http.MethodPost, Path: apiBase + "/model-test"},
 		{Method: http.MethodPost, Path: apiBase + "/credentials"},
 		{Method: http.MethodDelete, Path: apiBase + "/credentials"},
 		{Method: http.MethodGet, Path: apiBase + "/upstream-models"},
@@ -113,30 +125,47 @@ func (s *Service) management(raw json.RawMessage) (any, error) {
 		// The console verifies a management key by touching a cheap authenticated
 		// route; this endpoint exists only so a failure is a clear 401 instead of
 		// a 404 from the host's route table.
-		return managementJSON(http.StatusOK, map[string]any{"ok": true})
+		return s.withActive(func() (any, error) { return managementJSON(http.StatusOK, map[string]any{"ok": true}) })
 	case r.Method == http.MethodGet && path == apiBase+"/status":
-		return s.statusResponse()
+		return s.withActive(func() (any, error) { return s.statusResponse() })
 	case r.Method == http.MethodGet && path == apiBase+"/credentials":
-		return s.listCredentials()
+		return s.withActive(func() (any, error) { return s.listCredentials() })
 	case r.Method == http.MethodGet && path == apiBase+"/quota":
 		return s.quotaRequest(r)
 	case r.Method == http.MethodGet && path == apiBase+"/model-coverage":
 		return s.modelCoverageRequest(r)
+	case r.Method == http.MethodGet && (path == apiBase+"/request-logs" || path == apiBase+"/logs"):
+		return s.requestLogsRequest(r)
+	case r.Method == http.MethodGet && (path == apiBase+"/request-stats" || path == apiBase+"/logs/stats"):
+		return s.requestLogStatsRequest(r)
+	case (r.Method == http.MethodDelete && (path == apiBase+"/request-logs" || path == apiBase+"/logs")) ||
+		(r.Method == http.MethodPost && (path == apiBase+"/request-logs/clear" || path == apiBase+"/logs/clear")):
+		return s.requestLogClearRequest(r)
+	case r.Method == http.MethodGet && path == apiBase+"/config":
+		return s.configRequest()
+	case r.Method == http.MethodPost && path == apiBase+"/config":
+		return s.updateConfigRequest(r)
+	case r.Method == http.MethodGet && path == apiBase+"/runtime":
+		return s.runtimeRequest()
+	case r.Method == http.MethodPost && path == apiBase+"/model-test":
+		return s.modelTestRequest(r)
 	case r.Method == http.MethodPost && path == apiBase+"/credentials":
-		return s.saveCredentialRequest(r)
+		return s.withActive(func() (any, error) { return s.saveCredentialRequest(r) })
 	case r.Method == http.MethodDelete && path == apiBase+"/credentials":
-		return s.deleteCredential(r.Query.Get("id"))
+		return s.withActive(func() (any, error) { return s.deleteCredential(r.Query.Get("id")) })
 
 	case r.Method == http.MethodGet && path == apiBase+"/upstream-models":
 		return s.upstreamModels(r)
 	case r.Method == http.MethodGet && path == apiBase+"/models":
-		return managementJSON(http.StatusOK, map[string]any{"models": s.config().Models})
+		return s.withActive(func() (any, error) { return managementJSON(http.StatusOK, map[string]any{"models": s.config().Models}) })
 	case r.Method == http.MethodPost && path == apiBase+"/models":
-		result, err := s.importModels(r.Body)
-		if err != nil {
-			return managementError(statusOf(err), err.Error(), s.allKeys()...)
-		}
-		return managementJSON(http.StatusOK, result)
+		return s.withActive(func() (any, error) {
+			result, err := s.importModels(r.Body)
+			if err != nil {
+				return managementError(statusOf(err), err.Error(), s.allKeys()...)
+			}
+			return managementJSON(http.StatusOK, result)
+		})
 	default:
 		return managementError(http.StatusNotFound, "not found")
 	}
@@ -458,19 +487,37 @@ func (s *Service) upstreamModels(r ManagementRequest) (any, error) {
 // allKeys collects the live key values so redaction can strip them from any
 // upstream message before it is shown to the operator.
 func (s *Service) allKeys() []string {
+	return s.collectMetadataSecrets(false)
+}
+
+// metadataSecrets also removes workspace identifiers from diagnostic metadata.
+// Unlike credential/quota views, logs and runtime never need that identifier.
+func (s *Service) metadataSecrets() []string {
+	return s.collectMetadataSecrets(true)
+}
+
+func (s *Service) collectMetadataSecrets(includeWorkspace bool) []string {
+	if s == nil {
+		return nil
+	}
 	s.mu.RLock()
-	keys := make([]string, 0, 2*len(s.creds))
+	keys := make([]string, 0, 3*len(s.creds))
 	for _, c := range s.creds {
 		keys = append(keys, c.APIKey, c.ControlKey)
+		if includeWorkspace {
+			keys = append(keys, c.WorkspaceID)
+		}
 	}
 	s.mu.RUnlock()
-	// The pending key may already be in a reentrant host error while the live
-	// record still holds the previous key. Never nest pendingMu with mu.
+	// Never nest pendingMu with mu: auth.parse re-enters while a save is pending.
 	s.pendingMu.Lock()
 	for _, pending := range s.pendingSaves {
 		var c Credential
 		if json.Unmarshal(pending.body, &c) == nil {
 			keys = append(keys, c.APIKey, c.ControlKey)
+			if includeWorkspace {
+				keys = append(keys, c.WorkspaceID)
+			}
 		}
 	}
 	s.pendingMu.Unlock()
@@ -489,6 +536,23 @@ func safeManagementCode(code string, keys []string) bool {
 		}
 	}
 	return true
+}
+
+func safeDiagnosticKind(kind string, keys []string) bool {
+	if !safeManagementCode(kind, keys) {
+		return false
+	}
+	if isKnownUpstreamCode(kind) {
+		return true
+	}
+	switch kind {
+	case "upstream_error", "upstream_protocol_error", "upstream_transport_error", "response_limit_exceeded",
+		"invalid_request", "invalid_json", "model_not_enabled", "credential_unavailable", "credential_changed",
+		"plugin_unavailable", "host_contract_error", "request_canceled", "count_tokens_unavailable":
+		return true
+	default:
+		return false
+	}
 }
 
 func statusOf(err error) int {

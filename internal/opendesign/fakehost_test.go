@@ -33,6 +33,8 @@ type fakeHost struct {
 	streamCloseErrs []string
 	streamCloseRaw  []map[string]any
 	authDir         string
+	authListErr     error
+	authList        []map[string]any
 
 	// Operation bridge: every do/do_stream call is registered here so a cancel
 	// can release a blocked callback the way the real host does.
@@ -151,6 +153,17 @@ func (h *fakeHost) call(method string, in, out any) error {
 		return nil
 	case "host.auth.save":
 		return h.handleAuthSave(in, out)
+	case "host.auth.list":
+		h.mu.Lock()
+		err := h.authListErr
+		files := append([]map[string]any(nil), h.authList...)
+		h.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		assign(out, map[string]any{"files": files})
+		return nil
+
 	case "host.stream.emit":
 		h.mu.Lock()
 		h.emitPayloads = append(h.emitPayloads, rawField(in, "payload"))

@@ -110,6 +110,10 @@ func TestExecuteStreamErrorEventIsFailureNotSuccess(t *testing.T) {
 	if len(host.streamCloseErrs) != 1 || !strings.Contains(host.streamCloseErrs[0], "server_overloaded") {
 		t.Fatalf("stream close errors = %v", host.streamCloseErrs)
 	}
+	logs, total, _ := s.requestLogs.query(requestLogFilter{limit: 10})
+	if total != 1 || len(logs) != 1 || logs[0].Status != "error" || logs[0].HTTPStatus == nil || *logs[0].HTTPStatus != http.StatusOK || logs[0].UpstreamAttempted == nil || !*logs[0].UpstreamAttempted {
+		t.Fatalf("terminal stream log = %#v total=%d, want attempted upstream HTTP 200 error", logs, total)
+	}
 }
 
 // A malformed frame mid-stream must abort rather than be skipped.

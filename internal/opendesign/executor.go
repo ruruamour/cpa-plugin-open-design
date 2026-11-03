@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ExecutorRequest is the CPA executor RPC payload. Only the fields this plugin
@@ -28,6 +29,9 @@ type ExecutorRequest struct {
 	AuthMetadata    map[string]any    `json:"AuthMetadata"`
 	AuthAttributes  map[string]string `json:"AuthAttributes"`
 
+	UpstreamModelOverride string      `json:"-"`
+	CredentialOverride    *Credential `json:"-"`
+
 	StreamID       string `json:"stream_id"`
 	HostCallbackID string `json:"host_callback_id"`
 }
@@ -40,7 +44,7 @@ type ExecutorRequest struct {
 func decodeExecutorRequest(raw json.RawMessage) (ExecutorRequest, error) {
 	var r ExecutorRequest
 	if err := json.Unmarshal(raw, &r); err != nil {
-		return r, fail(http.StatusBadRequest, "invalid executor request JSON")
+		return r, localFail(http.StatusBadRequest, "invalid_request", "invalid executor request JSON")
 	}
 	return r, nil
 }
@@ -49,9 +53,13 @@ func decodeExecutorRequest(raw json.RawMessage) (ExecutorRequest, error) {
 // upstream model ID substituted. The caller's Authorization header is dropped by
 // construction: only headers built here reach the network.
 func (s *Service) prepare(r ExecutorRequest) (map[string]any, string, error) {
-	upstream, err := s.resolveModel(r.Model)
-	if err != nil {
-		return nil, "", err
+	upstream := strings.TrimSpace(r.UpstreamModelOverride)
+	var err error
+	if upstream == "" {
+		upstream, err = s.resolveModel(r.Model)
+		if err != nil {
+			return nil, "", err
+		}
 	}
 	// Payload is the provider-translated body. A host that only forwards the raw
 	// client request still works because OriginalRequest is the same shape here.
@@ -61,10 +69,10 @@ func (s *Service) prepare(r ExecutorRequest) (map[string]any, string, error) {
 	}
 	j, err := decodeObject(raw)
 	if err != nil {
-		return nil, "", fail(http.StatusBadRequest, "invalid request JSON payload")
+		return nil, "", localFail(http.StatusBadRequest, "invalid_request", "invalid request JSON payload")
 	}
 	if messages, ok := j["messages"].([]any); !ok || len(messages) == 0 {
-		return nil, "", fail(http.StatusBadRequest, "messages must be a nonempty array")
+		return nil, "", localFail(http.StatusBadRequest, "invalid_request", "messages must be a nonempty array")
 	}
 	j["model"] = upstream
 	return j, upstream, nil
@@ -90,31 +98,56 @@ func decodeObject(raw []byte) (map[string]any, error) {
 
 // execute handles executor.execute: one buffered upstream request.
 func (s *Service) execute(raw json.RawMessage) (any, error) {
-	if err := s.begin(); err != nil {
-		return nil, err
+	return s.executePinned(raw, "", nil, true)
+}
+
+// executePinned is used by explicit model tests to keep the credential and
+// alias mapping snapshot used for validation identical to the outbound request.
+func (s *Service) executePinned(raw json.RawMessage, upstreamModel string, credential *Credential, manageLifecycle bool) (result any, err error) {
+	if manageLifecycle {
+		if err := s.begin(); err != nil {
+			return nil, err
+		}
+		defer s.done()
 	}
-	defer s.done()
+	draft := &requestLogDraft{started: time.Now()}
+	defer func() { s.recordRequestLog(draft, err) }()
 	r, err := decodeExecutorRequest(raw)
 	if err != nil {
 		return nil, err
 	}
+	if upstreamModel != "" {
+		r.UpstreamModelOverride = upstreamModel
+	}
+	if credential != nil {
+		r.CredentialOverride = credential
+	}
+	draft.model = r.Model
+	var captured Credential
+	_ = json.Unmarshal(r.StorageJSON, &captured)
+	draft.secrets = []string{captured.APIKey, captured.ControlKey, captured.WorkspaceID}
 	c, err := s.selectedCredential(r)
+	draft.secrets = append(draft.secrets, c.APIKey, c.ControlKey, c.WorkspaceID)
 	if err != nil {
 		return nil, err
 	}
-	j, _, err := s.prepare(r)
+	draft.credentialID = c.ID
+	j, upstream, err := s.prepare(r)
 	if err != nil {
 		return nil, err
 	}
+	draft.upstreamModel = upstream
 	delete(j, "stream")
 	delete(j, "stream_options")
 
-	cfg := s.config()
 	body, err := json.Marshal(j)
 	if err != nil {
-		return nil, fail(http.StatusBadRequest, "could not encode upstream request")
+		return nil, localFail(http.StatusBadRequest, "invalid_request", "could not encode upstream request")
 	}
-	status, headers, respBody, err := s.doJSON(r.HostCallbackID, http.MethodPost, upstreamURL(cfg.BaseURL, "/chat/completions", nil), upstreamHeaders(c.APIKey), body)
+	status, headers, respBody, err := s.doJSON(r.HostCallbackID, http.MethodPost, upstreamURL(c.BaseURL, "/chat/completions", nil), upstreamHeaders(c.APIKey), body)
+	draft.upstreamAttempted = status >= 100 && status <= 599 || upstreamErrorWasAttempted(err)
+	draft.httpStatus = status
+	draft.requestID = requestIDFrom(headers)
 	if err != nil {
 		return nil, err
 	}
@@ -124,12 +157,15 @@ func (s *Service) execute(raw json.RawMessage) (any, error) {
 	}
 	root, decodeErr := decodeObject(respBody)
 	if decodeErr != nil {
-		return nil, upstreamProtocolError("upstream returned a non-JSON completion body")
+		return nil, upstreamProtocolError("upstream returned a non-JSON completion body", status)
 	}
 	// A 200 carrying a top-level error is an upstream failure, not a completion.
 	if errBody := successBodyError(root, status, respBody, keys...); errBody != nil {
 		return nil, errBody
 	}
+	// Only an upstream usage object may populate token counts; a missing or
+	// malformed field stays null instead of being guessed.
+	draft.usage = tokenUsageFromMap(root)
 	// Restore the client-facing alias so the caller sees the model it asked for.
 	if _, ok := root["model"]; ok {
 		root["model"] = r.Model
@@ -140,36 +176,50 @@ func (s *Service) execute(raw json.RawMessage) (any, error) {
 	return map[string]any{
 		"Payload":  respBody,
 		"Headers":  http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
-		"Metadata": map[string]any{"provider": Provider, "upstream_model": j["model"]},
+		"Metadata": map[string]any{"provider": Provider, "upstream_model": j["model"], "http_status": status},
 	}, nil
 }
 
 // executeStream handles executor.execute_stream. It returns as soon as the
 // upstream stream is open; frames are pushed through host.stream.emit.
-func (s *Service) executeStream(raw json.RawMessage) (any, error) {
+func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 	if err := s.begin(); err != nil {
 		return nil, err
 	}
 	release := sync.OnceFunc(s.done)
+	finished := false
+	draft := &requestLogDraft{started: time.Now(), stream: true}
+	// Every early return still records one metadata row. Once the goroutine takes
+	// over, it owns the draft and the release() call.
+	defer func() {
+		if !finished {
+			s.recordRequestLog(draft, err)
+			release()
+		}
+	}()
 	r, err := decodeExecutorRequest(raw)
 	if err != nil {
-		release()
 		return nil, err
 	}
+	draft.model = r.Model
+	var captured Credential
+	_ = json.Unmarshal(r.StorageJSON, &captured)
+	draft.secrets = []string{captured.APIKey, captured.ControlKey, captured.WorkspaceID}
 	c, err := s.selectedCredential(r)
+	draft.secrets = append(draft.secrets, c.APIKey, c.ControlKey, c.WorkspaceID)
 	if err != nil {
-		release()
 		return nil, err
 	}
-	j, _, err := s.prepare(r)
+	draft.credentialID = c.ID
+	j, upstream, err := s.prepare(r)
 	if err != nil {
-		release()
 		return nil, err
 	}
+	draft.upstreamModel = upstream
 	if r.StreamID == "" {
-		release()
-		return nil, fail(http.StatusInternalServerError, "host provided no output stream identifier")
+		return nil, localFail(http.StatusInternalServerError, "host_contract_error", "host provided no output stream identifier")
 	}
+
 	j["stream"] = true
 	opts, _ := j["stream_options"].(map[string]any)
 	if opts == nil {
@@ -182,19 +232,18 @@ func (s *Service) executeStream(raw json.RawMessage) (any, error) {
 
 	body, err := json.Marshal(j)
 	if err != nil {
-		release()
-		return nil, fail(http.StatusBadRequest, "could not encode upstream request")
+		return nil, localFail(http.StatusBadRequest, "invalid_request", "could not encode upstream request")
 	}
-	cfg := s.config()
-	stream, err := s.openStream(r.HostCallbackID, http.MethodPost, upstreamURL(cfg.BaseURL, "/chat/completions", nil), upstreamHeaders(c.APIKey), body)
+	stream, err := s.openStream(r.HostCallbackID, http.MethodPost, upstreamURL(c.BaseURL, "/chat/completions", nil), upstreamHeaders(c.APIKey), body)
+	draft.upstreamAttempted = stream.StatusCode >= 100 && stream.StatusCode <= 599 || upstreamErrorWasAttempted(err)
+	draft.httpStatus = stream.StatusCode
+	draft.requestID = requestIDFrom(stream.Headers)
 	if err != nil {
-		release()
 		return nil, err
 	}
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
 		// Buffer the error body, then fail the RPC before any output is emitted.
 		failure := s.readStreamError(r.HostCallbackID, stream, s.redactionKeys(c.APIKey, c.ControlKey)...)
-		release()
 		return nil, failure
 	}
 	// CPA owns the downstream envelope: emit raw JSON frames, and only wrap them
@@ -211,16 +260,30 @@ func (s *Service) executeStream(raw json.RawMessage) (any, error) {
 		return nil
 	}
 	go func() {
-		defer release()
-		defer func() {
-			_ = recover()
-		}()
 		// The keys are captured now so a credential replaced while the stream is
 		// open still redacts the key this request actually used.
 		keys := []string{c.APIKey, c.ControlKey}
-		streamErr := s.pumpSSE(r.HostCallbackID, stream, r.Model, emitter, requestChoiceCount(j), keys)
-		s.finishOutputStream(r.StreamID, streamErr, keys...)
+		usage := &tokenUsage{}
+		var streamErr error
+		defer release()
+		defer func() {
+			if recovered := recover(); recovered != nil && streamErr == nil {
+				streamErr = upstreamProtocolError("upstream stream processing failed")
+			}
+			draft.usage = *usage
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil && streamErr == nil {
+						streamErr = upstreamProtocolError("upstream stream finalization failed")
+					}
+				}()
+				s.finishOutputStream(r.StreamID, streamErr, keys...)
+			}()
+			s.recordRequestLog(draft, streamErr)
+		}()
+		streamErr = s.pumpSSE(r.HostCallbackID, stream, r.Model, emitter, requestChoiceCount(j), usage, keys)
 	}()
+	finished = true
 	return map[string]any{
 		"Headers": http.Header{"Content-Type": []string{"text/event-stream"}, "Cache-Control": []string{"no-cache"}},
 	}, nil
@@ -229,7 +292,7 @@ func (s *Service) executeStream(raw json.RawMessage) (any, error) {
 // pumpSSE decodes the upstream event stream and emits one JSON frame per event.
 // A `[DONE]` marker terminates the stream without being forwarded: the host
 // writes its own terminal marker.
-func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string, emit func([]byte) error, expectedChoices int64, keys []string) error {
+func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string, emit func([]byte) error, expectedChoices int64, usage *tokenUsage, keys []string) error {
 	decoder := &sseDecoder{maxBytes: maxSSEFrame}
 	var sawDone bool
 	// Per-choice completion: with n>1, one finished choice does not make the
@@ -259,9 +322,14 @@ func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string
 				// The event body is upstream-controlled: parse it with both the keys
 				// this request was sent with and every key known right now, so a code
 				// that carries a secret cannot become the error kind or message.
-				return upstreamErrorFromResponse(status, nil, event.Data, s.redactionKeys(keys...)...)
+				return upstreamErrorFromResponseObserved(status, stream.StatusCode, nil, event.Data, s.redactionKeys(keys...)...)
 			}
 			tracker.observe(root)
+			if usage != nil {
+				// Only values the upstream actually reported are kept; an absent
+				// usage object leaves every token count null.
+				usage.observe(root)
+			}
 			if model, ok := root["model"].(string); ok && model != "" {
 				root["model"] = alias
 			}
@@ -361,10 +429,11 @@ func successBodyError(root map[string]any, status int, raw []byte, keys ...strin
 	if root["error"] == nil && root["success"] != false {
 		return nil
 	}
+	observedStatus := status
 	if status < 400 {
 		status = http.StatusBadGateway
 	}
-	return upstreamErrorFromResponse(status, nil, raw, keys...)
+	return upstreamErrorFromResponseObserved(status, observedStatus, nil, raw, keys...)
 }
 
 // readStreamError reads a non-2xx upstream body and converts it into the matching

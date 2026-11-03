@@ -17,9 +17,11 @@ import (
 
 // Service holds plugin state. It is deliberately small: credentials, model
 // mappings and the in-flight upstream/output streams needed to shut down cleanly.
-// Nothing here persists request bodies, responses or log lines.
+// Nothing here persists request or response bodies; request logs persist only
+// the explicitly allowlisted metadata fields.
 type Service struct {
 	mu           sync.RWMutex
+	lifecycleMu  sync.Mutex
 	configMu     sync.Mutex
 	credentialMu sync.Mutex
 	authFileMu   sync.Mutex
@@ -29,33 +31,39 @@ type Service struct {
 	pendingMu    sync.Mutex
 	pendingSaves map[string]pendingSave
 
-	cfg                 Config
-	creds               map[string]Credential
-	billingEpoch        map[string]uint64 // guarded by mu; changes on either key/workspace replacement or clear/delete
-	quota               map[string]*quotaEntry
-	quotaSlots          chan struct{}
-	quotaNow            func() time.Time
-	quotaBudget         time.Duration
-	modelCoverage       map[modelCoverageKey]*modelCoverageEntry
-	modelCoverageSlots  chan struct{}
-	modelCoverageNow    func() time.Time
-	modelCoverageBudget time.Duration
-	authFiles           map[string]string
-	revoked             map[string]bool
-	host                HostCall
-	authDir             string
-	streams             map[string]struct{}
-	ops                 *operationTracker
-	loaded              bool
-	stopped             bool
-	active              sync.WaitGroup
-	activeN             atomic.Int64
-	stopCh              chan struct{}
+	cfg                  Config
+	creds                map[string]Credential
+	billingEpoch         map[string]uint64 // guarded by mu; changes on either key/workspace replacement or clear/delete
+	quota                map[string]*quotaEntry
+	quotaSlots           chan struct{}
+	quotaNow             func() time.Time
+	quotaBudget          time.Duration
+	modelCoverage        map[modelCoverageKey]*modelCoverageEntry
+	modelCoverageSlots   chan struct{}
+	modelCoverageNow     func() time.Time
+	modelCoverageBudget  time.Duration
+	authFiles            map[string]string
+	revoked              map[string]bool
+	requestLogs          *requestLogStore
+	modelTests           map[string]modelTestRecord
+	modelTestRunning     map[string]int
+	modelMappingRevision uint64
+	credentialEpoch      map[string]uint64
+	host                 HostCall
+	authDir              string
+	streams              map[string]struct{}
+	ops                  *operationTracker
+	loaded               bool
+	stopped              bool
+	active               sync.WaitGroup
+	activeN              atomic.Int64
+	stopCh               chan struct{}
 }
 
 // NewService returns an unconfigured plugin instance.
 func NewService() *Service {
-	return &Service{
+	requestLogs := newRequestLogStore()
+	s := &Service{
 		cfg:                 defaultConfig(),
 		creds:               map[string]Credential{},
 		billingEpoch:        map[string]uint64{},
@@ -69,11 +77,17 @@ func NewService() *Service {
 		modelCoverageBudget: modelCoverageBudget,
 		authFiles:           map[string]string{},
 		revoked:             map[string]bool{},
+		requestLogs:         requestLogs,
+		modelTests:          map[string]modelTestRecord{},
+		modelTestRunning:    map[string]int{},
+		credentialEpoch:     map[string]uint64{},
 		streams:             map[string]struct{}{},
 		pendingSaves:        map[string]pendingSave{},
 		ops:                 newOperationTracker(),
 		stopCh:              make(chan struct{}),
 	}
+	requestLogs.keys = s.metadataSecrets
+	return s
 }
 
 // SetHost installs the host callback bridge provided by cmd/passbridge.
@@ -171,6 +185,8 @@ func registration() any {
 }
 
 func (s *Service) configure(raw json.RawMessage) (err error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
 	var req struct {
@@ -204,9 +220,14 @@ func (s *Service) configure(raw json.RawMessage) (err error) {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.loaded && filepath.Clean(cfg.DataDir) != filepath.Clean(s.cfg.DataDir) {
+		s.mu.Unlock()
 		return fail(http.StatusConflict, "changing data_dir requires restarting the plugin with its complete data directory")
+	}
+	mappingChanged := s.loaded && !sameModels(s.cfg.Models, cfg.Models)
+	if mappingChanged {
+		s.modelMappingRevision++
+		s.clearModelTestsLocked()
 	}
 	if s.stopped {
 		// The host re-registers a quiesced instance when replacement fails.
@@ -216,14 +237,27 @@ func (s *Service) configure(raw json.RawMessage) (err error) {
 	}
 	s.cfg = cfg
 	s.loaded = true
+	s.mu.Unlock()
+	// A corrupt or unreadable log store must never block registration: the
+	// store falls back to an empty, writable state. Loading happens outside the
+	// service lock because it may parse up to the bounded snapshot and journal.
+	_ = s.requestLogs.configure(cfg.DataDir, cfg.logSettings())
 	return nil
+}
+
+func (s *Service) withActive(fn func() (any, error)) (any, error) {
+	if err := s.begin(); err != nil {
+		return managementError(statusOf(err), err.Error())
+	}
+	defer s.done()
+	return fn()
 }
 
 func (s *Service) begin() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopped {
-		return fail(http.StatusServiceUnavailable, "OpenDesign plugin is shutting down")
+		return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
 	}
 	s.active.Add(1)
 	s.activeN.Add(1)
@@ -243,8 +277,10 @@ func (s *Service) waitIdle() {
 }
 
 // quiesce stops accepting work, closes upstream and downstream streams, then
-// waits for in-flight handlers. It never persists anything.
+// waits for in-flight handlers and flushes bounded request metadata.
 func (s *Service) quiesce() (any, error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
 	if !s.stopped {
 		close(s.stopCh)
@@ -262,11 +298,18 @@ func (s *Service) quiesce() (any, error) {
 	// for headers blocks inside the host, where closing a stream id cannot help.
 	s.cancelOperations()
 	s.active.Wait()
+	// Invalidate and join any deferred log task before the synchronous shutdown
+	// flush, so an old task cannot write after this lifecycle boundary.
+	s.requestLogs.cancelScheduledFlush()
+	flushErr := s.requestLogs.flush()
+	if flushErr != nil {
+		return map[string]any{}, fail(http.StatusInternalServerError, "request log persistence failed during shutdown: "+flushErr.Error())
+	}
 	return map[string]any{}, nil
 }
 
 func (s *Service) saveSettings(cfg Config) error {
-	b, err := json.MarshalIndent(Config{DataDir: cfg.DataDir, BaseURL: cfg.BaseURL, Models: cfg.Models}, "", "  ")
+	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}

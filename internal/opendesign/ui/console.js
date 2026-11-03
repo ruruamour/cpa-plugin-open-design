@@ -52,6 +52,20 @@
     modelCoverageGeneration: 0,
     modelCoverageRevisions: {},
     busy: false,
+    // Optional routes are opt-in: only an explicit operator action fills these.
+    // Switching tabs never triggers a request.
+    activeTab: 'overview',
+    logQuery: { offset: 0, limit: 50, status: '', model: '', credentialID: '', attempted: '' },
+    requestLogs: [],
+    logPage: { loaded: false, total: 0, offset: 0, limit: 50, has_more: false, next_offset: null, retention: null },
+    requestStats: null,
+    config: null,
+    runtime: null,
+    modelTest: null,
+    modelTestGeneration: 0,
+    optionalBusy: {},
+    optionalGeneration: 0,
+    themePreference: 'system',
   };
 
   function modelCoverageKey(credentialID, modelID) {
@@ -171,6 +185,11 @@
       const node = $(id);
       if (node) node.hidden = !connected;
     }
+    for (const id of ['credentialsLocked', 'modelsLocked']) {
+      const node = $(id);
+      if (node) node.hidden = Boolean(connected);
+    }
+    renderOverview();
   }
 
   function setBusy(value) {
@@ -204,6 +223,177 @@
   function setDisabled(id, value) {
     const node = $(id);
     if (node) node.disabled = Boolean(value);
+  }
+
+  // --- tabs ----------------------------------------------------------------
+  //
+  // Switching a tab only toggles hidden/aria-selected. It never calls fetch, so
+  // opening the console or browsing sections cannot hit the optional routes.
+
+  const TABS = [
+    { name: 'overview', button: 'tabOverview', panel: 'overviewPanel' },
+    { name: 'credentials', button: 'tabCredentials', panel: 'credentialsPanel' },
+    { name: 'models', button: 'tabModels', panel: 'modelsTab' },
+    { name: 'logs', button: 'tabLogs', panel: 'logsPanel' },
+    { name: 'config', button: 'tabConfig', panel: 'configPanel' },
+  ];
+
+  function tabEntry(name) {
+    const wanted = String(name || '');
+    return TABS.find(item => item.name === wanted) || TABS[0];
+  }
+
+  function activateTab(name, options = {}) {
+    const target = tabEntry(name);
+    state.activeTab = target.name;
+    for (const item of TABS) {
+      const selected = item.name === target.name;
+      const buttonNode = $(item.button);
+      const panelNode = $(item.panel);
+      if (buttonNode) {
+        buttonNode.setAttribute('aria-selected', selected ? 'true' : 'false');
+        buttonNode.setAttribute('tabindex', selected ? '0' : '-1');
+      }
+      if (panelNode) panelNode.hidden = !selected;
+    }
+    if (options.focus) {
+      const active = $(target.button);
+      if (active && typeof active.focus === 'function') active.focus();
+    }
+    return target.name;
+  }
+
+  function tabFromEvent(event) {
+    const target = event && event.currentTarget;
+    return target && target.getAttribute ? target.getAttribute('data-tab') : '';
+  }
+
+  function handleTabKey(event) {
+    if (!event || !event.key) return;
+    const index = TABS.findIndex(item => item.name === state.activeTab);
+    let next = -1;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % TABS.length;
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index - 1 + TABS.length) % TABS.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = TABS.length - 1;
+    if (next < 0) return;
+    if (typeof event.preventDefault === 'function') event.preventDefault();
+    activateTab(TABS[next].name, { focus: true });
+  }
+
+  function renderFacts(container, facts, emptyText = '') {
+    if (!container) return;
+    if (!facts.length) {
+      container.replaceChildren(el('p', { className: 'empty', text: emptyText || '没有可显示的字段。' }));
+      return;
+    }
+    container.replaceChildren(...facts.map(fact => el('div', { className: 'fact' }, [
+      el('span', { className: 'fact-label', text: fact.label }),
+      el('span', { className: 'fact-value', text: fact.value }),
+    ])));
+  }
+
+  // --- theme ---------------------------------------------------------------
+  //
+  // The page defaults to the system colour scheme; an explicit, accessible
+  // toggle can pin light/dark without touching authentication or data state.
+
+  const THEME_STORAGE_KEY = 'open-design-theme';
+  let themeMedia = null;
+
+  function themeSystemDark() {
+    try {
+      return typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches === true;
+    } catch { return false; }
+  }
+
+  function readStoredTheme() {
+    try { return localStorage.getItem(THEME_STORAGE_KEY); } catch { return null; }
+  }
+
+  function persistTheme(preference) {
+    try {
+      if (preference === 'system') localStorage.removeItem(THEME_STORAGE_KEY);
+      else localStorage.setItem(THEME_STORAGE_KEY, preference);
+    } catch { /* Storage can be blocked; the in-memory preference still applies. */ }
+  }
+
+  function renderThemeToggle() {
+    const button = $('themeToggle');
+    if (!button) return;
+    const preference = Core.normalizeThemePreference(state.themePreference);
+    const resolved = Core.resolvedTheme(preference, themeSystemDark());
+    const label = Core.themePreferenceLabel(preference, resolved);
+    button.textContent = `主题：${label}`;
+    button.setAttribute('aria-label', `切换颜色主题，当前：${label}`);
+  }
+
+  function applyThemePreference(value, options = {}) {
+    state.themePreference = Core.normalizeThemePreference(value);
+    const resolved = Core.resolvedTheme(state.themePreference, themeSystemDark());
+    const root = document.documentElement;
+    if (root && root.setAttribute) {
+      root.setAttribute('data-theme', state.themePreference);
+      root.setAttribute('data-theme-resolved', resolved);
+    }
+    if (options.persist) persistTheme(state.themePreference);
+    renderThemeToggle();
+    return state.themePreference;
+  }
+
+  function cycleThemePreference() {
+    return applyThemePreference(Core.nextThemePreference(state.themePreference), { persist: true });
+  }
+
+  function initTheme() {
+    if (!themeMedia && typeof matchMedia === 'function') {
+      try {
+        themeMedia = matchMedia('(prefers-color-scheme: dark)');
+        const changed = () => {
+          if (state.themePreference === 'system') applyThemePreference('system');
+        };
+        if (themeMedia.addEventListener) themeMedia.addEventListener('change', changed);
+        else if (themeMedia.addListener) themeMedia.addListener(changed);
+      } catch { /* The CSS media query still follows the system. */ }
+    }
+    applyThemePreference(readStoredTheme() || 'system', { persist: false });
+  }
+
+  function retentionScopeText(retention) {
+    if (!retention) return '';
+    const range = retention.oldest && retention.newest
+      ? `${Core.formatTime(retention.oldest)} ~ ${Core.formatTime(retention.newest)}`
+      : '';
+    const window = retention.retention_days !== null ? `保留 ${retention.retention_days} 天` : '保留天数未知';
+    const cap = retention.max_entries !== null ? `最多 ${retention.max_entries} 条` : '最多条数未知';
+    const parts = [`统计范围：${window}，${cap}`];
+    if (range) parts.push(`数据时间 ${range}`);
+    parts.push(`当前 ${retention.entries} 条`);
+    return parts.join(' · ');
+  }
+
+  function overviewFacts() {
+    const credentials = Array.isArray(state.status.credentials) ? state.status.credentials : [];
+    const enabled = credentials.filter(item => !item.disabled).length;
+    const models = Array.isArray(state.status.models) ? state.status.models : [];
+    const connected = Boolean(state.verified);
+    return [
+      { label: '管理认证', value: connected ? '已验证' : '未验证' },
+      { label: '账户', value: connected ? `${credentials.length} 个（${enabled} 个启用）` : '--' },
+      { label: '模型映射', value: connected ? `${models.length} 个` : '--' },
+      { label: '版本', value: state.status.version || '--' },
+      { label: '上游地址', value: state.status.base_url || DEFAULT_BASE_URL },
+    ];
+  }
+
+  function renderOverview() {
+    const connected = Boolean(state.verified);
+    const badge = $('overviewBadge');
+    if (badge) {
+      badge.textContent = connected ? '已验证' : '未验证';
+      badge.className = connected ? 'badge good' : 'badge';
+    }
+    renderFacts($('overviewFacts'), overviewFacts());
   }
 
   function selectedCredentialItem() {
@@ -256,11 +446,60 @@
     showPanels(true);
   }
 
+  function resetManagementData() {
+    state.optionalGeneration += 1;
+    state.optionalBusy = {};
+    syncOptionalBusyControls();
+    state.status = { version: '', base_url: DEFAULT_BASE_URL, credentials: [], models: [] };
+    state.selectedCredential = '';
+    state.upstream = [];
+    state.upstreamFor = '';
+    state.upstreamQuery = '';
+    state.mappings = [];
+    state.savedMappings = [];
+    state.requestLogs = [];
+    state.logQuery = { offset: 0, limit: 50, status: '', model: '', credentialID: '', attempted: '' };
+    state.logPage = { loaded: false, total: 0, offset: 0, limit: 50, has_more: false, next_offset: null, retention: null };
+    state.requestStats = null;
+    state.config = null;
+    state.runtime = null;
+    state.modelTest = null;
+    state.modelTestGeneration += 1;
+    const status = $('logsFilterStatus');
+    if (status) status.value = '';
+    const attempted = $('logsFilterAttempted');
+    if (attempted) attempted.value = '';
+    const model = $('logsFilterModel');
+    if (model) model.value = '';
+    const credential = $('logsFilterCredential');
+    if (credential) credential.value = '';
+    const limit = $('logsFilterLimit');
+    if (limit) limit.value = '50';
+    renderAccounts();
+    renderModels();
+    renderOverview();
+    renderRequestLogs();
+    renderRequestStats();
+    renderConfig();
+    renderRuntime();
+    renderModelTest();
+    message('logsState', '');
+    message('configState', '');
+    message('modelTestState', '');
+  }
+
+  function clearRejectedManagementAuth() {
+    const rejected = state.verified && state.verified.headers;
+    if (!rejected) return;
+    try { Auth.clearAuth(rejected); } catch { /* Keep the page usable. */ }
+  }
+
   function showAuth(text, kind = 'error') {
     state.verified = null;
     state.candidate = null;
     invalidateModelRequest();
     invalidateQuota();
+    resetManagementData();
     resetAccountForm();
     setAuthCollapsed(false);
     showPanels(false);
@@ -293,6 +532,15 @@
     return Boolean(error) && isAuthStatus(error.status) && !isUpstreamSource(error);
   }
 
+  function optionalAuthFailure(error) {
+    if (!isManagementAuthError(error)) return false;
+    clearRejectedManagementAuth();
+    showAuth(error.status === 401
+      ? '401：管理密钥无效或已过期，请重新验证后再试。'
+      : '403：管理请求被拒绝，请确认管理密钥和来源 IP。');
+    return true;
+  }
+
   function upstreamErrorDetail(error) {
     const code = error && typeof error.code === 'string' ? error.code.trim() : '';
     return code ? `（${code}）` : '';
@@ -311,8 +559,10 @@
   }
 
   async function loadStatus(options = {}) {
+    const generation = state.optionalGeneration;
     try {
       const raw = await api().status();
+      if (generation !== state.optionalGeneration) return false;
       applyStatus(raw);
       const source = options.source || (state.verified && state.verified.source) || '';
       if (state.verified) state.verified.source = source;
@@ -321,13 +571,11 @@
       message('authState', '');
       return true;
     } catch (error) {
+      if (generation !== state.optionalGeneration) return false;
       // /status is a management-only route, so a 401/403 here always means the
       // management key, never an upstream account key.
       if (isAuthStatus(error.status)) {
-        const rejected = state.verified && state.verified.headers;
-        if (rejected && state.verified.source !== 'manual') {
-          try { Auth.clearAuth(rejected); } catch { /* Keep the page usable. */ }
-        }
+        clearRejectedManagementAuth();
         showAuth(error.status === 401
           ? '401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。'
           : '403：管理请求被拒绝，请确认管理密钥和来源 IP。');
@@ -362,6 +610,13 @@
 
   function applyStatus(raw) {
     const incoming = Core.normalizeStatus(raw);
+    const modelTestWasBusy = optionalBusy('modelTest');
+    state.modelTestGeneration += 1;
+    state.modelTest = null;
+    renderModelTest();
+    if (modelTestWasBusy) {
+      message('modelTestState', '账户状态已刷新，正在发送的模型测试结果已失效。', 'error');
+    }
     invalidateChangedQuotas(incoming.credentials);
     const serverModels = cloneMappings(incoming.models);
     // A status refresh (account add/update, background reload) must not silently
@@ -383,6 +638,7 @@
     renderMeta();
     renderAccounts();
     renderModels();
+    renderOverview();
     if (dirty) message('modelState', '账户信息已刷新；模型映射还有未保存的修改，草稿已保留。', '');
   }
 
@@ -592,9 +848,9 @@
     } else {
       block.append(el('p', { className: 'quota-meta', text: '重置时间：未知' }));
     }
-    const resetAt = Date.parse(window.resetsAt);
-    const exhaustsAt = Date.parse(window.forecast?.exhausts_at);
-    const expired = resetAt <= Date.now() || exhaustsAt <= Date.now();
+    const exhaustsAt = Date.parse(window.forecast && window.forecast.exhausts_at);
+    const resetsAt = Date.parse(window.resetsAt);
+    const expired = Core.quotaForecastExpired(window);
     const forecast = Core.forecastView(expired ? { state: 'expired' } : window.forecast);
     if (forecast.text) {
       const description = el('p', { className: `quota-forecast${forecast.tone === 'warn' ? ' warn' : ''}`, text: forecast.text });
@@ -605,7 +861,7 @@
         block.append(el('details', { className: 'quota-trend' }, [
           el('summary', { text: '用量趋势（估算）' }),
           description,
-          el('p', { className: 'quota-note', text: '依据此窗口的整体 credits 消耗；更换模型或用量变化会影响估算，不能换算为某个模型的剩余 token 或请求次数。' }),
+          el('p', { className: 'quota-note', text: '仅为估算；更换模型或用量变化会影响估算，不能换算为某个模型的剩余 token 或请求次数。' }),
         ]));
       }
     }
@@ -711,7 +967,7 @@
   function renderCredentialOptions() {
     const select = $('modelCredential');
     if (!select) return;
-    const options = [el('option', { value: '', text: '请选择账户' })];
+    const options = [el('option', { value: '', text: '请选择账户', attrs: { disabled: '', selected: '' } })];
     for (const item of state.status.credentials) {
       options.push(el('option', {
         value: item.id,
@@ -721,6 +977,29 @@
     }
     select.replaceChildren(...options);
     select.value = state.selectedCredential;
+    renderOptionalCredentialOptions();
+  }
+
+  // Credential pickers for the opt-in panels. They re-render locally only; no
+  // request is issued by populating them.
+  function renderOptionalCredentialOptions() {
+    for (const [id, emptyLabel, includeDisabled] of [
+      ['logsFilterCredential', '全部账户', true],
+      ['modelTestCredential', '请选择账户', false],
+    ]) {
+      const select = $(id);
+      if (!select) continue;
+      const previous = select.value;
+      const placeholderAttrs = includeDisabled ? {} : { disabled: '', selected: '' };
+      const options = [el('option', { value: '', text: emptyLabel, attrs: placeholderAttrs })];
+      for (const item of state.status.credentials) {
+        if (!includeDisabled && item.disabled) continue;
+        options.push(el('option', { value: item.id, text: item.disabled ? `${item.label}（已停用）` : item.label }));
+      }
+      select.replaceChildren(...options);
+      const valid = state.status.credentials.some(item => item.id === previous && (includeDisabled || !item.disabled));
+      select.value = valid ? previous : '';
+    }
   }
 
   function renderModels() {
@@ -1141,6 +1420,7 @@
       renderAccounts();
     } catch (error) {
       if (isManagementAuthError(error)) {
+        clearRejectedManagementAuth();
         const prefix = saved ? '账户已保存，但读取最新状态时认证失效。' : '';
         showAuth(prefix + (error.status === 401 ? '401：管理密钥无效或已过期，请重新验证。' : `403：${formatError(error)}`));
       } else {
@@ -1177,6 +1457,7 @@
       await refreshStatus();
     } catch (error) {
       if (isManagementAuthError(error)) {
+        clearRejectedManagementAuth();
         showAuth(`${deleted ? '账户已删除，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`);
       } else if (deleted) {
         message('accountState', `账户已删除，但读取最新状态失败：${formatError(error)}。请刷新状态确认。`, 'error');
@@ -1211,8 +1492,10 @@
       message('accountState', item.disabled ? '账户已启用。' : '账户已停用。');
       await refreshStatus();
     } catch (error) {
-      if (isManagementAuthError(error)) showAuth(`${updated ? '账户状态已更新，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`);
-      else message('accountState', updated
+      if (isManagementAuthError(error)) {
+        clearRejectedManagementAuth();
+        showAuth(`${updated ? '账户状态已更新，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`);
+      } else message('accountState', updated
         ? `账户已${item.disabled ? '启用' : '停用'}，但读取最新状态失败：${formatError(error)}。请刷新状态确认。`
         : `更新失败：${formatError(error)}`, 'error');
     } finally {
@@ -1349,6 +1632,598 @@
     }
   }
 
+  // --- optional routes (explicit operator action only) ---------------------
+  //
+  // None of these functions is called by rendering, status loading, tab
+  // switching or a timer. Each one is reachable only from its own button.
+
+  function optionalBusy(name) {
+    return Boolean(state.optionalBusy[name]);
+  }
+
+  function syncOptionalBusyControls() {
+    const logBusy = optionalLogBusy();
+    for (const id of ['refreshLogs', 'refreshStats', 'clearLogs', 'logsFilterStatus', 'logsFilterCredential', 'logsFilterModel', 'logsFilterAttempted', 'logsFilterLimit']) {
+      setDisabled(id, logBusy);
+    }
+    setDisabled('logsPrev', logBusy || state.logPage.offset <= 0);
+    setDisabled('logsNext', logBusy || !state.logPage.has_more);
+    for (const id of ['loadConfig']) setDisabled(id, optionalBusy('config'));
+    const configLocked = optionalBusy('config') || !state.config;
+    for (const id of ['configLogsEnabled', 'configRetentionDays', 'configMaxEntries', 'saveConfig']) {
+      setDisabled(id, configLocked);
+    }
+    setDisabled('loadRuntime', optionalBusy('runtime'));
+    for (const id of ['runModelTest', 'modelTestCredential', 'modelTestModel', 'modelTestPrompt']) {
+      setDisabled(id, optionalBusy('modelTest'));
+    }
+  }
+
+  function setOptionalBusy(name, value) {
+    if (value) state.optionalBusy[name] = true;
+    else delete state.optionalBusy[name];
+    syncOptionalBusyControls();
+  }
+
+  function optionalLogBusy() {
+    return optionalBusy('logs') || optionalBusy('stats') || optionalBusy('logsClear');
+  }
+
+  function optionalErrorText(error) {
+    if (isManagementAuthError(error)) {
+      return error.status === 401
+        ? '401：管理密钥无效或已过期，请重新验证后再试。'
+        : '403：管理请求被拒绝，请确认管理密钥和来源 IP。';
+    }
+    const status = error && Number.isInteger(error.status) ? error.status : 0;
+    if (status === 404 || status === 405) return `接口未提供（HTTP ${status}）`;
+    return status ? `请求失败（HTTP ${status}）：${formatError(error)}` : '请求失败，未连接到管理接口。';
+  }
+
+  function logStatusLabel(status, failed) {
+    if (failed) return '失败';
+    if (status === 'success') return '成功';
+    if (status === 'error') return '失败';
+    return '未知';
+  }
+
+  function credentialLabel(id) {
+    const item = state.status.credentials.find(entry => entry.id === id);
+    return item ? item.label : (id || '未知账户');
+  }
+
+  function logRow(record) {
+    const failed = record.status === 'error' || (record.http_status !== null && record.http_status >= 400);
+    const head = [el('span', {
+      className: `badge ${failed ? 'off' : 'on'}`,
+      text: logStatusLabel(record.status, failed),
+    })];
+    if (record.upstream_attempted === false) head.push(el('span', { className: 'badge', text: '本地拒绝' }));
+    if (record.http_status !== null && record.upstream_attempted !== false) head.push(el('span', { className: 'mono', text: `上游 HTTP ${record.http_status}` }));
+    if (record.stream) head.push(el('span', { className: 'badge', text: '流式' }));
+    const details = [];
+    if (record.model) details.push(`模型 ${record.model}`);
+    if (record.started_at) details.push(`时间 ${Core.formatTime(record.started_at) || record.started_at}`);
+    if (record.upstream_model && record.upstream_model !== record.model) details.push(`上游 ${record.upstream_model}`);
+    details.push(`账户 ${credentialLabel(record.credential_id)}`);
+    if (record.duration_ms !== null) details.push(`耗时 ${record.duration_ms} ms`);
+    if (record.total_tokens !== null) details.push(`Token ${record.total_tokens}`);
+    else if (record.input_tokens !== null || record.output_tokens !== null) {
+      details.push(`Token ${record.input_tokens ?? '?'} / ${record.output_tokens ?? '?'}`);
+    }
+    if (record.error_kind) details.push(`错误 ${record.error_kind}`);
+    if (record.request_id) details.push(`请求 ${record.request_id}`);
+    return el('div', { className: 'log-row', attrs: { 'data-log-id': record.id } }, [
+      el('div', { className: 'log-head' }, head),
+      el('div', { className: 'log-detail', text: details.join(' · ') }),
+    ]);
+  }
+
+  function renderRequestLogs() {
+    const list = $('requestLogList');
+    if (!list) return;
+    if (!state.logPage.loaded) {
+      list.replaceChildren(el('p', { className: 'empty', text: '尚未读取。点「刷新日志」后才会请求 GET /request-logs。' }));
+    } else if (!state.requestLogs.length) {
+      list.replaceChildren(el('p', { className: 'empty', text: '没有匹配的请求日志。' }));
+    } else {
+      list.replaceChildren(...state.requestLogs.map(logRow));
+    }
+    const info = $('logsPageInfo');
+    if (info) {
+      if (!state.logPage.loaded) info.textContent = '尚未读取日志。';
+      else {
+        const start = state.logPage.total ? state.logPage.offset + 1 : 0;
+        const end = state.logPage.offset + state.requestLogs.length;
+        info.textContent = `显示 ${start}-${end} / 共 ${state.logPage.total} 条`;
+      }
+    }
+    setDisabled('logsPrev', optionalLogBusy() || state.logPage.offset <= 0);
+    setDisabled('logsNext', optionalLogBusy() || !state.logPage.has_more);
+  }
+
+  function renderRequestStats() {
+    const container = $('requestStats');
+    const models = $('requestStatsModels');
+    const stats = state.requestStats;
+    if (!container) return;
+    if (!stats) {
+      container.replaceChildren(el('p', { className: 'empty', text: '点「读取统计」后才会请求 GET /request-stats。' }));
+      if (models) models.replaceChildren();
+      return;
+    }
+    const facts = [
+      { label: '总请求', value: String(stats.total) },
+      { label: '成功', value: String(stats.success) },
+      { label: '失败', value: String(stats.failed) },
+      { label: '流式', value: String(stats.streams) },
+    ];
+    const rate = Core.formatRatio(stats.success_rate);
+    if (rate) facts.push({ label: '成功率', value: rate });
+    if (stats.tokens.total !== null) facts.push({ label: 'Token 总量', value: String(stats.tokens.total) });
+    if (stats.tokens.input !== null) facts.push({ label: '输入 Token', value: String(stats.tokens.input) });
+    if (stats.tokens.output !== null) facts.push({ label: '输出 Token', value: String(stats.tokens.output) });
+    facts.push({ label: '有 usage 的请求', value: String(stats.tokens.requests_with_usage) });
+    facts.push({ label: '上游已尝试', value: String(stats.upstream_attempted) });
+    facts.push({ label: '本地拒绝', value: String(stats.local_rejected) });
+    facts.push({ label: '无 usage 的请求', value: String(stats.tokens.requests_without_usage) });
+    const scope = retentionScopeText(stats.retention);
+    if (scope) facts.push({ label: '统计范围', value: scope });
+    renderFacts(container, facts);
+    if (!models) return;
+    if (!stats.models.length) {
+      models.replaceChildren(el('p', { className: 'empty', text: '统计范围内没有按模型聚合的数据。' }));
+      return;
+    }
+    models.replaceChildren(...stats.models.map(item => {
+      const parts = [`共 ${item.total} 次`, `成功 ${item.success}`, `失败 ${item.failed}`,
+        `上游已尝试 ${item.upstream_attempted}`, `本地拒绝 ${item.local_rejected}`];
+      if (item.total_tokens !== null) parts.push(`Token ${item.total_tokens}`);
+      return el('div', { className: 'row', attrs: { 'data-stats-model': item.model } }, [
+        el('div', { className: 'row-main' }, [
+          el('span', { className: 'name mono', text: item.model }),
+          el('span', { className: `badge ${item.failed ? 'warn' : 'good'}`, text: item.failed ? '有失败' : '全部成功' }),
+        ]),
+        el('div', { className: 'row-detail hint', text: parts.join(' · ') }),
+      ]);
+    }));
+  }
+
+  function readLogQuery() {
+    const status = $('logsFilterStatus');
+    const model = $('logsFilterModel');
+    const credential = $('logsFilterCredential');
+    const attempted = $('logsFilterAttempted');
+    const limit = $('logsFilterLimit');
+    const parsedLimit = limit ? Number(limit.value) : 50;
+    return {
+      offset: state.logQuery.offset,
+      limit: [25, 50, 100].includes(parsedLimit) ? parsedLimit : 50,
+      status: status ? status.value : '',
+      model: model ? model.value.trim() : '',
+      credentialID: credential ? credential.value : '',
+      attempted: attempted ? attempted.value : '',
+    };
+  }
+
+  async function loadRequestLogs(options = {}) {
+    if (optionalLogBusy()) return;
+    const query = { ...readLogQuery() };
+    if (options.reset) query.offset = 0;
+    if (options.offset !== undefined) query.offset = options.offset;
+    if (options.keepFilters !== true) {
+      // Normalise the visible filter controls so the next page keeps them.
+      const limit = $('logsFilterLimit');
+      if (limit) limit.value = String(query.limit);
+    }
+    state.logQuery = { ...query };
+    const generation = state.optionalGeneration;
+    setOptionalBusy('logs', true);
+    message('logsState', '正在读取请求日志…');
+    const stillCurrent = () => generation === state.optionalGeneration;
+    try {
+      const raw = await api().requestLogs(query);
+      if (!stillCurrent()) return;
+      const page = Core.normalizeRequestLogsPage(raw);
+      state.requestLogs = page.logs;
+      state.logPage = {
+        loaded: true,
+        total: page.total,
+        offset: page.offset,
+        limit: page.limit,
+        has_more: page.has_more,
+        next_offset: page.next_offset,
+        retention: page.retention,
+      };
+      renderRequestLogs();
+      message('logsState', page.logs.length
+        ? `已读取 ${page.logs.length} 条日志（共 ${page.total} 条）。`
+        : '接口已响应，但没有匹配的日志。');
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (optionalAuthFailure(error)) return;
+      state.requestLogs = [];
+      state.logQuery = { ...state.logQuery, offset: 0 };
+      state.logPage = {
+        ...state.logPage,
+        loaded: true,
+        total: 0,
+        offset: 0,
+        has_more: false,
+        next_offset: null,
+      };
+      renderRequestLogs();
+      message('logsState', optionalErrorText(error), 'error');
+    } finally {
+      if (stillCurrent()) {
+        setOptionalBusy('logs', false);
+        renderRequestLogs();
+      }
+    }
+  }
+
+  function nextLogsPage() {
+    if (optionalLogBusy() || !state.logPage.has_more) return;
+    const fallback = Math.min(1_000_000, state.logPage.offset + state.logPage.limit);
+    const next = Number.isSafeInteger(state.logPage.next_offset) && state.logPage.next_offset >= 0 && state.logPage.next_offset <= 1_000_000
+      ? state.logPage.next_offset : null;
+    const target = next !== null && next > state.logPage.offset ? next : fallback;
+    if (target <= state.logPage.offset) return;
+    loadRequestLogs({ offset: target });
+  }
+
+  function previousLogsPage() {
+    if (optionalLogBusy() || state.logPage.offset <= 0) return;
+    loadRequestLogs({ offset: Math.max(0, state.logPage.offset - state.logPage.limit) });
+  }
+
+  async function loadRequestStats() {
+    if (optionalLogBusy()) return;
+    const generation = state.optionalGeneration;
+    setOptionalBusy('stats', true);
+    message('logsState', '正在读取请求统计…');
+    const stillCurrent = () => generation === state.optionalGeneration;
+    try {
+      const raw = await api().requestStats();
+      if (!stillCurrent()) return;
+      state.requestStats = Core.normalizeRequestStats(raw);
+      renderRequestStats();
+      message('logsState', '统计已更新。');
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (optionalAuthFailure(error)) return;
+      state.requestStats = null;
+      renderRequestStats();
+      message('logsState', optionalErrorText(error), 'error');
+    } finally {
+      if (stillCurrent()) {
+        setOptionalBusy('stats', false);
+        renderRequestLogs();
+      }
+    }
+  }
+
+  async function clearRequestLogs() {
+    if (optionalLogBusy()) return;
+    if (typeof confirm === 'function' && !confirm('清空全部请求日志？此操作不可撤销，但不会影响账户、模型映射或推理。')) return;
+    const generation = state.optionalGeneration;
+    setOptionalBusy('logsClear', true);
+    message('logsState', '正在清空请求日志…');
+    const stillCurrent = () => generation === state.optionalGeneration;
+    try {
+      await api().clearRequestLogs();
+      if (!stillCurrent()) return;
+      state.requestLogs = [];
+      state.requestStats = null;
+      state.logPage = { ...state.logPage, loaded: true, total: 0, offset: 0, has_more: false, next_offset: null };
+      state.logQuery = { ...state.logQuery, offset: 0 };
+      renderRequestLogs();
+      renderRequestStats();
+      message('logsState', '请求日志已清空。', 'ok');
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (optionalAuthFailure(error)) return;
+      message('logsState', `清空失败：${optionalErrorText(error)}`, 'error');
+    } finally {
+      if (stillCurrent()) {
+        setOptionalBusy('logsClear', false);
+        renderRequestLogs();
+      }
+    }
+  }
+
+  function renderConfig() {
+    const config = state.config;
+    const enabled = $('configLogsEnabled');
+    const days = $('configRetentionDays');
+    const max = $('configMaxEntries');
+    if (config) {
+      if (enabled) enabled.checked = config.logs.enabled !== false;
+      if (days) days.value = config.logs.retention_days === null ? '' : String(config.logs.retention_days);
+      if (max) max.value = config.logs.max_entries === null ? '' : String(config.logs.max_entries);
+    } else {
+      if (enabled) enabled.checked = false;
+      if (days) days.value = '';
+      if (max) max.value = '';
+    }
+    renderHostOwnedFacts();
+    syncOptionalBusyControls();
+  }
+
+  function renderHostOwnedFacts() {
+    const container = $('hostOwnedFacts');
+    if (!container) return;
+    const config = state.config;
+    if (!config) {
+      container.replaceChildren(el('p', { className: 'empty', text: '点「读取配置」后才会请求 GET /config。' }));
+      return;
+    }
+    const facts = [
+      { label: '上游地址', value: config.upstream.origin
+        ? `${config.upstream.origin}${config.upstream.fixed ? '（固定）' : ''}`
+        : (config.upstream.fixed ? '未知（固定）' : '未知') },
+      { label: '代理池', value: config.proxy.owner ? `宿主 ${config.proxy.owner}${config.proxy.read_only ? '（只读）' : ''}` : '宿主拥有（只读）' },
+      { label: '路由', value: config.routing.owner ? `宿主 ${config.routing.owner}${config.routing.read_only ? '（只读）' : ''}` : '宿主拥有（只读）' },
+      { label: '本插件私有代理', value: '不提供' },
+    ];
+    if (config.log_level) facts.push({ label: '日志级别', value: config.log_level });
+    renderFacts(container, facts);
+  }
+
+  async function loadConfig() {
+    if (optionalBusy('config')) return;
+    const generation = state.optionalGeneration;
+    setOptionalBusy('config', true);
+    message('configState', '正在读取配置…');
+    const stillCurrent = () => generation === state.optionalGeneration;
+    try {
+      const raw = await api().config();
+      if (!stillCurrent()) return;
+      state.config = Core.normalizeConfig(raw);
+      renderConfig();
+      message('configState', '配置已更新（只有请求日志设置可写）。', 'ok');
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (optionalAuthFailure(error)) return;
+      state.config = null;
+      renderConfig();
+      message('configState', optionalErrorText(error), 'error');
+    } finally {
+      if (stillCurrent()) setOptionalBusy('config', false);
+    }
+  }
+
+  async function saveConfig(event) {
+    if (event) event.preventDefault();
+    if (optionalBusy('config')) return;
+    const enabled = $('configLogsEnabled');
+    const days = $('configRetentionDays');
+    const max = $('configMaxEntries');
+    const logs = { enabled: Boolean(enabled && enabled.checked) };
+    const retention = days ? Number(days.value) : NaN;
+    const entries = max ? Number(max.value) : NaN;
+    if (!Number.isSafeInteger(retention) || retention < 1 || retention > 90) {
+      message('configState', '保留天数必须是 1 到 90 之间的整数。', 'error');
+      return;
+    }
+    if (!Number.isSafeInteger(entries) || entries < 1 || entries > 500) {
+      message('configState', '最多条数必须是 1 到 500 之间的整数。', 'error');
+      return;
+    }
+    logs.retention_days = retention;
+    logs.max_entries = entries;
+    const generation = state.optionalGeneration;
+    setOptionalBusy('config', true);
+    message('configState', '正在保存日志设置…');
+    const stillCurrent = () => generation === state.optionalGeneration;
+    try {
+      const raw = await api().updateConfig(logs);
+      if (!stillCurrent()) return;
+      state.config = Core.normalizeConfig(raw);
+      renderConfig();
+      message('configState', '日志设置已保存。', 'ok');
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (optionalAuthFailure(error)) return;
+      message('configState', `保存失败：${optionalErrorText(error)}`, 'error');
+    } finally {
+      if (stillCurrent()) setOptionalBusy('config', false);
+    }
+  }
+
+  function hostBoundaryText(host) {
+    if (!host) return '宿主状态未知';
+    const flags = [];
+    if (host.disabled === true) flags.push('已停用');
+    else if (host.disabled === false) flags.push('已启用');
+    if (host.unavailable === true) flags.push('不可用');
+    else if (host.unavailable === false) flags.push('可用');
+    if (host.status) flags.push(`状态 ${host.status}`);
+    if (host.status_message) flags.push(host.status_message);
+    if (host.next_retry_after) flags.push(`下次重试 ${Core.formatTime(host.next_retry_after) || host.next_retry_after}`);
+    return flags.length ? flags.join(' / ') : '宿主状态未知';
+  }
+
+  function renderRuntime() {
+    const facts = $('runtimeFacts');
+    const list = $('runtimeCredentials');
+    const runtime = state.runtime;
+    if (!runtime) {
+      renderFacts(facts, [], '点「读取运行时」后才会请求 GET /runtime。');
+      if (list) list.replaceChildren(el('p', { className: 'empty', text: '尚未读取 runtime。' }));
+      return;
+    }
+    renderFacts(facts, [
+      { label: '插件状态', value: runtime.stopped ? '已停止' : (runtime.loaded ? '已加载' : '未加载') },
+      { label: '在飞请求', value: String(runtime.active_requests) },
+      { label: '待处理操作', value: String(runtime.pending_operations) },
+      { label: '映射模型数', value: String(runtime.model_count) },
+      { label: '宿主账户状态', value: runtime.host.available ? '可读取' : '不可读取（仅插件侧状态）' },
+      { label: '观测时间', value: Core.formatTime(runtime.observed_at) || '未知' },
+    ]);
+    if (list) {
+      if (!runtime.credentials.length) {
+        list.replaceChildren(el('p', { className: 'empty', text: 'runtime 未返回账户。' }));
+      } else {
+        list.replaceChildren(...runtime.credentials.map(item => {
+          const head = [
+            el('span', { className: 'name', text: item.label }),
+            el('span', { className: `badge ${item.disabled ? 'off' : 'on'}`, text: item.disabled ? '已停用' : '已启用' }),
+          ];
+          if (item.testing) head.push(el('span', { className: 'badge', text: '测试中' }));
+          const details = [`映射模型 ${item.model_count} 个（${item.models_scope === 'shared' ? '全局共享' : '未知范围'}）`];
+          details.push(`宿主账户：${hostBoundaryText(item.host)}`);
+          if (item.last_test) {
+            const when = Core.formatTime(item.last_test.tested_at);
+            const outcome = item.last_test.status === 'success' ? '成功' : '失败';
+            const identity = [
+              item.last_test.model_id ? `模型 ${item.last_test.model_id}` : '',
+              item.last_test.upstream_model ? `上游 ${item.last_test.upstream_model}` : '',
+              item.last_test.error_kind ? `原因 ${item.last_test.error_kind}` : '',
+            ].filter(Boolean).join('，');
+            details.push(`最近测试 ${outcome}${when ? `（${when}）` : ''}${identity ? `：${identity}` : ''}`);
+          }
+          return el('div', { className: 'row', attrs: { 'data-runtime-credential': item.id } }, [
+            el('div', { className: 'row-main' }, head),
+            el('div', { className: 'row-detail hint', text: details.join(' · ') }),
+          ]);
+        }));
+      }
+    }
+  }
+
+  async function loadRuntime() {
+    if (optionalBusy('runtime')) return;
+    const generation = state.optionalGeneration;
+    setOptionalBusy('runtime', true);
+    message('configState', '正在读取运行时状态…');
+    const stillCurrent = () => generation === state.optionalGeneration;
+    try {
+      const raw = await api().runtime();
+      if (!stillCurrent()) return;
+      state.runtime = Core.normalizeRuntime(raw);
+      renderRuntime();
+      message('configState', '运行时状态已更新（只读）。', 'ok');
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (optionalAuthFailure(error)) return;
+      state.runtime = null;
+      renderRuntime();
+      message('configState', optionalErrorText(error), 'error');
+    } finally {
+      if (stillCurrent()) setOptionalBusy('runtime', false);
+    }
+  }
+
+  function renderModelTest() {
+    const facts = $('modelTestFacts');
+    if (!facts) return;
+    const result = state.modelTest;
+    if (!result) {
+      renderFacts(facts, [], '尚未测试。结果只会显示状态、耗时和 token 计数。');
+      return;
+    }
+    const ok = result.status === 'success';
+    const items = [
+      { label: '结果', value: ok ? '成功' : '失败' },
+      { label: '模型', value: result.model_id || '未知' },
+    ];
+    if (result.upstream_model) items.push({ label: '上游模型', value: result.upstream_model });
+    if (result.upstream_attempted === true) items.push({ label: '上游已尝试', value: '是' });
+    else if (result.upstream_attempted === false) items.push({ label: '上游已尝试', value: '否（本地拒绝）' });
+    if (result.upstream_attempted === true && result.http_status !== null) items.push({ label: '上游 HTTP', value: String(result.http_status) });
+    if (result.duration_ms !== null) items.push({ label: '耗时', value: `${result.duration_ms} ms` });
+    if (result.usage.total_tokens !== null) items.push({ label: 'Token 总量', value: String(result.usage.total_tokens) });
+    if (result.usage.prompt_tokens !== null) items.push({ label: '输入 Token', value: String(result.usage.prompt_tokens) });
+    if (result.usage.completion_tokens !== null) items.push({ label: '输出 Token', value: String(result.usage.completion_tokens) });
+    if (result.usage.total_tokens === null && result.usage.prompt_tokens === null && result.usage.completion_tokens === null) {
+      items.push({ label: 'Usage', value: '上游未返回' });
+    }
+    if (result.request_kind) items.push({ label: '请求类型', value: result.request_kind });
+    if (result.error_kind) items.push({ label: '错误类型', value: result.error_kind });
+    renderFacts(facts, items);
+    message('modelTestState', ok
+      ? '测试完成：只发送了一次真实推理请求，响应正文未显示。'
+      : '测试失败：未显示上游响应正文。', ok ? 'ok' : 'error');
+  }
+
+  function invalidateModelTestResult(text = '') {
+    state.modelTestGeneration += 1;
+    state.modelTest = null;
+    renderModelTest();
+    if (text) message('modelTestState', text, 'error');
+  }
+
+  async function runModelTest() {
+    if (optionalBusy('modelTest')) return;
+    const credential = $('modelTestCredential');
+    const model = $('modelTestModel');
+    const prompt = $('modelTestPrompt');
+    const credentialID = credential ? credential.value : '';
+    const modelID = model ? model.value.trim() : '';
+    if (!credentialID) {
+      message('modelTestState', '请先选择要测试的账户。', 'error');
+      return;
+    }
+    if (!modelID) {
+      message('modelTestState', '请填写客户端模型名后再发送测试。', 'error');
+      return;
+    }
+    if (typeof confirm === 'function' && !confirm(`向账户「${credentialLabel(credentialID)}」发送一次真实模型测试请求（模型 ${modelID}）？这会产生一次真实推理用量。`)) return;
+    const generation = state.optionalGeneration;
+    const modelTestGeneration = state.modelTestGeneration;
+    setOptionalBusy('modelTest', true);
+    state.modelTest = null;
+    renderModelTest();
+    message('modelTestState', '正在发送模型测试（只发送一次，不自动重试）…');
+    const stillCurrent = () => generation === state.optionalGeneration;
+    // A mapping save, a status refresh or a selection change advances the model
+    // test generation; a late answer for that older test is dropped silently so
+    // it can neither repaint the panel nor overwrite a newer explanation.
+    const resultStillCurrent = () => stillCurrent() && modelTestGeneration === state.modelTestGeneration;
+    const selectionCurrent = () => (!credential || credential.value === credentialID)
+      && (!model || model.value.trim() === modelID);
+    try {
+      const raw = await api().modelTest({
+        credentialID,
+        modelID,
+        prompt: prompt ? prompt.value.trim() : '',
+      });
+      if (!stillCurrent()) return;
+      if (!resultStillCurrent()) return;
+      if (!selectionCurrent()) {
+        state.modelTest = null;
+        renderModelTest();
+        message('modelTestState', '账户或模型选择已变化，已丢弃这次模型测试结果，请重新发送。', 'error');
+        return;
+      }
+      const normalized = Core.normalizeModelTest(raw);
+      if (normalized.credential_id !== credentialID || normalized.model_id !== modelID) {
+        state.modelTest = null;
+        renderModelTest();
+        message('modelTestState', '模型测试响应与当前账户或模型不一致，已丢弃，请重新发送。', 'error');
+        return;
+      }
+      state.modelTest = normalized;
+      renderModelTest();
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (optionalAuthFailure(error)) return;
+      if (!resultStillCurrent()) return;
+      if (!selectionCurrent()) {
+        state.modelTest = null;
+        renderModelTest();
+        message('modelTestState', '账户或模型选择已变化，已丢弃这次模型测试结果，请重新发送。', 'error');
+        return;
+      }
+      state.modelTest = null;
+      renderModelTest();
+      message('modelTestState', optionalErrorText(error), 'error');
+    } finally {
+      if (stillCurrent()) setOptionalBusy('modelTest', false);
+    }
+  }
+
   async function saveModels() {
     if (state.busy) return;
     let models;
@@ -1363,6 +2238,10 @@
     message('modelState', '正在保存模型映射…');
     try {
       const raw = await api().saveModels(models);
+      // Saving changes the host model catalog, so any displayed/in-flight model
+      // test no longer describes the current mapping. The generation increments
+      // exactly once, so a late response can never repaint the cleared result.
+      invalidateModelTestResult();
       const saved = raw && Array.isArray(raw.models) ? raw.models : models;
       const normalized = saved.map(item => ({ id: String(item.id || '').trim(), upstream_id: String(item.upstream_id || '').trim() }))
         .filter(item => item.id && item.upstream_id);
@@ -1373,14 +2252,15 @@
       message('modelState', `已保存 ${normalized.length} 个模型映射。`);
     } catch (error) {
       if (isAuthStatus(error.status) && !isUpstreamSource(error)) {
+        clearRejectedManagementAuth();
         showAuth(error.status === 401 ? '401：管理密钥无效或已过期，模型映射未保存。' : `403：${formatError(error)}`);
       } else if (isUpstreamSource(error)) {
         message('modelState', `保存失败（上游）：${formatError(error)}`, 'error');
       } else if (partialCompletion(formatError(error)) === 'mapping-persisted') {
         // The mapping is already on disk; only the host catalog refresh failed.
         // The saved baseline moves forward so the draft badge tells the truth.
+        invalidateModelTestResult();
         state.savedMappings = cloneMappings(models);
-        state.status.models = cloneMappings(models);
         renderMappings();
         message('modelState', `模型映射已保存，但宿主刷新模型目录失败：${formatError(error)}。可先刷新状态确认，再重试保存或启用账户触发刷新。`, 'error');
       } else {
@@ -1458,6 +2338,55 @@
     if (selectVisible) selectVisible.addEventListener('click', () => selectVisibleUpstream(true));
     const clearVisible = $('clearVisible');
     if (clearVisible) clearVisible.addEventListener('click', () => selectVisibleUpstream(false));
+    for (const item of TABS) {
+      const tab = $(item.button);
+      if (!tab) continue;
+      tab.addEventListener('click', event => activateTab(tabFromEvent(event)));
+      tab.addEventListener('keydown', handleTabKey);
+    }
+    const refreshLogs = $('refreshLogs');
+    if (refreshLogs) refreshLogs.addEventListener('click', () => loadRequestLogs({ reset: true }));
+    const refreshStats = $('refreshStats');
+    if (refreshStats) refreshStats.addEventListener('click', loadRequestStats);
+    const clearLogs = $('clearLogs');
+    if (clearLogs) clearLogs.addEventListener('click', clearRequestLogs);
+    const themeToggle = $('themeToggle');
+    if (themeToggle) themeToggle.addEventListener('click', cycleThemePreference);
+    const logsPrev = $('logsPrev');
+    if (logsPrev) logsPrev.addEventListener('click', previousLogsPage);
+    const logsNext = $('logsNext');
+    if (logsNext) logsNext.addEventListener('click', nextLogsPage);
+    const logsFilterStatus = $('logsFilterStatus');
+    if (logsFilterStatus) logsFilterStatus.addEventListener('change', () => loadRequestLogs({ reset: true }));
+    const logsFilterCredential = $('logsFilterCredential');
+    if (logsFilterCredential) logsFilterCredential.addEventListener('change', () => loadRequestLogs({ reset: true }));
+    const logsFilterModel = $('logsFilterModel');
+    if (logsFilterModel) {
+      logsFilterModel.addEventListener('change', () => loadRequestLogs({ reset: true }));
+      logsFilterModel.addEventListener('keydown', event => {
+        if (event.key === 'Enter') loadRequestLogs({ reset: true });
+      });
+    }
+    const logsFilterAttempted = $('logsFilterAttempted');
+    if (logsFilterAttempted) logsFilterAttempted.addEventListener('change', () => loadRequestLogs({ reset: true }));
+    const logsFilterLimit = $('logsFilterLimit');
+    if (logsFilterLimit) logsFilterLimit.addEventListener('change', () => loadRequestLogs({ reset: true }));
+    const loadConfigButton = $('loadConfig');
+    if (loadConfigButton) loadConfigButton.addEventListener('click', loadConfig);
+    const logSettingsForm = $('logSettingsForm');
+    if (logSettingsForm) logSettingsForm.addEventListener('submit', saveConfig);
+    const loadRuntimeButton = $('loadRuntime');
+    if (loadRuntimeButton) loadRuntimeButton.addEventListener('click', loadRuntime);
+    const runTestButton = $('runModelTest');
+    if (runTestButton) runTestButton.addEventListener('click', runModelTest);
+    const modelTestCredential = $('modelTestCredential');
+    if (modelTestCredential) modelTestCredential.addEventListener('change', () => {
+      invalidateModelTestResult('账户选择已变化，之前的模型测试结果已清除。');
+    });
+    const modelTestModel = $('modelTestModel');
+    if (modelTestModel) modelTestModel.addEventListener('input', () => {
+      invalidateModelTestResult('模型选择已变化，之前的模型测试结果已清除。');
+    });
   }
 
   async function submitAuth(event) {
@@ -1473,11 +2402,13 @@
       message('authState', '请输入当前 CPA 入口的管理密钥。', 'error');
       return;
     }
+    const generation = state.optionalGeneration;
     state.candidate = { headers: Auth.candidateHeaders(key, type) };
     setBusy(true);
     message('authState', '正在验证管理密钥…');
     try {
       const status = await api().status();
+      if (generation !== state.optionalGeneration) return;
       // Persist only after CPA accepted the key.
       Auth.saveAuth(key, type, remember);
       state.verified = { headers: state.candidate.headers, source: 'manual' };
@@ -1490,17 +2421,12 @@
       message('accountState', '');
       message('authState', '管理密钥验证成功，已开始读取账户和模型。', 'ok');
     } catch (error) {
-      state.candidate = null;
-      state.verified = null;
-      showPanels(false);
-      const badge = $('authBadge');
-      if (badge) {
-        badge.textContent = '未验证';
-        badge.className = 'badge';
-      }
-      message('authState', isManagementAuthError(error)
-        ? `${error.status}：管理密钥未通过验证，请检查后重试。`
-        : `验证失败：${formatError(error)}`, 'error');
+      if (generation !== state.optionalGeneration) return;
+      showAuth(isManagementAuthError(error)
+        ? (error.status === 401
+          ? '401：管理密钥未通过验证，请检查后重试。'
+          : '403：管理请求被拒绝，请确认管理密钥和来源 IP。')
+        : `验证失败：${formatError(error)}`);
     } finally {
       setBusy(false);
     }
@@ -1523,11 +2449,19 @@
   }
 
   async function bootstrap() {
+    initTheme();
     renderMeta();
+    activateTab('overview');
     setAuthCollapsed(false);
     resetAccountForm();
     renderAccounts();
     renderModels();
+    renderOverview();
+    renderRequestLogs();
+    renderRequestStats();
+    renderConfig();
+    renderRuntime();
+    renderModelTest();
     if (Auth.rememberEnabled && Auth.rememberEnabled()) {
       const remember = $('rememberAuth');
       if (remember) remember.checked = true;
@@ -1567,6 +2501,19 @@
       filterUpstream,
       selectVisibleUpstream,
       toggleAuthPanel,
+      activateTab,
+      handleTabKey,
+      loadRequestLogs,
+      loadRequestStats,
+      clearRequestLogs,
+      nextLogsPage,
+      previousLogsPage,
+      loadConfig,
+      saveConfig,
+      loadRuntime,
+      runModelTest,
+      cycleThemePreference,
+      applyThemePreference,
     },
     render: {
       applyStatus,
@@ -1584,6 +2531,14 @@
       syncFetchButton,
       syncModelTools,
       updateDirtyBadge,
+      renderOverview,
+      renderRequestLogs,
+      renderRequestStats,
+      renderConfig,
+      renderRuntime,
+      renderModelTest,
+      applyThemePreference,
+      cycleThemePreference,
     },
     managementBase,
   };

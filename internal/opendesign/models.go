@@ -9,6 +9,18 @@ import (
 	"time"
 )
 
+func sameModels(left, right []Model) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 // modelRegistration advertises the mapped models to CPA. It is dynamic on
 // purpose: with no credential the list is empty so CPA cannot route a request
 // that can never succeed.
@@ -50,14 +62,21 @@ func (s *Service) resolveModel(model string) (string, error) {
 			return m.UpstreamID, nil
 		}
 	}
-	return "", &APIError{Status: http.StatusBadRequest, Kind: "model_not_enabled", Message: "model is not enabled in the OpenDesign plugin: " + model}
+	return "", &APIError{Status: http.StatusBadRequest, Kind: "model_not_enabled", Message: "model is not enabled in the OpenDesign plugin"}
 }
 
 // discoverModels calls GET /models with the supplied credential. The key comes
 // from the stored credential, never from the browser.
 func (s *Service) discoverModels(callbackID string, c Credential) ([]UpstreamModel, error) {
-	cfg := s.config()
-	status, _, body, err := s.doJSON(callbackID, http.MethodGet, upstreamURL(cfg.BaseURL, "/models", nil), upstreamHeaders(c.APIKey), nil)
+	baseURL := c.BaseURL
+	if baseURL == "" {
+		baseURL = s.config().BaseURL
+	}
+	if err := validateBaseURL(baseURL); err != nil {
+		return nil, err
+	}
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	status, _, body, err := s.doJSON(callbackID, http.MethodGet, upstreamURL(baseURL, "/models", nil), upstreamHeaders(c.APIKey), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -123,14 +142,19 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 		return nil, fail(http.StatusInternalServerError, "could not persist model mapping")
 	}
 	s.mu.Lock()
+	mappingChanged := !sameModels(s.cfg.Models, cfg.Models)
 	s.cfg.Models = cfg.Models
+	if mappingChanged {
+		s.modelMappingRevision++
+		s.clearModelTestsLocked()
+	}
 	s.mu.Unlock()
 
 	// Publishing the mapping is enough for this plugin's own executor; the extra
 	// step below is what makes the host re-register the catalog. A failure here
 	// is reported but does not roll back the persisted mapping.
 	if err := s.refreshAuthModels(); err != nil {
-		return nil, fail(http.StatusBadGateway, "model mapping saved but the host model refresh failed: "+err.Error())
+		return nil, localFail(http.StatusBadGateway, "host_contract_error", "model mapping saved but the host model refresh failed: host rejected the refresh")
 	}
 	return map[string]any{"models": cfg.Models}, nil
 }
