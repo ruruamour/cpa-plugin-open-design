@@ -2,7 +2,7 @@
 
 ## 0.3.0 本轮验收
 
-2026-11-03 完成候选源码与离线验收。`0.3.0` 在 `0.2.0` 上新增请求日志／统计、官方模型级覆盖、显式模型测试、插件配置与 runtime，并将控制台整理为五个选项卡。
+2026-11-03 完成源码验收与 `nuoapi-net` 生产升级。`0.3.0` 在 `0.2.0` 上新增请求日志／统计、官方模型级覆盖、显式模型测试、插件配置与 runtime，并将控制台整理为五个选项卡。
 
 | 检查 | 结果与范围 |
 | --- | --- |
@@ -10,7 +10,7 @@
 | Node | `node --test tests/*.test.cjs`，139/139 通过，其中 OpenDesign 76 项 |
 | 源码 | Go 格式、三个管理 JS 的语法、`git diff --check` 通过 |
 | Debian 12 | Go 1.26.10、CGO、非 root、关闭网络，全仓 Go 测试与 Linux amd64 c-shared 构建通过 |
-| 交付候选库 | SHA256 `fa4b80e4e67ced901fa2596984bcee7c79729cb59f2aaf833a7fabe74d0262f6`，最高 GLIBC 2.34 |
+| CI 交付库 | SHA256 `fa4b80e4e67ced901fa2596984bcee7c79729cb59f2aaf833a7fabe74d0262f6`，最高 GLIBC 2.34；与本地 Debian 12 库逐字节相同 |
 | 原生 ABI | 同一 Debian 12 库 ctypes 冒烟 PASS，注册版本严格读取源码 `Version` |
 | 原版 CPA | 8.0.48（`dbb70621`）离线加载与 loopback CONNECT／私有 CA TLS 全流程 PASS |
 | Microsoft Edge | 153.0.4234.48、隔离 profile、两入口 540/540；五选项卡 × 浅深色 × 1280/390 宽，共 40 个布局，无横向溢出／页面脚本错误，6 张代表截图 |
@@ -22,9 +22,18 @@
 
 Edge 验证包含 ARIA／键盘焦点、tab 切换零请求、主题跟随系统与切换、统计输入／输出和分模型数据、nullable usage、配置范围、长达 512 字节模型名、显式确认的取消／接受、保存映射后撤销结果、旧会话迟到响应、401 恢复及 XSS 安全文本。首轮发现的系统主题标签未更新和长 runtime 模型撑开配置页已修复，完整复跑通过。浏览器 fixture 不构成真实额度或真实付费推理证据。
 
-提交／精确 HEAD CI／生产部署证据在完成后追加于本节；此处离线结果不代表候选已上线。GitHub Release 尚未发布。旧 `0.2.0` 记录保留原日期、提交、hash 和 CI，均为历史。
+### 0.3.0 提交与生产交付
 
-本轮本地证据：`/tmp/open-design-03-{go,race,vet,node,bookworm,ops}.log`、`/tmp/open-design-03-final-abi.{json,log}`、`/tmp/open-design-03-edge/report.json`。浏览器脚本为 `/tmp/open_design_03_edge_acceptance.py`，不随构建产物分发。
+- 功能与版本提交 `2601888247006bbccc1fbc10c4ae899cbb1176e9` 已推送到 `origin/open-design`；精确提交 [CI 41639144166](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/41639144166) 成功，下载 artifact `open-design-linux-amd64`。CI 库与上述离线验收库 SHA256 完全一致。
+- 本地交付目录 `dist/open-design-0.3.0-linux-amd64/` 包含 `.so`、SHA256SUMS、manifest 与 ABI 报告；`dist/open-design_0.3.0_linux_amd64.zip` 仅包含 `open-design.so`，ZIP SHA256 为 `84da7276ad744b67296c42af3635d6e5e7dd8150691b9edde7349d9d1c779e99`。GitHub Release 尚未发布。
+- 通过 ops `scripts/deploy-cpa-plugin-open-design.sh --local --yes` 安装到 `nuoapi-net`，先执行同脚本 `--dry-run`。生产备份 `/srv/cliproxy/_backups/open-design-20261103T125844Z` 的旧库／配置哈希与 manifest 一致，目录 `0700`、文件 `0600`；旧库 SHA256 保持历史 `dc2c00be...a9accc`。
+- 本地命令达到 60 秒等待上限，未取得最终退出码；随后独立只读核验确认部署锁已释放、服务 active、OpenDesign `0.3.0` registered／effective-enabled。两条控制台入口均 200、含五选项卡，HTML SHA256 `109b438dbcc53a813b4295afa2ce931531633b52c53fc194b001f79dcc422462` 与已验收 UI 完全一致。
+- `/config`、`/runtime`、`/request-logs`、`/request-stats` 可读取，宿主账户能力可用。日志策略为默认 7 天／500 条。生产基线与部署后均为 **1 凭据、1 映射**；映射、settings、OpenDesign auth 文件哈希均相同。此前历史记录中的 13 映射不代表本次部署前状态。
+- CPA 宿主 SHA256 `674052226d4dbb501c873b54c72b71ae2020c2b843f2d986b2156e92c6168c9a` 保持一致；配置去除本插件节后与备份完全相等。`clinepassbridge`、`grok-panel`、`grok-token-ledger` 均保持 registered／effective-enabled 且动态库哈希一致，`quota-pacer` 保持原禁用状态。
+
+本轮模型测试和推理验收均使用离线 fixture；生产验收使用元数据与静态页面读取，不作为新增真实付费推理或额度消费预测证据。旧 `0.2.0` 记录保留原日期、提交、hash 和 CI，均为历史。
+
+本轮本地证据：`/tmp/open-design-03-{go,race,vet,node,bookworm,ops}.log`、`/tmp/open-design-03-final-abi.{json,log}`、`/tmp/open-design-03-edge/report.json`、`/tmp/open-design-03-deploy-{preflight,live}.log`、`/tmp/open-design-03-production-{before,after}.json`、`/tmp/open-design-03-backup.json`。浏览器脚本为 `/tmp/open_design_03_edge_acceptance.py`，不随构建产物分发。
 
 以下为**历史**记录。
 

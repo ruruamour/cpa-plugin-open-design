@@ -4,11 +4,13 @@
 
 > 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`，当前版本 `0.3.0`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
-> `0.3.0` 已完成本地 Go／Node、Microsoft Edge 与原版 CPA 隔离验收；提交、CI 和上线状态见[验证记录](docs/verification.md)。
+> `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 
 ## 功能
 
-`0.2.0` 已于 2026-11-02 推送并部署到 `nuoapi-net`，部署来源为提交 `9fd8351` 及其成功 CI；本地交付库与线上插件哈希一致。GitHub Release 尚未发布。
+`0.3.0` 于 2026-11-03 从提交 `2601888` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台和原有效插件核验通过。GitHub Release 尚未发布。
+
+`0.2.0` 于 2026-11-02 从提交 `9fd8351` 及其成功 CI 部署，保留为历史记录。
 
 `0.3.0` 在 `0.2.0` 的账户、映射与额度能力之上增加以下功能：
 
