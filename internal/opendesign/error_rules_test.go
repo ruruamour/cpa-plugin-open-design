@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -394,8 +395,12 @@ func TestErrorRulesReconcileParsedCredentialKeepsUnknownFields(t *testing.T) {
 	if !sameErrorRules(rules, defaultErrorRules()) {
 		t.Fatalf("file rules = %+v", rules)
 	}
-	if mode := fileMode(t, path); mode != 0o600 {
-		t.Fatalf("rewritten file mode = %o, want 600", mode)
+	if runtime.GOOS != "windows" {
+		// Windows has no POSIX mode bits; the owner-only ACL is not readable
+		// through os.Stat, so the assertion only applies to the Unix targets.
+		if mode := fileMode(t, path); mode != 0o600 {
+			t.Fatalf("rewritten file mode = %o, want 600", mode)
+		}
 	}
 }
 
@@ -487,7 +492,11 @@ func TestErrorRulesFailedWriteKeepsPreviousPolicy(t *testing.T) {
 	}
 
 	next := []RequestErrorRule{{Status: http.StatusBadRequest, Match: []string{"next"}, Action: "continue"}}
+	// Windows does not enforce a read-only directory for the owner, so the
+	// persistence failure is injected there instead of via permissions.
+	restoreSwap := failJournalSwap(t)
 	status, _, _ := managementCall(t, s, http.MethodPut, apiBase+"/error-rules", nil, map[string]any{"rules": next})
+	restoreSwap()
 	if status != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", status)
 	}
@@ -497,6 +506,16 @@ func TestErrorRulesFailedWriteKeepsPreviousPolicy(t *testing.T) {
 	if view := getErrorRules(t, s); !sameErrorRules(view.Rules, previous) {
 		t.Fatalf("failed write changed the policy: %+v", view.Rules)
 	}
+}
+
+// failJournalSwap makes every staged-file rename fail, which is how a failed
+// policy write is injected on platforms where a read-only directory is not
+// enforced. The returned function restores the real rename.
+func failJournalSwap(t *testing.T) func() {
+	t.Helper()
+	original := swapJournalFile
+	swapJournalFile = func(string, string) error { return errors.New("Access is denied.") }
+	return func() { swapJournalFile = original }
 }
 
 func fileMode(t *testing.T, path string) os.FileMode {

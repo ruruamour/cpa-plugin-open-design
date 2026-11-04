@@ -574,6 +574,39 @@ type requestLogJournalWriter interface {
 	Close() error
 }
 
+// swapJournalFile publishes a staged file over its destination. Every rename of
+// request-log state goes through it so a test can inject the Windows-only
+// failure that cannot be reproduced on other platforms: Windows cannot replace
+// a destination that still has an open handle and reports "Access is denied".
+var swapJournalFile = func(tmp, dst string) error { return os.Rename(tmp, dst) }
+
+// requestLogRetryPauses is the bounded backoff for a Windows sharing violation.
+// A stuck handle belongs to this process or a scanner, so a few short pauses
+// resolve the common case without stalling a request.
+var requestLogRetryPauses = []time.Duration{5 * time.Millisecond, 20 * time.Millisecond, 60 * time.Millisecond}
+
+// withShareRetry retries op while it fails. Windows reports "Access is denied"
+// when a destination is still open, and the same call succeeds once the handle
+// is released; on other platforms the first call already succeeded.
+func withShareRetry(op func() error) error {
+	err := op()
+	for _, pause := range requestLogRetryPauses {
+		if err == nil {
+			return nil
+		}
+		time.Sleep(pause)
+		err = op()
+	}
+	return err
+}
+
+// publishStagedFile retries the rename that swaps a staged file into place.
+// Callers must have closed any handle on dst: an open destination is the very
+// thing Windows refuses to replace, so retrying it alone would not help.
+func publishStagedFile(tmp, dst string) error {
+	return withShareRetry(func() error { return swapJournalFile(tmp, dst) })
+}
+
 func appendRequestLogJournal(path string, offset int64, event requestLogJournalEvent) requestLogAppendResult {
 	return appendRequestLogJournalWithOpen(path, offset, event, func(name string, flags int, mode os.FileMode) (requestLogJournalWriter, error) {
 		return os.OpenFile(name, flags, mode)
@@ -612,6 +645,8 @@ func appendRequestLogJournalWithOpen(path string, offset int64, event requestLog
 			return result
 		}
 	}
+	// The source is closed before the swap because Windows cannot rename over a
+	// file that is still open; every read of it is finished by then.
 	tmp := path + ".tmp-" + newID()
 	defer os.Remove(tmp)
 	f, err := open(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -636,7 +671,11 @@ func appendRequestLogJournalWithOpen(path string, offset int64, event requestLog
 		result.err = err
 		return result
 	}
-	if err = os.Rename(tmp, path); err != nil {
+	if source != nil {
+		_ = source.Close()
+		source = nil
+	}
+	if err = publishStagedFile(tmp, path); err != nil {
 		result.err = err
 		return result
 	}
@@ -659,7 +698,14 @@ func syncRequestLogDirectory(dir string) error {
 	return errors.Join(f.Sync(), f.Close())
 }
 
+// truncateRequestLogJournal shortens the journal in place, which keeps the
+// inode so a concurrent append sharing the descriptor stays valid. Windows
+// cannot truncate a file another handle holds open, so the attempt is retried.
 func truncateRequestLogJournal(path string, offsets ...int64) error {
+	return withShareRetry(func() error { return truncateRequestLogJournalOnce(path, offsets...) })
+}
+
+func truncateRequestLogJournalOnce(path string, offsets ...int64) error {
 	flags := os.O_CREATE | os.O_WRONLY
 	if len(offsets) == 0 {
 		flags |= os.O_TRUNC
@@ -702,7 +748,7 @@ func prepareRequestLogSnapshot(dir string, sequence uint64, entries []RequestLog
 }
 
 func publishRequestLogSnapshot(dir, tmp string) (bool, error) {
-	if err := os.Rename(tmp, filepath.Join(dir, requestLogSnapshotName)); err != nil {
+	if err := publishStagedFile(tmp, filepath.Join(dir, requestLogSnapshotName)); err != nil {
 		return false, err
 	}
 	if runtime.GOOS != "windows" {
@@ -776,7 +822,7 @@ func (s *requestLogStore) flushLocked() error {
 	if !matched {
 		return nil
 	}
-	if err := os.Rename(tmp, filepath.Join(state.dir, requestLogSnapshotName)); err != nil {
+	if err := publishStagedFile(tmp, filepath.Join(state.dir, requestLogSnapshotName)); err != nil {
 		return err
 	}
 	published = true
@@ -1339,7 +1385,7 @@ func writeRequestLogFileAtomic(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := publishStagedFile(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}

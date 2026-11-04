@@ -301,6 +301,37 @@ func TestRequestLogQueryRejectsUnsafeRanges(t *testing.T) {
 	}
 }
 
+// Windows cannot replace a destination that still has an open handle, so the
+// journal append must close the file it read from before the swap.
+func TestRequestLogJournalAppendClosesSourceBeforeSwap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, requestLogJournalName)
+	first := appendRequestLogJournal(path, 0, requestLogJournalEvent{Sequence: 1, Clear: true})
+	if first.err != nil || !first.committed {
+		t.Fatalf("seed journal: %+v", first)
+	}
+
+	openAtSwap := true
+	original := swapJournalFile
+	swapJournalFile = func(tmp, dst string) error {
+		if handle, err := os.Open(dst); err == nil {
+			handle.Close()
+		} else {
+			openAtSwap = false
+		}
+		return original(tmp, dst)
+	}
+	t.Cleanup(func() { swapJournalFile = original })
+
+	second := appendRequestLogJournal(path, first.offset, requestLogJournalEvent{Sequence: 2, Clear: true})
+	if second.err != nil || !second.committed {
+		t.Fatalf("append: %+v", second)
+	}
+	if !openAtSwap {
+		t.Fatal("destination was not present at swap time")
+	}
+}
+
 // A successful append must contain exactly a complete event and newline.
 func TestRequestLogJournalAtomicAppendShape(t *testing.T) {
 	path := filepath.Join(t.TempDir(), requestLogJournalName)

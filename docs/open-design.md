@@ -1,6 +1,6 @@
 # OpenDesign 插件说明
 
-本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`，当前版本 `0.4.0`。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级。详见[验证记录](verification.md)。
+本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`，当前版本 `0.4.1`。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 只修复 Windows 上的请求日志持久化与跨平台测试问题。详见[验证记录](verification.md)。
 
 ## 范围
 
@@ -183,6 +183,7 @@ plugins:
 
 ## 当前验证边界
 
+- `0.4.1` 修复 Windows 上请求日志持久化在重命名目标仍被占用时失败的问题（先关闭源句柄 + 有限重试），并让依赖 POSIX 权限语义的两处测试在 Windows 上使用等价注入；运行时行为与 `0.4.0` 相同。
 - `0.4.0` 在 `0.3.0` 之上新增重试调度／错误规则；Go／race／vet、Node 测试、离线 ABI 冒烟与原版 CPA 隔离流程通过，并用双账号真实宿主验证了换号与冷却；详细证据见[验证记录](verification.md)。
 - `0.3.0` 全仓 Go／race／vet、Node 139 项、Edge 540 项、Debian 12 构建及原版 CPA 隔离流程通过；详细产物哈希与 CI／上线状态见[验证记录](verification.md)。
 - 2026-11-02 已用有效推理 Key 发现 13 个真实上游模型。官方直连和生产 CPA 插件各完成一次最小非流式请求，均返回 `OK`；生产路径使用 `open-design-minimax-m3.1-flash`，usage 219／3／222。这是 `0.2.0` 的历史生产事实，不属于 `0.3.0` 验收。
@@ -192,10 +193,10 @@ plugins:
 
 ## 发布 tag
 
-- 发布 tag 使用 `open-design-v0.4.0`，不创建或覆盖上游 `v*` tag。
+- 发布 tag 使用 `open-design-v0.4.1`，不创建或覆盖上游 `v*` tag。
 - 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定该 tag/版本。
-- GitHub Release 尚未发布；分支与生产交付状态见验证记录。
+- `open-design-v0.4.1` 已发布 GitHub Release；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release，分支与生产交付状态见验证记录。
 
 ## 上游与许可
 

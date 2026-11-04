@@ -19,7 +19,7 @@
 
 断言重点：
 
-- ABI v1 初始化、`plugin.register` 身份（`OpenDesign` / 从 `internal/opendesign/types.go` 读取的当前 `Version`，本轮为 `0.4.0`）、`management.register` 路由（含 `/error-rules` 四条路由）；
+- ABI v1 初始化、`plugin.register` 身份（`OpenDesign` / 从 `internal/opendesign/types.go` 读取的当前 `Version`，本轮为 `0.4.1`）、`management.register` 路由（含 `/error-rules` 四条路由）；
 - 假 Key `sk-amr-test-fixture` 只经 `host.auth.save` 落到 auth-dir，`/status`、`/credentials`、错误信封都不回显；
 - `auth.parse`、`model.for_auth` 的凭据导入与模型映射；
 - `executor.execute`：上游收到 `model=deepseek-v4.1-flash`（别名映射生效）、`Authorization: Bearer <key>`、`tools` 未被丢弃，返回 JSON 含 `usage`；

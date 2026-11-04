@@ -1,5 +1,32 @@
 # OpenDesign 插件验证记录
 
+## 0.4.1 本轮验收
+
+2026-11-04 发布 `0.4.1`。它只修 `0.4.0` 的跨平台缺陷，不改变功能与运行时行为。
+
+| 检查 | 结果与范围 |
+| --- | --- |
+| 全仓 Go | Go 1.26.4 的 `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 全部通过 |
+| Node | `node --test tests/*.test.cjs`，152/152 通过 |
+| Windows 语义 | 交叉编译 Windows 测试二进制成功；重命名占用冲突的重试、失败不提交、先关闭源句柄三类行为由注入用例锁定 |
+| 修复范围 | `internal/opendesign/request_log.go` 的日志/快照重命名与 journal 截断；`error_rules_test.go`、`persistence_consistency_test.go` 的跨平台测试 |
+
+### 0.4.1 修复内容
+
+`0.4.0` 的 GitHub Release 运行 `41791392077` 在 `windows-amd64` 上失败，`release` job 因此被跳过，Linux／arm64／macOS 三个平台构建均成功。失败用例与成因：
+
+- `TestErrorRulesFailedWriteKeepsPreviousPolicy`：Windows 不因目录只读而拒绝属主写入，`chmod 0500` 无法制造写失败。
+- `TestErrorRulesReconcileParsedCredentialKeepsUnknownFields`：Windows 无 POSIX 权限位，`os.Stat` 返回 `0666`。
+- `TestRequestLogCorruptAndOversizedJournalsCompactBeforeClear`、`TestRequestLogJournalAtomicAppendShape`：Windows 不允许替换或截断仍被本进程句柄打开的文件，报 `Access is denied`。
+
+修复：
+
+- 请求日志的 journal 追加在重命名前先关闭源文件句柄；快照发布与 journal 截断在重命名/截断失败时按 5ms／20ms／60ms 做有限重试。失败仍会如实返回并保持「失败不提交」，不会静默丢日志。
+- 两处依赖 POSIX 权限语义的用例改为等价注入（重命名失败注入、Windows 跳过权限位断言），不再依赖目录权限。
+- 新增 `internal/opendesign/windows_rename_test.go` 锁定上述 Windows 语义。
+
+`0.4.1` 的 CI 与发布证据在本节末尾补写。
+
 ## 0.4.0 本轮验收
 
 2026-11-04 完成源码验收。`0.4.0` 在 `0.3.0` 上新增可编辑的重试调度／错误规则：规则随每个凭据写入宿主 auth 文件的 `request_scoped_errors`，由 CPA 的 request-scoped 机制决定停止或换号、是否冷却。插件不做并发限制，也不做请求排队。
