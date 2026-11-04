@@ -803,6 +803,10 @@ class TlsFakeOrigin:
         # Official-shape billing fixture (wallet + funding-check). When None the
         # billing routes answer 404, so an unexpected call is visible.
         self.billing = None
+        # When set, /chat/completions failures are decided per attempt by this
+        # predicate (given the bearer header), so a retry-scheduling leg can make
+        # exactly one account fail and observe the host rotating to the other.
+        self.retry_fail = None
 
     def start(self):
         outer = self
@@ -898,6 +902,14 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
         self._record(raw)
+        retry_fail = getattr(self.owner, "retry_fail", None)
+        if retry_fail is not None and self.path.endswith("/chat/completions"):
+            if retry_fail(self.headers.get("Authorization")):
+                self._send(400, json.dumps({
+                    "message": "[code=tier_limit_exceeded] membership concurrency "
+                               "limit exceeded: 11/10 resets 2026-11-03T16:32:30Z",
+                    "type": "invalid_request_error"}).encode())
+                return
         if self.owner.fail is not None and self.path.endswith("/chat/completions"):
             status, body = self.owner.fail
             self._send(status, body.encode() if isinstance(body, str) else body)
@@ -1343,6 +1355,17 @@ def run_cpa_live(artifact, binary, version):
                 "proxy allowlist not restored after the redirect probe: %s"
                 % sorted(proxy.allow))
 
+        # ---- 6. request-scoped retry scheduling across two real accounts ----
+        # The plugin emits a marker, CPA matches it against the credential's
+        # rules and decides whether to stop or rotate and whether to cool the
+        # failed account. Both accounts point at the same fake origin, so one
+        # account fails with the production tier limit shape and the other one
+        # succeeds: the client must still get 200 and the fake origin must show
+        # exactly two attempts, on different bearer keys. Runs before the
+        # credential is deleted because it needs a healthy primary account.
+        evidence["host_retry_scheduling"] = run_retry_scheduling(
+            request, origin, credential_id)
+
         status, raw, _ = request(API + "/credentials?id=" + credential_id, method="DELETE")
         require(status == 200, "deleted credential returned %s: %s" % (status, raw))
         require(not list((work / "auths").glob("*.json")), "credential file survived delete")
@@ -1394,6 +1417,8 @@ def run_cpa_live(artifact, binary, version):
                 blockers.append("host_http_status." + code)
         if evidence.get("host_http_redirect", {}).get("status") != "PASS":
             blockers.append("host_http_redirect")
+        if evidence.get("host_retry_scheduling", {}).get("status") != "PASS":
+            blockers.append("host_retry_scheduling")
         if not registration_live:
             blockers.append("ui_flow.registration")
         if stage_failures:
@@ -1415,6 +1440,146 @@ def run_cpa_live(artifact, binary, version):
                 process.kill()
                 process.wait(timeout=10)
         shutil.rmtree(work, ignore_errors=True)
+
+
+def run_retry_scheduling(request, origin, primary_id):
+    """Two real accounts, one upstream failure, observed through the live host.
+
+    The plugin only classifies the failure and stamps a stable marker; CPA owns
+    the decision. A 400 with the production tier-limit body must therefore end
+    as a 200 for the caller, because the matched rule tells CPA to continue with
+    the next credential. The fake origin records the bearer key of every
+    attempt, which is the evidence that two different accounts were used.
+    """
+    result = {"status": "FAIL"}
+
+    def call(path, body=None, method=None, timeout=90):
+        try:
+            return request(path, body=body, method=method, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read(), dict(exc.headers or {})
+
+    second_key = FIXTURE_KEY + "-second"
+    status, raw, _ = call(API + "/credentials",
+                          {"label": "fixture-second", "api_key": second_key})
+    require(status == 201, "second credential create returned %s: %s" % (status, raw))
+    second_id = json.loads(raw)["id"]
+    require(FIXTURE_KEY not in raw.decode() and second_key not in raw.decode(),
+            "credential response leaked a key")
+
+    def inference_attempts():
+        return [r for r in origin.requests
+                if r["path"].endswith("/chat/completions") and r.get("authorization")]
+
+    def rule_view():
+        status, raw, _ = call(API + "/error-rules")
+        require(status == 200, "error-rules returned %s: %s" % (status, raw[:200]))
+        return json.loads(raw)
+
+    try:
+        # The production failure: 400 with a bracketed code in the message and a
+        # generic type, exactly what OpenDesign returned for 11/10 concurrency.
+        # Only the first attempt of a run fails, so a request that rotates
+        # recovers and a request that stops does not.
+        def failing_runs(rounds=40):
+            """Wait until the failing account and its replacement are both usable.
+
+            A freshly created credential reaches the host asynchronously, so the
+            first attempt can legitimately fail with no second candidate. Each
+            round fails the account that answers first, then reports what the
+            host did: two attempts (rotated) or one (no eligible candidate yet).
+            """
+            for _ in range(rounds):
+                attempts_before = len(inference_attempts())
+                seen = {"failures": 0}
+                first_key = {"key": None}
+
+                def fail_first(key):
+                    if first_key["key"] is None:
+                        first_key["key"] = key
+                    if key == first_key["key"] and seen["failures"] < 1:
+                        seen["failures"] += 1
+                        return True
+                    return False
+
+                origin.retry_fail = fail_first
+                status, raw, _ = call("/v1/chat/completions", {
+                    "model": "deepseek-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False}, timeout=120)
+                attempts = inference_attempts()[attempts_before:]
+                keys = [a["authorization"] for a in attempts]
+                if status == 200:
+                    return attempts, keys, status, raw, first_key["key"]
+                time.sleep(1)
+            return attempts, keys, status, raw, first_key["key"]
+
+        attempts, keys, status, raw, failing_key = failing_runs()
+        result["attempts"] = len(attempts)
+        result["distinct_keys"] = len(set(keys))
+        result["surfaced_status"] = status
+        require(status == 200, "the retry did not recover: %s %s" % (status, raw[:300]))
+        require(len(attempts) == 2, "expected exactly two upstream attempts, got %d" % len(attempts))
+        require(len(set(keys)) == 2, "both attempts used the same credential: %s" % keys)
+        require(("Bearer " + FIXTURE_KEY) in keys and ("Bearer " + second_key) in keys,
+                "unexpected credential set: %s" % keys)
+        body = json.loads(raw)
+        require(body["model"] == "deepseek-flash" and body["usage"]["total_tokens"] == 19, body)
+
+        # Cooling: with a continue-and-cooldown rule the account that failed must
+        # be skipped on the next request. Which of the two the host picked first
+        # is not deterministic under weighted-round-robin, so the expectation is
+        # expressed against the key that actually failed.
+        view = rule_view()
+        require(not view["sync"]["failed"], view["sync"])
+        healthy_key = ("Bearer " + second_key) if failing_key == "Bearer " + FIXTURE_KEY \
+            else "Bearer " + FIXTURE_KEY
+        result["failing_key_was_primary"] = failing_key == "Bearer " + FIXTURE_KEY
+        attempts_before = len(inference_attempts())
+        status, raw, _ = call("/v1/chat/completions", {
+            "model": "deepseek-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False}, timeout=120)
+        require(status == 200, "second call failed: %s %s" % (status, raw[:200]))
+        after = inference_attempts()[attempts_before:]
+        require(len(after) == 1 and after[0]["authorization"] == healthy_key,
+                "the cooled account was used again: %s" % [a["authorization"] for a in after])
+        require(all(a["authorization"] != failing_key for a in after),
+                "the cooled account was retried: %s" % [a["authorization"] for a in after])
+        result["cooled_account_skipped"] = True
+
+        # An explicit stop rule must not rotate: the caller sees the failure.
+        stop_rules = [{"status": 400, "match": ["[open-design:tier_limit_exceeded]"],
+                       "action": "stop"}]
+        status, raw, _ = call(API + "/error-rules", {"rules": stop_rules}, method="PUT")
+        require(status == 200, "stop policy rejected: %s %s" % (status, raw[:200]))
+        origin.retry_fail = lambda key: True
+        attempts_before = len(inference_attempts())
+        status, raw, _ = call("/v1/chat/completions", {
+            "model": "deepseek-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False}, timeout=120)
+        stop_attempts = inference_attempts()[attempts_before:]
+        require(status == 400, "a stop rule still rotated: %s %s" % (status, raw[:200]))
+        require(len(stop_attempts) == 1, "a stop rule made %d attempts" % len(stop_attempts))
+        result["stop_action_did_not_rotate"] = True
+        require("[open-design:tier_limit_exceeded]" in raw.decode(errors="replace"),
+                "the stop response lost the marker: %s" % raw[:200])
+
+        # Restore the built-in policy and remove the extra account.
+        status, raw, _ = call(API + "/error-rules/reset", {}, method="POST")
+        require(status == 200, "reset failed: %s %s" % (status, raw[:200]))
+        origin.retry_fail = None
+        status, raw, _ = call(API + "/credentials?id=" + second_id, method="DELETE")
+        require(status == 200, "second credential delete returned %s: %s" % (status, raw[:200]))
+        result["status"] = "PASS"
+    except AssertionError as exc:
+        result["failure"] = str(exc)[:300]
+    finally:
+        origin.fail = {}
+        if hasattr(origin, "retry_fail"):
+            origin.retry_fail = None
+    return result
 
 
 def run_quota_live(request, origin, proxy, credential_id, client_models, auth_dir):
