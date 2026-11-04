@@ -1,6 +1,6 @@
 # OpenDesign 插件说明
 
-本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`，当前版本 `0.4.5`。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射。详见[验证记录](verification.md)。
+本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`，当前版本 `0.4.5`。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射，并修复其快照一致性与控制台草稿问题；`0.4.6` 新增额度耗尽自动暂停。详见[验证记录](verification.md)。
 
 ## 范围
 
@@ -225,7 +225,7 @@ plugins:
 
 ## 当前验证边界
 
-- `0.4.5` 新增思考强度映射（每个模型一份「请求传入 → 发往上游」的表，默认关闭）；未配置时请求体与 `0.4.4` 完全一致。
+- `0.4.6` 新增额度耗尽自动暂停（信号判定、钳制、人工停用保护、持久化与恢复路径）；`0.4.5` 新增思考强度映射（每个模型一份「请求传入 → 发往上游」的表，默认关闭）并修复其快照一致性与控制台草稿问题；未配置映射时请求体与 `0.4.4` 完全一致。
 
 - `0.4.4` 把 OpenDesign 的额度耗尽报文（`402` + `insufficient_balance` 机器码）纳入分类白名单并新增默认规则：命中即换号冷却；不带机器码的裸 402 仍不分类。`0.4.3` 让「凭据 · 额度」标签页在打开时按账户顺序串行查询一次额度（不并发，离开即停止，60 秒内不重复请求）；`0.4.2` 把请求日志、快照、settings.json 与错误规则文件的持久化统一到同一条带有限重试的发布路径；`0.4.1` 修复 Windows 上请求日志持久化在重命名目标仍被占用时失败的问题（先关闭源句柄 + 有限重试），并让依赖 POSIX 权限语义的两处测试在 Windows 上使用等价注入。`0.4.4` 之前的行为与 `0.4.0` 相同；`0.4.4` 是 `0.4.0` 之后唯一改变分类结果的改动。
 - `0.4.0` 在 `0.3.0` 之上新增重试调度／错误规则；Go／race／vet、Node 测试、离线 ABI 冒烟与原版 CPA 隔离流程通过，并用双账号真实宿主验证了换号与冷却；详细证据见[验证记录](verification.md)。
@@ -237,10 +237,10 @@ plugins:
 
 ## 发布 tag
 
-- 发布 tag 使用 `open-design-v0.4.5`，不创建或覆盖上游 `v*` tag。
+- 发布 tag 使用 `open-design-v0.4.6`，不创建或覆盖上游 `v*` tag。
 - 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定该 tag/版本。
-- `open-design-v0.4.4` 已发布 GitHub Release；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release，分支与生产交付状态见验证记录。
+- `open-design-v0.4.4` 已发布 GitHub Release；`open-design-v0.4.5` 的 Release 因 macOS runner 被取消而未产出资产，其修复内容并入 `0.4.6` 重新发布；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release，分支与生产交付状态见验证记录。
 
 ## 上游与许可
 

@@ -1,6 +1,8 @@
 # OpenDesign 插件验证记录
 
-## 额度耗尽自动暂停（未部署）
+## 0.4.6 本轮验收（未部署）
+
+`0.4.6` = `0.4.5` 的思考强度映射 + 三处修复（后端模型/规则快照一致性、控制台默认表与保存并发、深拷贝数据竞争）+ 额度耗尽自动暂停。`open-design-v0.4.5` 的 Release 因 macOS runner 被取消未产出资产，故 `0.4.5` 未单独发布。
 
 插件识别上游明确的额度耗尽信号后，把账户临时移出本插件调度，到点或额度恢复后自动放回。实现参照 ClinePass 的 QuotaBlock：`Credential.Disabled` 保留人工选择，暂停另存于凭据 auth 文件的 `quota_block`／`quota_revision`。
 
