@@ -2,15 +2,25 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`，当前版本 `0.3.0`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`，当前版本 `0.4.0`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
+>
+> `0.4.0` 在 `0.3.0` 之上增加可编辑的重试调度／错误规则；验收记录同样在该文档。
 
 ## 功能
 
 `0.3.0` 于 2026-11-03 从提交 `2601888` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台和原有效插件核验通过。GitHub Release 尚未发布。
 
 `0.2.0` 于 2026-11-02 从提交 `9fd8351` 及其成功 CI 部署，保留为历史记录。
+
+`0.4.0` 在 `0.3.0` 之上新增**重试调度／错误规则**：
+
+- 每个 OpenDesign 账户可配置一组错误规则（HTTP 状态码 + 包含／正则条件 + `stop`／`stop-and-cooldown`／`continue`／`continue-and-cooldown` 四种动作），随凭据写入宿主 auth 文件的 `request_scoped_errors` 字段。
+- 规则匹配对象是**插件生成的错误 Message**，不是上游原始响应体；插件为上游错误、协议错误、传输错误、插件不可用和响应过大生成稳定的 `[open-design:<kind>]` 前缀，marker 只由封闭白名单拼出，上游文本无法伪造规则。
+- 管理路由 `GET`／`PUT /error-rules` 与 `POST /error-rules/sync`、`POST /error-rules/reset`；策略保存在 `<data_dir>/error-rules.json`，写入为原子替换。
+- 同步是**覆盖式逐账号推送**，只重写 `request_scoped_errors` 一个键，保留宿主或运维在 auth 文件中新增的未知字段；每个账号独立报告成功或失败，失败可重试恢复。
+- 不做并发限制、不做请求排队：插件只做错误分类与标记，是否换号、是否冷却由 CPA 宿主按规则决定。
 
 `0.3.0` 在 `0.2.0` 的账户、映射与额度能力之上增加以下功能：
 
@@ -35,10 +45,27 @@
 | 标签页 | 内容 |
 | --- | --- |
 | 概览 | 汇总管理接口已返回的账户与映射数量 |
-| 凭据 · 额度 | 账户增删改、可选 control Key／Workspace ID、手动刷新钱包与套餐窗口 |
+| 凭据 · 额度 | 账户增删改、可选 control Key／Workspace ID、手动刷新钱包与套餐窗口、编辑重试调度／错误规则 |
 | 模型映射 · 覆盖 | 拉取上游模型、搜索与批量勾选、保存映射、按模型查询官方覆盖、显式模型测试 |
 | 请求日志 | 只读元数据列表、汇总统计、筛选与分页、清空日志 |
 | 代理池 · 配置 | 请求日志开关与保留设置；宿主代理／路由／冷却只读展示，runtime 手动读取 |
+
+### 重试调度／错误规则
+
+每个账户可以带一组错误规则，随凭据写入宿主 auth 文件的 `request_scoped_errors`。规则是「HTTP 状态码 + 包含／正则条件 → 动作」：
+
+| 动作 | 含义 |
+| --- | --- |
+| `stop` | 停止当前请求，不换号、不冷却 |
+| `stop-and-cooldown` | 停止当前请求并冷却该账户 |
+| `continue` | 换到下一个可用账户，不冷却 |
+| `continue-and-cooldown` | 换到下一个可用账户并冷却该账户 |
+
+- 匹配对象是**插件生成的错误 Message**：上游错误、协议错误、传输错误、插件不可用和响应过大分别带稳定的 `[open-design:<kind>]` 前缀。marker 只由封闭白名单拼出，上游响应体无法伪造规则。
+- 状态码为硬匹配（400 就是 400，不做状态码族）。条件支持子串与正则；正则无效或字段越界会在保存时被拒绝。
+- 插件只负责分类和标记；是否换号、是否冷却、冷却多久由 CPA 宿主按规则与自身配置决定。**插件不做并发限制，也不做请求排队。**
+- `PUT /error-rules` 保存策略并逐账号推送，`POST /error-rules/sync` 只重新推送，`POST /error-rules/reset` 恢复内置默认策略。空数组表示该账户不写插件自有规则（由 CPA 配置决定）。
+- 同步只重写 `request_scoped_errors` 一个键，保留宿主或运维写入的未知字段；每个账号独立报告结果，失败的账号会列在响应里，可再次同步。
 
 ### 请求日志与统计
 
@@ -119,6 +146,9 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 | `GET` / `POST /v0/management/open-design/config` | 读取或修改请求日志开关、保留天数与条数上限 |
 | `GET /v0/management/open-design/runtime` | 插件可见运行时状态；宿主账户信息不可读时标记降级 |
 | `POST /v0/management/open-design/model-test` | 显式单次非流式模型测试，body 为 `{credential_id, model_id, prompt?|messages?}` |
+| `GET` / `PUT /v0/management/open-design/error-rules` | 读取或保存错误规则策略并逐账号同步 |
+| `POST /v0/management/open-design/error-rules/sync` | 只重新推送当前策略到所有账号 |
+| `POST /v0/management/open-design/error-rules/reset` | 恢复内置默认策略并推送 |
 
 `/logs` 与 `/logs/stats`、`/logs/clear` 是同一组日志路由的别名。
 
@@ -128,6 +158,7 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 - 推理 API key 和可选 control Key 只保存在 CPA 的 `auth-dir`，通过 `host.auth.save` 写入；插件设置中不保存 Key，管理响应不回显。宿主确认保存成功后才发布新凭据；请求发出后两种 Key 的输入框都会清空。
 - 映射保存在插件数据目录；上游模型目录、额度缓存、覆盖缓存与预测样本只在内存中。请求日志会落盘，但只写入元数据 allowlist，不含正文、headers、query、Key 或 Workspace ID。日志、截图和提交中不要包含 Key。
 - 当前 fork 使用公开 ABI，不修改、不打包也不发布 CPA 宿主。runtime 路由只公开宿主 `host.auth.list` 能提供的能力；读取不到时降级为插件侧状态，不伪造调度、冷却或代理信息。
+- 错误规则只写入每个凭据的 `request_scoped_errors`，不改宿主二进制也不写全局路由配置；策略文件是插件数据目录里的 `error-rules.json`，不包含 Key。
 
 ## 模型映射
 
@@ -157,10 +188,11 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 产物是 `dist/open-design.so`（Linux amd64，C shared ABI v1）。
 
-发布 tag 使用 `open-design-v0.3.0` 形式，避免与 fork 保留的上游 `v*` tag 冲突。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定该 tag/版本，`github-release` 的自动“取最新”不适用于本 fork。GitHub Release 尚未发布。
+发布 tag 使用 `open-design-v0.4.0` 形式，避免与 fork 保留的上游 `v*` tag 冲突。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定该 tag/版本，`github-release` 的自动“取最新”不适用于本 fork。GitHub Release 尚未发布。
 
 ## 当前验证边界
 
+- `0.4.0` 在 `0.3.0` 之上新增重试调度／错误规则，并已用双账号真实宿主验证：假上游按凭据返回生产 400 `tier_limit_exceeded` 后，宿主按规则换到另一账号并返回 200，冷却后下一次请求不再使用失败账号，`stop` 规则下不换号且响应保留 marker。全仓 Go／race／vet、Node 项、离线与原版 CPA 隔离流程见[验证记录](docs/verification.md)。
 - `0.3.0` 在 `0.2.0` 之上新增日志、统计、官方模型覆盖、显式模型测试、配置与 runtime。全仓 Go／race／vet、Node 139 项、Edge 540 项、Debian 12 构建和原版 CPA 隔离流程已通过，具体产物与上线状态见[验证记录](docs/verification.md)。
 - 以下为 `0.2.0` 已发生的生产事实，保留为历史，不属于 `0.3.0` 的验收证据：2026-11-02 发现 13 个模型；官方直连与生产 CPA 插件各完成一次最小 JSON 推理并得到 `OK`。生产插件测试使用 `open-design-minimax-m3.1-flash`，usage 为 219 输入／3 输出／222 总 token。13 个模型只验证发现、持久化与注册，没有逐个付费推理。
 - 早期现有推理 Key 对官方控制面钱包、账单汇总接口返回 401。随后，两份独立 control 授权直接查询钱包和各自工作区 funding-check，共四个 GET 均返回 200。上线 `0.2.0` 后，现有账户经完整推理 Key 精确比对确认属于 od1，补充授权并通过生产插件成功读取钱包与套餐窗口；真实消费趋势预测仍未验收。

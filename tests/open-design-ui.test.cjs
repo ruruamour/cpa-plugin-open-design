@@ -2523,3 +2523,46 @@ test('loading the console, switching tabs and changing theme never read the erro
   api.handlers.cycleThemePreference();
   assert.equal(errorRulesResponse(view).length, 0);
 });
+
+test('the error-rules dialog and its action help are wired to real handlers', () => {
+  const page = pageHTML();
+  for (const id of ['openErrorRules', 'closeErrorRules', 'addErrorRule', 'saveErrorRules',
+                    'retryErrorRules', 'resetErrorRules', 'openErrorRuleHelp', 'closeErrorRuleHelp']) {
+    assert.ok(page.includes(`id="${id}"`), `missing #${id}`);
+  }
+  // The console binds every one of them in its own module, so the button is not
+  // a dead control that only works in a browser acceptance run.
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/error-rules') ? respond(200, errorRulesBody()) : respond(200, statusBody())),
+  });
+  const api = view.context.OpenDesignConsole;
+  assert.equal(typeof api.handlers.openErrorRuleHelp, 'function');
+  assert.equal(typeof api.handlers.closeErrorRuleHelp, 'function');
+  assert.equal(typeof api.handlers.closeErrorRules, 'function');
+  // The fake DOM has no <dialog> implementation, so stub the two methods the
+  // console calls and assert they are reached through the exported handler.
+  const help = view.document.getElementById('errorRuleHelpDialog');
+  const calls = [];
+  help.showModal = () => calls.push('showModal');
+  help.close = () => calls.push('close');
+  help.open = false;
+  api.handlers.openErrorRuleHelp();
+  assert.deepEqual(calls, ['showModal']);
+  help.open = true;
+  api.handlers.closeErrorRuleHelp();
+  assert.deepEqual(calls, ['showModal', 'close']);
+});
+
+test('editing a rule marks the draft dirty and blocks 重新同步', async () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/error-rules') ? respond(200, errorRulesBody()) : respond(200, statusBody())),
+  });
+  const api = view.context.OpenDesignConsole;
+  await api.bootstrap();
+  await api.handlers.openErrorRules();
+  assert.equal(view.document.getElementById('retryErrorRules').disabled, false);
+  api.handlers.addErrorRule();
+  assert.equal(view.document.getElementById('retryErrorRules').disabled, true,
+    'an unsaved draft must not silently re-sync the saved policy');
+  assert.equal(view.document.getElementById('saveErrorRules').disabled, false);
+});

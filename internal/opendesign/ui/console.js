@@ -2355,6 +2355,19 @@
     if (dialog && typeof dialog.close === 'function' && dialog.open) dialog.close();
   }
 
+  // The action reference is a separate dialog so an operator can read what each
+  // action does without leaving the editor. It is pure static text: no request,
+  // no state, and it never touches the saved policy.
+  function openErrorRuleHelp() {
+    const dialog = $('errorRuleHelpDialog');
+    if (dialog && typeof dialog.showModal === 'function' && !dialog.open) dialog.showModal();
+  }
+
+  function closeErrorRuleHelp() {
+    const dialog = $('errorRuleHelpDialog');
+    if (dialog && typeof dialog.close === 'function' && dialog.open) dialog.close();
+  }
+
   function addErrorRule() {
     if (!errorRulesView.loaded) return;
     errorRulesDraft().push({ status: 429, action: 'continue-and-cooldown', conditions: [{ type: 'contains', text: '' }] });
@@ -2687,6 +2700,22 @@
     if (loadRuntimeButton) loadRuntimeButton.addEventListener('click', loadRuntime);
     const runTestButton = $('runModelTest');
     if (runTestButton) runTestButton.addEventListener('click', runModelTest);
+    const openRules = $('openErrorRules');
+    if (openRules) openRules.addEventListener('click', openErrorRules);
+    const closeRules = $('closeErrorRules');
+    if (closeRules) closeRules.addEventListener('click', closeErrorRules);
+    const addRule = $('addErrorRule');
+    if (addRule) addRule.addEventListener('click', addErrorRule);
+    const saveRules = $('saveErrorRules');
+    if (saveRules) saveRules.addEventListener('click', submitErrorRules);
+    const retryRules = $('retryErrorRules');
+    if (retryRules) retryRules.addEventListener('click', retryErrorRules);
+    const resetRules = $('resetErrorRules');
+    if (resetRules) resetRules.addEventListener('click', resetErrorRules);
+    const ruleHelp = $('openErrorRuleHelp');
+    if (ruleHelp) ruleHelp.addEventListener('click', openErrorRuleHelp);
+    const closeRuleHelp = $('closeErrorRuleHelp');
+    if (closeRuleHelp) closeRuleHelp.addEventListener('click', closeErrorRuleHelp);
     const modelTestCredential = $('modelTestCredential');
     if (modelTestCredential) modelTestCredential.addEventListener('change', () => {
       invalidateModelTestResult('账户选择已变化，之前的模型测试结果已清除。');
@@ -2822,6 +2851,8 @@
       loadRuntime,
       openErrorRules,
       closeErrorRules,
+      openErrorRuleHelp,
+      closeErrorRuleHelp,
       submitErrorRules,
       retryErrorRules,
       resetErrorRules,

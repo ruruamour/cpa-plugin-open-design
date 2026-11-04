@@ -2,7 +2,7 @@
 
 本目录只放本地离线验证脚本，不属于插件产物，也不进入发布包。
 
-`0.3.0` 的 ctypes 与原版 CPA 假上游冒烟同时覆盖日志／统计、`/config`、`/runtime`、`/model-test` 和 `/model-coverage`。所有账户与请求均为本地 fixture，验收记录见 `docs/verification.md`。
+`0.4.0` 的 ctypes 与原版 CPA 假上游冒烟同时覆盖日志／统计、`/config`、`/runtime`、`/model-test`、`/model-coverage` 和 `/error-rules`。`--cpa-live` 还包含一段双账号真实宿主轮换验证：假上游按凭据返回生产 400 `tier_limit_exceeded`，宿主必须按规则换到另一账号并返回 200，冷却后跳过失败账号，`stop` 规则下不换号。所有账户与请求均为本地 fixture，验收记录见 `docs/verification.md`。
 
 ## `smoke-abi.py` — 原生 C ABI v1 冒烟
 
@@ -19,7 +19,7 @@
 
 断言重点：
 
-- ABI v1 初始化、`plugin.register` 身份（`OpenDesign` / 从 `internal/opendesign/types.go` 读取的当前 `Version`，本轮为 `0.3.0`）、`management.register` 路由；
+- ABI v1 初始化、`plugin.register` 身份（`OpenDesign` / 从 `internal/opendesign/types.go` 读取的当前 `Version`，本轮为 `0.4.0`）、`management.register` 路由（含 `/error-rules` 四条路由）；
 - 假 Key `sk-amr-test-fixture` 只经 `host.auth.save` 落到 auth-dir，`/status`、`/credentials`、错误信封都不回显；
 - `auth.parse`、`model.for_auth` 的凭据导入与模型映射；
 - `executor.execute`：上游收到 `model=deepseek-v4.1-flash`（别名映射生效）、`Authorization: Bearer <key>`、`tools` 未被丢弃，返回 JSON 含 `usage`；
@@ -27,7 +27,7 @@
 - 同一条流在 `request_path=/v1/messages` 时输出**带 `data: ...\n\n` 的 SSE 帧**（对应 CPA Claude 路由语义）；
 - 上游 401/429 经 RPC 信封保留真实 `http_status`，且不泄漏 Key；
 - 流结束后 `host.http.stream_close` 与 `host.stream.close` 都被调用，`shutdown` 幂等；quiesce 后动态路由均为 503，ABI shutdown 后调用安全失败，清空后的日志快照为 `[]`；
-- `management_v03`／`host_management_v03`：配置严格校验与往返保存、固定上游与宿主代理／路由只读、runtime 与日志读取不发上游请求、官方模型级覆盖传真实 `modelId` 且与共享额度分开缓存、60 秒节流、显式模型测试只发一次有 16 token 上限的非流式请求、只返回 usage 与元数据、日志 allowlist／null usage／统计／清空；
+- `management_v03`／`host_management_v03`：错误规则默认策略读取、严格校验（未知字段／重复键／无效正则／超量一律 400）、保存后落盘 `data/error-rules.json` 并逐账号写入 `auths/<id>.json` 的 `request_scoped_errors`、`sync` 与 `reset` 往返一致；配置严格校验与往返保存、固定上游与宿主代理／路由只读、runtime 与日志读取不发上游请求、官方模型级覆盖传真实 `modelId` 且与共享额度分开缓存、60 秒节流、显式模型测试只发一次有 16 token 上限的非流式请求、只返回 usage 与元数据、日志 allowlist／null usage／统计／清空；
 - 额度（`quota_host`）：未配置 controlKey 的凭据 GET/refresh 都是 `not_configured` 且**零**上游请求；配置后普通 GET 只读缓存，`refresh=1` 才各取一次 `wallet/balance` 与 `workspace/{id}/billing/funding-check`（带 control bearer），响应形状按官方 `WorkspaceBillingPreflight` 严格逐字段校验（含 `modelId:null`、`updatedAt:null`、窗口 `forecast=insufficient_samples`）；立即再 refresh 命中 60 秒节流、不联网；`clear_billing` 后旧缓存不可用且不再联网，推理 key 保留。
 
 额度断言只做「首次样本 = `insufficient_samples`」这类不需要等待的判断；真正的预测要两个相隔 ≥60 秒的成功样本，由 Go 侧 fake clock 单测覆盖，冒烟脚本不会为了它 sleep 一分钟。
