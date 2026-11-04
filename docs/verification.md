@@ -17,6 +17,13 @@
 - 裸 402（上游只给自由文本 `payment required`，无机器可读码）保持 `upstream_error`、不匹配默认规则；生产 2026-11-01～04 共 6 次这样的 402，同批账号 496/500 为 200，无额度耗尽证据。
 - 新增用例：`TestSettingsSaveRetriesTransientWindowsShareViolation`、`TestSettingsSaveReportsPersistentWindowsShareViolation`、`TestErrorRulesBarePaymentRequiredStaysUnclassified`、`TestErrorRulesClassifyPaymentRequiredWithQuotaCode`。
 
+### 0.4.2 CI 与发布
+
+- 提交 `d3eb6c0`（统一持久化重试发布）与 `e84a27a`（升版 0.4.2 与文档）；CI `41808678867` 成功。
+- 发布 tag `open-design-v0.4.2` 指向 `e84a27a`。`git push` 建 tag 时 GitHub 返回 `Internal Server Error`，改用 REST API 创建 ref 成功，未改写任何已有 tag。
+- Release 运行 `41809302685` 成功：`metadata`、`linux-amd64`、`linux-arm64`、`darwin`（amd64／arm64）、`windows-amd64` 与 `release` 全部通过；`windows-amd64` 从 `0.4.0` 的失败转为通过。
+- Release 已发布（非草稿、非预发布），资产为五个平台 zip 与 `checksums.txt`；下载 `open-design_0.4.2_linux_amd64.zip` 复算 SHA256 与 `checksums.txt` 一致（`c61c55c2…fa4a7`）。
+
 ### 0.4.2 生产观察（只读）
 
 - 最近 500 条请求日志：496 条 200、3 条 402（`upstream_error`）、1 条 `upstream_transport_error`。
