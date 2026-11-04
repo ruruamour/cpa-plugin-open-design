@@ -110,6 +110,10 @@
         query: { credential_id: credentialID, model_id: modelID, refresh: options.refresh ? 1 : '' },
       }),
       saveModels: models => request('/models', { method: 'POST', body: { models } }),
+      // The thinking-strength policy for one model. The body carries the model
+      // identity plus the full rule table, so a stale tab can be rejected by the
+      // backend instead of silently overwriting a newer edit.
+      saveReasoningMapping: payload => request('/models/reasoning', { method: 'POST', body: payload }),
       // Optional observability/runtime routes. Every one of them is called from
       // an explicit operator action only: never while loading the page, switching
       // tabs or rendering. Query values are constrained by the backend.
@@ -142,6 +146,9 @@
           credential_id: String(input && input.credentialID || ''),
           model_id: String(input && input.modelID || ''),
           prompt: input && input.prompt ? String(input.prompt) : undefined,
+          // Omitted when the operator did not pick a strength, so the request
+          // body stays byte-identical to what it was before this field existed.
+          reasoning_effort: input && input.reasoningEffort ? String(input.reasoningEffort) : undefined,
         },
       }),
     };

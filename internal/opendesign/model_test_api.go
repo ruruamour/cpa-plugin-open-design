@@ -27,6 +27,10 @@ type modelTestInput struct {
 	ModelID      string          `json:"model_id"`
 	Prompt       string          `json:"prompt"`
 	Messages     json.RawMessage `json:"messages"`
+	// ReasoningEffort is optional. It is the *input* strength: the model's saved
+	// mapping still runs on top of it, so the test exercises the same policy a
+	// real request would.
+	ReasoningEffort string `json:"reasoning_effort"`
 }
 
 type modelTestUsage struct {
@@ -53,6 +57,10 @@ type modelTestResponse struct {
 	UpstreamAttempted bool            `json:"upstream_attempted"`
 	Streaming         bool            `json:"streaming"`
 	RequestKind       string          `json:"request_kind"`
+	// ReasoningEffort is the strength the test actually sent upstream, after the
+	// model's mapping ran. ReasoningMapping is present only when a rule matched.
+	ReasoningEffort  string                      `json:"reasoning_effort,omitempty"`
+	ReasoningMapping *RequestLogReasoningMapping `json:"reasoning_mapping,omitempty"`
 }
 
 type modelTestRecord struct {
@@ -113,6 +121,12 @@ func (s *Service) modelTestRequest(r ManagementRequest) (any, error) {
 	if len(alias) > 512 || strings.IndexFunc(alias, unicode.IsControl) >= 0 {
 		return managementError(http.StatusBadRequest, "invalid model_id")
 	}
+	// "未指定" (the empty string) is the only way to omit the field. "unset" is a
+	// configuration sentinel, not an input strength, so it is not accepted here.
+	testEffort := strings.ToLower(strings.TrimSpace(in.ReasoningEffort))
+	if testEffort != "" && (testEffort == reasoningUnset || !isReasoningSource(testEffort)) {
+		return managementError(http.StatusBadRequest, "invalid reasoning_effort")
+	}
 	snapshot, err := s.modelTestSnapshot(credentialID, alias)
 	if err != nil {
 		return managementError(statusOf(err), err.Error(), s.allKeys()...)
@@ -132,6 +146,12 @@ func (s *Service) modelTestRequest(r ManagementRequest) (any, error) {
 	payload := map[string]any{
 		"messages":   messages,
 		"max_tokens": modelTestOutputTokens,
+	}
+	// The strength goes into the payload unmodified: the executor applies the
+	// model's mapping exactly once, on the same path a real request takes.
+	reasoningSent, reasoningMapping := reasoningForModelTest(s, alias, testEffort)
+	if testEffort != "" {
+		payload["reasoning_effort"] = testEffort
 	}
 	raw := jsonBytes(ExecutorRequest{
 		AuthID:         c.ID,
@@ -168,6 +188,8 @@ func (s *Service) modelTestRequest(r ManagementRequest) (any, error) {
 		UpstreamAttempted: true,
 		Streaming:         false,
 		RequestKind:       "chat.completions",
+		ReasoningEffort:   reasoningSent,
+		ReasoningMapping:  reasoningMapping,
 	}
 	record.Status = "success"
 	record.DurationMS = duration
@@ -330,6 +352,22 @@ func (s *Service) clearModelTestsLocked(credentialID ...string) {
 			delete(s.modelTests, key)
 		}
 	}
+}
+
+// reasoningForModelTest reports the strength a probe will send and the rule that
+// produced it. It runs the same pure mapping the executor runs, on the same
+// input, so the reported conversion cannot drift from the request that is sent.
+func reasoningForModelTest(s *Service, alias, input string) (string, *RequestLogReasoningMapping) {
+	body := map[string]any{}
+	if effort := strings.ToLower(strings.TrimSpace(input)); effort != "" && effort != reasoningUnset {
+		body["reasoning_effort"] = effort
+	}
+	from, to, applied := applyReasoningMapping(body, s.reasoningMappingFor(alias))
+	sent := reasoningEffortOf(body)
+	if !applied {
+		return sent, nil
+	}
+	return sent, &RequestLogReasoningMapping{From: from, To: to}
 }
 
 func modelTestMessages(in modelTestInput) ([]map[string]any, error) {

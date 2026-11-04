@@ -70,6 +70,7 @@ func managementRoutes() []managementRoute {
 		{Method: http.MethodGet, Path: apiBase + "/upstream-models"},
 		{Method: http.MethodGet, Path: apiBase + "/models"},
 		{Method: http.MethodPost, Path: apiBase + "/models"},
+		{Method: http.MethodPost, Path: apiBase + "/models/reasoning"},
 		{Method: http.MethodPost, Path: apiBase + "/console/session"},
 	}
 }
@@ -165,10 +166,20 @@ func (s *Service) management(raw json.RawMessage) (any, error) {
 	case r.Method == http.MethodGet && path == apiBase+"/upstream-models":
 		return s.upstreamModels(r)
 	case r.Method == http.MethodGet && path == apiBase+"/models":
-		return s.withActive(func() (any, error) { return managementJSON(http.StatusOK, map[string]any{"models": s.config().Models}) })
+		return s.withActive(func() (any, error) {
+			return managementJSON(http.StatusOK, map[string]any{"models": modelViews(s.config().Models)})
+		})
 	case r.Method == http.MethodPost && path == apiBase+"/models":
 		return s.withActive(func() (any, error) {
 			result, err := s.importModels(r.Body)
+			if err != nil {
+				return managementError(statusOf(err), err.Error(), s.allKeys()...)
+			}
+			return managementJSON(http.StatusOK, result)
+		})
+	case r.Method == http.MethodPost && path == apiBase+"/models/reasoning":
+		return s.withActive(func() (any, error) {
+			result, err := s.saveReasoningMapping(r.Body)
 			if err != nil {
 				return managementError(statusOf(err), err.Error(), s.allKeys()...)
 			}
@@ -189,12 +200,8 @@ func (s *Service) statusResponse() (any, error) {
 	}
 	s.mu.RUnlock()
 	sortCredentials(credentials)
-	models := make([]map[string]any, 0, len(cfg.Models))
-	for _, m := range cfg.Models {
-		models = append(models, map[string]any{"id": m.ID, "upstream_id": m.UpstreamID})
-	}
-	return managementJSON(http.StatusOK, map[string]any{
-		"version":     Version,
+	models := modelViews(cfg.Models)
+	return managementJSON(http.StatusOK, map[string]any{"version": Version,
 		"base_url":    cfg.BaseURL,
 		"credentials": credentials,
 		"models":      models,

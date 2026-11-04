@@ -49,7 +49,12 @@
         const id = text(item.id);
         const upstreamID = text(item.upstream_id);
         if (!id || !upstreamID) continue;
-        models.push({ id, upstream_id: upstreamID });
+        // An absent policy stays absent so the console can tell "never configured"
+        // (pre-fill the vendor table) from "saved as empty" (show the stored table).
+        const stored = item.reasoning_mapping === undefined || item.reasoning_mapping === null
+          ? null
+          : normalizeReasoningMapping(item.reasoning_mapping);
+        models.push({ id, upstream_id: upstreamID, reasoning_mapping: stored });
       }
     }
     return {
@@ -87,6 +92,114 @@
       models.push({ id, upstream_id: upstreamID });
     }
     return models;
+  }
+
+  // --- thinking-strength mapping -------------------------------------------
+
+  // The closed sets the plugin accepts. The source list doubles as the render
+  // order, so the table never reshuffles between renders.
+  const REASONING_SOURCES = ['unset', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+  const REASONING_TARGETS = ['unset', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+  function reasoningLabel(value) {
+    const normalized = text(value);
+    return !normalized || normalized === 'unset' ? '未设置' : normalized;
+  }
+
+  function defaultReasoningRules() {
+    return [
+      { from: 'unset', to: 'unset' },
+      { from: 'none', to: 'none' },
+      { from: 'minimal', to: 'low' },
+      { from: 'low', to: 'low' },
+      { from: 'medium', to: 'high' },
+      { from: 'high', to: 'high' },
+      { from: 'xhigh', to: 'high' },
+      { from: 'max', to: 'max' },
+      { from: 'ultra', to: 'max' },
+    ];
+  }
+
+  // A DeepSeek upstream is pre-filled from the vendor table; every other model
+  // starts empty. Either way the mapping starts disabled: it is opt-in per model.
+  function defaultReasoningMapping(upstreamID) {
+    const upstream = text(upstreamID).toLowerCase();
+    return { enabled: false, rules: upstream.includes('deepseek') ? defaultReasoningRules() : [] };
+  }
+
+  // Reads whatever the server sent into the editor shape. Anything outside the
+  // closed sets, or a repeated source, is dropped rather than rendered: the
+  // table can then never offer a value the plugin would refuse to save.
+  function normalizeReasoningMapping(raw) {
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const rules = [];
+    const seen = new Set();
+    for (const rule of Array.isArray(source.rules) ? source.rules : []) {
+      const from = text(rule && rule.from).toLowerCase();
+      const to = text(rule && rule.to).toLowerCase();
+      if (!REASONING_SOURCES.includes(from) || !REASONING_TARGETS.includes(to) || seen.has(from)) continue;
+      seen.add(from);
+      rules.push({ from, to });
+    }
+    rules.sort((left, right) => REASONING_SOURCES.indexOf(left.from) - REASONING_SOURCES.indexOf(right.from));
+    return { enabled: source.enabled === true, rules };
+  }
+
+  // A stable identity for the dirty check and for draft keys.
+  function reasoningKey(mapping) {
+    const view = normalizeReasoningMapping(mapping);
+    return JSON.stringify([view.enabled, view.rules.map(rule => [rule.from, rule.to])]);
+  }
+
+  function reasoningSourceOptions() {
+    return REASONING_SOURCES.map(value => ({ value, label: reasoningLabel(value) }));
+  }
+
+  function reasoningTargetOptions() {
+    return REASONING_TARGETS.map(value => ({ value, label: reasoningLabel(value) }));
+  }
+
+  // The next source that has no rule yet, so "添加规则" never creates a
+  // duplicate the save route would reject. Returns an empty string when every
+  // source is already mapped.
+  function nextReasoningSource(rules) {
+    const used = new Set((Array.isArray(rules) ? rules : []).map(rule => text(rule && rule.from)));
+    return REASONING_SOURCES.find(value => !used.has(value)) || '';
+  }
+
+  // The save payload. Anything the plugin would reject is reported instead of
+  // dropped: silently discarding a rule would save a policy the operator did not
+  // write. Rule order is preserved so the request is exactly the edited table.
+  function buildReasoningPayload(model, mapping) {
+    const raw = mapping && typeof mapping === 'object' ? mapping : {};
+    const sources = new Set(REASONING_SOURCES);
+    const targets = new Set(REASONING_TARGETS);
+    const rules = [];
+    const seen = new Set();
+    for (const rule of Array.isArray(raw.rules) ? raw.rules : []) {
+      const from = text(rule && rule.from).toLowerCase();
+      const to = text(rule && rule.to).toLowerCase();
+      if (!sources.has(from) || !targets.has(to)) {
+        throw new Error(`未知的思考强度：${from || '（空）'} → ${to || '（空）'}`);
+      }
+      if (seen.has(from)) throw new Error(`请求强度「${reasoningLabel(from)}」重复，请修改或删除重复规则`);
+      seen.add(from);
+      rules.push({ from, to });
+    }
+    return {
+      model: text(model && model.id),
+      upstream_id: text(model && model.upstream_id),
+      reasoning_mapping: { enabled: raw.enabled === true, rules },
+    };
+  }
+
+  function reasoningConversionText(effort, mapping) {
+    const applied = mapping && typeof mapping === 'object' ? mapping : null;
+    if (applied && text(applied.to)) {
+      return `${reasoningLabel(applied.from)} → ${reasoningLabel(applied.to)}`;
+    }
+    const sent = text(effort);
+    return sent ? reasoningLabel(sent) : '—';
   }
 
   function hasUpstream(models, upstreamID) {
@@ -549,6 +662,8 @@
       total_tokens: safeCounter(value.total_tokens),
       request_id: safeIdentifier(value.request_id, 128),
       upstream_attempted: value.upstream_attempted === undefined ? null : value.upstream_attempted === true,
+      reasoning_effort: safeCode(value.reasoning_effort, 32),
+      reasoning_mapping: reasoningConversion(value.reasoning_mapping),
     };
     if (!record.id && !record.started_at && !record.model && !record.status) return null;
     return record;
@@ -724,7 +839,21 @@
       upstream_attempted: Object.prototype.hasOwnProperty.call(data, 'upstream_attempted') ? data.upstream_attempted === true : null,
       streaming: data.streaming === true,
       request_kind: safeCode(data.request_kind, 60),
+      // The strength actually sent, and the rule that produced it. Both come
+      // from the plugin's closed sets, so they are safe to render verbatim.
+      reasoning_effort: safeCode(data.reasoning_effort, 32),
+      reasoning_mapping: reasoningConversion(data.reasoning_mapping),
     };
+  }
+
+  // The server sends {from,to} only when a rule matched, so an absent or
+  // half-filled object means "no conversion happened".
+  function reasoningConversion(raw) {
+    const data = raw && typeof raw === 'object' ? raw : null;
+    if (!data) return null;
+    const from = safeCode(data.from, 32);
+    const to = safeCode(data.to, 32);
+    return from && to ? { from, to } : null;
   }
 
   // ---- Retry scheduling / request-scoped error rules --------------------------
@@ -956,6 +1085,16 @@
     forecastView,
     buildModelsPayload,
     hasUpstream,
+    reasoningLabel,
+    defaultReasoningRules,
+    defaultReasoningMapping,
+    normalizeReasoningMapping,
+    reasoningKey,
+    reasoningSourceOptions,
+    reasoningTargetOptions,
+    nextReasoningSource,
+    buildReasoningPayload,
+    reasoningConversionText,
     aliasForUpstream,
     addUpstream,
     removeUpstream,

@@ -1,6 +1,6 @@
 # OpenDesign 插件说明
 
-本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`，当前版本 `0.4.4`。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则。详见[验证记录](verification.md)。
+本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`，当前版本 `0.4.5`。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射。详见[验证记录](verification.md)。
 
 ## 范围
 
@@ -53,6 +53,7 @@ OpenDesign 生产接口：
 | `GET` / `POST` / `DELETE /credentials` | 账户列表、创建或更新、删除 |
 | `GET /upstream-models` | 读取 OpenDesign `GET /models` 候选 |
 | `GET` / `POST /models` | 读取或保存模型映射 |
+| `POST /models/reasoning` | 保存单个模型的思考强度映射（完整替换） |
 | `GET /quota?credential_id=<id>` | 共享钱包／套餐窗口缓存；`refresh=1` 手动查询 |
 | `GET /model-coverage?credential_id=<id>&model_id=<id>` | 模型级官方覆盖缓存；`refresh=1` 手动查询 |
 | `GET /request-logs` | 分页读取元数据日志 |
@@ -75,7 +76,7 @@ OpenDesign 生产接口：
 | --- | --- |
 | 概览 | 账户与映射数量 |
 | 凭据 · 额度 | 账户增删改、可选额度授权、打开标签页时按账户顺序自动查询共享额度（也可手动刷新）、编辑重试调度／错误规则 |
-| 模型映射 · 覆盖 | 上游模型、映射保存、模型级覆盖、显式模型测试 |
+| 模型映射 · 覆盖 | 上游模型、映射保存、按模型配置思考强度映射、模型级覆盖、显式模型测试 |
 | 请求日志 | 元数据日志、汇总统计、筛选分页、清空 |
 | 代理池 · 配置 | 日志开关与保留设置；宿主代理／路由／冷却只读；runtime 手动读取 |
 
@@ -117,6 +118,7 @@ OpenDesign 生产接口：
 - 控制台只有点击「发送测试」并确认后才调用；一次操作只发一次请求，**不重试**。
 - 最多 3 个并发测试，超出返回 429。
 - 响应只含状态、上游 HTTP、耗时、token 计数与错误类型，**不回传 completion**，也不回显 Key。
+- 可选传 `reasoning_effort`（不含配置哨兵 `unset`），它会先套用该模型已保存的思考强度映射，再发往上游；响应回显实际发出的强度与命中的转换。省略该字段时请求体与旧版本完全一致。
 - 测试会消耗真实推理用量；账户 Key、映射或启停状态在测试期间变化时，结果不写入 runtime 历史。
 
 ## runtime 与宿主能力
@@ -131,6 +133,24 @@ OpenDesign 生产接口：
 4. 客户端向 CPA 的 `/v1/chat/completions` 发送请求，`model` 使用已保存的客户端模型名。
 
 未配置的客户端模型名不会自动透传为上游模型 ID。
+
+## 思考强度映射
+
+每个模型可以单独配置一份「请求传入 → 发往上游」的思考强度映射，默认关闭：
+
+- 只处理**顶层** `reasoning_effort`。请求里的 `thinking`／`reasoning` 等嵌套字段原样转发，不被改写。
+- 只改写表里列出的强度。没有规则的强度（包括空值没有规则时）原样透传，插件不会猜一个默认值。
+- 目标可选 `unset`：命中时删除 `reasoning_effort` 字段，让上游使用自己的默认强度。与 `thinking`／`reasoning` 一样，它不会去删除嵌套字段。
+- 请求本身带了 `thinking`／`reasoning` 且没有传 `reasoning_effort` 时，`unset → unset` 这类规则不生效，避免与客户端的显式意图冲突。
+- 上游 ID 含 `deepseek` 的模型默认预填 DeepSeek 强度表（`minimal/low → low`、`medium/high/xhigh → high`、`max/ultra → max`），仍然需要手动启用。
+- 来源集合为 `unset`/`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`，目标集合相同但不含 `ultra`；超出集合的值会被接口拒绝，不会写入报文。
+- 请求值不是字符串（例如数字）时不做映射，原样交给上游校验。
+
+保存是「完整替换」：`POST /models/reasoning` 带 `model`、`upstream_id` 与整个 `reasoning_mapping`。模型不存在返回 404，上游 ID 与当前映射不一致返回 409（要求先刷新状态再配置），规则不合法返回 400。
+
+映射写入 settings，对以下路径生效：正式请求（`executor.execute`／`executor.execute_stream`）、控制台的显式模型测试。模型覆盖探测走的是官方计费接口的 GET，没有请求体，因此不涉及思考强度。
+
+请求日志会记录「实际发出的强度」与「命中的转换」（如 `medium → high`）两个只读字段，值都取自同一个闭集；超出集合的值在写入和读取时都会被丢弃。
 
 ## 构建与安装
 
@@ -183,6 +203,8 @@ plugins:
 
 ## 当前验证边界
 
+- `0.4.5` 新增思考强度映射（每个模型一份「请求传入 → 发往上游」的表，默认关闭）；未配置时请求体与 `0.4.4` 完全一致。
+
 - `0.4.4` 把 OpenDesign 的额度耗尽报文（`402` + `insufficient_balance` 机器码）纳入分类白名单并新增默认规则：命中即换号冷却；不带机器码的裸 402 仍不分类。`0.4.3` 让「凭据 · 额度」标签页在打开时按账户顺序串行查询一次额度（不并发，离开即停止，60 秒内不重复请求）；`0.4.2` 把请求日志、快照、settings.json 与错误规则文件的持久化统一到同一条带有限重试的发布路径；`0.4.1` 修复 Windows 上请求日志持久化在重命名目标仍被占用时失败的问题（先关闭源句柄 + 有限重试），并让依赖 POSIX 权限语义的两处测试在 Windows 上使用等价注入。`0.4.4` 之前的行为与 `0.4.0` 相同；`0.4.4` 是 `0.4.0` 之后唯一改变分类结果的改动。
 - `0.4.0` 在 `0.3.0` 之上新增重试调度／错误规则；Go／race／vet、Node 测试、离线 ABI 冒烟与原版 CPA 隔离流程通过，并用双账号真实宿主验证了换号与冷却；详细证据见[验证记录](verification.md)。
 - `0.3.0` 全仓 Go／race／vet、Node 139 项、Edge 540 项、Debian 12 构建及原版 CPA 隔离流程通过；详细产物哈希与 CI／上线状态见[验证记录](verification.md)。
@@ -193,7 +215,7 @@ plugins:
 
 ## 发布 tag
 
-- 发布 tag 使用 `open-design-v0.4.4`，不创建或覆盖上游 `v*` tag。
+- 发布 tag 使用 `open-design-v0.4.5`，不创建或覆盖上游 `v*` tag。
 - 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定该 tag/版本。
 - `open-design-v0.4.4` 已发布 GitHub Release；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release，分支与生产交付状态见验证记录。

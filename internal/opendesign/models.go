@@ -1,6 +1,7 @@
 package opendesign
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"path/filepath"
@@ -9,16 +10,31 @@ import (
 	"time"
 )
 
+// modelView is the model shape the console reads. It carries the stored
+// thinking-strength policy so the console can render it without a second route.
+// A model with no policy omits the field, which is what tells the console to
+// pre-fill the vendor table instead of showing an empty one.
+func modelView(m Model) map[string]any {
+	view := map[string]any{"id": m.ID, "upstream_id": m.UpstreamID}
+	if m.Reasoning != nil {
+		view["reasoning_mapping"] = m.Reasoning
+	}
+	return view
+}
+
+func modelViews(models []Model) []map[string]any {
+	views := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		views = append(views, modelView(m))
+	}
+	return views
+}
+
 func sameModels(left, right []Model) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
+	// Models carry an optional policy object, so a field-by-field comparison
+	// would compare pointers and report a change for two identical mappings.
+	// The canonical encoding is the same bytes a restart would read back.
+	return bytes.Equal(jsonBytes(left), jsonBytes(right))
 }
 
 // modelRegistration advertises the mapped models to CPA. It is dynamic on
@@ -45,6 +61,65 @@ func (s *Service) modelRegistration() any {
 		})
 	}
 	return map[string]any{"Provider": Provider, "Models": models}
+}
+
+// saveReasoningMapping replaces one model's thinking-strength policy.
+//
+// The whole cycle runs under configMu so two concurrent saves cannot interleave
+// persist and publish, and a stale tab cannot overwrite a newer edit. The
+// mapping only changes what this plugin sends upstream, so unlike a model-list
+// change it does not rewrite any auth file: the host's model catalog is
+// unaffected.
+func (s *Service) saveReasoningMapping(raw json.RawMessage) (any, error) {
+	var in struct {
+		Model      string            `json:"model"`
+		UpstreamID string            `json:"upstream_id"`
+		Mapping    *ReasoningMapping `json:"reasoning_mapping"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil || in.Mapping == nil {
+		return nil, localFail(http.StatusBadRequest, "invalid_request", "invalid reasoning mapping JSON")
+	}
+	model := strings.TrimSpace(in.Model)
+	upstream := strings.TrimSpace(in.UpstreamID)
+	if model == "" || upstream == "" {
+		return nil, localFail(http.StatusBadRequest, "invalid_request", "model and upstream_id are required")
+	}
+	if err := validateReasoningMapping(in.Mapping); err != nil {
+		return nil, err
+	}
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	cfg := s.config()
+	index := -1
+	for i := range cfg.Models {
+		if cfg.Models[i].ID == model {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return nil, fail(http.StatusNotFound, "model not found")
+	}
+	// A mapping written against one upstream ID must not silently follow the
+	// alias onto a different model, so the console is told to refresh instead.
+	if cfg.Models[index].UpstreamID != upstream {
+		return nil, fail(http.StatusConflict, "model upstream changed; refresh before saving")
+	}
+	cfg.Models[index].Reasoning = cloneReasoningMapping(in.Mapping)
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	if err := s.saveSettings(cfg); err != nil {
+		return nil, fail(http.StatusInternalServerError, "could not persist reasoning mapping")
+	}
+	s.mu.Lock()
+	s.cfg.Models = cfg.Models
+	// Results produced under the previous policy no longer describe what this
+	// model does, so they are dropped rather than shown as current.
+	s.modelMappingRevision++
+	s.clearModelTestsLocked()
+	s.mu.Unlock()
+	return map[string]any{"models": cfg.Models}, nil
 }
 
 // resolveModel maps a client alias onto the upstream model ID. An unknown alias is
@@ -134,7 +209,23 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 	defer s.configMu.Unlock()
 
 	cfg := s.config()
+	previous := cfg.Models
 	cfg.Models = append([]Model(nil), in.Models...)
+	// An incoming list that omits the policy keeps the stored one. The upstream ID
+	// has to match as well: a rule written for one upstream must not be silently
+	// applied to another model that happens to reuse the alias. A policy sent in
+	// the body always wins.
+	for i := range cfg.Models {
+		if cfg.Models[i].Reasoning != nil {
+			continue
+		}
+		for _, existing := range previous {
+			if existing.ID == cfg.Models[i].ID && existing.UpstreamID == cfg.Models[i].UpstreamID {
+				cfg.Models[i].Reasoning = cloneReasoningMapping(existing.Reasoning)
+				break
+			}
+		}
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}

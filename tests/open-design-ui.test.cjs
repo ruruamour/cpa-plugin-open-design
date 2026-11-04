@@ -2630,3 +2630,343 @@ test('editing a rule marks the draft dirty and blocks 重新同步', async () =>
     'an unsaved draft must not silently re-sync the saved policy');
   assert.equal(view.document.getElementById('saveErrorRules').disabled, false);
 });
+
+// ---- 思考强度映射 (thinking-strength mapping) --------------------------------
+
+// The shared `plain` helper above normalizes vm-context objects for strict
+// deep comparison; the reasoning cases below rely on it.
+
+const reasoningStatus = (...models) => statusBody({ models });
+
+test('the reasoning panel exists with real controls and does not add a tab', () => {
+  const page = pageHTML();
+  for (const id of [
+    'reasoningPanel', 'reasoningModel', 'reasoningEnabled', 'reasoningRows',
+    'addReasoningRule', 'resetReasoningTable', 'saveReasoning', 'reasoningState', 'reasoningDirty',
+  ]) {
+    assert.ok(page.includes(`id="${id}"`), `${id} must be present`);
+  }
+  assert.ok(page.includes('思考强度映射'));
+  // The panel lives inside the models tab: the console keeps its five tabs.
+  const tabs = [...page.matchAll(/data-tab="([^"]+)"/g)].map(match => match[1]);
+  assert.deepEqual(tabs, ['overview', 'credentials', 'models', 'logs', 'config']);
+  // A disabled mapping never rewrites a request, so the copy has to say so.
+  assert.ok(/默认关闭/.test(page));
+});
+
+test('reasoning helpers default, normalize and validate against the closed sets', () => {
+  const core = fakePage().context.OpenDesignCore;
+  // A DeepSeek upstream is pre-filled but disabled; anything else starts empty.
+  const prefill = plain(core.defaultReasoningMapping('deepseek-v4.1-flash'));
+  assert.equal(prefill.enabled, false, 'the pre-fill must not enable itself');
+  assert.deepEqual(prefill, plain(core.defaultReasoningMapping('DeepSeek-V4')));
+  assert.deepEqual(plain(core.defaultReasoningMapping('vela/gpt-6')), { enabled: false, rules: [] });
+  assert.deepEqual(plain(core.defaultReasoningMapping('')), { enabled: false, rules: [] });
+  assert.deepEqual(Object.fromEntries(prefill.rules.map(rule => [rule.from, rule.to])), {
+    unset: 'unset', none: 'none', minimal: 'low', low: 'low',
+    medium: 'high', high: 'high', xhigh: 'high', max: 'max', ultra: 'max',
+  });
+  // ultra is a request-side strength only: it can never be a target.
+  assert.ok(!core.reasoningTargetOptions().some(option => option.value === 'ultra'));
+  assert.ok(core.reasoningSourceOptions().some(option => option.value === 'ultra'));
+
+  // Server data outside the closed sets, or a repeated source, is dropped.
+  assert.deepEqual(
+    plain(core.normalizeReasoningMapping({
+      enabled: true,
+      rules: [
+        { from: 'high', to: 'high' },
+        { from: 'bogus', to: 'high' },
+        { from: 'medium', to: 'ultra' },
+        { from: 'low', to: 'low' },
+        { from: 'low', to: 'max' },
+      ],
+    })),
+    { enabled: true, rules: [{ from: 'low', to: 'low' }, { from: 'high', to: 'high' }] },
+    'unknown strengths and duplicate sources never reach the table',
+  );
+  // `enabled` is strict: only a literal true counts.
+  assert.equal(core.normalizeReasoningMapping({ enabled: 'true' }).enabled, false);
+  assert.deepEqual(plain(core.normalizeReasoningMapping(null)), { enabled: false, rules: [] });
+});
+
+test('reasoning dirtiness ignores rule order and the payload rejects duplicates', () => {
+  const core = fakePage().context.OpenDesignCore;
+  const left = { enabled: true, rules: [{ from: 'medium', to: 'high' }, { from: 'low', to: 'low' }] };
+  const right = { enabled: true, rules: [{ from: 'low', to: 'low' }, { from: 'medium', to: 'high' }] };
+  assert.equal(core.reasoningKey(left), core.reasoningKey(right), 'row order is not a change');
+  assert.notEqual(core.reasoningKey(left), core.reasoningKey({ ...left, enabled: false }));
+  assert.notEqual(core.reasoningKey(left), core.reasoningKey({ enabled: true, rules: [{ from: 'medium', to: 'low' }] }));
+
+  assert.deepEqual(plain(core.buildReasoningPayload({ id: 'od-flash', upstream_id: 'open-design/flash' }, left)), {
+    model: 'od-flash',
+    upstream_id: 'open-design/flash',
+    reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }, { from: 'low', to: 'low' }] },
+  }, 'the edited row order is what gets sent');
+  assert.throws(() => core.buildReasoningPayload({ id: 'a', upstream_id: 'b' }, {
+    enabled: true, rules: [{ from: 'medium', to: 'high' }, { from: 'medium', to: 'low' }],
+  }), /重复/, 'a duplicate source is an operator error, not a silent overwrite');
+  assert.throws(() => core.buildReasoningPayload({ id: 'a', upstream_id: 'b' }, {
+    enabled: true, rules: [{ from: 'extreme', to: 'high' }],
+  }), /未知的思考强度/, 'a value outside the closed sets is refused, never dropped');
+  // Adding a rule always picks an unused source, so the table cannot self-collide.
+  assert.equal(core.nextReasoningSource([{ from: 'unset' }, { from: 'none' }]), 'minimal');
+  assert.equal(core.nextReasoningSource(core.reasoningSourceOptions().map(option => ({ from: option.value }))), '');
+});
+
+test('the reasoning table pre-fills a DeepSeek model and stays empty for others', async () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/status') ? respond(200, reasoningStatus(
+      { id: 'od-deepseek', upstream_id: 'deepseek-v4.1-flash' },
+      { id: 'od-other', upstream_id: 'vela/gpt-6-luna' },
+    )) : respond(404, { error: 'not found' })),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const select = view.document.getElementById('reasoningModel');
+  assert.equal(select.children.length, 2, 'every saved model gets a row in the picker');
+  assert.equal(api.state.reasoningModelKey, select.children[0].value, 'the first saved model is selected');
+  assert.equal(view.document.getElementById('reasoningEnabled').checked, false, 'a fresh model is disabled');
+  assert.equal(view.document.getElementById('reasoningRows').children.length, 9, 'the vendor table is pre-filled');
+
+  api.handlers.selectReasoningModel(select.children[1].value);
+  assert.equal(view.document.getElementById('reasoningRows').children.length, 1,
+    'an unknown upstream shows the empty-state row instead of a fabricated table');
+  assert.equal(api.render.reasoningDirty(), false, 'the pre-fill equals the stored baseline until it is edited');
+});
+
+test('saving a reasoning policy posts the rule table and clears the draft', async () => {
+  const calls = [];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+        calls.push(JSON.parse(init.body));
+        return respond(200, {
+          models: [{
+            id: 'od-flash',
+            upstream_id: 'open-design/flash',
+            reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }] },
+          }],
+        });
+      }
+      if (url.includes('/status')) return respond(200, statusBody());
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.setReasoningEnabled(true);
+  assert.equal(api.render.reasoningDirty(), true, 'enabling the policy is an unsaved change');
+  assert.equal(view.document.getElementById('reasoningDirty').hidden, false, 'the unsaved badge is shown');
+
+  await api.handlers.saveReasoning();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], {
+    model: 'od-flash',
+    upstream_id: 'open-design/flash',
+    reasoning_mapping: { enabled: true, rules: [] },
+  }, 'the payload is the full policy for one model');
+  assert.equal(api.render.reasoningDirty(), false, 'the draft is dropped once the server accepted it');
+  assert.match(view.document.getElementById('reasoningState').textContent, /已保存/);
+  assert.equal(api.state.reasoningSaving, false);
+  assert.equal(view.document.getElementById('reasoningDirty').hidden, true);
+  // The server's answer is the new baseline, so the table now shows the policy.
+  assert.deepEqual(plain(api.render.currentReasoningMapping(api.state.serverModels[0])),
+    { enabled: true, rules: [{ from: 'medium', to: 'high' }] });
+});
+
+test('a duplicate strength is refused in the table and never sent', async () => {
+  const calls = [];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+        calls.push(JSON.parse(init.body));
+        return respond(200, { models: [] });
+      }
+      if (url.includes('/status')) return respond(200, statusBody());
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const model = () => api.state.serverModels[0];
+  await api.handlers.addReasoningRule();
+  await api.handlers.addReasoningRule();
+  let rules = plain(api.render.currentReasoningMapping(model())).rules;
+  assert.equal(rules.length, 2, 'two rows were added with distinct sources');
+  assert.notEqual(rules[0].from, rules[1].from);
+
+  // Point the second row at a strength the first row already owns.
+  await api.handlers.changeReasoningRule(1, 'from', rules[0].from);
+  rules = plain(api.render.currentReasoningMapping(model())).rules;
+  assert.notEqual(rules[1].from, rules[0].from, 'the duplicate is refused before it can be saved');
+  assert.match(view.document.getElementById('reasoningState').textContent, /已有规则/,
+    'the conflict is explained instead of silently applied');
+
+  await api.handlers.saveReasoning();
+  assert.equal(calls.length, 1);
+  const sent = calls[0].reasoning_mapping.rules;
+  assert.equal(new Set(sent.map(rule => rule.from)).size, sent.length, 'the saved policy has no duplicate source');
+});
+
+test('a reasoning save reports 404 and 409 instead of pretending to succeed', async () => {
+  for (const [status, expected] of [[404, /模型已不存在/], [409, /上游模型 ID 已变化/]]) {
+    const view = fakePage({
+      fetchImpl: async (url, init = {}) => {
+        if (url.endsWith('/models/reasoning') && init.method === 'POST') return respond(status, { error: 'rejected' });
+        if (url.includes('/status')) return respond(200, statusBody());
+        return respond(404, { error: 'not found' });
+      },
+    });
+    const api = view.context.OpenDesignConsole;
+    api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+    await api.render.loadStatus();
+    await api.handlers.addReasoningRule();
+    await api.handlers.saveReasoning();
+    assert.match(view.document.getElementById('reasoningState').textContent, expected, `${status} is explained`);
+    assert.equal(view.document.getElementById('reasoningDirty').hidden, false, 'the draft survives a rejected save');
+  }
+});
+
+test('the reasoning table follows a server refresh and keeps one draft per model', async () => {
+  let models = [
+    { id: 'od-a', upstream_id: 'deepseek-v4.1-flash', reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }] } },
+    { id: 'od-b', upstream_id: 'vela/gpt-6-luna' },
+  ];
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/status') ? respond(200, reasoningStatus(...models)) : respond(404, { error: 'not found' })),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const select = view.document.getElementById('reasoningModel');
+  const first = select.children[0].value;
+  console.error('DEBUG-A', Object.keys(api.state.serverModels[0]).join(','), String(api.state.serverModels[0].reasoning_mapping));
+  console.error('DEBUG-F', JSON.stringify(plain(reasoningStatus(...models)).length), JSON.stringify(Object.keys(plain(reasoningStatus(...models)))));
+  const probe = reasoningStatus(...models);
+  console.error('DEBUG-G', JSON.stringify(probe.models && probe.models[0] && Object.keys(probe.models[0])));
+  api.render.applyStatus(probe);
+  console.error('DEBUG-H', JSON.stringify(Object.keys(api.state.serverModels[0])));
+  console.error('DEBUG-B', Object.keys(plain(reasoningStatus(...models))).join(','));
+  assert.deepEqual(plain(api.render.currentReasoningMapping(api.state.serverModels[0])),
+    { enabled: true, rules: [{ from: 'medium', to: 'high' }] }, 'the stored policy is the starting point');
+  assert.equal(api.render.reasoningDirty(), false);
+
+  await api.handlers.addReasoningRule();
+  assert.equal(api.render.reasoningDirty(), true);
+  // Switching away keeps the draft for the first model instead of discarding it.
+  api.handlers.selectReasoningModel(select.children[1].value);
+  assert.equal(api.render.reasoningDirty(), false, 'the second model has its own baseline');
+  assert.equal(plain(api.render.currentReasoningMapping(api.state.serverModels[0])).rules.length, 2);
+  api.handlers.selectReasoningModel(first);
+  assert.equal(api.render.reasoningDirty(), true, 'returning to a model restores its draft');
+
+  // A status refresh must not silently accept an unsaved draft as saved.
+  api.render.applyStatus(reasoningStatus(...models));
+  assert.equal(api.render.reasoningDirty(), true, 'an unsaved draft survives a refresh as a draft');
+  // A model that disappears takes its draft with it.
+  models = [{ id: 'od-b', upstream_id: 'vela/gpt-6-luna' }];
+  api.render.applyStatus(reasoningStatus(...models));
+  assert.equal(api.state.reasoningModelKey.includes('od-b'), true, 'the picker falls back to a live model');
+  assert.equal(api.state.reasoningDrafts.size, 0, 'a removed model leaves no orphaned policy');
+});
+
+test('the model test sends a chosen strength and displays the applied conversion', async () => {
+  const bodies = [];
+  const view = fakePage({
+    confirmImpl: () => true,
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/model-test') && init.method === 'POST') {
+        bodies.push(JSON.parse(init.body));
+        return respond(200, {
+          credential_id: 'cred-1', model_id: 'od-flash', status: 'success', upstream_attempted: true, http_status: 200,
+          reasoning_effort: 'high', reasoning_mapping: { from: 'medium', to: 'high' },
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      }
+      if (url.includes('/status')) return respond(200, statusBody());
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.handlers.populateReasoningInputs();
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const strength = view.document.getElementById('modelTestReasoning');
+  assert.equal(strength.children[0].value, '', '未指定 stays the default so an existing test is unchanged');
+  assert.equal(strength.children[0].textContent, '未指定');
+  assert.ok(![...strength.children].some(option => option.value === 'unset'),
+    'the configuration sentinel is not offered as a test input');
+
+  view.document.getElementById('modelTestCredential').value = 'cred-1';
+  view.document.getElementById('modelTestModel').value = 'od-flash';
+  await api.handlers.runModelTest();
+  assert.equal(Object.prototype.hasOwnProperty.call(bodies[0], 'reasoning_effort'), false,
+    'an unspecified strength is omitted from the request body entirely');
+
+  strength.value = 'medium';
+  await api.handlers.runModelTest();
+  assert.equal(bodies[1].reasoning_effort, 'medium', 'the chosen strength is sent as the input strength');
+  const facts = view.document.getElementById('modelTestFacts').textContent;
+  assert.match(facts, /思考强度/, 'the conversion is reported');
+  assert.match(facts, /medium → high/);
+});
+
+test('an injected reasoning value in a model-test response is rendered as literal text', async () => {
+  const injected = '‹img src=x onerror=alert(1)›';
+  const view = fakePage({
+    confirmImpl: () => true,
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/model-test') && init.method === 'POST') {
+        return respond(200, {
+          credential_id: 'cred-1', model_id: 'od-flash', status: 'success',
+          reasoning_effort: injected, reasoning_mapping: { from: injected, to: injected },
+        });
+      }
+      if (url.includes('/status')) return respond(200, statusBody());
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  view.document.getElementById('modelTestCredential').value = 'cred-1';
+  view.document.getElementById('modelTestModel').value = 'od-flash';
+  await api.handlers.runModelTest();
+  const facts = view.document.getElementById('modelTestFacts').textContent;
+  assert.ok(!facts.includes(injected), 'a value outside the closed sets is dropped, not displayed');
+  assert.ok(!facts.includes('思考强度'), 'no row is shown for an unrecognized strength');
+});
+
+test('a request-log row shows a mapped strength and stays quiet for a passthrough', async () => {
+  const logs = {
+    logs: [
+      {
+        id: 'log-1', started_at: '2026-11-05T01:00:00Z', status: 'success', model: 'od-flash',
+        reasoning_effort: 'high', reasoning_mapping: { from: 'medium', to: 'high' },
+      },
+      { id: 'log-2', started_at: '2026-11-05T01:01:00Z', status: 'success', model: 'od-flash', reasoning_effort: 'none' },
+      { id: 'log-3', started_at: '2026-11-05T01:02:00Z', status: 'success', model: 'od-flash' },
+      {
+        id: 'log-4', started_at: '2026-11-05T01:03:00Z', status: 'success', model: 'od-flash',
+        reasoning_effort: '‹b›injected‹/b›', reasoning_mapping: { from: '‹b›', to: '‹b›' },
+      },
+    ],
+    total: 4,
+  };
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/status') ? respond(200, statusBody()) : respond(200, logs)),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.loadRequestLogs({ reset: true });
+  const rows = view.document.getElementById('requestLogList').children;
+  assert.match(rows[0].textContent, /思考强度 medium → high/);
+  assert.match(rows[1].textContent, /思考强度 none/, 'a passthrough with an explicit strength is still reported');
+  assert.ok(!/思考强度/.test(rows[2].textContent), 'a request with no strength shows no row');
+  assert.ok(!rows[3].textContent.includes('injected'), 'an injected value outside the closed sets is dropped');
+});

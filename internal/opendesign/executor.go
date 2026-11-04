@@ -78,6 +78,24 @@ func (s *Service) prepare(r ExecutorRequest) (map[string]any, string, error) {
 	return j, upstream, nil
 }
 
+// prepareWithReasoning decodes the outbound body, resolves the upstream model,
+// and applies the model's thinking-strength policy. The policy runs once, before
+// any attempt, and the same decision feeds both the outbound value and the log
+// row, so a recorded conversion always describes the request that was sent.
+func (s *Service) prepareWithReasoning(r ExecutorRequest, draft *requestLogDraft) (map[string]any, string, error) {
+	j, upstream, err := s.prepare(r)
+	if err != nil {
+		return nil, "", err
+	}
+	if from, to, applied := applyReasoningMapping(j, s.reasoningMappingFor(r.Model)); applied && draft != nil {
+		draft.reasoningFrom, draft.reasoningTo, draft.reasoningMapped = from, to, true
+	}
+	if draft != nil {
+		draft.reasoningEffort = reasoningEffortOf(j)
+	}
+	return j, upstream, nil
+}
+
 // decodeObject preserves every number as json.Number so an integer the client
 // sent cannot come back as a float.
 func decodeObject(raw []byte) (map[string]any, error) {
@@ -132,7 +150,7 @@ func (s *Service) executePinned(raw json.RawMessage, upstreamModel string, crede
 		return nil, err
 	}
 	draft.credentialID = c.ID
-	j, upstream, err := s.prepare(r)
+	j, upstream, err := s.prepareWithReasoning(r, draft)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +229,7 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 		return nil, err
 	}
 	draft.credentialID = c.ID
-	j, upstream, err := s.prepare(r)
+	j, upstream, err := s.prepareWithReasoning(r, draft)
 	if err != nil {
 		return nil, err
 	}

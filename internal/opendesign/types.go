@@ -12,7 +12,7 @@ import (
 
 const (
 	// Version is the plugin version advertised at registration.
-	Version = "0.4.4"
+	Version = "0.4.5"
 	// PluginID is the CPA plugin identifier and management path segment.
 	PluginID = "open-design"
 	// Provider is the CPA provider key for this plugin.
@@ -86,6 +86,24 @@ func localFail(status int, kind, message string) error {
 type Model struct {
 	ID         string `json:"id"`
 	UpstreamID string `json:"upstream_id"`
+	// Reasoning is the per-model thinking-strength policy. It is optional so a
+	// mapping written by an older version keeps working unchanged.
+	Reasoning *ReasoningMapping `json:"reasoning_mapping,omitempty"`
+}
+
+// ReasoningMapping is one model's thinking-strength policy: whether the mapping
+// runs, and which incoming strengths it rewrites. Rules are an ordered list so
+// settings.json stays byte-stable across saves; the source is the address, so a
+// duplicate source cannot be stored.
+type ReasoningMapping struct {
+	Enabled bool            `json:"enabled" yaml:"enabled"`
+	Rules   []ReasoningRule `json:"rules,omitempty" yaml:"rules,omitempty"`
+}
+
+// ReasoningRule rewrites one incoming strength onto the value sent upstream.
+type ReasoningRule struct {
+	From string `json:"from" yaml:"from"`
+	To   string `json:"to" yaml:"to"`
 }
 
 // Config is the plugin-owned configuration. There is no field for credentials:
@@ -152,6 +170,9 @@ func (c *Config) validate() error {
 			return localFail(http.StatusBadRequest, "invalid_request", "model aliases must be unique")
 		}
 		seen[m.ID] = true
+		if err := validateReasoningMapping(m.Reasoning); err != nil {
+			return err
+		}
 	}
 	if c.Logs.RetentionDays != 0 && (c.Logs.RetentionDays < 1 || c.Logs.RetentionDays > maxRequestLogRetentionDays) {
 		return fail(http.StatusBadRequest, "logs.retention_days must be between 1 and 90")

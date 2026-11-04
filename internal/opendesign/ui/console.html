@@ -101,6 +101,13 @@
     .button.compact { min-height: 34px; padding: 4px 10px; font-size: 12px; }
     .check { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
     .check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); flex: none; }
+    .effort-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .effort-table th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 500; }
+    .effort-table th, .effort-table td { padding: 7px 0; border-bottom: 1px solid var(--line); }
+    .effort-table th:last-child, .effort-table td:last-child { width: 96px; text-align: right; }
+    .effort-table td:first-child { padding-right: 18px; }
+    .effort-table select { width: 100%; }
+    .effort-table .effort-empty { color: var(--muted); text-align: center; padding: 18px 0; border-bottom: none; }
     .rows { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 8px; }
     .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
     .row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; min-width: 0; }
@@ -396,6 +403,44 @@
       </div>
     </section>
 
+    <section class="panel" id="reasoningPanel" aria-labelledby="reasoningTitle">
+      <div class="panel-head">
+        <div>
+          <h2 id="reasoningTitle">思考强度映射</h2>
+          <p class="hint">请求传入 → 发往上游。只改写顶层 <span class="mono">reasoning_effort</span>；未添加规则的强度直接透传，目标选「未设置」会移除该字段。已有 <span class="mono">thinking</span> / <span class="mono">reasoning</span> 且未传强度时保留原策略。每个模型独立配置，默认关闭。</p>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="toolbar">
+          <label class="field">
+            <span>模型</span>
+            <select class="control" id="reasoningModel"><option value="" disabled selected>暂无模型</option></select>
+          </label>
+          <span class="badge warn" id="reasoningDirty" hidden>未保存</span>
+        </div>
+        <label class="check" style="max-width: 340px;">
+          <input id="reasoningEnabled" type="checkbox">
+          启用此模型的映射
+        </label>
+        <table class="effort-table">
+          <thead>
+            <tr>
+              <th scope="col">请求传入</th>
+              <th scope="col" title="选择「未设置」会移除 reasoning_effort 字段；模型默认强度由上游决定。">映射为</th>
+              <th scope="col">操作</th>
+            </tr>
+          </thead>
+          <tbody id="reasoningRows"></tbody>
+        </table>
+        <div class="panel-actions">
+          <button class="button compact" id="addReasoningRule" type="button">添加规则</button>
+          <button class="button compact" id="resetReasoningTable" type="button">恢复默认表</button>
+          <button class="button primary" id="saveReasoning" type="button">保存映射</button>
+        </div>
+        <p class="state" id="reasoningState" role="status" aria-live="polite" hidden></p>
+      </div>
+    </section>
+
       <section class="panel" aria-labelledby="modelTestTitle">
         <div class="panel-head">
           <div>
@@ -417,6 +462,12 @@
           <label class="field">
             <span>提示词（可选）</span>
             <input class="control" id="modelTestPrompt" maxlength="512" autocomplete="off" placeholder="默认使用极小的探测提示">
+          </label>
+          <label class="field narrow">
+            <span>思考强度（可选）</span>
+            <select class="control" id="modelTestReasoning">
+              <option value="" selected>未指定</option>
+            </select>
           </label>
           <button class="button primary" id="runModelTest" type="button">发送测试</button>
         </div>

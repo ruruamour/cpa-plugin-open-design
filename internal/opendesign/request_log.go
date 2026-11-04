@@ -63,6 +63,18 @@ type RequestLogEntry struct {
 	// reached the provider. A nil value is treated as true for logs written by
 	// versions before this field existed.
 	UpstreamAttempted *bool `json:"upstream_attempted,omitempty"`
+	// ReasoningEffort is the top-level strength the request carried when it was
+	// sent upstream, after any mapping rule ran. Empty means no explicit value.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// ReasoningMapping records a rule that changed the strength. It is absent
+	// when no rule matched, so "unchanged" and "no rule" stay distinguishable.
+	ReasoningMapping *RequestLogReasoningMapping `json:"reasoning_mapping,omitempty"`
+}
+
+// RequestLogReasoningMapping is the closed from→to pair of one applied rule.
+type RequestLogReasoningMapping struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 type requestLogSettings struct {
@@ -1195,6 +1207,10 @@ type requestLogDraft struct {
 	upstreamAttempted bool
 	secrets           []string
 	usage             tokenUsage
+	reasoningEffort   string
+	reasoningFrom     string
+	reasoningTo       string
+	reasoningMapped   bool
 }
 
 func (s *Service) recordRequestLog(draft *requestLogDraft, requestErr error) {
@@ -1220,6 +1236,12 @@ func (s *Service) recordRequestLog(draft *requestLogDraft, requestErr error) {
 		InputTokens:   sanitizeToken(draft.usage.Input),
 		OutputTokens:  sanitizeToken(draft.usage.Output),
 		TotalTokens:   sanitizeToken(draft.usage.Total),
+	}
+	// Both values come from closed strength sets the plugin itself operates on,
+	// never from upstream text, so they are safe to store as-is.
+	entry.ReasoningEffort = draft.reasoningEffort
+	if draft.reasoningMapped {
+		entry.ReasoningMapping = &RequestLogReasoningMapping{From: draft.reasoningFrom, To: draft.reasoningTo}
 	}
 	if entry.DurationMS < 0 {
 		entry.DurationMS = 0
@@ -1338,6 +1360,20 @@ func sanitizeRequestLogEntry(entry RequestLogEntry, keys ...string) (RequestLogE
 			entry.ErrorKind = nil
 		} else {
 			entry.ErrorKind = &kind
+		}
+	}
+	// A strength is stored only when it is one the plugin itself recognises. A
+	// hand-edited snapshot can therefore not smuggle arbitrary text into the
+	// console through the reasoning column.
+	if entry.ReasoningEffort != "" && !isReasoningSource(entry.ReasoningEffort) {
+		entry.ReasoningEffort = ""
+	}
+	if entry.ReasoningMapping != nil {
+		from, to := entry.ReasoningMapping.From, entry.ReasoningMapping.To
+		if !isReasoningSource(from) || !isReasoningTarget(to) {
+			entry.ReasoningMapping = nil
+		} else {
+			entry.ReasoningMapping = &RequestLogReasoningMapping{From: from, To: to}
 		}
 	}
 	entry.InputTokens = sanitizeToken(entry.InputTokens)

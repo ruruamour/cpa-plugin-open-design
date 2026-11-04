@@ -37,6 +37,13 @@
     upstreamQuery: '',
     mappings: [],
     savedMappings: [],
+    // Models exactly as the server describes them, including each saved
+    // thinking-strength policy. Kept apart from the editor rows above, which
+    // carry only id and upstream_id and drive the dirty badge.
+    serverModels: [],
+    reasoningModelKey: '',
+    reasoningDrafts: new Map(),
+    reasoningSaving: false,
     accountEdit: null,
     authCollapsed: false,
     // Quota snapshots are keyed by credential id. They are only fetched when the
@@ -190,7 +197,7 @@
   }
 
   function showPanels(connected) {
-    for (const id of ['accountsPanel', 'modelsPanel']) {
+    for (const id of ['accountsPanel', 'modelsPanel', 'reasoningPanel']) {
       const node = $(id);
       if (node) node.hidden = !connected;
     }
@@ -207,11 +214,12 @@
       const node = $(id);
       if (node) node.disabled = state.busy;
     }
-    for (const id of ['accountList', 'upstreamList', 'mappingList']) {
+    for (const id of ['accountList', 'upstreamList', 'mappingList', 'reasoningRows']) {
       setRowButtonsDisabled($(id), state.busy);
     }
     syncFetchButton();
     syncModelTools();
+    syncReasoningControls();
     // Rebuild account rows on release so disabled accounts keep their
     // 「获取模型」 button disabled (the sweep above cannot know it).
     if (!state.busy) renderAccounts();
@@ -470,6 +478,10 @@
     state.upstreamQuery = '';
     state.mappings = [];
     state.savedMappings = [];
+    state.serverModels = [];
+    state.reasoningModelKey = '';
+    state.reasoningDrafts.clear();
+    state.reasoningSaving = false;
     state.requestLogs = [];
     state.logQuery = { offset: 0, limit: 50, status: '', model: '', credentialID: '', attempted: '' };
     state.logPage = { loaded: false, total: 0, offset: 0, limit: 50, has_more: false, next_offset: null, retention: null };
@@ -641,9 +653,15 @@
     // discard mapping edits the operator has not saved yet. The saved baseline is
     // always refreshed; the draft is replaced only when it is not dirty.
     const dirty = mappingsDirty();
+    // state.status and incoming are the same object, so the server's model list
+    // has to be captured before status.models is replaced with the editor-shaped
+    // clone below: that write would otherwise rebind incoming.models too and the
+    // stored thinking-strength policies would be lost.
+    const fullModels = incoming.models;
     state.status = incoming;
     state.status.models = cloneMappings(serverModels);
     state.savedMappings = cloneMappings(serverModels);
+    state.serverModels = Array.isArray(fullModels) ? fullModels : [];
     if (!dirty) state.mappings = cloneMappings(serverModels);
     if (state.accountEdit && !incoming.credentials.some(item => item.id === state.accountEdit.id)) {
       resetAccountForm();
@@ -1053,6 +1071,7 @@
     renderCredentialOptions();
     renderUpstream();
     renderMappings();
+    renderReasoning();
   }
 
   function visibleUpstream() {
@@ -1710,7 +1729,7 @@
     setDisabled('loadRuntime', optionalBusy('runtime'));
     setDisabled('openErrorRules', optionalBusy('errorRules'));
     syncErrorRulesControls();
-    for (const id of ['runModelTest', 'modelTestCredential', 'modelTestModel', 'modelTestPrompt']) {
+    for (const id of ['runModelTest', 'modelTestCredential', 'modelTestModel', 'modelTestPrompt', 'modelTestReasoning']) {
       setDisabled(id, optionalBusy('modelTest'));
     }
   }
@@ -1761,6 +1780,13 @@
     if (record.model) details.push(`模型 ${record.model}`);
     if (record.started_at) details.push(`时间 ${Core.formatTime(record.started_at) || record.started_at}`);
     if (record.upstream_model && record.upstream_model !== record.model) details.push(`上游 ${record.upstream_model}`);
+    // Only the conversion is shown: an unmapped request is indistinguishable from
+    // one that never carried a strength, so the row stays quiet in both cases.
+    if (record.reasoning_mapping) {
+      details.push(`思考强度 ${Core.reasoningConversionText(record.reasoning_effort, record.reasoning_mapping)}`);
+    } else if (record.reasoning_effort) {
+      details.push(`思考强度 ${Core.reasoningLabel(record.reasoning_effort)}`);
+    }
     details.push(`账户 ${credentialLabel(record.credential_id)}`);
     if (record.duration_ms !== null) details.push(`耗时 ${record.duration_ms} ms`);
     if (record.total_tokens !== null) details.push(`Token ${record.total_tokens}`);
@@ -2501,6 +2527,14 @@
     if (result.upstream_attempted === true) items.push({ label: '上游已尝试', value: '是' });
     else if (result.upstream_attempted === false) items.push({ label: '上游已尝试', value: '否（本地拒绝）' });
     if (result.upstream_attempted === true && result.http_status !== null) items.push({ label: '上游 HTTP', value: String(result.http_status) });
+    // The plugin sends the strength after the model's mapping runs, so the row
+    // shows the conversion an operator configured rather than the raw input.
+    if (result.reasoning_effort) {
+      items.push({
+        label: '思考强度',
+        value: Core.reasoningConversionText(result.reasoning_effort, result.reasoning_mapping),
+      });
+    }
     if (result.duration_ms !== null) items.push({ label: '耗时', value: `${result.duration_ms} ms` });
     if (result.usage.total_tokens !== null) items.push({ label: 'Token 总量', value: String(result.usage.total_tokens) });
     if (result.usage.prompt_tokens !== null) items.push({ label: '输入 Token', value: String(result.usage.prompt_tokens) });
@@ -2528,8 +2562,10 @@
     const credential = $('modelTestCredential');
     const model = $('modelTestModel');
     const prompt = $('modelTestPrompt');
+    const reasoning = $('modelTestReasoning');
     const credentialID = credential ? credential.value : '';
     const modelID = model ? model.value.trim() : '';
+    const reasoningEffort = reasoning ? reasoning.value : '';
     if (!credentialID) {
       message('modelTestState', '请先选择要测试的账户。', 'error');
       return;
@@ -2538,7 +2574,10 @@
       message('modelTestState', '请填写客户端模型名后再发送测试。', 'error');
       return;
     }
-    if (typeof confirm === 'function' && !confirm(`向账户「${credentialLabel(credentialID)}」发送一次真实模型测试请求（模型 ${modelID}）？这会产生一次真实推理用量。`)) return;
+    const reasoningNote = reasoningEffort
+      ? `，思考强度 ${Core.reasoningLabel(reasoningEffort)}（按该模型已保存的映射转换）`
+      : '';
+    if (typeof confirm === 'function' && !confirm(`向账户「${credentialLabel(credentialID)}」发送一次真实模型测试请求（模型 ${modelID}${reasoningNote}）？这会产生一次真实推理用量。`)) return;
     const generation = state.optionalGeneration;
     const modelTestGeneration = state.modelTestGeneration;
     setOptionalBusy('modelTest', true);
@@ -2557,6 +2596,7 @@
         credentialID,
         modelID,
         prompt: prompt ? prompt.value.trim() : '',
+        reasoningEffort,
       });
       if (!stillCurrent()) return;
       if (!resultStillCurrent()) return;
@@ -2617,6 +2657,15 @@
       state.status.models = cloneMappings(normalized);
       state.savedMappings = cloneMappings(normalized);
       state.mappings = cloneMappings(normalized);
+      // The server echoes each model's stored policy, so the reasoning table's
+      // baseline moves with the model list instead of going stale.
+      applyServerModels(raw && Array.isArray(raw.models)
+        ? raw.models.map(item => ({
+          id: String(item.id || '').trim(),
+          upstream_id: String(item.upstream_id || '').trim(),
+          reasoning_mapping: item.reasoning_mapping || null,
+        })).filter(item => item.id && item.upstream_id)
+        : normalized);
       renderModels();
       message('modelState', `已保存 ${normalized.length} 个模型映射。`);
     } catch (error) {
@@ -2665,6 +2714,249 @@
     message('modelState', '已还原为最近一次保存的模型映射。', '');
   }
 
+  // --- thinking-strength mapping -------------------------------------------
+
+  // A model is identified by both halves of its mapping, so editing an alias to
+  // point at a different upstream is treated as a different model (and the
+  // policy has to be saved again for the new upstream).
+  function reasoningModelKey(model) {
+    return `${String((model && model.id) || '').trim()}\u0000${String((model && model.upstream_id) || '').trim()}`;
+  }
+
+  function selectedReasoningModel() {
+    const key = state.reasoningModelKey;
+    return state.serverModels.find(model => reasoningModelKey(model) === key) || null;
+  }
+
+  // A draft wins while one exists; otherwise the saved policy, and for a model
+  // that has never been saved the pre-fill derived from its upstream ID. Draft
+  // rules keep the operator's row order so editing never reshuffles the table.
+  function currentReasoningMapping(model) {
+    if (!model) return { enabled: false, rules: [] };
+    const draft = state.reasoningDrafts.get(reasoningModelKey(model));
+    if (draft) return { enabled: draft.enabled, rules: draft.rules.map(rule => ({ from: rule.from, to: rule.to })) };
+    if (model.reasoning_mapping) return Core.normalizeReasoningMapping(model.reasoning_mapping);
+    return Core.defaultReasoningMapping(model.upstream_id);
+  }
+
+  function reasoningBaseline(model) {
+    if (!model) return { enabled: false, rules: [] };
+    return model.reasoning_mapping
+      ? Core.normalizeReasoningMapping(model.reasoning_mapping)
+      : Core.defaultReasoningMapping(model.upstream_id);
+  }
+
+  function reasoningDirty() {
+    const model = selectedReasoningModel();
+    if (!model) return false;
+    return Core.reasoningKey(currentReasoningMapping(model)) !== Core.reasoningKey(reasoningBaseline(model));
+  }
+
+  // Drafts are only kept for models that still exist, so a removed model can
+  // never leave an orphaned policy behind.
+  function pruneReasoningDrafts() {
+    const live = new Set(state.serverModels.map(reasoningModelKey));
+    for (const key of [...state.reasoningDrafts.keys()]) {
+      if (!live.has(key)) state.reasoningDrafts.delete(key);
+    }
+  }
+
+  function updateReasoningRows(mutate) {
+    const model = selectedReasoningModel();
+    if (!model) return;
+    const draft = currentReasoningMapping(model);
+    mutate(draft);
+    state.reasoningDrafts.set(reasoningModelKey(model), { enabled: draft.enabled, rules: draft.rules });
+    renderReasoning();
+  }
+
+  function setReasoningEnabled(enabled) {
+    updateReasoningRows(draft => { draft.enabled = Boolean(enabled); });
+    message('reasoningState', '');
+  }
+
+  function addReasoningRule() {
+    const model = selectedReasoningModel();
+    if (!model) return;
+    const next = Core.nextReasoningSource(currentReasoningMapping(model).rules);
+    if (!next) {
+      message('reasoningState', '所有请求强度都有规则了，无需再添加。', '');
+      return;
+    }
+    // A new rule is an identity mapping: it changes nothing until the operator
+    // picks a target, so adding a row can never silently rewrite traffic.
+    updateReasoningRows(draft => { draft.rules.push({ from: next, to: next }); });
+    message('reasoningState', '');
+  }
+
+  function removeReasoningRule(index) {
+    updateReasoningRows(draft => { draft.rules.splice(index, 1); });
+    message('reasoningState', '');
+  }
+
+  function changeReasoningRule(index, field, value) {
+    const model = selectedReasoningModel();
+    if (!model) return;
+    const draft = currentReasoningMapping(model);
+    if (!draft.rules[index]) return;
+    if (field === 'from' && draft.rules.some((rule, other) => other !== index && rule.from === value)) {
+      // Two rules for one strength would be rejected by the plugin, so the
+      // duplicate is refused here instead of failing at save time.
+      renderReasoning();
+      message('reasoningState', `请求强度「${Core.reasoningLabel(value)}」已有规则，请先修改或删除原有规则。`, 'error');
+      return;
+    }
+    draft.rules[index][field] = value;
+    state.reasoningDrafts.set(reasoningModelKey(model), { enabled: draft.enabled, rules: draft.rules });
+    renderReasoning();
+    message('reasoningState', '');
+  }
+
+  // Restores the vendor table for the selected model, enabled or not, without
+  // writing anything: the operator still has to save.
+  function resetReasoningTable() {
+    const model = selectedReasoningModel();
+    if (!model) return;
+    updateReasoningRows(draft => {
+      draft.rules = Core.defaultReasoningRules();
+    });
+    message('reasoningState', '已恢复默认表，点击「保存映射」后生效。', '');
+  }
+
+  function reasoningSelect(value, options, onChange) {
+    const node = el('select', { className: 'control' });
+    for (const option of options) node.append(el('option', { value: option.value, text: option.label }));
+    node.value = value;
+    node.addEventListener('change', event => onChange(event.target.value));
+    return node;
+  }
+
+  function renderReasoningRows(rules, model) {
+    const body = $('reasoningRows');
+    if (!body) return;
+    const rows = [];
+    if (!model) {
+      rows.push(el('tr', {}, [el('td', { className: 'effort-empty', attrs: { colspan: '3' }, text: '先保存模型映射，再配置思考强度。' })]));
+    } else {
+      if (!rules.length) {
+        rows.push(el('tr', {}, [el('td', { className: 'effort-empty', attrs: { colspan: '3' }, text: '暂无规则，所有强度直接透传' })]));
+      }
+      rules.forEach((rule, index) => {
+        rows.push(el('tr', {}, [
+          el('td', {}, [reasoningSelect(rule.from, Core.reasoningSourceOptions(), value => changeReasoningRule(index, 'from', value))]),
+          el('td', {}, [reasoningSelect(rule.to, Core.reasoningTargetOptions(), value => changeReasoningRule(index, 'to', value))]),
+          el('td', {}, [el('button', { className: 'button compact danger', type: 'button', text: '删除', on: () => removeReasoningRule(index) })]),
+        ]));
+      });
+    }
+    body.replaceChildren(...rows);
+  }
+
+  function syncReasoningControls() {
+    const model = selectedReasoningModel();
+    const mapping = currentReasoningMapping(model);
+    const busy = state.busy || state.reasoningSaving;
+    const enabled = $('reasoningEnabled');
+    if (enabled) {
+      enabled.checked = mapping.enabled;
+      enabled.disabled = busy || !model;
+    }
+    const modelSelect = $('reasoningModel');
+    if (modelSelect) modelSelect.disabled = busy || !state.serverModels.length;
+    const add = $('addReasoningRule');
+    if (add) add.disabled = busy || !model || !Core.nextReasoningSource(mapping.rules);
+    const reset = $('resetReasoningTable');
+    if (reset) reset.disabled = busy || !model;
+    const save = $('saveReasoning');
+    if (save) save.disabled = busy || !model;
+    const dirty = $('reasoningDirty');
+    if (dirty) dirty.hidden = !model || !reasoningDirty();
+  }
+
+  function renderReasoning() {
+    pruneReasoningDrafts();
+    const select = $('reasoningModel');
+    if (select) {
+      const options = state.serverModels.map(model => el('option', {
+        value: reasoningModelKey(model),
+        text: `${model.id} → ${model.upstream_id}`,
+      }));
+      if (!options.length) options.push(el('option', { value: '', text: '暂无模型', disabled: true }));
+      select.replaceChildren(...options);
+      const previous = state.reasoningModelKey;
+      const keep = state.serverModels.some(model => reasoningModelKey(model) === previous);
+      state.reasoningModelKey = keep ? previous : (state.serverModels.length ? reasoningModelKey(state.serverModels[0]) : '');
+      select.value = state.reasoningModelKey;
+    }
+    const model = selectedReasoningModel();
+    renderReasoningRows(currentReasoningMapping(model).rules, model);
+    syncReasoningControls();
+    if (!model) message('reasoningState', '');
+  }
+
+  function selectReasoningModel(key) {
+    state.reasoningModelKey = String(key || '');
+    renderReasoning();
+    message('reasoningState', '');
+  }
+
+  // The model test's strength picker. "未指定" stays the default so a test with
+  // no strength behaves exactly as it did before this control existed.
+  function populateReasoningInputs() {
+    const select = $('modelTestReasoning');
+    if (!select) return;
+    const options = Core.reasoningSourceOptions().filter(option => option.value !== 'unset');
+    select.replaceChildren(
+      el('option', { value: '', text: '未指定' }),
+      ...options.map(option => el('option', { value: option.value, text: option.label })),
+    );
+  }
+
+  // The reasoning panel reads the server's model list only, so a reasoning save
+  // refreshes that list without touching the model editor's saved baseline.
+  function applyServerModels(models) {
+    state.serverModels = Array.isArray(models) ? models : [];
+  }
+
+  async function saveReasoning() {
+    const model = selectedReasoningModel();
+    if (!model || state.reasoningSaving || state.busy) return;
+    let payload;
+    try {
+      payload = Core.buildReasoningPayload(model, currentReasoningMapping(model));
+    } catch (error) {
+      message('reasoningState', `无法保存：${error.message}`, 'error');
+      return;
+    }
+    state.reasoningSaving = true;
+    syncReasoningControls();
+    message('reasoningState', '正在保存思考强度映射…');
+    try {
+      const raw = await api().saveReasoningMapping(payload);
+      applyServerModels(raw && Array.isArray(raw.models) ? raw.models : null);
+      state.reasoningDrafts.delete(reasoningModelKey(model));
+      // The policy is request-shaping state: a result produced under the old
+      // rules no longer describes what the plugin will now send.
+      invalidateModelTestResult();
+      renderReasoning();
+      message('reasoningState', `已保存 ${model.id} 的思考强度映射${payload.reasoning_mapping.enabled ? '（已启用）' : '（当前关闭，不生效）'}。`);
+    } catch (error) {
+      if (isAuthStatus(error.status) && !isUpstreamSource(error)) {
+        clearRejectedManagementAuth();
+        showAuth(error.status === 401 ? '401：管理密钥无效或已过期，映射未保存。' : `403：${formatError(error)}`);
+      } else if (error.status === 409) {
+        message('reasoningState', `保存失败：上游模型 ID 已变化，请先刷新状态再重新配置。`, 'error');
+      } else if (error.status === 404) {
+        message('reasoningState', '保存失败：模型已不存在，请刷新状态。', 'error');
+      } else {
+        message('reasoningState', `保存失败：${formatError(error)}`, 'error');
+      }
+    } finally {
+      state.reasoningSaving = false;
+      syncReasoningControls();
+    }
+  }
+
   function setAuthCollapsed(collapsed) {
     state.authCollapsed = Boolean(collapsed);
     const body = $('authBody');
@@ -2681,6 +2973,7 @@
   }
 
   function bind() {
+    populateReasoningInputs();
     const authForm = $('authForm');
     if (authForm) authForm.addEventListener('submit', submitAuth);
     const clear = $('authClear');
@@ -2699,6 +2992,16 @@
     if (addButton) addButton.addEventListener('click', addMapping);
     const revertButton = $('revertMappings');
     if (revertButton) revertButton.addEventListener('click', revertMappings);
+    const reasoningModel = $('reasoningModel');
+    if (reasoningModel) reasoningModel.addEventListener('change', () => selectReasoningModel(reasoningModel.value));
+    const reasoningEnabled = $('reasoningEnabled');
+    if (reasoningEnabled) reasoningEnabled.addEventListener('change', () => setReasoningEnabled(reasoningEnabled.checked));
+    const addReasoning = $('addReasoningRule');
+    if (addReasoning) addReasoning.addEventListener('click', addReasoningRule);
+    const resetReasoning = $('resetReasoningTable');
+    if (resetReasoning) resetReasoning.addEventListener('click', resetReasoningTable);
+    const saveReasoningButton = $('saveReasoning');
+    if (saveReasoningButton) saveReasoningButton.addEventListener('click', saveReasoning);
     const select = $('modelCredential');
     if (select) select.addEventListener('change', () => selectCredential(select.value));
     const search = $('upstreamSearch');
@@ -2882,6 +3185,14 @@
       saveModels,
       addMapping,
       revertMappings,
+      selectReasoningModel,
+      setReasoningEnabled,
+      addReasoningRule,
+      removeReasoningRule,
+      changeReasoningRule,
+      resetReasoningTable,
+      saveReasoning,
+      populateReasoningInputs,
       refreshQuota,
       checkModelCoverage,
       filterUpstream,
@@ -2918,6 +3229,9 @@
       renderModelCoverage,
       renderMappings,
       renderModels,
+      renderReasoning,
+      reasoningDirty,
+      currentReasoningMapping,
       showAuth,
       loadStatus,
       resetAccountForm,
