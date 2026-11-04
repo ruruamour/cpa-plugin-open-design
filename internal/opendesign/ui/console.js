@@ -45,6 +45,10 @@
     quotaBusy: {},
     quotaGeneration: 0,
     quotaRevisions: {},
+    // Set while the credentials tab walks the accounts one by one. It is cleared
+    // by a generation bump, so a logout or a credential edit stops the walk.
+    quotaAutoGeneration: 0,
+    quotaAutoRunning: false,
     // Model coverage is a separate cache. It carries only official preflight
     // signals and never shares quota snapshots or quota busy state.
     modelCoverage: {},
@@ -99,6 +103,10 @@
   // Logout invalidates every request; editing one credential invalidates only
   // its own quota and model-coverage requests so other accounts can finish.
   function invalidateQuota(credentialID) {
+    // Any invalidation also cancels an in-flight walk: a logout clears every
+    // snapshot, and editing one account must not continue with stale rows.
+    state.quotaAutoGeneration += 1;
+    state.quotaAutoRunning = false;
     if (credentialID === undefined) {
       state.quotaGeneration += 1;
       state.quotaRevisions = {};
@@ -261,6 +269,10 @@
       const active = $(target.button);
       if (active && typeof active.focus === 'function') active.focus();
     }
+    // Leaving the tab cancels the walk before anything else can run, so a slow
+    // response cannot start the next account after the operator moved on.
+    if (target.name !== 'credentials') cancelQuotaAutoLoad();
+    if (target.name === 'credentials') void autoLoadQuotaForAccounts();
     return target.name;
   }
 
@@ -924,9 +936,38 @@
     return card;
   }
 
+  // Opening the credentials tab refreshes every configured account once. The walk
+  // is strictly serial: one upstream query at a time, so a tab switch never fans
+  // out into a burst against the official control API. A generation bump (logout,
+  // credential edit, another tab switch) cancels the rest of the walk.
+  function cancelQuotaAutoLoad() {
+    state.quotaAutoGeneration += 1;
+    state.quotaAutoRunning = false;
+  }
+
+  async function autoLoadQuotaForAccounts() {
+    const generation = (state.quotaAutoGeneration += 1);
+    state.quotaAutoRunning = true;
+    try {
+      for (const item of state.status.credentials.slice()) {
+        if (generation !== state.quotaAutoGeneration) return;
+        if (!item || !item.billing_configured || item.disabled) continue;
+        if (state.quotaBusy[item.id]) continue;
+        // A snapshot still inside the 60s window would only come back throttled,
+        // so the walk skips it instead of spending a request to learn nothing.
+        const known = state.quotas[item.id];
+        const next = known && known.next_refresh_at ? Date.parse(known.next_refresh_at) : NaN;
+        if (!Number.isNaN(next) && next > Date.now()) continue;
+        await refreshQuota(item, { automatic: true });
+      }
+    } finally {
+      if (generation === state.quotaAutoGeneration) state.quotaAutoRunning = false;
+    }
+  }
+
   function quotaRefreshHint(quota) {
     const next = quota && quota.next_refresh_at ? Date.parse(quota.next_refresh_at) : NaN;
-    if (Number.isNaN(next)) return '额度查询不会自动轮询；只有点「刷新额度」才会向上游请求。';
+    if (Number.isNaN(next)) return '打开本页会按账户顺序自动查询一次；也可以随时点「刷新额度」。';
     const seconds = Math.round((next - Date.now()) / 1000);
     if (seconds <= 0) return '可以刷新额度。';
     return `两次上游查询至少间隔 60 秒，约 ${seconds} 秒后可再次刷新。`;
@@ -938,7 +979,7 @@
     const head = el('div', { className: 'quota-head' }, [
       el('span', { className: 'quota-window-title', text: '额度' }),
       quota ? quotaStateBadge(quota.state) : el('span', { className: 'badge', text: item.billing_configured ? '未查询' : '未配置' }),
-      el('span', { className: 'hint', text: quota ? quotaRefreshHint(quota) : '额度查询可选，不会自动请求。' }),
+      el('span', { className: 'hint', text: quota ? quotaRefreshHint(quota) : (item.billing_configured ? '打开本页会自动按顺序查询。' : '额度查询可选，未配置时不查询。') }),
     ]);
     const refresh = button(busy ? '刷新中…' : '刷新额度', 'refresh-quota', {
       className: 'button compact',
@@ -959,7 +1000,7 @@
     } else if (!quota) {
       cards.append(el('div', { className: 'quota-card' }, [
         el('h4', { text: '尚未查询' }),
-        el('p', { className: 'quota-note', text: '点「刷新额度」读取。本页不会自动向上游查询。' }),
+        el('p', { className: 'quota-note', text: '打开本页会按账户顺序自动查询一次，也可以点「刷新额度」立即读取。' }),
       ]));
     } else {
       cards.append(quotaWalletCard(item, quota));
@@ -1581,11 +1622,13 @@
     }
   }
 
-  // Explicit refresh only. A cached GET without refresh=1 never reaches upstream,
-  // so opening/refreshing the page cannot spend quota calls.
-  async function refreshQuota(item) {
+  // Refreshes one account. The explicit button and the serial tab walk share it;
+  // automatic runs stay silent on success so opening the tab does not spam the
+  // status line with one message per account.
+  async function refreshQuota(item, options = {}) {
+    const automatic = options.automatic === true;
     if (!item || !item.billing_configured) {
-      message('accountState', '该账户还没有配置官方 controlKey，无法查询额度。点「编辑」添加后再试。', 'error');
+      if (!automatic) message('accountState', '该账户还没有配置官方 controlKey，无法查询额度。点「编辑」添加后再试。', 'error');
       return;
     }
     if (state.quotaBusy[item.id]) return;
@@ -1604,12 +1647,17 @@
         const previous = state.quotas[item.id];
         if (previous) previous.next_refresh_at = quota.next_refresh_at;
         else state.quotas[item.id] = quota;
-        message('accountState', `额度刷新已节流：${quotaRefreshHint(quota)}`, '');
+        if (!automatic) message('accountState', `额度刷新已节流：${quotaRefreshHint(quota)}`, '');
       } else {
         state.quotas[item.id] = quota;
-        message('accountState', quota.state === 'error'
-          ? `账户「${item.label}」额度查询失败：${quotaErrorText('未取得数据', quota.error)}；管理登录未受影响。`
-          : `账户「${item.label}」额度已更新（${QUOTA_STATE_TEXT[quota.state] || quota.state}）。`, quota.state === 'error' ? 'error' : '');
+        const failed = quota.state === 'error';
+        // The serial walk reports failures only: a toast per healthy account on
+        // every tab switch would bury the one account that actually needs help.
+        if (!automatic || failed) {
+          message('accountState', failed
+            ? `账户「${item.label}」额度查询失败：${quotaErrorText('未取得数据', quota.error)}；管理登录未受影响。`
+            : `账户「${item.label}」额度已更新（${QUOTA_STATE_TEXT[quota.state] || quota.state}）。`, failed ? 'error' : '');
+        }
       }
       renderAccounts();
     } catch (error) {

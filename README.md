@@ -2,13 +2,15 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`，当前版本 `0.4.2`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`，当前版本 `0.4.3`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
-> `0.4.0` 在 `0.3.0` 之上增加可编辑的重试调度／错误规则，已于 2026-11-04 部署到 `nuoapi-net`；`0.4.1` 修复 Windows 上请求日志持久化与跨平台测试；`0.4.2` 把 settings.json 与错误规则文件也纳入同一条重试发布路径，并锁定裸 402 不并入额度分类。验收记录同样在该文档。
+> `0.4.0` 在 `0.3.0` 之上增加可编辑的重试调度／错误规则，已于 2026-11-04 部署到 `nuoapi-net`；`0.4.1` 修复 Windows 上请求日志持久化与跨平台测试；`0.4.2` 把 settings.json 与错误规则文件也纳入同一条重试发布路径，并锁定裸 402 不并入额度分类；`0.4.3` 让「凭据 · 额度」标签页在打开时按账户顺序串行刷新额度。验收记录同样在该文档。
 
 ## 功能
+
+`0.4.3` 让控制台的「凭据 · 额度」标签页在打开时自动按账户顺序逐个查询一次额度：一个账号一个账号地查，不并发；离开标签页即停止；60 秒节流窗口内的账号会被跳过；未配置 control Key 或已停用的账号不查询。失败账号会在状态行单独提示，成功账号不再逐个弹出消息。
 
 `0.4.2` 把插件内所有持久化重命名（请求日志、快照、settings.json、错误规则文件）统一到同一条带有限重试的发布路径，避免 Windows 上目标文件被占用时保存失败；并补两条用例锁定裸 402 不并入额度分类（只有带 `insufficient_quota` 码的 402 才换号冷却）。
 
@@ -16,7 +18,7 @@
 
 `0.4.0` 于 2026-11-04 从提交 `e66497e` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台、错误规则同步和原有效插件核验通过。
 
-GitHub Release 使用 `open-design-v0.4.2`（`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release；`0.4.1` 已发布）。
+GitHub Release 使用 `open-design-v0.4.3`（`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release；`0.4.1`、`0.4.2` 已发布）。
 
 `0.3.0` 于 2026-11-03 从提交 `2601888` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台和原有效插件核验通过。
 
@@ -34,7 +36,7 @@ GitHub Release 使用 `open-design-v0.4.2`（`0.4.0` 的 tag 因 Windows 平台�
 
 - 添加、编辑、启停和删除 OpenDesign 账户，支持替换推理 API key；编辑时留空保留原 Key。
 - 一次点击获取官方 `GET /models` 列表，支持搜索、批量勾选、共享模型映射与未保存草稿保护。新增映射默认使用 `open-design-` 前缀。
-- 可选配置独立 control Key，手动查询官方账号钱包（USD）与工作区套餐窗口（credits）。新增和编辑账户均可填写两个可选字段：control Key、Workspace ID。实际剩余量与重置时间直接显示；符合采样条件的整体 credits 趋势默认折叠，不换算为单模型剩余 token 或请求数。详见[额度说明](docs/quota.md)。
+- 可选配置独立 control Key，查询官方账号钱包（USD）与工作区套餐窗口（credits）；打开「凭据 · 额度」会按账户顺序自动查询一次，也可点「刷新额度」手动重查（同一账号 60 秒内不重复请求上游）。新增和编辑账户均可填写两个可选字段：control Key、Workspace ID。实际剩余量与重置时间直接显示；符合采样条件的整体 credits 趋势默认折叠，不换算为单模型剩余 token 或请求数。详见[额度说明](docs/quota.md)。
 - 新增**官方模型级覆盖查询**（`GET /model-coverage`）：按官方 `funding-check` 的 `modelId` 读取某个模型的覆盖与资金检查结果，与共享钱包／套餐窗口额度分开展示，手动触发、每模型凭据组合 60 秒节流、30 秒预算。
 - 新增**请求日志与统计**，只保存元数据 allowlist，不保存请求/响应正文、headers、query、API key、control key 或 Workspace ID；默认开启，保留 7 天、最多 500 条，上限 90 天／500 条。异步持久化 25ms 合并、失败 2 秒重试，关闭时同步 flush；清空操作持久化为 tombstone。日志条目带 nullable usage 与 `upstream_attempted`，统计单独给出本地拒绝数。
 - 新增**显式单次模型测试**（`POST /model-test`）：仅在控制台确认后发送一次非流式请求，不重试、不回传 completion，最多 3 个并发。
@@ -48,12 +50,12 @@ GitHub Release 使用 `open-design-v0.4.2`（`0.4.0` 的 tag 因 Windows 平台�
 
 ## 控制台
 
-控制台分为 5 个标签页，全部操作都由按钮手动触发，切换标签页不会自动发请求：
+控制台分为 5 个标签页，除「凭据 · 额度」外切换标签页不会自动发请求。打开「凭据 · 额度」会按账户顺序自动查询一次额度（一个账号一个账号地查，不会并发），其余操作仍由按钮手动触发：
 
 | 标签页 | 内容 |
 | --- | --- |
 | 概览 | 汇总管理接口已返回的账户与映射数量 |
-| 凭据 · 额度 | 账户增删改、可选 control Key／Workspace ID、手动刷新钱包与套餐窗口、编辑重试调度／错误规则 |
+| 凭据 · 额度 | 账户增删改、可选 control Key／Workspace ID、打开标签页时按账户顺序自动查询额度（可随时点「刷新额度」重查）、编辑重试调度／错误规则 |
 | 模型映射 · 覆盖 | 拉取上游模型、搜索与批量勾选、保存映射、按模型查询官方覆盖、显式模型测试 |
 | 请求日志 | 只读元数据列表、汇总统计、筛选与分页、清空日志 |
 | 代理池 · 配置 | 请求日志开关与保留设置；宿主代理／路由／冷却只读展示，runtime 手动读取 |
@@ -131,7 +133,7 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 2. 在账户管理中添加 OpenDesign 推理 API key。标签仅作备注，不承诺将客户端请求固定调度到该账户。
 3. 点击账户的“获取模型”，搜索、勾选模型并保存映射；已有别名会保留，新增别名默认加 `open-design-` 前缀。
 4. 在客户端填入 CPA 的 API 地址和 CPA 客户端 API key，使用已保存的客户端模型名调用 `/v1/chat/completions`。
-5. 如需额度，在新增或编辑账户时展开可选额度配置：同一账号的 control Key 用于查钱包，再填 Workspace ID 可查套餐窗口。保存后点该账户的「刷新额度」；两项都留空可照常推理。查询和趋势估算不改变账号启停或调度。
+5. 如需额度，在新增或编辑账户时展开可选额度配置：同一账号的 control Key 用于查钱包，再填 Workspace ID 可查套餐窗口。打开「凭据 · 额度」会按账户顺序自动查询一次（也可点该账户的「刷新额度」重查）；两项都留空可照常推理。查询和趋势估算不改变账号启停或调度。
 6. 如需排查请求，在「请求日志」标签页手动刷新元数据列表或读取统计；如需按模型看官方覆盖，在「模型映射 · 覆盖」里对单个模型点「检查覆盖」；如需发一次小型真实请求，在同一页点「发送测试」并确认。三者都不会自动触发。
 
 管理页需要 CPA 管理认证。插件数据目录默认为 `plugins/open-design-data`，可通过 `data_dir` 修改；容器部署请持久化插件目录、CPA 的 `auth-dir` 和该数据目录（请求日志快照与 journal 也在其中）。
@@ -146,7 +148,7 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 | `GET /v0/management/open-design/status` | 插件状态与模型映射 |
 | `GET /v0/management/open-design/upstream-models` | 获取 OpenDesign `GET /models` 候选 |
 | `GET` / `POST /v0/management/open-design/models` | 读取或保存模型映射 |
-| `GET /v0/management/open-design/quota?credential_id=<id>` | 读取共享额度缓存；加 `&refresh=1` 手动查询官方钱包与套餐窗口，最小间隔 60 秒 |
+| `GET /v0/management/open-design/quota?credential_id=<id>` | 读取共享额度缓存；加 `&refresh=1` 查询官方钱包与套餐窗口，最小间隔 60 秒（控制台打开该标签页时按账户顺序逐个调用） |
 | `GET /v0/management/open-design/model-coverage?credential_id=<id>&model_id=<id>` | 读取模型级官方覆盖缓存；加 `&refresh=1` 手动查询官方 `funding-check`，每组合最小间隔 60 秒 |
 | `GET /v0/management/open-design/request-logs` | 分页读取元数据日志，支持 `limit`、`offset`、`status`、`model`、`credential_id`、`attempted`、`since`、`until` |
 | `GET /v0/management/open-design/request-stats` | 读取汇总统计（含本地拒绝数） |
@@ -196,11 +198,11 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 产物是 `dist/open-design.so`（Linux amd64，C shared ABI v1）。
 
-发布 tag 使用 `open-design-v0.4.2` 形式，避免与 fork 保留的上游 `v*` tag 冲突。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定该 tag/版本，`github-release` 的自动“取最新”不适用于本 fork。
+发布 tag 使用 `open-design-v0.4.3` 形式，避免与 fork 保留的上游 `v*` tag 冲突。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定该 tag/版本，`github-release` 的自动“取最新”不适用于本 fork。
 
 ## 当前验证边界
 
-- `0.4.2`／`0.4.1` 只做跨平台持久化修复与分类边界锁定，不改变功能与运行时行为；`0.4.0` 在 `0.3.0` 之上新增重试调度／错误规则，并已用双账号真实宿主验证：假上游按凭据返回生产 400 `tier_limit_exceeded` 后，宿主按规则换到另一账号并返回 200，冷却后下一次请求不再使用失败账号，`stop` 规则下不换号且响应保留 marker。全仓 Go／race／vet、Node 项、离线与原版 CPA 隔离流程见[验证记录](docs/verification.md)。
+- `0.4.3` 只改控制台额度刷新触发方式（打开标签页串行自动查询）；`0.4.2`／`0.4.1` 只做跨平台持久化修复与分类边界锁定；`0.4.0` 在 `0.3.0` 之上新增重试调度／错误规则，并已用双账号真实宿主验证：假上游按凭据返回生产 400 `tier_limit_exceeded` 后，宿主按规则换到另一账号并返回 200，冷却后下一次请求不再使用失败账号，`stop` 规则下不换号且响应保留 marker。全仓 Go／race／vet、Node 项、离线与原版 CPA 隔离流程见[验证记录](docs/verification.md)。
 - `0.3.0` 在 `0.2.0` 之上新增日志、统计、官方模型覆盖、显式模型测试、配置与 runtime。全仓 Go／race／vet、Node 139 项、Edge 540 项、Debian 12 构建和原版 CPA 隔离流程已通过，具体产物与上线状态见[验证记录](docs/verification.md)。
 - 以下为 `0.2.0` 已发生的生产事实，保留为历史，不属于 `0.3.0` 的验收证据：2026-11-02 发现 13 个模型；官方直连与生产 CPA 插件各完成一次最小 JSON 推理并得到 `OK`。生产插件测试使用 `open-design-minimax-m3.1-flash`，usage 为 219 输入／3 输出／222 总 token。13 个模型只验证发现、持久化与注册，没有逐个付费推理。
 - 早期现有推理 Key 对官方控制面钱包、账单汇总接口返回 401。随后，两份独立 control 授权直接查询钱包和各自工作区 funding-check，共四个 GET 均返回 200。上线 `0.2.0` 后，现有账户经完整推理 Key 精确比对确认属于 od1，补充授权并通过生产插件成功读取钱包与套餐窗口；真实消费趋势预测仍未验收。

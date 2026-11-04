@@ -1120,12 +1120,73 @@ test('loading status never requests quota; only the explicit refresh button does
   assert.match(quotaText(view), /尚未查询/);
   assert.match(quotaText(view), /刷新额度/);
 
+  // Opening the credentials tab refreshes the accounts, one at a time.
+  consoleApi.handlers.activateTab('credentials');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const quotaCalls = calls.filter(call => call.url.includes('/quota'));
+  assert.equal(quotaCalls.length, 1, 'one account means exactly one quota call');
+  assert.match(quotaCalls[0].url, /\/quota\?credential_id=cred-1&refresh=1$/);
+  assert.equal(quotaCalls[0].method, 'GET');
+
+  // The explicit button still works after the automatic pass.
   const refresh = quotaButtons(view).find(node => node.getAttribute('data-action') === 'refresh-quota');
   assert.ok(refresh);
   await refresh.emit('click');
-  const quotaCall = calls.find(call => call.url.includes('/quota'));
-  assert.match(quotaCall.url, /\/quota\?credential_id=cred-1&refresh=1$/);
-  assert.equal(quotaCall.method, 'GET');
+  assert.equal(calls.filter(call => call.url.includes('/quota')).length, 2);
+});
+
+test('opening the credentials tab walks accounts serially and skips the unconfigured ones', async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const order = [];
+  const credentials = [
+    { id: 'cred-a', label: 'A', disabled: false, billing_configured: true, workspace_id: 'ws-a' },
+    { id: 'cred-b', label: 'B', disabled: false, billing_configured: false, workspace_id: '' },
+    { id: 'cred-c', label: 'C', disabled: false, billing_configured: true, workspace_id: 'ws-c' },
+    { id: 'cred-d', label: 'D', disabled: true, billing_configured: true, workspace_id: 'ws-d' },
+  ];
+  const { consoleApi, calls } = quotaPage(async url => {
+    if (url.includes('/quota')) {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      order.push(id);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      inFlight -= 1;
+      return respond(200, quotaContract({ credential_id: id }));
+    }
+    return respond(404, { error: 'not found' });
+  }, credentials);
+  consoleApi.handlers.activateTab('credentials');
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.deepEqual(order, ['cred-a', 'cred-c'], 'configured, enabled accounts are queried in list order');
+  assert.equal(peak, 1, 'accounts are queried one at a time, never concurrently');
+  assert.equal(calls.filter(call => call.url.includes('/quota')).length, 2);
+});
+
+test('switching away from the credentials tab stops the serial walk', async () => {
+  let release = () => {};
+  const gate = new Promise(resolve => { release = resolve; });
+  const order = [];
+  const credentials = [
+    { id: 'cred-a', label: 'A', disabled: false, billing_configured: true, workspace_id: 'ws-a' },
+    { id: 'cred-b', label: 'B', disabled: false, billing_configured: true, workspace_id: 'ws-b' },
+  ];
+  const { consoleApi } = quotaPage(async url => {
+    if (url.includes('/quota')) {
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      order.push(id);
+      await gate;
+      return respond(200, quotaContract({ credential_id: id }));
+    }
+    return respond(404, { error: 'not found' });
+  }, credentials);
+  consoleApi.handlers.activateTab('credentials');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  consoleApi.handlers.activateTab('overview');
+  release();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(order, ['cred-a'], 'the walk stops after leaving the tab');
 });
 
 test('an available quota snapshot renders balance, credits windows, meters and reset times', async () => {
