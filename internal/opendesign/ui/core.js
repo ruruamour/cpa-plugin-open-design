@@ -54,7 +54,15 @@
         const stored = item.reasoning_mapping === undefined || item.reasoning_mapping === null
           ? null
           : normalizeReasoningMapping(item.reasoning_mapping);
-        models.push({ id, upstream_id: upstreamID, reasoning_mapping: stored });
+        // An optional opaque revision lets the console ask the backend to reject
+        // a save that was written against an older model/rule table. A backend
+        // that does not send it leaves the field empty and the save omits it.
+        models.push({
+          id,
+          upstream_id: upstreamID,
+          reasoning_mapping: stored,
+          reasoning_revision: text(item.reasoning_revision),
+        });
       }
     }
     return {
@@ -159,6 +167,14 @@
     return REASONING_TARGETS.map(value => ({ value, label: reasoningLabel(value) }));
   }
 
+  // A newly added rule starts as an identity mapping, but a source that is not
+  // itself a legal target (ultra) has to fall back to a value the target picker
+  // actually offers, otherwise the row could never be saved.
+  function defaultReasoningTarget(source) {
+    const value = text(source).toLowerCase();
+    return REASONING_TARGETS.includes(value) ? value : 'max';
+  }
+
   // The next source that has no rule yet, so "添加规则" never creates a
   // duplicate the save route would reject. Returns an empty string when every
   // source is already mapped.
@@ -170,7 +186,7 @@
   // The save payload. Anything the plugin would reject is reported instead of
   // dropped: silently discarding a rule would save a policy the operator did not
   // write. Rule order is preserved so the request is exactly the edited table.
-  function buildReasoningPayload(model, mapping) {
+  function buildReasoningPayload(model, mapping, expectedRevision) {
     const raw = mapping && typeof mapping === 'object' ? mapping : {};
     const sources = new Set(REASONING_SOURCES);
     const targets = new Set(REASONING_TARGETS);
@@ -186,11 +202,16 @@
       seen.add(from);
       rules.push({ from, to });
     }
-    return {
+    const payload = {
       model: text(model && model.id),
       upstream_id: text(model && model.upstream_id),
       reasoning_mapping: { enabled: raw.enabled === true, rules },
     };
+    // Only sent when the server advertised a revision; an older backend that
+    // never sends one keeps receiving the exact same body as before.
+    const revision = text(expectedRevision);
+    if (revision) payload.expected_revision = revision;
+    return payload;
   }
 
   function reasoningConversionText(effort, mapping) {
@@ -1093,6 +1114,7 @@
     reasoningSourceOptions,
     reasoningTargetOptions,
     nextReasoningSource,
+    defaultReasoningTarget,
     buildReasoningPayload,
     reasoningConversionText,
     aliasForUpstream,

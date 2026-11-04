@@ -44,6 +44,10 @@
     reasoningModelKey: '',
     reasoningDrafts: new Map(),
     reasoningSaving: false,
+    // Bumped by every logout/status refresh. A reasoning save captures it and
+    // discards its own late response once it no longer matches, so a stale
+    // answer can neither re-enable the draft nor overwrite a newer list.
+    reasoningGeneration: 0,
     accountEdit: null,
     authCollapsed: false,
     // Quota snapshots are keyed by credential id. They are only fetched when the
@@ -482,6 +486,7 @@
     state.reasoningModelKey = '';
     state.reasoningDrafts.clear();
     state.reasoningSaving = false;
+    state.reasoningGeneration += 1;
     state.requestLogs = [];
     state.logQuery = { offset: 0, limit: 50, status: '', model: '', credentialID: '', attempted: '' };
     state.logPage = { loaded: false, total: 0, offset: 0, limit: 50, has_more: false, next_offset: null, retention: null };
@@ -644,6 +649,10 @@
     state.modelTestGeneration += 1;
     state.modelTest = null;
     renderModelTest();
+    // A status refresh replaces the model list, so a reasoning save issued
+    // before it is stale: its response must not repopulate the panel.
+    state.reasoningGeneration += 1;
+    state.reasoningSaving = false;
     if (modelTestWasBusy) {
       message('modelTestState', '账户状态已刷新，正在发送的模型测试结果已失效。', 'error');
     }
@@ -2529,7 +2538,7 @@
     if (result.upstream_attempted === true && result.http_status !== null) items.push({ label: '上游 HTTP', value: String(result.http_status) });
     // The plugin sends the strength after the model's mapping runs, so the row
     // shows the conversion an operator configured rather than the raw input.
-    if (result.reasoning_effort) {
+    if (result.reasoning_effort || result.reasoning_mapping) {
       items.push({
         label: '思考强度',
         value: Core.reasoningConversionText(result.reasoning_effort, result.reasoning_mapping),
@@ -2785,7 +2794,7 @@
     }
     // A new rule is an identity mapping: it changes nothing until the operator
     // picks a target, so adding a row can never silently rewrite traffic.
-    updateReasoningRows(draft => { draft.rules.push({ from: next, to: next }); });
+    updateReasoningRows(draft => { draft.rules.push({ from: next, to: Core.defaultReasoningTarget(next) }); });
     message('reasoningState', '');
   }
 
@@ -2818,20 +2827,22 @@
     const model = selectedReasoningModel();
     if (!model) return;
     updateReasoningRows(draft => {
-      draft.rules = Core.defaultReasoningRules();
+      // A non-DeepSeek model has no vendor table to restore, so this yields the
+      // empty table instead of silently writing DeepSeek rules onto it.
+      draft.rules = Core.defaultReasoningMapping(model.upstream_id).rules.map(rule => ({ from: rule.from, to: rule.to }));
     });
     message('reasoningState', '已恢复默认表，点击「保存映射」后生效。', '');
   }
 
-  function reasoningSelect(value, options, onChange) {
-    const node = el('select', { className: 'control' });
+  function reasoningSelect(value, options, onChange, disabled = false) {
+    const node = el('select', { className: 'control', disabled });
     for (const option of options) node.append(el('option', { value: option.value, text: option.label }));
     node.value = value;
     node.addEventListener('change', event => onChange(event.target.value));
     return node;
   }
 
-  function renderReasoningRows(rules, model) {
+  function renderReasoningRows(rules, model, busy = false) {
     const body = $('reasoningRows');
     if (!body) return;
     const rows = [];
@@ -2843,9 +2854,9 @@
       }
       rules.forEach((rule, index) => {
         rows.push(el('tr', {}, [
-          el('td', {}, [reasoningSelect(rule.from, Core.reasoningSourceOptions(), value => changeReasoningRule(index, 'from', value))]),
-          el('td', {}, [reasoningSelect(rule.to, Core.reasoningTargetOptions(), value => changeReasoningRule(index, 'to', value))]),
-          el('td', {}, [el('button', { className: 'button compact danger', type: 'button', text: '删除', on: () => removeReasoningRule(index) })]),
+          el('td', {}, [reasoningSelect(rule.from, Core.reasoningSourceOptions(), value => changeReasoningRule(index, 'from', value), busy)]),
+          el('td', {}, [reasoningSelect(rule.to, Core.reasoningTargetOptions(), value => changeReasoningRule(index, 'to', value), busy)]),
+          el('td', {}, [el('button', { className: 'button compact danger', type: 'button', text: '删除', disabled: busy, on: () => removeReasoningRule(index) })]),
         ]));
       });
     }
@@ -2889,7 +2900,7 @@
       select.value = state.reasoningModelKey;
     }
     const model = selectedReasoningModel();
-    renderReasoningRows(currentReasoningMapping(model).rules, model);
+    renderReasoningRows(currentReasoningMapping(model).rules, model, state.busy || state.reasoningSaving);
     syncReasoningControls();
     if (!model) message('reasoningState', '');
   }
@@ -2921,39 +2932,46 @@
   async function saveReasoning() {
     const model = selectedReasoningModel();
     if (!model || state.reasoningSaving || state.busy) return;
+    const generation = state.reasoningGeneration;
     let payload;
     try {
-      payload = Core.buildReasoningPayload(model, currentReasoningMapping(model));
+      payload = Core.buildReasoningPayload(model, currentReasoningMapping(model), model.reasoning_revision);
     } catch (error) {
       message('reasoningState', `无法保存：${error.message}`, 'error');
       return;
     }
+    const key = reasoningModelKey(model);
     state.reasoningSaving = true;
-    syncReasoningControls();
+    // Every row is rebuilt disabled so a click mid-save cannot be silently lost.
+    renderReasoning();
     message('reasoningState', '正在保存思考强度映射…');
     try {
       const raw = await api().saveReasoningMapping(payload);
+      if (generation !== state.reasoningGeneration) return;
       applyServerModels(raw && Array.isArray(raw.models) ? raw.models : null);
-      state.reasoningDrafts.delete(reasoningModelKey(model));
+      state.reasoningDrafts.delete(key);
       // The policy is request-shaping state: a result produced under the old
       // rules no longer describes what the plugin will now send.
       invalidateModelTestResult();
       renderReasoning();
       message('reasoningState', `已保存 ${model.id} 的思考强度映射${payload.reasoning_mapping.enabled ? '（已启用）' : '（当前关闭，不生效）'}。`);
     } catch (error) {
+      if (generation !== state.reasoningGeneration) return;
       if (isAuthStatus(error.status) && !isUpstreamSource(error)) {
         clearRejectedManagementAuth();
         showAuth(error.status === 401 ? '401：管理密钥无效或已过期，映射未保存。' : `403：${formatError(error)}`);
       } else if (error.status === 409) {
-        message('reasoningState', `保存失败：上游模型 ID 已变化，请先刷新状态再重新配置。`, 'error');
+        message('reasoningState', '保存失败：模型或规则已变更，请刷新状态后重新配置。', 'error');
       } else if (error.status === 404) {
         message('reasoningState', '保存失败：模型已不存在，请刷新状态。', 'error');
       } else {
         message('reasoningState', `保存失败：${formatError(error)}`, 'error');
       }
     } finally {
-      state.reasoningSaving = false;
-      syncReasoningControls();
+      if (generation === state.reasoningGeneration) {
+        state.reasoningSaving = false;
+        renderReasoning();
+      }
     }
   }
 
