@@ -25,7 +25,11 @@
 - 两处依赖 POSIX 权限语义的用例改为等价注入（重命名失败注入、Windows 跳过权限位断言），不再依赖目录权限。
 - 新增 `internal/opendesign/windows_rename_test.go` 锁定上述 Windows 语义。
 
-`0.4.1` 的 CI 与发布证据在本节末尾补写。
+### 0.4.1 CI 与发布
+
+- 修复提交 `afc3057`（升版与跨平台修复）与 `8f87279`（错误规则写失败用例改为重命名注入）；CI `41797433234` 成功。
+- 发布 tag `open-design-v0.4.1` 指向 `8f87279`，Release 运行 `41797477955` 成功：`metadata`、`linux-amd64`、`linux-arm64`、`darwin`（amd64／arm64）、`windows-amd64` 五个构建全部通过，`release` job 产出并校验五个平台压缩包与 `checksums.txt`。`0.4.0` 的 tag 因同一 Windows 失败未产出 Release。
+- Release 已从 draft 发布（非草稿、非预发布），资产：`open-design_0.4.1_{linux_amd64,linux_arm64,darwin_amd64,darwin_arm64,windows_amd64}.zip` 与 `checksums.txt`。下载 `open-design_0.4.1_linux_amd64.zip` 复算 SHA256 与 `checksums.txt` 一致（`66a1c963…85fad`）。
 
 ## 0.4.0 本轮验收
 
