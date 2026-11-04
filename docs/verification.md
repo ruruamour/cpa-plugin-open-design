@@ -15,6 +15,25 @@
 
 真实报文来自生产会话记录（`402` + `details.coding_plan_exhausted=true` + `reset_at`），当时插件把它当成未分类的 `upstream_error`，只能靠宿主对裸 402 的固定 30 分钟冷却兜底。
 
+### 生产部署
+
+2026-11-04 从提交 `563c6b3` 的 CI 产物（[CI 41842818883](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/41842818883)）部署到 `nuoapi-net`；Release 为 [open-design-v0.4.4](https://github.com/ruruamour/cpa-plugin-open-design/releases/tag/open-design-v0.4.4)（[发布运行 41842864324](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/41842864324) 五平台全绿），并已转为正式发布。
+
+| 核验项 | 结果 |
+| --- | --- |
+| 库哈希 | `15302e91ebfdefcbe232b52ea6866bce2eddffffd38a6b597a30730971c5da15`，与 Release 的 `linux_amd64` 资产一致 |
+| 版本 | `GET /open-design/status` → `version=0.4.4` |
+| 规则 | 默认规则 9 条；凭据 auth 文件 `request_scoped_errors` 已写入包含 `402 + [open-design:insufficient_balance]` 的新规则；`sync total=6 succeeded=6 failed=[]` |
+| 控制台 | `/v0/resource/plugins/open-design/console` → 200，页面已包含新 marker 文案 |
+| 服务 | `cliproxy-cpa.service` `active` |
+| 备份 | `/srv/cliproxy/_backups/open-design-20261104T140718Z` |
+
+本轮没有触发真实额度耗尽事件（6 个账号当前都有额度），因此**分类正确性由单元用例锁定**，而“规则命中后宿主换号 + 冷却”的机制沿用 `0.4.0` 已用真实宿主验证过的链路。
+
+### 未做的部分：冷却时长
+
+CPA 对 `402`／`403` 的冷却时长是写死的 30 分钟（`conductor_cooldown.go` 凭据级与模型级两处都是 `now.Add(30 * time.Minute)`），**不读** `Retry-After`；只有 `429`、`404` 与 408/5xx 分支会采纳重试提示。因此插件无法把冷却时长设成上游 `reset_at`：本插件也没有在任何一处发送 `retry_after_seconds`（`pluginabi.Error` 里有这个可选字段，但当前实现不使用）。若要把暂停拉长到真实重置时间，需要在宿主侧改动或改由插件自行暂停账号，两者都超出本仓库只维护插件的边界，本轮未做。
+
 ## 0.4.3 本轮验收
 
 2026-11-04 发布 `0.4.3`。唯一改动是控制台额度刷新的触发方式：打开「凭据 · 额度」标签页时按账户顺序串行查询一次。
