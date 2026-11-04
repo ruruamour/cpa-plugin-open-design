@@ -283,10 +283,17 @@ func upstreamErrorFromResponseObserved(status, observedStatus int, headers http.
 	return &APIError{Status: status, Kind: kind, Message: message, upstreamAttempted: true, upstreamStatus: observedStatus}
 }
 
+// isKnownUpstreamCode reports whether an upstream code is on the closed
+// allowlist that the plugin is willing to name.
+//
+// insufficient_balance is OpenDesign's own code for a spent coding plan or an
+// uncovered wallet. It is listed separately from insufficient_quota because the
+// two upstreams mean different things by them and the plugin's default rules
+// key on distinct markers.
 func isKnownUpstreamCode(code string) bool {
 	switch code {
-	case "invalid_api_key", "invalid_request", "rate_limit_exceeded", "insufficient_quota", "model_not_found",
-		"context_length_exceeded", "server_error", "server_overloaded", "tier_limit_exceeded":
+	case "invalid_api_key", "invalid_request", "rate_limit_exceeded", "insufficient_quota", "insufficient_balance",
+		"model_not_found", "context_length_exceeded", "server_error", "server_overloaded", "tier_limit_exceeded":
 		return true
 	default:
 		return false

@@ -2385,6 +2385,9 @@ test('error rule explanations map known markers and never produce markup', () =>
   const known = Core.explainErrorRule({ status: 400, match: ['[open-design:tier_limit_exceeded]'], action: 'continue-and-cooldown' }, 0);
   assert.match(known.name, /账号并发上限/);
   assert.match(known.detail, /tier_limit_exceeded/);
+  const balance = Core.explainErrorRule({ status: 402, match: ['[open-design:insufficient_balance]'], action: 'continue-and-cooldown' }, 0);
+  assert.match(balance.name, /额度耗尽或余额不足/);
+  assert.match(balance.detail, /insufficient_balance/);
   const fallback = Core.explainErrorRule({ status: 503, match: ['some custom text'], action: 'stop' }, 2);
   assert.match(fallback.name, /规则 3 · 自定义条件/);
   assert.match(fallback.detail, /503/);

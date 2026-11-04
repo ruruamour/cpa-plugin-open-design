@@ -93,6 +93,11 @@ func defaultErrorRules() []RequestErrorRule {
 		{Status: http.StatusTooManyRequests, Match: []string{upstreamErrorMarkerFor("rate_limit_exceeded")}, Action: "continue-and-cooldown"},
 		{Status: http.StatusTooManyRequests, Match: []string{upstreamErrorMarkerFor("insufficient_quota")}, Action: "continue-and-cooldown"},
 		{Status: http.StatusPaymentRequired, Match: []string{upstreamErrorMarkerFor("insufficient_quota")}, Action: "continue-and-cooldown"},
+		// OpenDesign reports a spent coding plan (with a reset time) or an
+		// uncovered wallet as 402 with its own insufficient_balance code. The
+		// marker only exists when that machine code was present, so a bare
+		// 402 with free text still stays unclassified.
+		{Status: http.StatusPaymentRequired, Match: []string{upstreamErrorMarkerFor("insufficient_balance")}, Action: "continue-and-cooldown"},
 		{Status: http.StatusUnauthorized, Match: []string{upstreamErrorMarkerFor("invalid_api_key")}, Action: "stop-and-cooldown"},
 		{Status: http.StatusForbidden, Match: []string{upstreamErrorMarkerFor("invalid_api_key")}, Action: "stop-and-cooldown"},
 		{Status: http.StatusInternalServerError, Match: []string{upstreamErrorMarkerFor("server_error")}, Action: "continue-and-cooldown"},

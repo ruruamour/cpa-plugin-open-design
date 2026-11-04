@@ -1,5 +1,20 @@
 # OpenDesign 插件验证记录
 
+## 0.4.4 本轮验收
+
+2026-11-04 发布 `0.4.4`。唯一改动是上游额度耗尽报文的分类：OpenDesign 的 `402` 报文带自有机器码 `insufficient_balance`（`error.code` 或 `[code=...]` 文本）时归类并换号冷却；不带机器码的裸 `402` 仍不分类。
+
+| 检查 | 结果与范围 |
+| --- | --- |
+| 分类 | `isKnownUpstreamCode` 白名单加入 `insufficient_balance`；默认规则新增 `402 + [open-design:insufficient_balance] → continue-and-cooldown` |
+| 报文稳定性 | 插件只输出 `[open-design:insufficient_balance] upstream request failed: payment required`，不带上游的 wallet／plan／`reset_at` 文本 |
+| 边界 | 裸 `402 payment required`（无机器码）仍为 `upstream_error` 且不匹配任何默认规则；非白名单码（如 `insufficient_balance_evil`）不进入 message，无法伪造 marker |
+| 新增用例 | `TestErrorRulesClassifyInsufficientBalanceWithPlanFlag`、`TestErrorRulesInsufficientBalanceMarkerIsClosed`、`TestErrorRulesUnknownBalanceCodeStaysUnclassified`；Node 侧 `explainErrorRule` 新增 marker 文案断言 |
+| 全仓 Go | `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 通过 |
+| Node | `node --test tests/*.test.cjs`，154/154 通过 |
+
+真实报文来自生产会话记录（`402` + `details.coding_plan_exhausted=true` + `reset_at`），当时插件把它当成未分类的 `upstream_error`，只能靠宿主对裸 402 的固定 30 分钟冷却兜底。
+
 ## 0.4.3 本轮验收
 
 2026-11-04 发布 `0.4.3`。唯一改动是控制台额度刷新的触发方式：打开「凭据 · 额度」标签页时按账户顺序串行查询一次。

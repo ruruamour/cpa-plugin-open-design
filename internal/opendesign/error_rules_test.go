@@ -181,6 +181,72 @@ func TestErrorRulesClassifyPaymentRequiredWithQuotaCode(t *testing.T) {
 	}
 }
 
+// The real production exhaustion payload from OpenDesign: 402 with its own
+// insufficient_balance code and a coding_plan_exhausted flag. This is the only
+// signal that distinguishes "this account is out of quota" from the bare
+// "payment required" text, so it must classify and route to another account.
+func TestErrorRulesClassifyInsufficientBalanceWithPlanFlag(t *testing.T) {
+	body := []byte(`{"error":{"code":"insufficient_balance","details":{"coding_plan_exhausted":true,"reset_at":"2026-11-03T12:02:06Z"},"message":"[code=insufficient_balance] Coding Plan quota is exhausted and wallet balance is insufficient. Please top up your wallet to continue now.","type":"insufficient_balance"}}`)
+	err := upstreamErrorFromResponse(http.StatusPaymentRequired, nil, body)
+	var apiErr *APIError
+	if !asAPIError(err, &apiErr) {
+		t.Fatalf("error is %T, want *APIError", err)
+	}
+	if apiErr.Kind != "insufficient_balance" {
+		t.Fatalf("kind = %q, want insufficient_balance", apiErr.Kind)
+	}
+	if status := statusOf(err); status != http.StatusPaymentRequired {
+		t.Fatalf("status = %d, want 402", status)
+	}
+	// The message must stay a stable plugin-owned marker: the upstream text
+	// names the wallet, the plan and a reset timestamp.
+	if strings.Contains(apiErr.Message, "wallet") || strings.Contains(apiErr.Message, "2026-11-03") {
+		t.Fatalf("message echoed upstream text: %q", apiErr.Message)
+	}
+	rule := matchErrorRule(defaultErrorRules(), statusOf(err), apiErr.Message)
+	if rule == nil || rule.Action != "continue-and-cooldown" {
+		t.Fatalf("rule = %+v, want continue-and-cooldown", rule)
+	}
+}
+
+// The same exhaustion code reaches the plugin through a streamed close, where
+// only the structured detail survives. Both the code and the marker are fixed.
+func TestErrorRulesInsufficientBalanceMarkerIsClosed(t *testing.T) {
+	for _, body := range [][]byte{
+		[]byte(`{"error":{"code":"insufficient_balance","message":"x"}}`),
+		[]byte(`{"error":{"message":"[code=insufficient_balance] Coding Plan quota is exhausted"}}`),
+	} {
+		err := upstreamErrorFromResponse(http.StatusPaymentRequired, nil, body)
+		var apiErr *APIError
+		if !asAPIError(err, &apiErr) {
+			t.Fatalf("error is %T, want *APIError", err)
+		}
+		if got, want := apiErr.Message, upstreamErrorMarkerFor("insufficient_balance")+" upstream request failed: payment required"; got != want {
+			t.Fatalf("body %q: message = %q, want %q", body, got, want)
+		}
+		if !safeDiagnosticKind(apiErr.Kind, nil) {
+			t.Fatalf("body %q: kind %q is not a safe diagnostic kind", body, apiErr.Kind)
+		}
+	}
+}
+
+// A caller-supplied marker must not be able to forge the exhaustion rule: an
+// unknown code never reaches the message, so the marker cannot be injected.
+func TestErrorRulesUnknownBalanceCodeStaysUnclassified(t *testing.T) {
+	err := upstreamErrorFromResponse(http.StatusPaymentRequired, nil,
+		[]byte(`{"error":{"code":"insufficient_balance_evil","message":"payment required"}}`))
+	var apiErr *APIError
+	if !asAPIError(err, &apiErr) {
+		t.Fatalf("error is %T, want *APIError", err)
+	}
+	if apiErr.Kind != "upstream_error" {
+		t.Fatalf("kind = %q, want upstream_error", apiErr.Kind)
+	}
+	if rule := matchErrorRule(defaultErrorRules(), statusOf(err), apiErr.Message); rule != nil {
+		t.Fatalf("unclassified 402 matched rule %+v", rule)
+	}
+}
+
 // An upstream code that is not on the closed allowlist must not become part of
 // the message: otherwise a caller-supplied string could forge a rule marker.
 func TestErrorRulesMessageNeverEchoesUnknownCode(t *testing.T) {

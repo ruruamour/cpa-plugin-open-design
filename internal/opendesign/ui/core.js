@@ -749,6 +749,7 @@
     ['[open-design:tier_limit_exceeded]', '账号并发上限', '上游返回会员并发上限（tier_limit_exceeded）；该账号暂不可用，可继续尝试其他账号。'],
     ['[open-design:rate_limit_exceeded]', '上游频率限制', '请求速率达到上游上限；冷却该账号并尝试其他账号。'],
     ['[open-design:insufficient_quota]', '账号额度不足', '账号额度已耗尽；冷却该账号并尝试其他额度可用的账号。'],
+    ['[open-design:insufficient_balance]', '额度耗尽或余额不足', '上游返回 OpenDesign 的 insufficient_balance（Coding Plan 额度耗尽或钱包余额不足）；冷却该账号并尝试其他账号。'],
     ['[open-design:invalid_api_key]', '密钥无效', '上游拒绝该密钥；停止并冷却该账号，等待人工更换密钥。'],
     ['[open-design:server_error]', '上游服务错误', '上游返回服务端错误；冷却该账号并尝试其他账号。'],
     ['[open-design:server_overloaded]', '上游过载', '上游过载；冷却该账号并尝试其他账号。'],
