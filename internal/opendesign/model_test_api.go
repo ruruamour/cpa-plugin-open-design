@@ -91,6 +91,7 @@ type modelTestSnapshot struct {
 	credential      Credential
 	alias           string
 	upstreamModel   string
+	reasoning       *ReasoningMapping
 	mappingRevision uint64
 	credentialEpoch uint64
 }
@@ -147,9 +148,6 @@ func (s *Service) modelTestRequest(r ManagementRequest) (any, error) {
 		"messages":   messages,
 		"max_tokens": modelTestOutputTokens,
 	}
-	// The strength goes into the payload unmodified: the executor applies the
-	// model's mapping exactly once, on the same path a real request takes.
-	reasoningSent, reasoningMapping := reasoningForModelTest(s, alias, testEffort)
 	if testEffort != "" {
 		payload["reasoning_effort"] = testEffort
 	}
@@ -175,8 +173,13 @@ func (s *Service) modelTestRequest(r ManagementRequest) (any, error) {
 	}
 	finish := sync.OnceFunc(func() { s.modelTestFinished(key, record, identity) })
 	defer finish()
-	result, callErr := s.executePinned(raw, snapshot.upstreamModel, &c, false)
+	// The executor returns the model snapshot it actually used. The probe echoes
+	// that decision instead of predicting it, so it can never claim a strength it
+	// did not send (a concurrent mapping save or a passthrough value included).
+	executed, decision, callErr := s.executePinnedWithReasoning(raw, snapshot.upstreamModel, snapshot.reasoning, &c, false)
 	duration := time.Since(started).Milliseconds()
+	reasoningSent := decision.effort
+	reasoningMapping := decision.mapping
 	keys := append(s.metadataSecrets(), c.APIKey, c.ControlKey, c.WorkspaceID)
 	response := modelTestResponse{
 		CredentialID:      requestLogText(c.ID, 128, keys...),
@@ -185,7 +188,7 @@ func (s *Service) modelTestRequest(r ManagementRequest) (any, error) {
 		Status:            "success",
 		DurationMS:        duration,
 		RealInference:     true,
-		UpstreamAttempted: true,
+		UpstreamAttempted: decision.attempted,
 		Streaming:         false,
 		RequestKind:       "chat.completions",
 		ReasoningEffort:   reasoningSent,
@@ -209,7 +212,7 @@ func (s *Service) modelTestRequest(r ManagementRequest) (any, error) {
 			record.HTTPStatus = &status
 		}
 	} else {
-		resultMap, resultOK := result.(map[string]any)
+		resultMap, resultOK := executed.(map[string]any)
 		if resultOK {
 			if metadata, metadataOK := resultMap["Metadata"].(map[string]any); metadataOK {
 				if status, statusOK := metadata["http_status"].(int); statusOK && status >= 100 && status <= 599 {
@@ -225,6 +228,13 @@ func (s *Service) modelTestRequest(r ManagementRequest) (any, error) {
 		}
 	}
 	finish()
+	// A strength is only reported when the executor actually attempted the
+	// upstream call. A local failure (no host HTTP request) must not claim it sent
+	// a value, even though the mapping had already been selected.
+	if !response.UpstreamAttempted {
+		response.ReasoningEffort = ""
+		response.ReasoningMapping = nil
+	}
 	return managementJSON(http.StatusOK, response)
 }
 
@@ -233,9 +243,11 @@ func (s *Service) modelTestSnapshot(credentialID, alias string) (modelTestSnapsh
 	c, credentialOK := s.creds[credentialID]
 	revoked := s.revoked[credentialID]
 	upstream := ""
+	var reasoning *ReasoningMapping
 	for _, model := range s.cfg.Models {
 		if model.ID == alias {
 			upstream = model.UpstreamID
+			reasoning = cloneReasoningMapping(model.Reasoning)
 			break
 		}
 	}
@@ -262,7 +274,7 @@ func (s *Service) modelTestSnapshot(credentialID, alias string) (modelTestSnapsh
 	if err := validateBaseURL(c.BaseURL); err != nil {
 		return modelTestSnapshot{}, err
 	}
-	return modelTestSnapshot{credential: c, alias: alias, upstreamModel: upstream, mappingRevision: revision, credentialEpoch: epoch}, nil
+	return modelTestSnapshot{credential: c, alias: alias, upstreamModel: upstream, reasoning: reasoning, mappingRevision: revision, credentialEpoch: epoch}, nil
 }
 
 func (s *Service) modelTestStarted(key string) bool {
@@ -352,22 +364,6 @@ func (s *Service) clearModelTestsLocked(credentialID ...string) {
 			delete(s.modelTests, key)
 		}
 	}
-}
-
-// reasoningForModelTest reports the strength a probe will send and the rule that
-// produced it. It runs the same pure mapping the executor runs, on the same
-// input, so the reported conversion cannot drift from the request that is sent.
-func reasoningForModelTest(s *Service, alias, input string) (string, *RequestLogReasoningMapping) {
-	body := map[string]any{}
-	if effort := strings.ToLower(strings.TrimSpace(input)); effort != "" && effort != reasoningUnset {
-		body["reasoning_effort"] = effort
-	}
-	from, to, applied := applyReasoningMapping(body, s.reasoningMappingFor(alias))
-	sent := reasoningEffortOf(body)
-	if !applied {
-		return sent, nil
-	}
-	return sent, &RequestLogReasoningMapping{From: from, To: to}
 }
 
 func modelTestMessages(in modelTestInput) ([]map[string]any, error) {

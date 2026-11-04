@@ -1,6 +1,7 @@
 package opendesign
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -98,18 +99,21 @@ func validateReasoningMapping(mapping *ReasoningMapping) error {
 }
 
 // reasoningMappingFor returns the policy bound to a client alias or an exact
-// upstream ID. The returned value is a copy, so a caller may not mutate config.
+// upstream ID. The returned value is a deep copy, so a caller may not mutate
+// config. It reads under the service lock directly (not through config()) so it
+// never shares the published slice.
 func (s *Service) reasoningMappingFor(model string) *ReasoningMapping {
 	model = strings.TrimSpace(model)
-	models := s.config().Models
-	for i := range models {
-		if models[i].ID == model {
-			return cloneReasoningMapping(models[i].Reasoning)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for i := range s.cfg.Models {
+		if s.cfg.Models[i].ID == model {
+			return cloneReasoningMapping(s.cfg.Models[i].Reasoning)
 		}
 	}
-	for i := range models {
-		if models[i].UpstreamID == model {
-			return cloneReasoningMapping(models[i].Reasoning)
+	for i := range s.cfg.Models {
+		if s.cfg.Models[i].UpstreamID == model {
+			return cloneReasoningMapping(s.cfg.Models[i].Reasoning)
 		}
 	}
 	return nil
@@ -124,6 +128,44 @@ func cloneReasoningMapping(mapping *ReasoningMapping) *ReasoningMapping {
 		copied.Rules = append([]ReasoningRule(nil), mapping.Rules...)
 	}
 	return copied
+}
+
+// reasoningRevision is a stable token for one model's reasoning policy. It is
+// derived only from the policy content, so every reader of the same published
+// configuration agrees on it without a shared counter. A tab can echo the token
+// it was rendered with and a save compares it to the model's current policy.
+func reasoningRevision(m Model) string {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	write := func(text string) {
+		for i := 0; i < len(text); i++ {
+			h ^= uint64(text[i])
+			h *= prime64
+		}
+	}
+	write(m.ID)
+	write("\x00")
+	write(m.UpstreamID)
+	write("\x00")
+	if m.Reasoning == nil {
+		write("nil")
+		return fmt.Sprintf("%016x", h)
+	}
+	if m.Reasoning.Enabled {
+		write("1")
+	} else {
+		write("0")
+	}
+	for _, rule := range m.Reasoning.Rules {
+		write("\x01")
+		write(rule.From)
+		write("\x02")
+		write(rule.To)
+	}
+	return fmt.Sprintf("%016x", h)
 }
 
 // applyReasoningMapping rewrites the top-level reasoning_effort in place and
@@ -169,9 +211,10 @@ func applyReasoningMapping(j map[string]any, mapping *ReasoningMapping) (from, t
 	return "", "", false
 }
 
-// reasoningEffortOf reads the strength a body actually carries. An absent or
-// blank value is reported as none so the log can distinguish "not sent" from a
-// value the client named.
+// reasoningEffortOf reads the strength a body actually carries. The value is
+// returned verbatim: the log must describe the bytes that were sent, so an
+// uppercase, padded or unknown passthrough value is never reported as a
+// normalized strength the request did not contain.
 func reasoningEffortOf(j map[string]any) string {
 	raw, exists := j["reasoning_effort"]
 	if !exists || raw == nil {
@@ -181,5 +224,5 @@ func reasoningEffortOf(j map[string]any) string {
 	if !ok {
 		return ""
 	}
-	return strings.ToLower(strings.TrimSpace(value))
+	return value
 }

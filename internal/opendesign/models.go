@@ -11,11 +11,13 @@ import (
 )
 
 // modelView is the model shape the console reads. It carries the stored
-// thinking-strength policy so the console can render it without a second route.
-// A model with no policy omits the field, which is what tells the console to
-// pre-fill the vendor table instead of showing an empty one.
+// thinking-strength policy so the console can render it without a second route,
+// plus a stable reasoning_revision token the console echoes back when saving so
+// a stale tab is rejected instead of clobbering a newer edit. A model with no
+// policy omits the mapping field, which is what tells the console to pre-fill the
+// vendor table instead of showing an empty one.
 func modelView(m Model) map[string]any {
-	view := map[string]any{"id": m.ID, "upstream_id": m.UpstreamID}
+	view := map[string]any{"id": m.ID, "upstream_id": m.UpstreamID, "reasoning_revision": reasoningRevision(m)}
 	if m.Reasoning != nil {
 		view["reasoning_mapping"] = m.Reasoning
 	}
@@ -70,11 +72,17 @@ func (s *Service) modelRegistration() any {
 // mapping only changes what this plugin sends upstream, so unlike a model-list
 // change it does not rewrite any auth file: the host's model catalog is
 // unaffected.
+//
+// expected_revision is an optional optimistic-lock token: when supplied it must
+// equal the current reasoning revision, so a tab that opened before another save
+// is rejected with 409 instead of silently clobbering it. Omitting it keeps the
+// old last-writer-wins behavior for existing callers.
 func (s *Service) saveReasoningMapping(raw json.RawMessage) (any, error) {
 	var in struct {
-		Model      string            `json:"model"`
-		UpstreamID string            `json:"upstream_id"`
-		Mapping    *ReasoningMapping `json:"reasoning_mapping"`
+		Model            string            `json:"model"`
+		UpstreamID       string            `json:"upstream_id"`
+		Mapping          *ReasoningMapping `json:"reasoning_mapping"`
+		ExpectedRevision *string           `json:"expected_revision"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil || in.Mapping == nil {
 		return nil, localFail(http.StatusBadRequest, "invalid_request", "invalid reasoning mapping JSON")
@@ -105,6 +113,12 @@ func (s *Service) saveReasoningMapping(raw json.RawMessage) (any, error) {
 	if cfg.Models[index].UpstreamID != upstream {
 		return nil, fail(http.StatusConflict, "model upstream changed; refresh before saving")
 	}
+	// The revision check and the mutation run under the same configMu, so a
+	// concurrent save cannot slip between the compare and the publish.
+	currentRevision := reasoningRevision(cfg.Models[index])
+	if in.ExpectedRevision != nil && *in.ExpectedRevision != "" && *in.ExpectedRevision != currentRevision {
+		return nil, localFail(http.StatusConflict, "reasoning_revision_conflict", "reasoning mapping changed since this page was loaded; refresh before saving")
+	}
 	cfg.Models[index].Reasoning = cloneReasoningMapping(in.Mapping)
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -119,25 +133,18 @@ func (s *Service) saveReasoningMapping(raw json.RawMessage) (any, error) {
 	s.modelMappingRevision++
 	s.clearModelTestsLocked()
 	s.mu.Unlock()
-	return map[string]any{"models": cfg.Models}, nil
+	return map[string]any{"models": modelViews(cfg.Models), "reasoning_revision": reasoningRevision(cfg.Models[index])}, nil
 }
 
 // resolveModel maps a client alias onto the upstream model ID. An unknown alias is
-// rejected locally so the request never reaches the network.
+// rejected locally so the request never reaches the network. The lookup shares
+// modelSnapshotFor so it always observes one published configuration.
 func (s *Service) resolveModel(model string) (string, error) {
-	model = strings.TrimSpace(model)
-	for _, m := range s.config().Models {
-		if m.ID == model {
-			return m.UpstreamID, nil
-		}
+	snapshot, ok := s.modelSnapshotFor(model)
+	if !ok {
+		return "", &APIError{Status: http.StatusBadRequest, Kind: "model_not_enabled", Message: "model is not enabled in the OpenDesign plugin"}
 	}
-	// An exact upstream ID is also callable, which keeps logs and mirrors usable.
-	for _, m := range s.config().Models {
-		if m.UpstreamID == model {
-			return m.UpstreamID, nil
-		}
-	}
-	return "", &APIError{Status: http.StatusBadRequest, Kind: "model_not_enabled", Message: "model is not enabled in the OpenDesign plugin"}
+	return snapshot.upstream, nil
 }
 
 // discoverModels calls GET /models with the supplied credential. The key comes
@@ -211,6 +218,14 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 	cfg := s.config()
 	previous := cfg.Models
 	cfg.Models = append([]Model(nil), in.Models...)
+	// Canonicalize the incoming alias/upstream IDs before matching, so a
+	// whitespace-only edit cannot make the keep-existing-policy lookup miss and
+	// silently drop a saved rule table. validate() would trim them later, but by
+	// then the policy had already been decided.
+	for i := range cfg.Models {
+		cfg.Models[i].ID = strings.TrimSpace(cfg.Models[i].ID)
+		cfg.Models[i].UpstreamID = strings.TrimSpace(cfg.Models[i].UpstreamID)
+	}
 	// An incoming list that omits the policy keeps the stored one. The upstream ID
 	// has to match as well: a rule written for one upstream must not be silently
 	// applied to another model that happens to reuse the alias. A policy sent in
@@ -220,7 +235,7 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 			continue
 		}
 		for _, existing := range previous {
-			if existing.ID == cfg.Models[i].ID && existing.UpstreamID == cfg.Models[i].UpstreamID {
+			if strings.TrimSpace(existing.ID) == cfg.Models[i].ID && strings.TrimSpace(existing.UpstreamID) == cfg.Models[i].UpstreamID {
 				cfg.Models[i].Reasoning = cloneReasoningMapping(existing.Reasoning)
 				break
 			}
@@ -247,7 +262,7 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 	if err := s.refreshAuthModels(); err != nil {
 		return nil, localFail(http.StatusBadGateway, "host_contract_error", "model mapping saved but the host model refresh failed: host rejected the refresh")
 	}
-	return map[string]any{"models": cfg.Models}, nil
+	return map[string]any{"models": modelViews(cfg.Models)}, nil
 }
 
 // refreshAuthModels rewrites every live credential with a new model revision so

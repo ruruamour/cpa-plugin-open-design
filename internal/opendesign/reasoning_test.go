@@ -97,6 +97,12 @@ func TestApplyReasoningMapping(t *testing.T) {
 			wantPresent: false, wantFrom: "low", wantApplied: true,
 		},
 		{
+			// An unsupported passthrough is preserved verbatim; the value must not be
+			// reported as a strength the plugin recognized.
+			name: "uppercase passthrough is preserved", body: map[string]any{"reasoning_effort": "HIGH"},
+			wantEffort: "HIGH", wantPresent: true,
+		},
+		{
 			name: "unmatched strength passes through", body: map[string]any{"reasoning_effort": "none"},
 			wantEffort: "none", wantPresent: true,
 		},

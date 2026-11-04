@@ -31,6 +31,11 @@ type ExecutorRequest struct {
 
 	UpstreamModelOverride string      `json:"-"`
 	CredentialOverride    *Credential `json:"-"`
+	// ReasoningPinned/ReasoningOverride carry an explicit policy snapshot for the
+	// explicit model test, so the policy cannot be re-resolved from a newer
+	// published configuration after the upstream ID was captured.
+	ReasoningPinned   bool              `json:"-"`
+	ReasoningOverride *ReasoningMapping `json:"-"`
 
 	StreamID       string `json:"stream_id"`
 	HostCallbackID string `json:"host_callback_id"`
@@ -49,17 +54,60 @@ func decodeExecutorRequest(raw json.RawMessage) (ExecutorRequest, error) {
 	return r, nil
 }
 
+// modelSnapshot is one consistent read of the published model list. The alias
+// resolution and the reasoning policy both come from the same slice, so a
+// concurrent save can never pair a new upstream ID with an old rule table (or
+// vice versa). The policy is a deep copy, so the caller never touches the
+// published configuration.
+type modelSnapshot struct {
+	upstream  string
+	reasoning *ReasoningMapping
+}
+
+// modelSnapshotFor reads one model row by alias or exact upstream ID under a
+// single lock acquisition. It returns ok=false for an unknown model so the
+// caller can produce the same model_not_enabled error resolveModel did.
+func (s *Service) modelSnapshotFor(model string) (modelSnapshot, bool) {
+	model = strings.TrimSpace(model)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for i := range s.cfg.Models {
+		if s.cfg.Models[i].ID == model {
+			return modelSnapshot{upstream: s.cfg.Models[i].UpstreamID, reasoning: cloneReasoningMapping(s.cfg.Models[i].Reasoning)}, true
+		}
+	}
+	for i := range s.cfg.Models {
+		if s.cfg.Models[i].UpstreamID == model {
+			return modelSnapshot{upstream: s.cfg.Models[i].UpstreamID, reasoning: cloneReasoningMapping(s.cfg.Models[i].Reasoning)}, true
+		}
+	}
+	return modelSnapshot{}, false
+}
+
 // prepare validates the request and produces the outbound OpenAI payload with the
 // upstream model ID substituted. The caller's Authorization header is dropped by
-// construction: only headers built here reach the network.
-func (s *Service) prepare(r ExecutorRequest) (map[string]any, string, error) {
+// construction: only headers built here reach the network. The model snapshot is
+// taken once and returned so the reasoning policy is applied from the exact same
+// configuration the upstream ID came from.
+func (s *Service) prepare(r ExecutorRequest) (map[string]any, string, modelSnapshot, error) {
+	snapshot := modelSnapshot{}
 	upstream := strings.TrimSpace(r.UpstreamModelOverride)
-	var err error
 	if upstream == "" {
-		upstream, err = s.resolveModel(r.Model)
-		if err != nil {
-			return nil, "", err
+		var ok bool
+		snapshot, ok = s.modelSnapshotFor(r.Model)
+		if !ok {
+			return nil, "", modelSnapshot{}, &APIError{Status: http.StatusBadRequest, Kind: "model_not_enabled", Message: "model is not enabled in the OpenDesign plugin"}
 		}
+		upstream = snapshot.upstream
+	} else if r.ReasoningPinned {
+		// The model test pins both the upstream ID and the policy it snapshotted,
+		// so a concurrent save cannot pair the old upstream with a new rule table.
+		snapshot = modelSnapshot{upstream: upstream, reasoning: cloneReasoningMapping(r.ReasoningOverride)}
+	} else if resolved, ok := s.modelSnapshotFor(r.Model); ok && resolved.upstream == upstream {
+		// An explicit override pins the upstream ID. The policy still has to come
+		// from the same row, so it is read in the same snapshot as the alias
+		// rather than re-resolved later.
+		snapshot = resolved
 	}
 	// Payload is the provider-translated body. A host that only forwards the raw
 	// client request still works because OriginalRequest is the same shape here.
@@ -69,13 +117,13 @@ func (s *Service) prepare(r ExecutorRequest) (map[string]any, string, error) {
 	}
 	j, err := decodeObject(raw)
 	if err != nil {
-		return nil, "", localFail(http.StatusBadRequest, "invalid_request", "invalid request JSON payload")
+		return nil, "", modelSnapshot{}, localFail(http.StatusBadRequest, "invalid_request", "invalid request JSON payload")
 	}
 	if messages, ok := j["messages"].([]any); !ok || len(messages) == 0 {
-		return nil, "", localFail(http.StatusBadRequest, "invalid_request", "messages must be a nonempty array")
+		return nil, "", modelSnapshot{}, localFail(http.StatusBadRequest, "invalid_request", "messages must be a nonempty array")
 	}
 	j["model"] = upstream
-	return j, upstream, nil
+	return j, upstream, snapshot, nil
 }
 
 // prepareWithReasoning decodes the outbound body, resolves the upstream model,
@@ -83,11 +131,11 @@ func (s *Service) prepare(r ExecutorRequest) (map[string]any, string, error) {
 // any attempt, and the same decision feeds both the outbound value and the log
 // row, so a recorded conversion always describes the request that was sent.
 func (s *Service) prepareWithReasoning(r ExecutorRequest, draft *requestLogDraft) (map[string]any, string, error) {
-	j, upstream, err := s.prepare(r)
+	j, upstream, snapshot, err := s.prepare(r)
 	if err != nil {
 		return nil, "", err
 	}
-	if from, to, applied := applyReasoningMapping(j, s.reasoningMappingFor(r.Model)); applied && draft != nil {
+	if from, to, applied := applyReasoningMapping(j, snapshot.reasoning); applied && draft != nil {
 		draft.reasoningFrom, draft.reasoningTo, draft.reasoningMapped = from, to, true
 	}
 	if draft != nil {
@@ -119,12 +167,31 @@ func (s *Service) execute(raw json.RawMessage) (any, error) {
 	return s.executePinned(raw, "", nil, true)
 }
 
+// reasoningDecision is the executor's own account of the thinking-strength policy
+// it applied: the effort actually sent, the rule that produced it and whether an
+// upstream call was attempted. The explicit model test echoes this rather than
+// re-deriving it, so it can never claim a value the request did not carry.
+type reasoningDecision struct {
+	effort    string
+	mapping   *RequestLogReasoningMapping
+	attempted bool
+}
+
 // executePinned is used by explicit model tests to keep the credential and
 // alias mapping snapshot used for validation identical to the outbound request.
 func (s *Service) executePinned(raw json.RawMessage, upstreamModel string, credential *Credential, manageLifecycle bool) (result any, err error) {
+	result, _, err = s.executePinnedWithReasoning(raw, upstreamModel, nil, credential, manageLifecycle)
+	return result, err
+}
+
+// executePinnedWithReasoning runs one pinned buffered request and also returns
+// the reasoning decision the executor reached. When reasoning is non-nil the
+// policy is pinned alongside the upstream model, so a concurrent save cannot
+// apply a newer rule table to an older upstream ID.
+func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel string, reasoning *ReasoningMapping, credential *Credential, manageLifecycle bool) (result any, decision reasoningDecision, err error) {
 	if manageLifecycle {
 		if err := s.begin(); err != nil {
-			return nil, err
+			return nil, reasoningDecision{}, err
 		}
 		defer s.done()
 	}
@@ -132,10 +199,14 @@ func (s *Service) executePinned(raw json.RawMessage, upstreamModel string, crede
 	defer func() { s.recordRequestLog(draft, err) }()
 	r, err := decodeExecutorRequest(raw)
 	if err != nil {
-		return nil, err
+		return nil, reasoningDecision{}, err
 	}
 	if upstreamModel != "" {
 		r.UpstreamModelOverride = upstreamModel
+	}
+	if reasoning != nil {
+		r.ReasoningPinned = true
+		r.ReasoningOverride = reasoning
 	}
 	if credential != nil {
 		r.CredentialOverride = credential
@@ -147,39 +218,44 @@ func (s *Service) executePinned(raw json.RawMessage, upstreamModel string, crede
 	c, err := s.selectedCredential(r)
 	draft.secrets = append(draft.secrets, c.APIKey, c.ControlKey, c.WorkspaceID)
 	if err != nil {
-		return nil, err
+		return nil, reasoningDecision{}, err
 	}
 	draft.credentialID = c.ID
 	j, upstream, err := s.prepareWithReasoning(r, draft)
 	if err != nil {
-		return nil, err
+		return nil, reasoningDecision{}, err
 	}
 	draft.upstreamModel = upstream
+	decision = reasoningDecision{effort: draft.reasoningEffort}
+	if draft.reasoningMapped {
+		decision.mapping = &RequestLogReasoningMapping{From: draft.reasoningFrom, To: draft.reasoningTo}
+	}
 	delete(j, "stream")
 	delete(j, "stream_options")
 
 	body, err := json.Marshal(j)
 	if err != nil {
-		return nil, localFail(http.StatusBadRequest, "invalid_request", "could not encode upstream request")
+		return nil, decision, localFail(http.StatusBadRequest, "invalid_request", "could not encode upstream request")
 	}
 	status, headers, respBody, err := s.doJSON(r.HostCallbackID, http.MethodPost, upstreamURL(c.BaseURL, "/chat/completions", nil), upstreamHeaders(c.APIKey), body)
 	draft.upstreamAttempted = status >= 100 && status <= 599 || upstreamErrorWasAttempted(err)
+	decision.attempted = draft.upstreamAttempted
 	draft.httpStatus = status
 	draft.requestID = requestIDFrom(headers)
 	if err != nil {
-		return nil, err
+		return nil, decision, err
 	}
 	keys := s.redactionKeys(c.APIKey, c.ControlKey)
 	if status < 200 || status >= 300 {
-		return nil, upstreamErrorFromResponse(status, headers, respBody, keys...)
+		return nil, decision, upstreamErrorFromResponse(status, headers, respBody, keys...)
 	}
 	root, decodeErr := decodeObject(respBody)
 	if decodeErr != nil {
-		return nil, upstreamProtocolError("upstream returned a non-JSON completion body", status)
+		return nil, decision, upstreamProtocolError("upstream returned a non-JSON completion body", status)
 	}
 	// A 200 carrying a top-level error is an upstream failure, not a completion.
 	if errBody := successBodyError(root, status, respBody, keys...); errBody != nil {
-		return nil, errBody
+		return nil, decision, errBody
 	}
 	// Only an upstream usage object may populate token counts; a missing or
 	// malformed field stays null instead of being guessed.
@@ -195,7 +271,7 @@ func (s *Service) executePinned(raw json.RawMessage, upstreamModel string, crede
 		"Payload":  respBody,
 		"Headers":  http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
 		"Metadata": map[string]any{"provider": Provider, "upstream_model": j["model"], "http_status": status},
-	}, nil
+	}, decision, nil
 }
 
 // executeStream handles executor.execute_stream. It returns as soon as the

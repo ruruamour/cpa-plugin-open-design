@@ -118,8 +118,20 @@ func (s *Service) config() Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	c := s.cfg
-	c.Models = append([]Model{}, c.Models...)
+	c.Models = make([]Model, len(s.cfg.Models))
+	for i := range s.cfg.Models {
+		c.Models[i] = cloneModel(s.cfg.Models[i])
+	}
 	return c
+}
+
+// cloneModel copies a Model including its optional reasoning policy. Without the
+// deep copy a caller would share the slice backing the published configuration,
+// so cfg.validate() rewriting Rules[i].From/To would race a concurrent reader
+// (and a concurrent save) on the same published slice.
+func cloneModel(m Model) Model {
+	m.Reasoning = cloneReasoningMapping(m.Reasoning)
+	return m
 }
 
 // Handle dispatches one plugin RPC. Only methods we actually implement are
