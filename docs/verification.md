@@ -31,7 +31,12 @@
 - 功能与版本提交 `6109fefdda471ca408053c705602686d36675d47` 已推送到 `origin/open-design`；精确提交 [CI 41776632744](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/41776632744) 成功，下载 artifact `open-design-linux-amd64`。
 - 交付库 SHA256 `d1febadb0843c4a29682320fa5f5ed424abfd0d3633bb2dec3fd3ac5476fabda`，最高 GLIBC 2.34。用与 CI 相同的 `golang:1.26-bookworm` 镜像、相同步骤与参数在本机重建，结果与该 artifact 逐字节相同（本机无法直连 `proxy.golang.org`，改为挂载本机模块缓存，其余命令一致）。
 - 交付目录 `dist/open-design-0.4.0-linux-amd64/` 含 `.so`、`SHA256SUMS`、`manifest.json` 与 `abi-report.json`；`dist/open-design_0.4.0_linux_amd64.zip` 仅含 `open-design.so`，ZIP SHA256 `2ea49aa2ba6d7844e7c1d578d87fef8123626cbccbde35278cc99f1551056b0e`。GitHub Release 尚未发布。
-- 部署与生产核验记录见下一节（随后补写）。
+### 0.4.0 生产交付与只读核验
+
+- 通过 ops `scripts/deploy-cpa-plugin-open-design.sh --local --yes --dry-run` 只读预检后，以同脚本 `--local --yes` 安装到 `nuoapi-net`，两次都取得退出码 0（`0.3.0` 那轮出现的 60 秒等待上限没有复现）。备份 `/srv/cliproxy/_backups/open-design-20261104T052345Z`（`0700`／`0600`），旧库 `fa4b80e4…d0262f6` 与 `0.3.0` 交付库一致。
+- 部署后独立只读核验：`GET /status` 的 `version` 为 `0.4.0`，`registered` 与 `effective_enabled` 为 true；两个控制台入口 200，含五选项卡与错误规则对话框，HTML SHA256 `79206ae236dbbffa0f91618b90688f0788731585ba0082de64265448054adc0d` 与本地按 `ui.go` 方式拼装的源码字节相同。
+- 错误规则：`GET /error-rules` 返回 8 条默认策略，`sync={"total":4,"succeeded":4,"failed":[]}`；4 个 OpenDesign auth 文件均带 `request_scoped_errors`，各 8 条，状态码覆盖 400／401／402／403／429／500／503。
+- 边界核对：宿主 `exe`、`config.yaml`、`settings.json`、模型映射、凭据数（4）与模型数（1）全部与部署前相同；只有 `open-design.so` 从 `fa4b80e4…` 换成 `d1febadb…`，以及 auth 文件新增 `request_scoped_errors` 字段。本轮没有任何真实推理或额度查询。
 
 本轮证据：`/tmp/open-design-04-{go,race,vet,node}.log`、`/tmp/open-design-04-abi.json`、`/tmp/open-design-04-host.json`、`/tmp/open-design-04-edge/report.json`、`/tmp/open-design-04-ci-abi.json`、`/tmp/od04-exact-out/open-design.so`、`/tmp/od04-ci/open-design.so`。浏览器脚本为 `/tmp/open_design_04_edge_acceptance.py`，不随构建产物分发。
 
