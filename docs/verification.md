@@ -1,5 +1,40 @@
 # OpenDesign 插件验证记录
 
+## 0.4.0 本轮验收
+
+2026-11-04 完成源码验收。`0.4.0` 在 `0.3.0` 上新增可编辑的重试调度／错误规则：规则随每个凭据写入宿主 auth 文件的 `request_scoped_errors`，由 CPA 的 request-scoped 机制决定停止或换号、是否冷却。插件不做并发限制，也不做请求排队。
+
+| 检查 | 结果与范围 |
+| --- | --- |
+| 全仓 Go | Go 1.26.4 的 `go test ./...`、`go test -race ./... -count=1`、`go vet ./...` 全部通过 |
+| Node | `node --test tests/*.test.cjs`，152/152 通过 |
+| 源码 | Go 格式、四个管理 JS 的语法、`git diff --check` 通过 |
+| 原生 ABI | ctypes 冒烟 PASS，注册版本严格读取源码 `Version`；`management_v03` 含 `error_rules_roundtrip_and_sync` |
+| 原版 CPA | 8.0.48（`dbb70621-hotfix3`）离线加载与 loopback CONNECT／私有 CA TLS 全流程 PASS |
+| 真实宿主换号 | 双凭据 + 假上游生产 400 `tier_limit_exceeded`：命中规则后换到另一账号并返回 200，冷却后跳过失败账号，`stop` 规则下不换号 |
+| Microsoft Edge | 153.0.4234.48、隔离 profile、两入口 592/592；含错误规则对话框阶段与双主题截图 |
+| Debian 12 | 与 CI 完全相同的镜像／步骤／参数重新构建，结果与 CI 产物逐字节相同 |
+| ops | 28 项离线部署回归通过；guard 版本 0.4.0 |
+
+### 错误规则专项验证
+
+- **匹配对象**：规则匹配插件生成的错误 Message，不是上游响应体。上游错误、协议错误、传输错误、插件不可用和响应过大分别带 `[open-design:<kind>]` 前缀；marker 只由封闭白名单拼出，上游文本无法伪造规则。测试含「未知 code 不回显」用例。
+- **分类**：`tier_limit_exceeded` 纳入受控已知码；上游写在消息里的 `[code=...]` 只在白名单内识别，其余一律归为 `upstream_error`。
+- **存储**：策略保存在 `<data_dir>/error-rules.json`，严格解析（拒绝未知字段、重复键、尾 JSON、超量条件、无效正则），原子写；文件损坏回退默认并上报 `load_error`，失败写不覆盖旧策略。
+- **同步**：`GET`／`PUT /error-rules` 与 `POST /error-rules/{sync,reset}`。同步只重写每个凭据的 `request_scoped_errors` 一个键，保留宿主或运维新增的未知字段（测试覆盖 `operator_note`），逐账号独立报告失败，失败可重试恢复。
+- **空数组语义**：空规则表示不写插件自有规则，由 CPA 配置决定，UI 明确显示该边界。
+- **真实宿主轮换**（`--cpa-live`）：假上游按 Bearer 返回一次 400 `tier_limit_exceeded`。客户端收到 200，假上游记录两次尝试、两个不同账号；随后的请求只使用健康账号，证明冷却生效；把策略改成 `stop` 后同一故障只尝试一次并把带 marker 的 400 透传给客户端。
+- **UI 接线**：Edge 验收发现并修复了「错误规则」按钮与对话框内按钮没有绑定点击事件的问题（Node 用例原先直接调用 handlers，绕过了 DOM 绑定）。修复后在 `bind()` 中接线，并补 2 项 Node 用例锁定该行为。
+
+### 0.4.0 交付产物
+
+- 功能与版本提交 `6109fefdda471ca408053c705602686d36675d47` 已推送到 `origin/open-design`；精确提交 [CI 41776632744](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/41776632744) 成功，下载 artifact `open-design-linux-amd64`。
+- 交付库 SHA256 `d1febadb0843c4a29682320fa5f5ed424abfd0d3633bb2dec3fd3ac5476fabda`，最高 GLIBC 2.34。用与 CI 相同的 `golang:1.26-bookworm` 镜像、相同步骤与参数在本机重建，结果与该 artifact 逐字节相同（本机无法直连 `proxy.golang.org`，改为挂载本机模块缓存，其余命令一致）。
+- 交付目录 `dist/open-design-0.4.0-linux-amd64/` 含 `.so`、`SHA256SUMS`、`manifest.json` 与 `abi-report.json`；`dist/open-design_0.4.0_linux_amd64.zip` 仅含 `open-design.so`，ZIP SHA256 `2ea49aa2ba6d7844e7c1d578d87fef8123626cbccbde35278cc99f1551056b0e`。GitHub Release 尚未发布。
+- 部署与生产核验记录见下一节（随后补写）。
+
+本轮证据：`/tmp/open-design-04-{go,race,vet,node}.log`、`/tmp/open-design-04-abi.json`、`/tmp/open-design-04-host.json`、`/tmp/open-design-04-edge/report.json`、`/tmp/open-design-04-ci-abi.json`、`/tmp/od04-exact-out/open-design.so`、`/tmp/od04-ci/open-design.so`。浏览器脚本为 `/tmp/open_design_04_edge_acceptance.py`，不随构建产物分发。
+
 ## 0.3.0 本轮验收
 
 2026-11-03 完成源码验收与 `nuoapi-net` 生产升级。`0.3.0` 在 `0.2.0` 上新增请求日志／统计、官方模型级覆盖、显式模型测试、插件配置与 runtime，并将控制台整理为五个选项卡。
