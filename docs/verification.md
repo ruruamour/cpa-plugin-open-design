@@ -1,5 +1,28 @@
 # OpenDesign 插件验证记录
 
+## 0.4.2 本轮验收
+
+2026-11-04 发布 `0.4.2`。它把插件内所有持久化重命名统一到一条带有限重试的发布路径，并锁定裸 402 的分类边界；运行时行为与 `0.4.0`／`0.4.1` 相同。
+
+| 检查 | 结果与范围 |
+| --- | --- |
+| 全仓 Go | Go 1.26.4 的 `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 全部通过 |
+| Node | `node --test tests/*.test.cjs`，152/152 通过 |
+| Windows 语义 | 交叉编译 Windows 测试二进制成功；请求日志、快照、settings.json 的重命名占用冲突重试与失败不提交由注入用例锁定 |
+| 分类边界 | 裸 402 保持 `upstream_error` 且不匹配任何默认规则；带 `insufficient_quota` 码的 402 仍换号冷却 |
+
+### 0.4.2 改动内容
+
+- `renameFile`／`publishStagedFile`／`publishRetryPauses` 从请求日志专用提升为插件通用；`settings.json`（`saveSettings`）与错误规则文件（`publishErrorRulesFile`）改用同一发布路径，占用冲突按 5ms／20ms／60ms 有限重试，最终失败仍如实返回并清理临时文件。
+- 裸 402（上游只给自由文本 `payment required`，无机器可读码）保持 `upstream_error`、不匹配默认规则；生产 2026-11-01～04 共 6 次这样的 402，同批账号 496/500 为 200，无额度耗尽证据。
+- 新增用例：`TestSettingsSaveRetriesTransientWindowsShareViolation`、`TestSettingsSaveReportsPersistentWindowsShareViolation`、`TestErrorRulesBarePaymentRequiredStaysUnclassified`、`TestErrorRulesClassifyPaymentRequiredWithQuotaCode`。
+
+### 0.4.2 生产观察（只读）
+
+- 最近 500 条请求日志：496 条 200、3 条 402（`upstream_error`）、1 条 `upstream_transport_error`。
+- `GET /v0/management/auth-files` 的 OpenDesign 凭据：4 个 `active`、0 冷却；`od6819533028@fldubai.com` 有 1 条模型级冷却（`scope=model`、`reason=payment_required`、`http_status=402`），由 CPA 宿主按 402 生成，非插件写入。
+- 未发现插件侧额度暂停（`quota.signals` 为空）与额度耗尽判定。
+
 ## 0.4.1 本轮验收
 
 2026-11-04 发布 `0.4.1`。它只修 `0.4.0` 的跨平台缺陷，不改变功能与运行时行为。
