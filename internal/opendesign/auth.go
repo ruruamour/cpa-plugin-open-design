@@ -74,6 +74,11 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 	if c.BaseURL == "" {
 		c.BaseURL = s.config().BaseURL
 	}
+	// Reconcile the plugin-wide retry-scheduling policy before the credential is
+	// published: an auth file written by an older plugin version, or by hand,
+	// gets the current rules. Caller holds authFileMu and no host call happens
+	// here, so the rewrite is safe on this path.
+	s.applyErrorRules(&c, dir, baseName, r.RawJSON, pending)
 	if pending {
 		// The host parses the new body, then writes the file, then upserts its
 		// records; any of the last two steps can still fail and leave the POST
@@ -161,8 +166,12 @@ func (s *Service) authData(c Credential) map[string]any {
 		"Label":       c.Label,
 		"Disabled":    c.Disabled,
 		"StorageJSON": jsonBytes(c),
-		"Metadata":    map[string]any{"type": Provider},
-		"Attributes":  map[string]string{"auth_kind": "api_key"},
+		// CPA reads request_scoped_errors from the auth metadata to classify an
+		// upstream failure as stop/continue and to decide whether the failed
+		// credential is cooled down. The plugin owns the policy; the scheduling
+		// decision stays with CPA.
+		"Metadata":   map[string]any{"type": Provider, "request_scoped_errors": errorRulesForMetadata(c.RequestScopedErrors)},
+		"Attributes": map[string]string{"auth_kind": "api_key"},
 	}
 }
 
@@ -267,6 +276,9 @@ func (s *Service) saveCredential(c Credential, filename string) error {
 	// record hold. Publishing here also covers a save whose reentrant
 	// auth.parse never ran.
 	s.storeCredentialLocked(c)
+	// The written file carries exactly this credential's rules, so the policy is
+	// known to be in sync for this account.
+	s.markErrorRulesSyncedLocked(c.ID, c.RequestScopedErrors, nil)
 	if filename != "" {
 		s.authFiles[c.ID] = filepath.Base(filename)
 	}

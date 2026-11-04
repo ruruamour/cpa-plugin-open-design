@@ -60,6 +60,10 @@ func managementRoutes() []managementRoute {
 		{Method: http.MethodGet, Path: apiBase + "/config"},
 		{Method: http.MethodPost, Path: apiBase + "/config"},
 		{Method: http.MethodGet, Path: apiBase + "/runtime"},
+		{Method: http.MethodGet, Path: apiBase + "/error-rules"},
+		{Method: http.MethodPut, Path: apiBase + "/error-rules"},
+		{Method: http.MethodPost, Path: apiBase + "/error-rules/sync"},
+		{Method: http.MethodPost, Path: apiBase + "/error-rules/reset"},
 		{Method: http.MethodPost, Path: apiBase + "/model-test"},
 		{Method: http.MethodPost, Path: apiBase + "/credentials"},
 		{Method: http.MethodDelete, Path: apiBase + "/credentials"},
@@ -147,6 +151,10 @@ func (s *Service) management(raw json.RawMessage) (any, error) {
 		return s.updateConfigRequest(r)
 	case r.Method == http.MethodGet && path == apiBase+"/runtime":
 		return s.runtimeRequest()
+	case (r.Method == http.MethodGet || r.Method == http.MethodPut) && path == apiBase+"/error-rules":
+		return s.withActive(func() (any, error) { return s.errorRulesRequest(r) })
+	case r.Method == http.MethodPost && (path == apiBase+"/error-rules/sync" || path == apiBase+"/error-rules/reset"):
+		return s.withActive(func() (any, error) { return s.errorRulesRequest(r) })
 	case r.Method == http.MethodPost && path == apiBase+"/model-test":
 		return s.modelTestRequest(r)
 	case r.Method == http.MethodPost && path == apiBase+"/credentials":
@@ -290,7 +298,7 @@ func (s *Service) createCredential(in credentialInput) (any, error) {
 		return managementError(http.StatusBadRequest, "label exceeds 100 characters")
 	}
 	cfg := s.config()
-	c := Credential{Type: Provider, ID: PluginID + "-" + newID(), Label: label, APIKey: key, BaseURL: cfg.BaseURL}
+	c := Credential{Type: Provider, ID: PluginID + "-" + newID(), Label: label, APIKey: key, BaseURL: cfg.BaseURL, RequestScopedErrors: s.currentErrorRules()}
 	if err := applyBillingInput(&c, in); err != nil {
 		return managementError(statusOf(err), err.Error())
 	}
@@ -344,6 +352,10 @@ func (s *Service) updateCredential(id string, in credentialInput) (any, error) {
 	if c.BaseURL == "" {
 		c.BaseURL = s.config().BaseURL
 	}
+	// Every credential writer runs under credentialMu, and the rule sync runs
+	// under the same lock, so reading the live policy here guarantees a late
+	// credential save can never write a previous policy back into an auth file.
+	c.RequestScopedErrors = s.currentErrorRules()
 	filename := s.fileNameFor(c)
 	if filepath.Base(filename) != filename || strings.ContainsAny(filename, `/\`) {
 		return managementError(http.StatusBadRequest, "invalid credential filename")

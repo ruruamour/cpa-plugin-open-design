@@ -44,6 +44,10 @@ type Service struct {
 	modelCoverageBudget  time.Duration
 	authFiles            map[string]string
 	revoked              map[string]bool
+	errorRules           []RequestErrorRule
+	errorRulesLoadError  string
+	errorRuleSynced      map[string]string
+	errorRuleSyncErrors  map[string]string
 	requestLogs          *requestLogStore
 	modelTests           map[string]modelTestRecord
 	modelTestRunning     map[string]int
@@ -77,6 +81,9 @@ func NewService() *Service {
 		modelCoverageBudget: modelCoverageBudget,
 		authFiles:           map[string]string{},
 		revoked:             map[string]bool{},
+		errorRules:          defaultErrorRules(),
+		errorRuleSynced:     map[string]string{},
+		errorRuleSyncErrors: map[string]string{},
 		requestLogs:         requestLogs,
 		modelTests:          map[string]modelTestRecord{},
 		modelTestRunning:    map[string]int{},
@@ -242,6 +249,14 @@ func (s *Service) configure(raw json.RawMessage) (err error) {
 	// store falls back to an empty, writable state. Loading happens outside the
 	// service lock because it may parse up to the bounded snapshot and journal.
 	_ = s.requestLogs.configure(cfg.DataDir, cfg.logSettings())
+	// The retry-scheduling policy is operator-editable and lives next to the
+	// settings. A corrupt file falls back to the built-in defaults and is
+	// reported on GET /error-rules instead of blocking registration.
+	rules, loadErr := loadErrorRules(cfg.DataDir)
+	s.mu.Lock()
+	s.errorRules = rules
+	s.errorRulesLoadError = loadErr
+	s.mu.Unlock()
 	return nil
 }
 

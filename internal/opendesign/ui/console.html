@@ -180,6 +180,18 @@
     .log-detail { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .toolbar .field.narrow { flex: 0 1 150px; }
     .read-only { min-width: 0; border: 1px dashed var(--line); border-radius: 8px; padding: 10px 12px; background: var(--surface-2); }
+    dialog { width: min(920px, 94vw); max-height: 88vh; overflow: auto; border: 1px solid var(--line); border-radius: 12px; padding: 16px; background: var(--surface); color: var(--text); }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+    .dialog-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; justify-content: space-between; }
+    .dialog-head h2 { margin: 0; }
+    .error-rule-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-width: 0; }
+    .error-rule-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+    .error-rule-fields { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+    .error-rule-condition { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-top: 8px; min-width: 0; }
+    .error-rule-condition-text { min-width: 0; width: 100%; font-family: var(--mono, monospace); overflow-wrap: anywhere; }
+    .error-rule-description { margin: 6px 0 0; overflow-wrap: anywhere; }
+    .error-rule-name { overflow-wrap: anywhere; }
+    #errorRulesState { white-space: pre-wrap; }
     @media (max-width: 760px) {
       .split { grid-template-columns: minmax(0, 1fr); }
       .mapping-row { grid-template-columns: minmax(0, 1fr); }
@@ -322,6 +334,10 @@
           <p class="hint">编辑时留空表示保留原值；勾选后保存可清除额度授权，推理 Key 保留。</p>
         </details>
         <p class="state" id="accountState" role="status" aria-live="polite" hidden></p>
+        <div class="panel-actions" style="margin-top: 12px;">
+          <button class="button compact" id="openErrorRules" type="button">错误规则</button>
+          <span class="hint">配置 CPA 的重试调度：命中规则的失败是停止还是继续换号，以及是否冷却失败的账号。保存后会同步到每个账号的凭据。</span>
+        </div>
       </form>
       <div class="rows" id="accountList" style="margin-top: 14px;" aria-live="polite"></div>
     </section>
@@ -524,6 +540,40 @@
       </section>
     </section>
   </main>
+
+  <dialog id="errorRulesDialog" aria-labelledby="errorRulesTitle">
+    <div class="dialog-head">
+      <div>
+        <h2 id="errorRulesTitle">错误规则</h2>
+        <p class="hint">作用范围：<span class="mono">全部 OpenDesign 凭据</span>。规则保存在插件中，并随每个账号的凭据同步给 CPA；实际的换号与冷却决定由 CPA 做出。</p>
+      </div>
+      <button class="button compact" id="openErrorRuleHelp" type="button">动作说明</button>
+    </div>
+    <p class="state" id="errorRulesState" role="status" aria-live="polite" hidden></p>
+    <div class="rows" id="errorRulesList" aria-live="polite"></div>
+    <div class="panel-actions" style="margin-top: 10px;">
+      <button class="button compact" id="addErrorRule" type="button">新增规则</button>
+      <button class="button compact" id="resetErrorRules" type="button">恢复默认</button>
+      <button class="button compact" id="retryErrorRules" type="button">重新同步</button>
+      <button class="button primary" id="saveErrorRules" type="button">保存并同步所有账号</button>
+      <button class="button" id="closeErrorRules" type="button">关闭</button>
+    </div>
+  </dialog>
+
+  <dialog id="errorRuleHelpDialog" aria-labelledby="errorRuleHelpTitle">
+    <div class="dialog-head">
+      <h2 id="errorRuleHelpTitle">动作说明</h2>
+      <button class="button compact" id="closeErrorRuleHelp" type="button">关闭</button>
+    </div>
+    <div class="read-only">
+      <section><h3>停止</h3><p><b>当前请求：</b>停止重试和切换凭据，把错误返回客户端。</p><p><b>后续调度：</b>不影响凭据的冷却状态。</p></section>
+      <section><h3>停止并冷却</h3><p><b>当前请求：</b>停止重试和切换凭据，把错误返回客户端。</p><p><b>后续调度：</b>把失败的凭据或模型暂时排除出调度。</p></section>
+      <section><h3>继续</h3><p><b>当前请求：</b>继续尝试其他可用候选账号。</p><p><b>后续调度：</b>不冷却失败的凭据。</p></section>
+      <section><h3>继续并冷却</h3><p><b>当前请求：</b>继续尝试其他可用凭据。</p><p><b>后续调度：</b>冷却期间跳过失败的凭据。</p></section>
+      <section><h3>匹配方式</h3><p>「包含文本」按子串匹配上游错误文本；「正则表达式」使用 Go 正则语法。状态码必须与上游返回的 HTTP 状态一致，两者都命中才会触发动作。</p></section>
+      <section><h3>规则为空时</h3><p>没有规则时不写入插件自有规则，改由 CPA 自身的配置决定分类与调度。</p></section>
+    </div>
+  </dialog>
 
   <script>
     /*__OPEN_DESIGN_AUTH__*/

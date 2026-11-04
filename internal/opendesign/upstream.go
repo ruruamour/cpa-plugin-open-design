@@ -74,13 +74,14 @@ const (
 )
 
 // upstreamProtocolError marks a response we could not interpret. It is a 502
-// because the failure is the upstream's, not the caller's.
+// because the failure is the upstream's, not the caller's. The marker keeps it
+// matchable by a request-scoped rule even though the status is synthesized.
 func upstreamProtocolError(message string, status ...int) error {
 	upstreamStatus := 0
 	if len(status) > 0 {
 		upstreamStatus = status[0]
 	}
-	return &APIError{Status: http.StatusBadGateway, Kind: "upstream_protocol_error", Message: message, upstreamAttempted: true, upstreamStatus: upstreamStatus}
+	return &APIError{Status: http.StatusBadGateway, Kind: "upstream_protocol_error", Message: upstreamErrorMarkerFor("upstream_protocol_error") + " " + message, upstreamAttempted: true, upstreamStatus: upstreamStatus}
 }
 
 // upstreamHeaders is the complete outbound header set. The client's own
@@ -123,7 +124,7 @@ func (s *Service) doJSON(callbackID, method, url string, headers http.Header, bo
 		return out.StatusCode, out.Headers, nil, &APIError{
 			Status:            http.StatusRequestEntityTooLarge,
 			Kind:              "response_limit_exceeded",
-			Message:           "upstream response exceeds plugin limit",
+			Message:           upstreamErrorMarkerFor("response_limit_exceeded") + " upstream response exceeds plugin limit",
 			upstreamAttempted: true,
 			upstreamStatus:    out.StatusCode,
 		}
@@ -153,7 +154,7 @@ func (s *Service) openStream(callbackID, method, url string, headers http.Header
 		return out, upstreamTransportError(errors.New(out.Error), out.StatusCode)
 	}
 	if out.StreamID == "" {
-		return out, &APIError{Status: http.StatusBadGateway, Kind: "host_contract_error", Message: "host returned no upstream stream identifier", upstreamAttempted: true, upstreamStatus: out.StatusCode}
+		return out, &APIError{Status: http.StatusBadGateway, Kind: "host_contract_error", Message: upstreamErrorMarkerFor("host_contract_error") + " host returned no upstream stream identifier", upstreamAttempted: true, upstreamStatus: out.StatusCode}
 	}
 	s.mu.Lock()
 	stopped := s.stopped
@@ -163,7 +164,7 @@ func (s *Service) openStream(callbackID, method, url string, headers http.Header
 	s.mu.Unlock()
 	if stopped {
 		s.closeUpstream(out.StreamID)
-		return out, &APIError{Status: http.StatusServiceUnavailable, Kind: "plugin_unavailable", Message: "OpenDesign plugin is shutting down", upstreamAttempted: true, upstreamStatus: out.StatusCode}
+		return out, &APIError{Status: http.StatusServiceUnavailable, Kind: "plugin_unavailable", Message: upstreamErrorMarkerFor("plugin_unavailable") + " OpenDesign plugin is shutting down", upstreamAttempted: true, upstreamStatus: out.StatusCode}
 	}
 	return out, nil
 }
@@ -217,7 +218,7 @@ func upstreamTransportError(err error, observedStatus ...int) error {
 	if len(observedStatus) > 0 && observedStatus[0] >= 100 && observedStatus[0] <= 599 {
 		status = observedStatus[0]
 	}
-	return &APIError{Status: http.StatusBadGateway, Kind: "upstream_transport_error", Message: "upstream request failed", upstreamAttempted: true, upstreamStatus: status}
+	return &APIError{Status: http.StatusBadGateway, Kind: "upstream_transport_error", Message: upstreamErrorMarkerFor("upstream_transport_error") + " upstream request failed", upstreamAttempted: true, upstreamStatus: status}
 }
 
 func upstreamErrorWasAttempted(err error) bool {
@@ -255,15 +256,28 @@ func upstreamErrorFromResponseObserved(status, observedStatus int, headers http.
 					candidate = strings.TrimSpace(detail.Message[:colon])
 				}
 			}
+			// A code that is known and machine-shaped names the failure. OpenAI's
+			// error type field is consulted too: the production tier limit arrives
+			// as a bracketed code inside the message with type=invalid_request_error,
+			// so the type alone is not specific enough to classify it.
 			if isKnownUpstreamCode(candidate) && safeManagementCode(candidate, keys) {
 				kind = candidate
 			}
 		}
 	}
-	message := "upstream request failed"
-	if kind != "upstream_error" {
-		message = kind + ": upstream request failed"
-	} else if text := http.StatusText(observedStatus); text != "" {
+	// Some upstreams report the classification in the message rather than a code
+	// field. Only a closed allowlist of known codes is recognized, and the text
+	// around it never becomes part of the plugin message.
+	if kind == "upstream_error" {
+		if marker := knownUpstreamCodeFromMessage(body); marker != "" {
+			kind = marker
+		}
+	}
+	// The marker is built only from the closed allowlist above. CPA matches its
+	// request-scoped error rules against this message, so it must stay stable and
+	// must never echo upstream-controlled text.
+	message := upstreamErrorMarkerFor(kind) + " upstream request failed"
+	if text := http.StatusText(observedStatus); text != "" {
 		message += ": " + strings.ToLower(text)
 	}
 	return &APIError{Status: status, Kind: kind, Message: message, upstreamAttempted: true, upstreamStatus: observedStatus}
@@ -271,10 +285,40 @@ func upstreamErrorFromResponseObserved(status, observedStatus int, headers http.
 
 func isKnownUpstreamCode(code string) bool {
 	switch code {
-	case "invalid_api_key", "invalid_request", "rate_limit_exceeded", "insufficient_quota", "model_not_found", "context_length_exceeded", "server_error", "server_overloaded":
+	case "invalid_api_key", "invalid_request", "rate_limit_exceeded", "insufficient_quota", "model_not_found",
+		"context_length_exceeded", "server_error", "server_overloaded", "tier_limit_exceeded":
 		return true
 	default:
 		return false
+	}
+}
+
+// knownUpstreamCodeFromMessage recognizes an allowlisted error code that an
+// upstream embedded in free-form text, e.g. OpenDesign's
+// "[code=tier_limit_exceeded] membership concurrency limit exceeded". Only a
+// code on the closed allowlist is returned; the surrounding text is discarded,
+// so upstream content can never forge a rule marker.
+func knownUpstreamCodeFromMessage(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	text := string(body)
+	const marker = "[code="
+	for start := 0; ; {
+		index := strings.Index(text[start:], marker)
+		if index < 0 {
+			return ""
+		}
+		value := text[start+index+len(marker):]
+		end := strings.IndexByte(value, ']')
+		if end < 0 {
+			return ""
+		}
+		candidate := strings.TrimSpace(value[:end])
+		if isKnownUpstreamCode(candidate) {
+			return candidate
+		}
+		start += index + len(marker)
 	}
 }
 

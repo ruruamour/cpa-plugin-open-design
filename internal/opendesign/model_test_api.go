@@ -461,7 +461,6 @@ func modelTestErrorMessage(kind string) string {
 		return "upstream request failed"
 	}
 }
-
 func modelTestAttempted(err error) bool {
 	return upstreamErrorWasAttempted(err)
 }

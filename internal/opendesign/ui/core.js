@@ -727,6 +727,209 @@
     };
   }
 
+  // ---- Retry scheduling / request-scoped error rules --------------------------
+  //
+  // The policy is a list of CPA request-scoped error rules. The plugin owns the
+  // policy and writes it into every credential's auth file; CPA owns the actual
+  // scheduling decision (whether to rotate and whether to cool a credential).
+
+  const ERROR_RULE_ACTIONS = [
+    ['stop', '停止'],
+    ['stop-and-cooldown', '停止并冷却'],
+    ['continue', '继续'],
+    ['continue-and-cooldown', '继续并冷却'],
+  ];
+
+  const ERROR_RULE_KINDS = [['contains', '包含文本'], ['regex', '正则表达式']];
+
+  // Known markers map to a friendly name plus one sentence. Only markers this
+  // plugin emits are listed, so an operator never sees a rule described as
+  // something it cannot match.
+  const ERROR_RULE_MARKERS = [
+    ['[open-design:tier_limit_exceeded]', '账号并发上限', '上游返回会员并发上限（tier_limit_exceeded）；该账号暂不可用，可继续尝试其他账号。'],
+    ['[open-design:rate_limit_exceeded]', '上游频率限制', '请求速率达到上游上限；冷却该账号并尝试其他账号。'],
+    ['[open-design:insufficient_quota]', '账号额度不足', '账号额度已耗尽；冷却该账号并尝试其他额度可用的账号。'],
+    ['[open-design:invalid_api_key]', '密钥无效', '上游拒绝该密钥；停止并冷却该账号，等待人工更换密钥。'],
+    ['[open-design:server_error]', '上游服务错误', '上游返回服务端错误；冷却该账号并尝试其他账号。'],
+    ['[open-design:server_overloaded]', '上游过载', '上游过载；冷却该账号并尝试其他账号。'],
+    ['[open-design:model_not_found]', '模型不可用', '该账号没有这个模型；冷却该模型并尝试其他账号。'],
+    ['[open-design:context_length_exceeded]', '上下文过长', '请求超出模型上下文；重试不会成功，停止切换账号。'],
+    ['[open-design:response_limit_exceeded]', '响应过大', '上游响应超过插件上限；重试不会成功。'],
+    ['[open-design:upstream_protocol_error]', '上游响应异常', '上游返回了无法解析的响应；冷却该账号并尝试其他账号。'],
+    ['[open-design:upstream_transport_error]', '上游连接失败', '无法连接上游或连接中断；冷却该账号并尝试其他账号。'],
+    ['[open-design:upstream_error]', '未分类上游错误', '上游返回了未被更具体规则覆盖的错误。'],
+  ];
+
+  function errorRuleActionLabel(action) {
+    const entry = ERROR_RULE_ACTIONS.find(([value]) => value === text(action));
+    return entry ? entry[1] : '';
+  }
+
+  function errorRuleKindLabel(kind) {
+    const entry = ERROR_RULE_KINDS.find(([value]) => value === text(kind));
+    return entry ? entry[1] : '';
+  }
+
+  // Conditions are read from either shape: the wire shape uses match /
+  // match-regexr, while the editor draft uses one conditions list.
+  function errorRuleConditions(rule) {
+    const source = rule && typeof rule === 'object' ? rule : {};
+    const out = [];
+    for (const value of Array.isArray(source.match) ? source.match : []) {
+      const condition = text(value);
+      if (condition) out.push({ type: 'contains', text: condition });
+    }
+    for (const value of Array.isArray(source['match-regexr']) ? source['match-regexr'] : []) {
+      const condition = text(value);
+      if (condition) out.push({ type: 'regex', text: condition });
+    }
+    for (const entry of Array.isArray(source.conditions) ? source.conditions : []) {
+      const condition = text(entry && entry.text);
+      if (!condition) continue;
+      const type = text(entry && entry.type) === 'regex' ? 'regex' : 'contains';
+      // The wire shape was already collected above; do not double-count it.
+      if (out.some(item => item.type === type && item.text === condition)) continue;
+      out.push({ type, text: condition });
+    }
+    return out;
+  }
+
+  // explainErrorRule returns a display name and description. It never returns
+  // HTML; callers assign the result with textContent.
+  function explainErrorRule(rule, index = 0) {
+    const conditions = errorRuleConditions(rule);
+    const status = safeInteger(rule && rule.status, 100, 599);
+    const matched = ERROR_RULE_MARKERS.filter(([marker]) => conditions.some(condition => condition.type === 'contains' && condition.text === marker));
+    if (matched.length) {
+      return {
+        name: `规则 ${index + 1} · ${matched.map(item => item[1]).join(' / ')}`,
+        detail: matched.map(item => item[2]).join(' '),
+      };
+    }
+    const parts = [];
+    if (status !== null) parts.push(`状态码 ${status}`);
+    if (conditions.length) {
+      const contains = conditions.filter(condition => condition.type === 'contains').length;
+      const regex = conditions.length - contains;
+      const shape = [];
+      if (contains) shape.push(`${contains} 项包含文本`);
+      if (regex) shape.push(`${regex} 项正则表达式`);
+      parts.push(shape.join(' 与 '));
+    }
+    return {
+      name: `规则 ${index + 1} · 自定义条件`,
+      detail: parts.length ? `匹配 ${parts.join('，')}。` : '尚未设置匹配条件。',
+    };
+  }
+
+  // normalizeErrorRules reads GET/PUT/POST /error-rules. Every value is bounded
+  // and every unknown field is dropped, so the console can render server data
+  // directly with textContent.
+  function normalizeErrorRule(value) {
+    const rule = value && typeof value === 'object' ? value : {};
+    const status = safeInteger(rule.status, 100, 599);
+    const action = ERROR_RULE_ACTIONS.some(([name]) => name === text(rule.action)) ? text(rule.action) : '';
+    const conditions = [];
+    for (const entry of Array.isArray(rule.match) ? rule.match : []) {
+      const condition = shortText(entry, 4096);
+      if (condition) conditions.push({ type: 'contains', text: condition });
+    }
+    for (const entry of Array.isArray(rule['match-regexr']) ? rule['match-regexr'] : []) {
+      const condition = shortText(entry, 4096);
+      if (condition) conditions.push({ type: 'regex', text: condition });
+    }
+    return { status: status === null ? 0 : status, action, conditions };
+  }
+
+  function normalizeErrorRules(value) {
+    const data = value && typeof value === 'object' ? value : {};
+    const syncSource = data.sync && typeof data.sync === 'object' ? data.sync : {};
+    const failed = (Array.isArray(syncSource.failed) ? syncSource.failed : []).map(item => {
+      const row = item && typeof item === 'object' ? item : {};
+      return {
+        id: safeIdentifier(row.id, 128),
+        label: shortText(row.label, 100),
+        error: shortText(row.error, 200),
+      };
+    });
+    return {
+      rules: (Array.isArray(data.rules) ? data.rules : []).map(normalizeErrorRule),
+      defaults: (Array.isArray(data.defaults) ? data.defaults : []).map(normalizeErrorRule),
+      inherits_cpa: data.inherits_cpa === true,
+      load_error: shortText(data.load_error, 300),
+      sync: {
+        total: safeInteger(syncSource.total) ?? 0,
+        succeeded: safeInteger(syncSource.succeeded) ?? 0,
+        failed,
+      },
+    };
+  }
+
+  // buildErrorRulesPayload turns the editor draft into the wire shape. Empty
+  // condition lists are omitted rather than sent as null, and an empty draft is
+  // an empty array (which means "inherit the CPA configuration").
+  function buildErrorRulesPayload(rules) {
+    const out = [];
+    for (const rule of Array.isArray(rules) ? rules : []) {
+      const status = safeInteger(Number(rule && rule.status), 100, 599);
+      const action = ERROR_RULE_ACTIONS.some(([name]) => name === text(rule && rule.action)) ? text(rule.action) : '';
+      const match = [];
+      const matchRegexr = [];
+      for (const condition of Array.isArray(rule && rule.conditions) ? rule.conditions : []) {
+        const value = text(condition && condition.text);
+        if (!value) continue;
+        if (text(condition && condition.type) === 'regex') matchRegexr.push(value);
+        else match.push(value);
+      }
+      const entry = { status: status === null ? 0 : status, action };
+      if (match.length) entry.match = match;
+      if (matchRegexr.length) entry['match-regexr'] = matchRegexr;
+      out.push(entry);
+    }
+    return out;
+  }
+
+  // validateErrorRules mirrors the backend's rejections so the operator gets an
+  // immediate, specific message. The backend remains the authority.
+  function validateErrorRules(rules) {
+    const list = Array.isArray(rules) ? rules : [];
+    if (list.length > 100) return '规则最多 100 条。';
+    for (let index = 0; index < list.length; index += 1) {
+      const rule = list[index] || {};
+      const status = safeInteger(Number(rule.status), 100, 599);
+      if (status === null) return `第 ${index + 1} 条规则的状态码必须是 100 到 599 之间的整数。`;
+      if (!ERROR_RULE_ACTIONS.some(([name]) => name === text(rule.action))) return `第 ${index + 1} 条规则需要选择一个动作。`;
+      const conditions = (Array.isArray(rule.conditions) ? rule.conditions : [])
+        .map(condition => ({ type: text(condition && condition.type), text: text(condition && condition.text) }))
+        .filter(condition => condition.text);
+      if (!conditions.length) return `第 ${index + 1} 条规则至少需要一个匹配条件。`;
+      if (conditions.length > 64) return `第 ${index + 1} 条规则的匹配条件过多。`;
+      for (const condition of conditions) {
+        if (condition.text.length > 4096) return `第 ${index + 1} 条规则的匹配条件超过 4096 个字符。`;
+        if (condition.type === 'regex') {
+          try {
+            new RegExp(condition.text);
+          } catch {
+            return `第 ${index + 1} 条规则的正则表达式无效。`;
+          }
+        }
+      }
+    }
+    return '';
+  }
+
+  // errorRulesSyncText renders the per-account sync result as plain text.
+  function errorRulesSyncText(sync) {
+    const data = sync && typeof sync === 'object' ? sync : {};
+    const total = safeInteger(data.total) ?? 0;
+    const succeeded = safeInteger(data.succeeded) ?? 0;
+    const failed = Array.isArray(data.failed) ? data.failed : [];
+    const head = `同步完成：${succeeded}/${total} 个账号`;
+    if (!failed.length) return head;
+    const lines = failed.map(item => `${text(item && item.label) || text(item && item.id) || '未命名账号'}：${text(item && item.error) || '同步失败'}`);
+    return `${head}\n${lines.join('\n')}`;
+  }
+
   function formatRatio(value) {
     return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1
       ? `${(value * 100).toFixed(2)}%`
@@ -765,6 +968,13 @@
     normalizeConfig,
     normalizeRuntime,
     normalizeModelTest,
+    normalizeErrorRules,
+    explainErrorRule,
+    errorRuleActionLabel,
+    errorRuleKindLabel,
+    buildErrorRulesPayload,
+    validateErrorRules,
+    errorRulesSyncText,
     normalizeRetention,
     formatRatio,
     safeInteger,

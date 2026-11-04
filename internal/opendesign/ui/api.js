@@ -126,6 +126,12 @@
       requestStats: () => request('/request-stats'),
       clearRequestLogs: () => request('/request-logs', { method: 'DELETE' }),
       config: () => request('/config'),
+      // Request-scoped retry-scheduling policy. Reading it happens only when the
+      // operator opens the error-rules dialog; nothing here runs on page load.
+      errorRules: () => request('/error-rules'),
+      saveErrorRules: rules => request('/error-rules', { method: 'PUT', body: { rules } }),
+      syncErrorRules: () => request('/error-rules/sync', { method: 'POST', body: {} }),
+      resetErrorRules: () => request('/error-rules/reset', { method: 'POST', body: {} }),
       // Only plugin-owned log settings are accepted by the backend; upstream,
       // proxy and routing stay host-owned and read-only.
       updateConfig: logs => request('/config', { method: 'POST', body: { logs } }),

@@ -190,6 +190,12 @@ type Credential struct {
 	// credential's model list only when the auth file content changes, so a
 	// mapping update without a revision bump would never reach the host.
 	ModelRevision int64 `json:"model_revision,omitempty"`
+	// RequestScopedErrors is the plugin-wide retry-scheduling policy carried by
+	// this credential. CPA reads it from the auth file metadata and decides
+	// whether an upstream failure stops the request or rotates to another
+	// credential, and whether the failed credential is cooled down. The plugin
+	// owns the policy; CPA owns the scheduling decision.
+	RequestScopedErrors []RequestErrorRule `json:"request_scoped_errors,omitempty"`
 	// billingRevision is an opaque in-memory identity for UI cache invalidation.
 	// It is random, never derived from a key and never persisted in auth files.
 	// runtimeEpoch fences model tests against credential identity changes, even
@@ -199,7 +205,7 @@ type Credential struct {
 	extraFields     map[string]json.RawMessage
 }
 
-var credentialJSONFields = []string{"type", "id", "label", "api_key", "control_key", "workspace_id", "disabled", "base_url", "model_revision"}
+var credentialJSONFields = []string{"type", "id", "label", "api_key", "control_key", "workspace_id", "disabled", "base_url", "model_revision", "request_scoped_errors"}
 
 // UnmarshalJSON keeps host- or operator-added fields so a rewrite through
 // host.auth.save cannot silently drop them.

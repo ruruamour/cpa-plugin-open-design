@@ -61,6 +61,7 @@
     requestStats: null,
     config: null,
     runtime: null,
+    errorRules: null,
     modelTest: null,
     modelTestGeneration: 0,
     optionalBusy: {},
@@ -463,6 +464,10 @@
     state.requestStats = null;
     state.config = null;
     state.runtime = null;
+    state.errorRules = null;
+    errorRulesView.loaded = false;
+    errorRulesView.dirty = false;
+    errorRulesView.generation += 1;
     state.modelTest = null;
     state.modelTestGeneration += 1;
     const status = $('logsFilterStatus');
@@ -482,6 +487,7 @@
     renderRequestStats();
     renderConfig();
     renderRuntime();
+    renderErrorRules();
     renderModelTest();
     message('logsState', '');
     message('configState', '');
@@ -1654,6 +1660,8 @@
       setDisabled(id, configLocked);
     }
     setDisabled('loadRuntime', optionalBusy('runtime'));
+    setDisabled('openErrorRules', optionalBusy('errorRules'));
+    syncErrorRulesControls();
     for (const id of ['runModelTest', 'modelTestCredential', 'modelTestModel', 'modelTestPrompt']) {
       setDisabled(id, optionalBusy('modelTest'));
     }
@@ -2115,6 +2123,306 @@
     }
   }
 
+  // --- retry scheduling / request-scoped error rules ------------------------
+  //
+  // The policy is edited in a dialog and pushed into every credential's auth
+  // file. Opening the dialog is the only read; nothing here runs on page load,
+  // tab switch or render. A generation counter discards a late response from a
+  // dialog the operator has already reopened.
+
+  const errorRulesView = { loaded: false, busy: false, dirty: false, generation: 0 };
+
+  function errorRulesDraft() {
+    return state.errorRules ? state.errorRules.rules : [];
+  }
+
+  function errorRulesBaseline() {
+    return state.errorRules ? state.errorRules.baseline : [];
+  }
+
+  function errorRulesPayload() {
+    return Core.buildErrorRulesPayload(errorRulesDraft());
+  }
+
+  function errorRulesDirty() {
+    return JSON.stringify(errorRulesPayload()) !== JSON.stringify(Core.buildErrorRulesPayload(errorRulesBaseline()));
+  }
+
+  function markErrorRulesDirty(options = {}) {
+    errorRulesView.dirty = errorRulesDirty();
+    syncErrorRulesControls();
+    // Editing a value refreshes only the card's own explanation, so the input
+    // keeps focus and the caret position; structural edits rebuild the list.
+    if (options.rerender) renderErrorRules();
+    else refreshErrorRuleExplanations();
+  }
+
+  function refreshErrorRuleExplanations() {
+    const list = $('errorRulesList');
+    if (!list) return;
+    const rules = errorRulesDraft();
+    for (const card of [...(list.children || [])]) {
+      const index = Number(card.getAttribute && card.getAttribute('data-rule'));
+      const rule = Number.isInteger(index) ? rules[index] : null;
+      if (!rule) continue;
+      const explanation = Core.explainErrorRule(rule, index);
+      for (const node of [...(card.children || [])]) {
+        if (node.className && node.className.indexOf('error-rule-name') >= 0) node.textContent = explanation.name;
+        if (node.className && node.className.indexOf('error-rule-description') >= 0) node.textContent = explanation.detail;
+      }
+    }
+  }
+
+  function syncErrorRulesControls() {
+    const locked = errorRulesView.busy || !errorRulesView.loaded;
+    setDisabled('addErrorRule', locked);
+    setDisabled('saveErrorRules', locked || !errorRulesView.dirty);
+    setDisabled('resetErrorRules', locked);
+    // Re-syncing while the draft has unsaved edits would push the saved policy
+    // and then look like the edits were applied, so it stays blocked.
+    setDisabled('retryErrorRules', locked || errorRulesView.dirty);
+    setDisabled('closeErrorRules', errorRulesView.busy);
+    const retry = $('retryErrorRules');
+    if (retry) retry.setAttribute('title', errorRulesView.dirty ? '请先保存编辑中的规则' : '将已保存规则重新同步到所有账号');
+    const list = $('errorRulesList');
+    if (!list) return;
+    const stack = [...(list.children || [])];
+    while (stack.length) {
+      const node = stack.pop();
+      if (node.tagName === 'INPUT' || node.tagName === 'SELECT' || node.tagName === 'TEXTAREA' || node.tagName === 'BUTTON') {
+        node.disabled = locked;
+      }
+      if (node.children) stack.push(...node.children);
+    }
+  }
+
+  function errorRuleConditionRow(ruleIndex, condition, position) {
+    const kind = el('select', { className: 'control error-rule-kind', attrs: { 'aria-label': `规则 ${ruleIndex + 1} 条件 ${position + 1} 匹配类型` } });
+    for (const [value, label] of [['contains', '包含文本'], ['regex', '正则表达式']]) {
+      const option = el('option', { text: label, attrs: { value } });
+      kind.append(option);
+    }
+    kind.value = condition.type === 'regex' ? 'regex' : 'contains';
+    kind.addEventListener('change', () => {
+      condition.type = kind.value === 'regex' ? 'regex' : 'contains';
+      markErrorRulesDirty();
+    });
+    const textarea = el('textarea', { className: 'control error-rule-condition-text', attrs: { rows: '2', spellcheck: 'false', 'aria-label': `规则 ${ruleIndex + 1} 条件 ${position + 1} 匹配内容` } });
+    textarea.value = condition.text;
+    textarea.addEventListener('input', () => {
+      condition.text = textarea.value;
+      markErrorRulesDirty();
+    });
+    const remove = el('button', { className: 'button compact danger', type: 'button', text: '删除条件' });
+    remove.addEventListener('click', () => {
+      const rule = errorRulesDraft()[ruleIndex];
+      if (!rule) return;
+      rule.conditions.splice(position, 1);
+      markErrorRulesDirty({ rerender: true });
+    });
+    return el('div', { className: 'error-rule-condition', attrs: { 'data-condition': String(position) } }, [
+      el('label', { className: 'field condition-kind-field' }, [el('span', { text: '匹配类型' }), kind]),
+      el('label', { className: 'field' }, [el('span', { text: '匹配内容' }), textarea]),
+      el('div', { className: 'row-actions' }, [remove]),
+    ]);
+  }
+
+  function errorRuleCard(rule, index) {
+    const explanation = Core.explainErrorRule(rule, index);
+    const status = el('input', { className: 'control error-rule-status', type: 'number', attrs: { min: '100', max: '599', step: '1', required: 'required', 'aria-label': `规则 ${index + 1} 状态码` } });
+    status.value = String(rule.status || '');
+    status.addEventListener('input', () => {
+      rule.status = Number(status.value);
+      markErrorRulesDirty();
+    });
+    const action = el('select', { className: 'control error-rule-action', attrs: { 'aria-label': `规则 ${index + 1} 动作` } });
+    for (const [value, label] of [['stop', '停止'], ['stop-and-cooldown', '停止并冷却'], ['continue', '继续'], ['continue-and-cooldown', '继续并冷却']]) {
+      action.append(el('option', { text: label, attrs: { value } }));
+    }
+    action.value = rule.action || 'stop';
+    action.addEventListener('change', () => {
+      rule.action = action.value;
+      markErrorRulesDirty();
+    });
+    const up = el('button', { className: 'button compact', type: 'button', text: '上移', attrs: { 'aria-label': `规则 ${index + 1} 上移` } });
+    up.addEventListener('click', () => moveErrorRule(index, -1));
+    const down = el('button', { className: 'button compact', type: 'button', text: '下移', attrs: { 'aria-label': `规则 ${index + 1} 下移` } });
+    down.addEventListener('click', () => moveErrorRule(index, 1));
+    const remove = el('button', { className: 'button compact danger', type: 'button', text: '删除' });
+    remove.addEventListener('click', () => {
+      errorRulesDraft().splice(index, 1);
+      markErrorRulesDirty({ rerender: true });
+    });
+    const addCondition = el('button', { className: 'button compact', type: 'button', text: '新增条件' });
+    addCondition.addEventListener('click', () => {
+      rule.conditions.push({ type: 'contains', text: '' });
+      markErrorRulesDirty({ rerender: true });
+    });
+    return el('section', { className: 'error-rule-card', attrs: { 'data-rule': String(index), 'aria-label': `规则 ${index + 1}` } }, [
+      el('div', { className: 'error-rule-head' }, [
+        el('strong', { className: 'error-rule-name', text: explanation.name }),
+        el('div', { className: 'row-actions' }, [up, down, remove]),
+      ]),
+      el('p', { className: 'error-rule-description hint', text: explanation.detail }),
+      el('div', { className: 'error-rule-fields' }, [
+        el('label', { className: 'field narrow' }, [el('span', { text: '状态码' }), status]),
+        el('label', { className: 'field' }, [el('span', { text: '动作' }), action]),
+      ]),
+      ...rule.conditions.map((condition, position) => errorRuleConditionRow(index, condition, position)),
+      el('div', { className: 'row-actions' }, [addCondition]),
+    ]);
+  }
+
+  function moveErrorRule(index, delta) {
+    const rules = errorRulesDraft();
+    const target = index + delta;
+    if (target < 0 || target >= rules.length) return;
+    const [rule] = rules.splice(index, 1);
+    rules.splice(target, 0, rule);
+    markErrorRulesDirty({ rerender: true });
+  }
+
+  function renderErrorRules() {
+    const list = $('errorRulesList');
+    if (!list) return;
+    if (!errorRulesView.loaded) {
+      list.replaceChildren(el('p', { className: 'empty', text: '正在读取错误规则…' }));
+      return;
+    }
+    const rules = errorRulesDraft();
+    if (!rules.length) {
+      list.replaceChildren(el('p', { className: 'empty', text: '没有规则。此时不写入插件自有规则，由 CPA 自身的配置决定分类与调度。' }));
+      syncErrorRulesControls();
+      return;
+    }
+    list.replaceChildren(...rules.map((rule, index) => errorRuleCard(rule, index)));
+    syncErrorRulesControls();
+  }
+
+  function errorRulesSyncText(view) {
+    const head = Core.errorRulesSyncText(view.sync);
+    const lines = [head];
+    if (view.inherits_cpa) lines.push('当前没有插件自有规则，由 CPA 配置决定。');
+    if (view.load_error) lines.push(view.load_error);
+    return lines.join('\n');
+  }
+
+  function applyErrorRulesResponse(raw) {
+    const view = Core.normalizeErrorRules(raw);
+    state.errorRules = {
+      rules: view.rules.map(rule => ({ status: rule.status, action: rule.action, conditions: rule.conditions.map(condition => ({ ...condition })) })),
+      baseline: view.rules.map(rule => ({ status: rule.status, action: rule.action, conditions: rule.conditions.map(condition => ({ ...condition })) })),
+      defaults: view.defaults,
+      inherits_cpa: view.inherits_cpa,
+      load_error: view.load_error,
+      sync: view.sync,
+    };
+    errorRulesView.loaded = true;
+    errorRulesView.dirty = false;
+    renderErrorRules();
+    return view;
+  }
+
+  async function openErrorRules() {
+    const dialog = $('errorRulesDialog');
+    if (dialog && typeof dialog.showModal === 'function' && !dialog.open) dialog.showModal();
+    errorRulesView.generation += 1;
+    const generation = errorRulesView.generation;
+    errorRulesView.loaded = false;
+    renderErrorRules();
+    setOptionalBusy('errorRules', true);
+    message('errorRulesState', '正在读取错误规则…');
+    const stillCurrent = () => generation === errorRulesView.generation;
+    try {
+      const raw = await api().errorRules();
+      if (!stillCurrent()) return;
+      const view = applyErrorRulesResponse(raw);
+      message('errorRulesState', errorRulesSyncText(view), view.sync.failed.length || view.load_error ? 'error' : 'ok');
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (optionalAuthFailure(error)) return;
+      errorRulesView.loaded = false;
+      renderErrorRules();
+      message('errorRulesState', optionalErrorText(error), 'error');
+    } finally {
+      if (stillCurrent()) setOptionalBusy('errorRules', false);
+    }
+  }
+
+  function closeErrorRules() {
+    if (errorRulesView.busy) return;
+    const dialog = $('errorRulesDialog');
+    if (dialog && typeof dialog.close === 'function' && dialog.open) dialog.close();
+  }
+
+  function addErrorRule() {
+    if (!errorRulesView.loaded) return;
+    errorRulesDraft().push({ status: 429, action: 'continue-and-cooldown', conditions: [{ type: 'contains', text: '' }] });
+    markErrorRulesDirty({ rerender: true });
+  }
+
+  async function submitErrorRules() {
+    if (errorRulesView.busy || !errorRulesView.loaded) return;
+    const problem = Core.validateErrorRules(errorRulesDraft());
+    if (problem) {
+      message('errorRulesState', problem, 'error');
+      return;
+    }
+    const generation = errorRulesView.generation;
+    setOptionalBusy('errorRules', true);
+    message('errorRulesState', '正在保存并同步到所有账号…');
+    try {
+      const raw = await api().saveErrorRules(errorRulesPayload());
+      if (generation !== errorRulesView.generation) return;
+      const view = applyErrorRulesResponse(raw);
+      message('errorRulesState', errorRulesSyncText(view), view.sync.failed.length ? 'error' : 'ok');
+    } catch (error) {
+      if (generation !== errorRulesView.generation) return;
+      if (optionalAuthFailure(error)) return;
+      message('errorRulesState', optionalErrorText(error), 'error');
+    } finally {
+      if (generation === errorRulesView.generation) setOptionalBusy('errorRules', false);
+    }
+  }
+
+  async function retryErrorRules() {
+    if (errorRulesView.busy || !errorRulesView.loaded || errorRulesView.dirty) return;
+    const generation = errorRulesView.generation;
+    setOptionalBusy('errorRules', true);
+    message('errorRulesState', '正在重新同步到所有账号…');
+    try {
+      const raw = await api().syncErrorRules();
+      if (generation !== errorRulesView.generation) return;
+      const view = applyErrorRulesResponse(raw);
+      message('errorRulesState', errorRulesSyncText(view), view.sync.failed.length ? 'error' : 'ok');
+    } catch (error) {
+      if (generation !== errorRulesView.generation) return;
+      if (optionalAuthFailure(error)) return;
+      message('errorRulesState', optionalErrorText(error), 'error');
+    } finally {
+      if (generation === errorRulesView.generation) setOptionalBusy('errorRules', false);
+    }
+  }
+
+  async function resetErrorRules() {
+    if (errorRulesView.busy || !errorRulesView.loaded) return;
+    const generation = errorRulesView.generation;
+    setOptionalBusy('errorRules', true);
+    message('errorRulesState', '正在恢复默认规则…');
+    try {
+      const raw = await api().resetErrorRules();
+      if (generation !== errorRulesView.generation) return;
+      const view = applyErrorRulesResponse(raw);
+      message('errorRulesState', errorRulesSyncText(view), view.sync.failed.length ? 'error' : 'ok');
+    } catch (error) {
+      if (generation !== errorRulesView.generation) return;
+      if (optionalAuthFailure(error)) return;
+      message('errorRulesState', optionalErrorText(error), 'error');
+    } finally {
+      if (generation === errorRulesView.generation) setOptionalBusy('errorRules', false);
+    }
+  }
+
   function renderModelTest() {
     const facts = $('modelTestFacts');
     if (!facts) return;
@@ -2461,6 +2769,7 @@
     renderRequestStats();
     renderConfig();
     renderRuntime();
+    renderErrorRules();
     renderModelTest();
     if (Auth.rememberEnabled && Auth.rememberEnabled()) {
       const remember = $('rememberAuth');
@@ -2511,6 +2820,12 @@
       loadConfig,
       saveConfig,
       loadRuntime,
+      openErrorRules,
+      closeErrorRules,
+      submitErrorRules,
+      retryErrorRules,
+      resetErrorRules,
+      addErrorRule,
       runModelTest,
       cycleThemePreference,
       applyThemePreference,
@@ -2536,6 +2851,9 @@
       renderRequestStats,
       renderConfig,
       renderRuntime,
+      renderErrorRules,
+      applyErrorRulesResponse,
+      errorRulesSyncText,
       renderModelTest,
       applyThemePreference,
       cycleThemePreference,

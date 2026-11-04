@@ -2282,3 +2282,244 @@ test('system color changes update the theme label and resolved value without fet
   assert.equal(view.document.documentElement.getAttribute('data-theme-resolved'), 'light', 'system events preserve an explicit preference');
   assert.equal(view.calls.length, 0, 'color changes do not trigger management or provider requests');
 });
+
+// --- retry scheduling / request-scoped error rules ---------------------------
+
+const errorRulesBody = (overrides = {}) => ({
+  rules: [
+    { status: 400, match: ['[open-design:tier_limit_exceeded]'], action: 'continue-and-cooldown' },
+    { status: 429, match: ['[open-design:insufficient_quota]'], action: 'continue-and-cooldown' },
+  ],
+  defaults: [
+    { status: 400, match: ['[open-design:tier_limit_exceeded]'], action: 'continue-and-cooldown' },
+  ],
+  sync: { total: 2, succeeded: 2, failed: [] },
+  inherits_cpa: false,
+  ...overrides,
+});
+
+function errorRulesResponse(view) {
+  const calls = view.calls.map(call => ({ url: call.url, init: call.init }));
+  return calls.filter(call => call.url.includes('/error-rules'));
+}
+
+// depth-first search for a node carrying a class, so the tests do not depend on
+// the exact nesting of a rule card.
+function byClass(node, className) {
+  const stack = [...(node.children || [])];
+  while (stack.length) {
+    const current = stack.shift();
+    if (current.className && String(current.className).split(/\s+/).includes(className)) return current;
+    if (current.children) stack.push(...current.children);
+  }
+  return null;
+}
+
+function ruleCard(view, index) {
+  return view.document.getElementById('errorRulesList').children[index];
+}
+
+test('error rule explanations map known markers and never produce markup', () => {
+  const Core = fakePage().context.OpenDesignCore;
+  const known = Core.explainErrorRule({ status: 400, match: ['[open-design:tier_limit_exceeded]'], action: 'continue-and-cooldown' }, 0);
+  assert.match(known.name, /账号并发上限/);
+  assert.match(known.detail, /tier_limit_exceeded/);
+  const fallback = Core.explainErrorRule({ status: 503, match: ['some custom text'], action: 'stop' }, 2);
+  assert.match(fallback.name, /规则 3 · 自定义条件/);
+  assert.match(fallback.detail, /503/);
+  const forged = Core.explainErrorRule({ status: 400, match: ['<img onerror=alert(1)>'], action: 'stop' }, 0);
+  assert.ok(!/<img/.test(forged.name) && !/<img/.test(forged.detail), 'explanations must stay plain text');
+  const empty = Core.explainErrorRule({ status: 500, action: 'stop' }, 0);
+  assert.match(empty.detail, /状态码 500/);
+  assert.match(empty.name, /自定义条件/);
+});
+
+test('error rule payload keeps both condition kinds, drops blanks and omits empty arrays', () => {
+  const Core = fakePage().context.OpenDesignCore;
+  const payload = Core.buildErrorRulesPayload([
+    {
+      status: 429,
+      action: 'continue-and-cooldown',
+      conditions: [
+        { type: 'contains', text: '  [open-design:rate_limit_exceeded]  ' },
+        { type: 'regex', text: '^\\[open-design:' },
+        { type: 'contains', text: '   ' },
+      ],
+    },
+    { status: 500, action: 'stop', conditions: [{ type: 'contains', text: 'boom' }] },
+  ]);
+  assert.equal(payload.length, 2);
+  // Values cross a vm boundary, so compare structurally.
+  assert.deepEqual(JSON.parse(JSON.stringify(payload[0])), {
+    status: 429,
+    action: 'continue-and-cooldown',
+    match: ['[open-design:rate_limit_exceeded]'],
+    'match-regexr': ['^\\[open-design:'],
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(payload[1])), { status: 500, action: 'stop', match: ['boom'] });
+  assert.ok(!('match-regexr' in payload[1]), 'an empty regex list is omitted, never null');
+  assert.deepEqual(JSON.parse(JSON.stringify(Core.buildErrorRulesPayload([]))), []);
+});
+
+test('error rule validation rejects bad status, empty conditions and invalid regexes', () => {
+  const Core = fakePage().context.OpenDesignCore;
+  assert.match(Core.validateErrorRules([{ status: 99, action: 'stop', conditions: [{ type: 'contains', text: 'x' }] }]), /100 到 599/);
+  assert.match(Core.validateErrorRules([{ status: 400, action: 'stop', conditions: [{ type: 'contains', text: '  ' }] }]), /至少需要一个匹配条件/);
+  assert.match(Core.validateErrorRules([{ status: 400, action: 'stop', conditions: [{ type: 'regex', text: '(' }] }]), /正则表达式无效/);
+  assert.match(Core.validateErrorRules([{ status: 400, action: 'rotate', conditions: [{ type: 'contains', text: 'x' }] }]), /选择一个动作/);
+  assert.equal(Core.validateErrorRules([{ status: 400, action: 'stop', conditions: [{ type: 'contains', text: 'x' }] }]), '');
+});
+
+test('opening the error-rules dialog fetches once, keeps a late response out of a newer open', async () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/error-rules') ? respond(200, errorRulesBody()) : respond(200, statusBody())),
+  });
+  const api = view.context.OpenDesignConsole;
+  await api.bootstrap();
+  const before = errorRulesResponse(view).length;
+  assert.equal(before, 0, 'loading the console must not read the error rules');
+  await api.handlers.openErrorRules();
+  assert.equal(errorRulesResponse(view).length, 1);
+  const list = view.document.getElementById('errorRulesList');
+  assert.equal(list.children.length, 2);
+  assert.equal(list.children[0].getAttribute('data-rule'), '0');
+  assert.match(byClass(list.children[0], 'error-rule-name').textContent, /账号并发上限/);
+  await api.handlers.openErrorRules();
+  assert.equal(errorRulesResponse(view).length, 2, 'each explicit open reads the policy again');
+});
+
+test('saving error rules sends the edited policy and renders the per-account sync result', async () => {
+  const bodies = [];
+  const view = fakePage({
+    fetchImpl: async (url, init) => {
+      if (url.includes('/error-rules/sync')) return respond(200, errorRulesBody());
+      if (url.includes('/error-rules')) {
+        if (init && init.method === 'PUT') {
+          bodies.push(JSON.parse(init.body));
+          return respond(200, errorRulesBody({ sync: { total: 2, succeeded: 1, failed: [{ id: 'cred-2', label: '备用账号', error: '凭据规则同步失败，请重试同步' }] } }));
+        }
+        return respond(200, errorRulesBody());
+      }
+      return respond(200, statusBody());
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  await api.bootstrap();
+  await api.handlers.openErrorRules();
+  const list = view.document.getElementById('errorRulesList');
+  const status = byClass(ruleCard(view, 0), 'error-rule-status');
+  status.value = '401';
+  await status.emit('input');
+  await api.handlers.submitErrorRules();
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].rules[0].status, 401);
+  assert.deepEqual(bodies[0].rules[0].match, ['[open-design:tier_limit_exceeded]']);
+  const state = view.document.getElementById('errorRulesState');
+  assert.match(state.textContent, /同步完成：1\/2 个账号/);
+  assert.match(state.textContent, /备用账号/);
+  assert.ok(!/<img|onerror/.test(state.textContent));
+});
+
+test('the sync result renders an injected error string as literal text', async () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/error-rules')
+      ? respond(200, errorRulesBody({ sync: { total: 1, succeeded: 0, failed: [{ id: 'cred-1', label: '<img onerror=alert(1)>', error: '<script>bad</script>' }] } }))
+      : respond(200, statusBody())),
+  });
+  const api = view.context.OpenDesignConsole;
+  await api.bootstrap();
+  await api.handlers.openErrorRules();
+  const text = view.document.getElementById('errorRulesState').textContent;
+  assert.match(text, /<img onerror=alert\(1\)>/);
+  assert.match(text, /<script>bad<\/script>/);
+});
+
+test('re-syncing is blocked while the draft is dirty and posts the saved policy when clean', async () => {
+  const calls = [];
+  const view = fakePage({
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      return url.includes('/error-rules') ? respond(200, errorRulesBody()) : respond(200, statusBody());
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  await api.bootstrap();
+  await api.handlers.openErrorRules();
+  const retry = view.document.getElementById('retryErrorRules');
+  assert.equal(retry.disabled, false, 'a clean draft can be re-synced');
+  const status = byClass(ruleCard(view, 0), 'error-rule-status');
+  status.value = '500';
+  await status.emit('input');
+  assert.equal(retry.disabled, true, 'unsaved edits block re-syncing');
+  assert.match(retry.getAttribute('title'), /请先保存/);
+  await api.handlers.retryErrorRules();
+  assert.equal(calls.filter(call => call.url.includes('/error-rules/sync')).length, 0, 'a dirty draft must not re-sync');
+  await api.handlers.submitErrorRules();
+  assert.equal(retry.disabled, false);
+  await api.handlers.retryErrorRules();
+  const sync = calls.filter(call => call.url.includes('/error-rules/sync'));
+  assert.equal(sync.length, 1);
+  assert.equal(sync[0].init.method, 'POST');
+  assert.equal(sync[0].init.body, '{}');
+});
+
+test('reset replaces the draft with the server defaults', async () => {
+  const calls = [];
+  const view = fakePage({
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      if (url.includes('/error-rules/reset')) {
+        return respond(200, errorRulesBody({ rules: [{ status: 500, match: ['empty response content'], action: 'stop' }], defaults: [{ status: 500, match: ['empty response content'], action: 'stop' }] }));
+      }
+      return url.includes('/error-rules') ? respond(200, errorRulesBody()) : respond(200, statusBody());
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  await api.bootstrap();
+  await api.handlers.openErrorRules();
+  await api.handlers.resetErrorRules();
+  const reset = calls.filter(call => call.url.includes('/error-rules/reset'));
+  assert.equal(reset.length, 1);
+  assert.equal(reset[0].init.method, 'POST');
+  const list = view.document.getElementById('errorRulesList');
+  assert.equal(list.children.length, 1);
+  const status = byClass(ruleCard(view, 0), 'error-rule-status');
+  assert.equal(String(status.value), '500');
+});
+
+test('the error-rules dialog is present in the console page and adds no tab', () => {
+  const page = pageHTML();
+  for (const id of ['errorRulesDialog', 'errorRulesList', 'saveErrorRules', 'retryErrorRules', 'resetErrorRules', 'closeErrorRules', 'openErrorRuleHelp', 'errorRuleHelpDialog', 'errorRulesState', 'openErrorRules', 'addErrorRule']) {
+    assert.ok(page.includes(`id="${id}"`), `missing #${id}`);
+  }
+  const tabs = [...page.matchAll(/<button class="tab" id="([^"]+)"/g)].map(match => match[1]);
+  assert.deepEqual(tabs, ['tabOverview', 'tabCredentials', 'tabModels', 'tabLogs', 'tabConfig']);
+  assert.ok(page.includes('role="dialog"') || page.includes('<dialog'), 'the rules editor is a dialog');
+  for (const action of ['停止并冷却', '继续并冷却', '包含文本', '正则表达式']) assert.ok(page.includes(action), `help/editor mentions ${action}`);
+});
+
+test('an empty rule list is explained as inheriting the CPA configuration', async () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/error-rules')
+      ? respond(200, errorRulesBody({ rules: [], defaults: [], inherits_cpa: true, sync: { total: 1, succeeded: 1, failed: [] } }))
+      : respond(200, statusBody())),
+  });
+  const api = view.context.OpenDesignConsole;
+  await api.bootstrap();
+  await api.handlers.openErrorRules();
+  assert.match(view.document.getElementById('errorRulesList').textContent, /由 CPA 自身的配置决定/);
+  assert.match(view.document.getElementById('errorRulesState').textContent, /由 CPA 配置决定/);
+});
+
+test('loading the console, switching tabs and changing theme never read the error rules', async () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/error-rules') ? respond(200, errorRulesBody()) : respond(200, statusBody())),
+  });
+  const api = view.context.OpenDesignConsole;
+  await api.bootstrap();
+  for (const tab of ['credentials', 'models', 'logs', 'config', 'overview']) api.handlers.activateTab(tab);
+  api.handlers.applyThemePreference('dark');
+  api.handlers.applyThemePreference('light');
+  api.handlers.cycleThemePreference();
+  assert.equal(errorRulesResponse(view).length, 0);
+});
