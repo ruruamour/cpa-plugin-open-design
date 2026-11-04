@@ -1324,7 +1324,8 @@ def run_cpa_live(artifact, binary, version):
             request, origin, proxy, credential_id, client_models, work / "auths")
 
         origin.billing = official_billing_fixture()
-        evidence["host_management_v03"] = run_management_v03(request, origin, credential_id)
+        evidence["host_management_v03"] = run_management_v03(
+            request, origin, credential_id, work)
 
         # ---- host HTTP redirect: is Authorization re-sent across origins? ----
         # Must run BEFORE the delete: a removed credential makes the
@@ -2274,11 +2275,13 @@ def run(artifact, version):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def run_management_v03(request, origin, credential_id):
+def run_management_v03(request, origin, credential_id, work=None):
     """Same management contract through ctypes and the unmodified CPA host.
 
     All traffic is loopback-fixture traffic. Counts come from the fake origin,
-    not the HTTP status of a local route or an inferred token estimate.
+    not the HTTP status of a local route or an inferred token estimate. When
+    work is supplied (the real-host run) the persisted policy and the auth file
+    the host loads are inspected on disk as well.
     """
     def call(suffix, body=None, method=None, expected=200):
         try:
@@ -2363,10 +2366,51 @@ def run_management_v03(request, origin, credential_id):
     require(call("/request-logs")["logs"] == [], "clear left visible entries")
     empty = call("/request-stats")
     require(empty["total"] == 0 and empty["tokens"]["total"] is None, empty)
+
+    # Request-scoped retry-scheduling policy: it must be readable, validated,
+    # persisted, and pushed into the credential the host actually loaded.
+    rules = call("/error-rules")
+    require(rules["rules"] and rules["defaults"] == rules["rules"] and not rules["inherits_cpa"], rules)
+    require(rules["sync"]["total"] >= 1 and not rules["sync"]["failed"], rules)
+    marker = "[open-design:tier_limit_exceeded]"
+    require(any(rule["status"] == 400 and marker in rule.get("match", []) and
+                rule["action"] == "continue-and-cooldown" for rule in rules["rules"]),
+            "the built-in policy lost the production tier limit rule")
+    before = len(origin.requests)
+    call("/error-rules", {"rules": [{"status": 400, "action": "stop"}]}, method="PUT", expected=400)
+    # A substring condition is literal, so the invalid pattern must go in
+    # match-regexr; putting it in match would be a valid literal.
+    call("/error-rules", {"rules": [{"status": 400, "match-regexr": ["("], "action": "stop"}]},
+         method="PUT", expected=400)
+    call("/error-rules", {"rules": [{"status": 400, "match": ["x"], "action": "stop", "extra": 1}]},
+         method="PUT", expected=400)
+    require(len(origin.requests) == before, "error-rule validation contacted upstream")
+    custom = [{"status": 400, "match": [marker], "action": "continue-and-cooldown"},
+              {"status": 502, "match-regexr": ["^\\[open-design:upstream_"], "action": "stop"}]
+    saved = call("/error-rules", {"rules": custom}, method="PUT")
+    require(saved["rules"] == custom and saved["sync"]["succeeded"] == saved["sync"]["total"] and
+            not saved["sync"]["failed"], saved)
+    # The policy is persisted for a restart, not just held in memory.
+    if work is not None:
+        on_disk = json.loads((work / "data/error-rules.json").read_text())
+        require(on_disk["rules"] == custom, on_disk)
+        # The auth file CPA reads carries the same rules under the metadata key.
+        auth_file = json.loads((work / "auths" / (credential_id + ".json")).read_text())
+        require(auth_file.get("request_scoped_errors") == custom, auth_file)
+    resynced = call("/error-rules/sync", {}, method="POST")
+    require(resynced["rules"] == custom and not resynced["sync"]["failed"], resynced)
+    reset = call("/error-rules/reset", {}, method="POST")
+    require(reset["rules"] == rules["rules"] and not reset["sync"]["failed"], reset)
+    if work is not None:
+        auth_file = json.loads((work / "auths" / (credential_id + ".json")).read_text())
+        require(auth_file.get("request_scoped_errors") == rules["rules"], auth_file)
+    require(len(origin.requests) == before, "error-rule routes generated upstream traffic")
+
     call("/credentials", {"id": credential_id, "clear_billing": True})
     return {"status": "PASS", "config_roundtrip": True, "runtime": True,
             "model_test_single_buffered_request": True, "metadata_allowlist": True,
-            "coverage_modelId_and_cache": True, "stats_and_clear": True}
+            "coverage_modelId_and_cache": True, "stats_and_clear": True,
+            "error_rules_roundtrip_and_sync": True}
 
 
 def run_quota_ctypes(plugin, host, upstream, credential_id):
