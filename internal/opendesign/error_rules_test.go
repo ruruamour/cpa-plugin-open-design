@@ -480,42 +480,33 @@ func TestErrorRulesFailedWriteKeepsPreviousPolicy(t *testing.T) {
 		t.Fatalf("save previous policy: %d %s", status, raw)
 	}
 
-	// A read-only data directory makes the temporary file write fail.
-	dataDir := s.config().DataDir
-	original := fileMode(t, dataDir)
-	if err := os.Chmod(dataDir, 0o500); err != nil {
-		t.Fatalf("chmod data dir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dataDir, original) })
-	if os.Geteuid() == 0 {
-		t.Skip("running as root: a read-only directory is not enforced")
-	}
+	// The failure is injected at the rename so the case behaves the same on
+	// every platform: a read-only directory does not stop the owner on Windows,
+	// and running as root bypasses it elsewhere.
+	restore := failErrorRulesPublish(t)
 
 	next := []RequestErrorRule{{Status: http.StatusBadRequest, Match: []string{"next"}, Action: "continue"}}
-	// Windows does not enforce a read-only directory for the owner, so the
-	// persistence failure is injected there instead of via permissions.
-	restoreSwap := failJournalSwap(t)
 	status, _, _ := managementCall(t, s, http.MethodPut, apiBase+"/error-rules", nil, map[string]any{"rules": next})
-	restoreSwap()
+	restore()
 	if status != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", status)
-	}
-	if err := os.Chmod(dataDir, original); err != nil {
-		t.Fatalf("restore data dir: %v", err)
 	}
 	if view := getErrorRules(t, s); !sameErrorRules(view.Rules, previous) {
 		t.Fatalf("failed write changed the policy: %+v", view.Rules)
 	}
+	if leftovers, _ := filepath.Glob(filepath.Join(s.config().DataDir, errorRulesFile) + ".tmp-*"); len(leftovers) != 0 {
+		t.Fatalf("failed write left staged files: %v", leftovers)
+	}
 }
 
-// failJournalSwap makes every staged-file rename fail, which is how a failed
-// policy write is injected on platforms where a read-only directory is not
-// enforced. The returned function restores the real rename.
-func failJournalSwap(t *testing.T) func() {
+// failErrorRulesPublish makes the policy-file rename fail, which is how a failed
+// write is injected on platforms where a read-only directory is not enforced.
+// The returned function restores the real rename.
+func failErrorRulesPublish(t *testing.T) func() {
 	t.Helper()
-	original := swapJournalFile
-	swapJournalFile = func(string, string) error { return errors.New("Access is denied.") }
-	return func() { swapJournalFile = original }
+	original := publishErrorRulesFile
+	publishErrorRulesFile = func(string, string) error { return errors.New("Access is denied.") }
+	return func() { publishErrorRulesFile = original }
 }
 
 func fileMode(t *testing.T, path string) os.FileMode {

@@ -275,6 +275,11 @@ func loadErrorRules(dataDir string) ([]RequestErrorRule, string) {
 // write and the rename to prove the published policy and the file agree.
 var testErrorRulesWriteHook atomic.Pointer[func()]
 
+// publishErrorRulesFile renames a staged policy file into place. It is a
+// variable so a test can inject a persistence failure on platforms where a
+// read-only directory does not stop the owner from writing.
+var publishErrorRulesFile = func(tmp, path string) error { return os.Rename(tmp, path) }
+
 func saveErrorRules(dataDir string, rules []RequestErrorRule) error {
 	path := filepath.Join(dataDir, errorRulesFile)
 	body, err := json.MarshalIndent(errorRulesDocument{Rules: rules}, "", "  ")
@@ -289,7 +294,7 @@ func saveErrorRules(dataDir string, rules []RequestErrorRule) error {
 	if hook := testErrorRulesWriteHook.Load(); hook != nil {
 		(*hook)()
 	}
-	return os.Rename(tmp, path)
+	return publishErrorRulesFile(tmp, path)
 }
 
 // markErrorRulesSyncedLocked records a bounded, fixed sync state. Caller holds mu.
@@ -530,7 +535,7 @@ func writeJSONAtomic(path string, v any) error {
 		return err
 	}
 	defer os.Remove(tmp)
-	return os.Rename(tmp, path)
+	return publishErrorRulesFile(tmp, path)
 }
 
 // compileErrorRuleRegexp compiles one operator-supplied pattern. It exists so a
