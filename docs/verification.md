@@ -16,7 +16,7 @@
 | 恢复 | 后台 30 秒 ticker 与管理读路径只做本地到期与失败重试，**不发额度请求**；`POST /quota-pause/recheck` 仅在新于观察时间且 `funding_check=available` 时提前解除，多模型歧义返回 409；`POST /quota-pause/resume` 为操作员显式解除 |
 | 管理接口 | `GET /quota-pause`、`POST /quota-pause/resume`、`POST /quota-pause/recheck`；`GET /status`、`/credentials` 返回 `quota_paused`／`effective_disabled`／`quota_pause`（不含任何 Key 指纹） |
 | 配置 | `pause.enabled`（默认开启）与 `pause.max_seconds`（60–604800，默认 86400）；`POST /config` 只接受 `logs` 与 `pause` 两段，未知字段 400 |
-| Go 用例 | `quota_pause_deadline_test.go`、`quota_pause_signal_test.go`、`quota_pause_identity_test.go`、`quota_pause_manual_test.go`、`quota_pause_persist_test.go`、`quota_pause_executor_test.go`，共 27 个用例 |
+| Go 用例 | `quota_pause_deadline_test.go`、`quota_pause_signal_test.go`、`quota_pause_identity_test.go`、`quota_pause_manual_test.go`、`quota_pause_persist_test.go`、`quota_pause_executor_test.go`，共 29 个用例；含「暂停期间人工停用／启用后到期清扫不得翻转人工选择」两条 |
 | Node 用例 | 额度徽标与人工开关分离、解除按钮不发 `/credentials`、重查未通过提示、暂停配置默认值与越界拒绝 |
 | 全仓 Go | `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 通过 |
 | ABI | `scripts/smoke-abi.py`（CGO `c-shared` 构建）PASS |

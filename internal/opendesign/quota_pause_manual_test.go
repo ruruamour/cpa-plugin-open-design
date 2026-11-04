@@ -1,11 +1,57 @@
 package opendesign
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+// mirrorAuthFile stands in for the real host.auth.save write: CPA persists the
+// credential StorageJSON it was handed, so the fake host has to be told to do it.
+func mirrorAuthFile(t *testing.T, s *Service, host *fakeHost, id string) {
+	t.Helper()
+	c, ok := liveCredential(s, id)
+	if !ok {
+		t.Fatal("credential not found")
+	}
+	s.mu.RLock()
+	filename := s.authFiles[id]
+	s.mu.RUnlock()
+	if err := os.MkdirAll(host.authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host.authDir, filename), jsonBytes(c), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// assertPersistedQuotaState reads the auth file back and compares the operator
+// flag and whether a quota block is still present.
+func assertPersistedQuotaState(t *testing.T, s *Service, host *fakeHost, id string, wantDisabled, wantNoBlock bool) {
+	t.Helper()
+	s.mu.RLock()
+	filename := s.authFiles[id]
+	s.mu.RUnlock()
+	path := filepath.Join(host.authDir, filename)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var disk Credential
+	if err := json.Unmarshal(raw, &disk); err != nil {
+		t.Fatal(err)
+	}
+	if disk.Disabled != wantDisabled {
+		t.Fatalf("persisted disabled = %t, want %t", disk.Disabled, wantDisabled)
+	}
+	if wantNoBlock && disk.QuotaBlock != nil {
+		t.Fatal("persisted credential still carries a quota block")
+	}
+}
 
 func setFixtureQuotaBlock(t *testing.T, s *Service, id string) {
 	t.Helper()
@@ -180,4 +226,66 @@ func TestQuotaPauseConfigRouteRoundTrip(t *testing.T) {
 	if status != http.StatusOK || pause["enabled"] != false || pause["max_seconds"] != float64(3600) {
 		t.Fatalf("pause config was lost: %#v", body["pause"])
 	}
+}
+
+// A pause must never resurrect an account the operator turned off while it was
+// paused: the deadline sweep has to keep the newest manual choice.
+func TestQuotaBlockDeadlineSweepKeepsManualDisableSetDuringPause(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	quotaFixtureAuthFile(t, s, host, id, nil)
+	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+	setNow := setQuotaPauseFixtureClock(s, now)
+	source, _ := liveCredential(s, id)
+	s.observeQuotaBlock(source, "fixture-model", &APIError{Status: 402, quotaExhausted: true, quotaResetAt: now.Add(30 * time.Minute)})
+	if c, _ := liveCredential(s, id); !c.quotaBlocked() || c.Disabled {
+		t.Fatal("fixture did not create a pause on an enabled account")
+	}
+	// The operator stops the account while the quota pause is still active. The
+	// fake host does not touch the filesystem, so mirror what the real
+	// host.auth.save writes (StorageJSON is exactly jsonBytes(credential)).
+	if status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil, map[string]any{"id": id, "disabled": true}); status != http.StatusOK {
+		t.Fatal("manual disable during a pause failed")
+	}
+	mirrorAuthFile(t, s, host, id)
+	// Reaching the deadline must clear only the pause.
+	now = now.Add(30 * time.Minute)
+	setNow(now)
+	s.sweepQuotaBlocks(make(chan struct{}))
+	c, _ := liveCredential(s, id)
+	if c.quotaBlocked() {
+		t.Fatal("the sweep did not clear the expired pause")
+	}
+	if !c.Disabled {
+		t.Fatal("the sweep re-enabled an account the operator had disabled")
+	}
+	// And the persisted file must agree with memory.
+	assertPersistedQuotaState(t, s, host, id, true, true)
+}
+
+// The opposite ordering: an account the operator re-enabled while paused must
+// stay enabled after the pause expires.
+func TestQuotaBlockDeadlineSweepKeepsManualEnableSetDuringPause(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	quotaFixtureAuthFile(t, s, host, id, map[string]any{"disabled": true})
+	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+	setNow := setQuotaPauseFixtureClock(s, now)
+	source, _ := liveCredential(s, id)
+	s.observeQuotaBlock(source, "fixture-model", &APIError{Status: 402, quotaExhausted: true, quotaResetAt: now.Add(30 * time.Minute)})
+	if c, _ := liveCredential(s, id); !c.quotaBlocked() || !c.Disabled {
+		t.Fatal("fixture did not keep the manual disable on a paused account")
+	}
+	if status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil, map[string]any{"id": id, "disabled": false}); status != http.StatusOK {
+		t.Fatal("manual enable during a pause failed")
+	}
+	mirrorAuthFile(t, s, host, id)
+	now = now.Add(30 * time.Minute)
+	setNow(now)
+	s.sweepQuotaBlocks(make(chan struct{}))
+	c, _ := liveCredential(s, id)
+	if c.quotaBlocked() || c.Disabled {
+		t.Fatalf("sweep produced blocked:%t disabled:%t", c.quotaBlocked(), c.Disabled)
+	}
+	assertPersistedQuotaState(t, s, host, id, false, true)
 }
