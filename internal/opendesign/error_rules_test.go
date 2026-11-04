@@ -130,6 +130,57 @@ func regexpMatch(pattern, value string) bool {
 	return re.MatchString(value)
 }
 
+// A bare 402 with no machine-readable code stays unclassified on purpose. The
+// plugin cannot tell "this account is out of quota" from "payment required for
+// another reason", and guessing would cool down healthy accounts: production
+// saw six such 402s in one day, none of them an exhausted OpenDesign account.
+func TestErrorRulesBarePaymentRequiredStaysUnclassified(t *testing.T) {
+	for _, body := range [][]byte{
+		[]byte(`{"error":{"message":"payment required"}}`),
+		[]byte(`{"error":{"type":"invalid_request_error","message":"Insufficient credits"}}`),
+		[]byte(`{"detail":"Payment Required"}`),
+		nil,
+	} {
+		err := upstreamErrorFromResponse(http.StatusPaymentRequired, nil, body)
+		var apiErr *APIError
+		if !asAPIError(err, &apiErr) {
+			t.Fatalf("error is %T, want *APIError", err)
+		}
+		if apiErr.Kind != "upstream_error" {
+			t.Fatalf("body %q: kind = %q, want upstream_error", body, apiErr.Kind)
+		}
+		if status := statusOf(err); status != http.StatusPaymentRequired {
+			t.Fatalf("body %q: status = %d, want 402", body, status)
+		}
+		// The payment-required rule only matches the insufficient_quota marker,
+		// so an unclassified 402 must not be routed to another account.
+		if rule := matchErrorRule(defaultErrorRules(), statusOf(err), apiErr.Message); rule != nil {
+			t.Fatalf("body %q: unclassified 402 matched rule %+v", body, rule)
+		}
+	}
+}
+
+// The 402 that does carry the allowlisted code is still classified and routed.
+func TestErrorRulesClassifyPaymentRequiredWithQuotaCode(t *testing.T) {
+	for _, body := range [][]byte{
+		[]byte(`{"error":{"code":"insufficient_quota","message":"quota exhausted"}}`),
+		[]byte(`{"error":{"message":"[code=insufficient_quota] out of credits"}}`),
+	} {
+		err := upstreamErrorFromResponse(http.StatusPaymentRequired, nil, body)
+		var apiErr *APIError
+		if !asAPIError(err, &apiErr) {
+			t.Fatalf("error is %T, want *APIError", err)
+		}
+		if apiErr.Kind != "insufficient_quota" {
+			t.Fatalf("body %q: kind = %q, want insufficient_quota", body, apiErr.Kind)
+		}
+		rule := matchErrorRule(defaultErrorRules(), statusOf(err), apiErr.Message)
+		if rule == nil || rule.Action != "continue-and-cooldown" {
+			t.Fatalf("body %q: rule = %+v, want continue-and-cooldown", body, rule)
+		}
+	}
+}
+
 // An upstream code that is not on the closed allowlist must not become part of
 // the message: otherwise a caller-supplied string could forge a rule marker.
 func TestErrorRulesMessageNeverEchoesUnknownCode(t *testing.T) {

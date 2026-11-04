@@ -51,6 +51,7 @@
 
 - **匹配对象**：规则匹配插件生成的错误 Message，不是上游响应体。上游错误、协议错误、传输错误、插件不可用和响应过大分别带 `[open-design:<kind>]` 前缀；marker 只由封闭白名单拼出，上游文本无法伪造规则。测试含「未知 code 不回显」用例。
 - **分类**：`tier_limit_exceeded` 纳入受控已知码；上游写在消息里的 `[code=...]` 只在白名单内识别，其余一律归为 `upstream_error`。
+- **裸 402 的处置**：只有带白名单码（`insufficient_quota` 的 `code` 字段或 `[code=...]` 文本）的 402 才分类并触发换号冷却；不带机器码的 402 保持 `upstream_error`，不匹配任何默认规则，因此不换号、不冷却。生产 2026-11-01～04 共出现 6 次这样的 402（模型 `deepseek-v4.1-flash`，`err=[open-design:upstream_error] upstream request failed: payment required`），同一批账号的 200 请求占 496/500，未发现额度耗尽证据；把上游的自由文本映射成额度判定会误冷却健康账号，故不改默认策略。判定由 `TestErrorRulesBarePaymentRequiredStaysUnclassified` 与 `TestErrorRulesClassifyPaymentRequiredWithQuotaCode` 锁定。
 - **存储**：策略保存在 `<data_dir>/error-rules.json`，严格解析（拒绝未知字段、重复键、尾 JSON、超量条件、无效正则），原子写；文件损坏回退默认并上报 `load_error`，失败写不覆盖旧策略。
 - **同步**：`GET`／`PUT /error-rules` 与 `POST /error-rules/{sync,reset}`。同步只重写每个凭据的 `request_scoped_errors` 一个键，保留宿主或运维新增的未知字段（测试覆盖 `operator_note`），逐账号独立报告失败，失败可重试恢复。
 - **空数组语义**：空规则表示不写插件自有规则，由 CPA 配置决定，UI 明确显示该边界。
