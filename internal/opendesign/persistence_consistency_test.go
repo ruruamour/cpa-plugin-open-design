@@ -312,8 +312,8 @@ func TestRequestLogJournalAppendClosesSourceBeforeSwap(t *testing.T) {
 	}
 
 	openAtSwap := true
-	original := swapJournalFile
-	swapJournalFile = func(tmp, dst string) error {
+	original := renameFile
+	renameFile = func(tmp, dst string) error {
 		if handle, err := os.Open(dst); err == nil {
 			handle.Close()
 		} else {
@@ -321,7 +321,7 @@ func TestRequestLogJournalAppendClosesSourceBeforeSwap(t *testing.T) {
 		}
 		return original(tmp, dst)
 	}
-	t.Cleanup(func() { swapJournalFile = original })
+	t.Cleanup(func() { renameFile = original })
 
 	second := appendRequestLogJournal(path, first.offset, requestLogJournalEvent{Sequence: 2, Clear: true})
 	if second.err != nil || !second.committed {

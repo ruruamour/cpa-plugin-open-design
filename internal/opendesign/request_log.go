@@ -574,23 +574,23 @@ type requestLogJournalWriter interface {
 	Close() error
 }
 
-// swapJournalFile publishes a staged file over its destination. Every rename of
-// request-log state goes through it so a test can inject the Windows-only
-// failure that cannot be reproduced on other platforms: Windows cannot replace
-// a destination that still has an open handle and reports "Access is denied".
-var swapJournalFile = func(tmp, dst string) error { return os.Rename(tmp, dst) }
+// renameFile publishes a staged file over its destination. Every durable write
+// in this plugin goes through it so a test can inject the Windows-only failure
+// that cannot be reproduced on other platforms: Windows cannot replace a
+// destination that still has an open handle and reports "Access is denied".
+var renameFile = func(tmp, dst string) error { return os.Rename(tmp, dst) }
 
-// requestLogRetryPauses is the bounded backoff for a Windows sharing violation.
-// A stuck handle belongs to this process or a scanner, so a few short pauses
+// publishRetryPauses is the bounded backoff for a Windows sharing violation. A
+// stuck handle belongs to this process or a scanner, so a few short pauses
 // resolve the common case without stalling a request.
-var requestLogRetryPauses = []time.Duration{5 * time.Millisecond, 20 * time.Millisecond, 60 * time.Millisecond}
+var publishRetryPauses = []time.Duration{5 * time.Millisecond, 20 * time.Millisecond, 60 * time.Millisecond}
 
 // withShareRetry retries op while it fails. Windows reports "Access is denied"
 // when a destination is still open, and the same call succeeds once the handle
 // is released; on other platforms the first call already succeeded.
 func withShareRetry(op func() error) error {
 	err := op()
-	for _, pause := range requestLogRetryPauses {
+	for _, pause := range publishRetryPauses {
 		if err == nil {
 			return nil
 		}
@@ -604,7 +604,7 @@ func withShareRetry(op func() error) error {
 // Callers must have closed any handle on dst: an open destination is the very
 // thing Windows refuses to replace, so retrying it alone would not help.
 func publishStagedFile(tmp, dst string) error {
-	return withShareRetry(func() error { return swapJournalFile(tmp, dst) })
+	return withShareRetry(func() error { return renameFile(tmp, dst) })
 }
 
 func appendRequestLogJournal(path string, offset int64, event requestLogJournalEvent) requestLogAppendResult {

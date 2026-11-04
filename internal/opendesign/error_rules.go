@@ -275,10 +275,10 @@ func loadErrorRules(dataDir string) ([]RequestErrorRule, string) {
 // write and the rename to prove the published policy and the file agree.
 var testErrorRulesWriteHook atomic.Pointer[func()]
 
-// publishErrorRulesFile renames a staged policy file into place. It is a
-// variable so a test can inject a persistence failure on platforms where a
-// read-only directory does not stop the owner from writing.
-var publishErrorRulesFile = func(tmp, path string) error { return os.Rename(tmp, path) }
+// publishErrorRulesFile renames a staged policy file into place through the
+// shared retrying publish. It stays a variable so a test can inject the failure
+// on platforms where a read-only directory does not stop the owner writing.
+var publishErrorRulesFile = publishStagedFile
 
 func saveErrorRules(dataDir string, rules []RequestErrorRule) error {
 	path := filepath.Join(dataDir, errorRulesFile)

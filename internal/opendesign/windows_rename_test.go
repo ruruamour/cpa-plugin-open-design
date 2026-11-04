@@ -15,14 +15,14 @@ import (
 func installSwapFailure(t *testing.T, failures int) *int32 {
 	t.Helper()
 	var attempts int32
-	original := swapJournalFile
-	swapJournalFile = func(tmp, dst string) error {
+	original := renameFile
+	renameFile = func(tmp, dst string) error {
 		if int(atomic.AddInt32(&attempts, 1)) <= failures {
 			return errors.New("Access is denied.")
 		}
 		return original(tmp, dst)
 	}
-	t.Cleanup(func() { swapJournalFile = original })
+	t.Cleanup(func() { renameFile = original })
 	return &attempts
 }
 
@@ -145,5 +145,36 @@ func TestSnapshotPublishRetriesTransientWindowsShareViolation(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, requestLogSnapshotName)); err != nil {
 		t.Fatalf("snapshot was not published: %v", err)
+	}
+}
+
+// Settings are written through the same retrying publish, so a transient
+// Windows sharing violation on settings.json must not fail an operator save.
+func TestSettingsSaveRetriesTransientWindowsShareViolation(t *testing.T) {
+	s, _ := newTestService(t)
+	cfg := s.config()
+	attempts := installSwapFailure(t, 2)
+	if err := s.saveSettings(cfg); err != nil {
+		t.Fatalf("saveSettings under share violation: %v", err)
+	}
+	if got := atomic.LoadInt32(attempts); got != 3 {
+		t.Fatalf("rename attempts = %d, want 3", got)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, settingsFile)); err != nil {
+		t.Fatalf("settings.json was not published: %v", err)
+	}
+}
+
+// A persistent violation still surfaces as a failed save and leaves no staged
+// file behind.
+func TestSettingsSaveReportsPersistentWindowsShareViolation(t *testing.T) {
+	s, _ := newTestService(t)
+	cfg := s.config()
+	installSwapFailure(t, 1<<30)
+	if err := s.saveSettings(cfg); err == nil {
+		t.Fatal("saveSettings unexpectedly succeeded")
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(cfg.DataDir, settingsFile) + ".tmp-*"); len(leftovers) != 0 {
+		t.Fatalf("failed save left staged files: %v", leftovers)
 	}
 }

@@ -334,7 +334,9 @@ func (s *Service) saveSettings(cfg Config) error {
 		return err
 	}
 	defer os.Remove(tmp)
-	if err := os.Rename(tmp, path); err != nil {
+	// The swap goes through the same retrying publish as the request log, so a
+	// transient Windows sharing violation on settings.json does not fail a save.
+	if err := publishStagedFile(tmp, path); err != nil {
 		return err
 	}
 	if hook := testSettingsWriteHook.Load(); hook != nil {
