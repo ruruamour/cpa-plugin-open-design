@@ -110,6 +110,11 @@
         query: { credential_id: credentialID, model_id: modelID, refresh: options.refresh ? 1 : '' },
       }),
       saveModels: models => request('/models', { method: 'POST', body: { models } }),
+      // Quota pause is plugin-owned: it never changes the operator's `disabled`
+      // choice. Resume and recheck are explicit single-credential actions.
+      quotaPauses: () => request('/quota-pause'),
+      resumeQuotaPause: credentialID => request('/quota-pause/resume', { method: 'POST', body: { credential_id: credentialID } }),
+      recheckQuotaPause: credentialID => request('/quota-pause/recheck', { method: 'POST', body: { credential_id: credentialID } }),
       // The thinking-strength policy for one model. The body carries the model
       // identity plus the full rule table, so a stale tab can be rejected by the
       // backend instead of silently overwriting a newer edit.
@@ -138,7 +143,10 @@
       resetErrorRules: () => request('/error-rules/reset', { method: 'POST', body: {} }),
       // Only plugin-owned log settings are accepted by the backend; upstream,
       // proxy and routing stay host-owned and read-only.
-      updateConfig: logs => request('/config', { method: 'POST', body: { logs } }),
+      // The plugin only accepts its own sections: request-log policy and the
+      // quota-pause policy. Host-owned scheduling is never sent from here.
+      updateConfig: (logs, pause) => request('/config', { method: 'POST', body: pause ? { logs, pause } : { logs } }),
+      updatePauseConfig: pause => request('/config', { method: 'POST', body: { pause } }),
       runtime: () => request('/runtime'),
       modelTest: input => request('/model-test', {
         method: 'POST',

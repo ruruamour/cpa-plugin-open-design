@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // upstreamCall is one buffered request through the host transport.
@@ -280,7 +281,14 @@ func upstreamErrorFromResponseObserved(status, observedStatus int, headers http.
 	if text := http.StatusText(observedStatus); text != "" {
 		message += ": " + strings.ToLower(text)
 	}
-	return &APIError{Status: status, Kind: kind, Message: message, upstreamAttempted: true, upstreamStatus: observedStatus}
+	// Account-wide quota suspension uses a narrower, structured signal than
+	// general error classification. It never trusts a message marker alone.
+	resetAt, exhausted := quotaPauseSignal(observedStatus, headers, body, time.Now())
+	return &APIError{
+		Status: status, Kind: kind, Message: message,
+		upstreamAttempted: true, upstreamStatus: observedStatus,
+		quotaExhausted: exhausted, quotaResetAt: resetAt,
+	}
 }
 
 // isKnownUpstreamCode reports whether an upstream code is on the closed

@@ -521,15 +521,23 @@ test('the console validates management keys before storing and handles 401 feedb
 
 test('model mapping validates aliases, deduplicates, and derives a safe payload', () => {
   const core = fakePage().context.OpenDesignCore;
+  const credentialView = (overrides = {}) => ({
+    id: 'cred-1', label: '主账户', disabled: false, billing_configured: false,
+    billing_revision: '', workspace_id: '',
+    // The quota pause is a separate, plugin-owned flag: `disabled` stays the
+    // operator's own choice and the two are never conflated.
+    quota_paused: false, effective_disabled: false, quota_pause: null,
+    ...overrides,
+  });
   assert.deepEqual(
     JSON.parse(JSON.stringify(core.normalizeStatus(statusBody()).credentials)),
-    [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: false, billing_revision: '', workspace_id: '' }],
+    [credentialView()],
   );
   assert.deepEqual(
     JSON.parse(JSON.stringify(core.normalizeStatus(statusBody({
       credentials: [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: true, workspace_id: 'ws-1' }],
     })).credentials)),
-    [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: true, billing_revision: '', workspace_id: 'ws-1' }],
+    [credentialView({ billing_configured: true, workspace_id: 'ws-1' })],
   );
   assert.deepEqual(
     JSON.parse(JSON.stringify(core.normalizeUpstreamModels({ data: [{ id: 'a' }, { id: 'a' }, { id: 'b', owned_by: 'x' }, null, {}] }))),
@@ -3163,4 +3171,133 @@ test('a status refresh discards an in-flight reasoning save response', async () 
   assert.equal(api.state.reasoningSaving, false);
   assert.ok(!/已保存/.test(view.document.getElementById('reasoningState').textContent),
     'a response for the superseded generation is not announced as a fresh save');
+});
+
+// ---- 额度暂停 (plugin-owned quota pause) ------------------------------------
+
+test('quota pause is shown separately from the operator disabled switch', () => {
+  const core = fakePage().context.OpenDesignCore;
+  const paused = core.normalizeStatus(statusBody({
+    credentials: [{
+      id: 'cred-1', label: '主账户', disabled: false,
+      quota_paused: true, effective_disabled: true,
+      quota_pause: {
+        reason: 'quota_exhausted', source: 'upstream',
+        resume_at: new Date(Date.now() + 3600_000).toISOString(),
+        manual_disabled: false, model_id: 'open-design/flash',
+      },
+    }],
+  })).credentials[0];
+  // The operator's own switch stays off even while the account is paused.
+  assert.equal(paused.disabled, false);
+  assert.equal(paused.quota_paused, true);
+  assert.equal(paused.effective_disabled, true);
+  assert.match(core.quotaPauseText(paused.quota_pause), /额度暂停（剩余/);
+  // A pause with no usable deadline still renders as a pause.
+  assert.equal(core.quotaPauseText({ resume_at: '' }), '额度暂停');
+  assert.equal(core.quotaPauseText(null), '');
+  assert.equal(core.normalizeQuotaPause(null), null);
+});
+
+test('a paused account offers 解除额度暂停 and never flips the disabled switch', async () => {
+  const calls = [];
+  const pause = {
+    reason: 'quota_exhausted', source: 'upstream',
+    resume_at: new Date(Date.now() + 3600_000).toISOString(),
+    manual_disabled: false, model_id: 'open-design/flash',
+  };
+  const view = fakePage({
+    confirmImpl: () => true,
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, init });
+      if (url.endsWith('/quota-pause/resume')) return respond(200, { pauses: [] });
+      if (url.endsWith('/status')) {
+        return respond(200, statusBody({
+          credentials: [{ id: 'cred-1', label: '主账户', disabled: false, quota_paused: true, effective_disabled: true, quota_pause: pause }],
+        }));
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const row = view.document.getElementById('accountList').children[0];
+  assert.match(row.textContent, /额度暂停/);
+  // The row exposes an explicit resume control, but nothing runs on render.
+  const actionsRow = row.children[1];
+  const actionTexts = [...actionsRow.children].map(node => node.textContent);
+  assert.ok(actionTexts.includes('解除额度暂停'), `expected a resume control, got ${actionTexts.join(',')}`);
+  assert.equal(calls.filter(call => call.url.endsWith('/quota-pause/resume')).length, 0,
+    'the console must not resume without an operator click');
+
+  await api.handlers.resumeQuotaPause(api.state.status.credentials[0]);
+  const sent = calls.filter(call => call.url.endsWith('/quota-pause/resume'));
+  assert.equal(sent.length, 1);
+  assert.deepEqual(JSON.parse(sent[0].init.body), { credential_id: 'cred-1' });
+  assert.equal(sent[0].init.method, 'POST');
+  // The pause is cleared through the pause route only; `disabled` was never posted.
+  assert.ok(!calls.some(call => call.url.endsWith('/credentials')), 'resuming a pause must not toggle the account');
+});
+
+test('recheck posts the credential id and reports an unproven preflight', async () => {
+  const calls = [];
+  const view = fakePage({
+    confirmImpl: () => true,
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, init });
+      if (url.endsWith('/quota-pause/recheck')) return respond(409, { error: '本次预检未能证明额度已恢复' });
+      if (url.endsWith('/status')) return respond(200, statusBody());
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.recheckQuotaPause({ id: 'cred-1', label: '主账户' });
+  const sent = calls.filter(call => call.url.endsWith('/quota-pause/recheck'));
+  assert.equal(sent.length, 1);
+  assert.deepEqual(JSON.parse(sent[0].init.body), { credential_id: 'cred-1' });
+  assert.match(view.document.getElementById('accountState').textContent, /重查未通过/);
+});
+
+test('额度的自动暂停开关是可写的插件配置，默认开启', async () => {
+  const core = fakePage().context.OpenDesignCore;
+  const defaults = core.normalizeConfig({ logs: {}, upstream: { origin: 'https://x', fixed: true }, proxy: {}, routing: {} });
+  assert.equal(defaults.pause.enabled, true);
+  assert.equal(defaults.pause.max_seconds, 86400);
+  // Out-of-range values fall back instead of being sent back to the plugin.
+  const clamped = core.normalizeConfig({ pause: { enabled: false, max_seconds: 1 } });
+  assert.equal(clamped.pause.enabled, false);
+  assert.equal(clamped.pause.max_seconds, 86400);
+
+  const calls = [];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, init });
+      if (url.endsWith('/config') && init.method === 'POST') {
+        return respond(200, { logs: {}, pause: { enabled: false, max_seconds: 3600, owner: 'plugin' }, upstream: { fixed: true }, proxy: {}, routing: {} });
+      }
+      if (url.endsWith('/config')) {
+        return respond(200, { logs: {}, pause: { enabled: true, max_seconds: 86400, owner: 'plugin' }, upstream: { fixed: true }, proxy: {}, routing: {} });
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.handlers.loadConfig();
+  assert.equal(view.document.getElementById('configPauseEnabled').checked, true);
+  assert.equal(view.document.getElementById('configPauseMaxSeconds').value, '86400');
+  view.document.getElementById('configPauseMaxSeconds').value = '5';
+  await api.handlers.savePauseConfig({ preventDefault() {} });
+  assert.ok(!calls.some(call => call.init.method === 'POST'), 'an out-of-range value must not be submitted');
+  assert.match(view.document.getElementById('configState').textContent, /60 到 604800/);
+  view.document.getElementById('configPauseMaxSeconds').value = '3600';
+  view.document.getElementById('configPauseEnabled').checked = false;
+  await api.handlers.savePauseConfig({ preventDefault() {} });
+  const sent = calls.filter(call => call.init.method === 'POST');
+  assert.equal(sent.length, 1);
+  assert.deepEqual(JSON.parse(sent[0].init.body), { pause: { enabled: false, max_seconds: 3600 } });
+  assert.equal(view.document.getElementById('configPauseEnabled').checked, false);
 });

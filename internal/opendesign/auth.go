@@ -103,6 +103,7 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 		}
 		return map[string]any{"Handled": true, "Auth": data}, nil
 	}
+	now := s.quotaPauseTime()
 	s.mu.Lock()
 	if s.revoked[c.ID] && !resolvedFile {
 		// A watcher may have queued this callback before the delete landed.
@@ -112,6 +113,21 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 	if resolvedFile {
 		delete(s.revoked, c.ID)
 	}
+	if current, exists := s.creds[c.ID]; exists {
+		if current.APIKey == c.APIKey && current.QuotaRevision != "" && current.QuotaRevision != c.QuotaRevision {
+			// A watcher can have read an old snapshot just before a quota write.
+			// Keep the live plugin-owned block while still accepting other fields.
+			c.QuotaBlock = cloneQuotaBlock(current.QuotaBlock)
+			c.QuotaRevision = current.QuotaRevision
+		} else if current.APIKey != c.APIKey {
+			delete(s.quotaPauseErrors, c.ID)
+		}
+	}
+	if block, changed := normalizeQuotaBlock(c, now); changed {
+		c.QuotaBlock = block
+		c.QuotaRevision = newID()
+		s.quotaPauseErrors[c.ID] = quotaPauseSyncError
+	}
 	s.storeCredentialLocked(c)
 	if r.FileName != "" {
 		s.authFiles[c.ID] = filepath.Base(r.FileName)
@@ -120,6 +136,7 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 		s.authDir = r.Host.AuthDir
 	}
 	s.mu.Unlock()
+	s.wakeQuotaPauseWorker()
 	return map[string]any{"Handled": true, "Auth": s.authData(c)}, nil
 }
 
@@ -164,7 +181,7 @@ func (s *Service) authData(c Credential) map[string]any {
 		"ID":          c.ID,
 		"FileName":    s.fileNameFor(c),
 		"Label":       c.Label,
-		"Disabled":    c.Disabled,
+		"Disabled":    c.effectiveDisabled(),
 		"StorageJSON": jsonBytes(c),
 		// CPA reads request_scoped_errors from the auth metadata to classify an
 		// upstream failure as stop/continue and to decide whether the failed
@@ -207,7 +224,7 @@ func (s *Service) selectedCredential(request ExecutorRequest) (Credential, error
 		if !ok || revoked {
 			return c, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential was replaced or removed")
 		}
-		if epoch != c.runtimeEpoch || current.APIKey != c.APIKey || current.ControlKey != c.ControlKey || current.WorkspaceID != c.WorkspaceID || current.Disabled != c.Disabled || currentBaseURL != snapshotBaseURL {
+		if epoch != c.runtimeEpoch || current.APIKey != c.APIKey || current.ControlKey != c.ControlKey || current.WorkspaceID != c.WorkspaceID || current.Disabled != c.Disabled || current.QuotaRevision != c.QuotaRevision || currentBaseURL != snapshotBaseURL {
 			return c, localFail(http.StatusConflict, "credential_changed", "OpenDesign credential changed while the model test was starting")
 		}
 		c.BaseURL = snapshotBaseURL
@@ -231,6 +248,9 @@ func (s *Service) selectedCredential(request ExecutorRequest) (Credential, error
 	}
 	if c.Disabled || revoked {
 		return c, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential is disabled or removed")
+	}
+	if c.quotaBlocked() {
+		return c, localFail(http.StatusTooManyRequests, "quota_blocked", quotaBlockMarker+" OpenDesign account quota is temporarily paused")
 	}
 	if c.BaseURL == "" {
 		c.BaseURL = s.config().BaseURL

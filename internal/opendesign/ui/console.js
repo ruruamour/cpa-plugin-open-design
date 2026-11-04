@@ -742,12 +742,18 @@
     } else {
       const rows = items.map(item => {
         const editing = Boolean(state.accountEdit && state.accountEdit.id === item.id);
+        const pause = item.quota_pause;
         const detail = el('div', { className: 'row-main' }, [
           el('span', { className: 'name', text: item.label }),
           el('span', {
             className: `badge ${item.disabled ? 'off' : 'on'}`,
             text: item.disabled ? '已停用' : '已启用',
           }),
+          // A quota pause is separate from the operator's own switch: it never
+          // changes `disabled`, so it gets its own badge and its own controls.
+          pause ? el('span', { className: 'badge warn', text: Core.quotaPauseText(pause) }) : null,
+          pause && pause.multiple_models ? el('span', { className: 'badge', text: '多个模型' }) : null,
+          pause && pause.error ? el('span', { className: 'badge off', text: '同步待重试' }) : null,
           item.billing_configured ? el('span', { className: 'badge', text: '额度已配置' }) : null,
           editing ? el('span', { className: 'badge', text: '正在编辑' }) : null,
         ]);
@@ -765,6 +771,14 @@
             className: 'button compact',
             on: () => toggleAccount(item),
           }),
+          pause ? button('解除额度暂停', 'resume-quota-pause', {
+            className: 'button compact',
+            on: () => resumeQuotaPause(item),
+          }) : null,
+          pause && !pause.multiple_models && pause.model_id ? button('重查额度', 'recheck-quota-pause', {
+            className: 'button compact',
+            on: () => recheckQuotaPause(item),
+          }) : null,
           button('删除', 'delete-account', {
             className: 'button compact danger',
             on: () => deleteAccount(item),
@@ -1578,6 +1592,43 @@
     }
   }
 
+  // Manual resume clears only the plugin-owned quota block; the operator's own
+  // disabled switch is untouched. It always asks first, because it puts an
+  // exhausted account straight back into CPA scheduling.
+  async function resumeQuotaPause(item) {
+    if (state.busy) return;
+    if (typeof confirm === 'function' && !confirm(`解除账户「${item.label}」的额度暂停？该账户会立即重新参与 CPA 调度。`)) return;
+    setBusy(true);
+    message('accountState', '正在解除额度暂停…');
+    try {
+      await api().resumeQuotaPause(item.id);
+      await refreshStatus();
+      message('accountState', '已解除额度暂停；账户是否调度仍由 CPA 与启用状态决定。');
+    } catch (error) {
+      message('accountState', `解除失败：${formatError(error)}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Recheck runs one fresh official model preflight. Only a proven available
+  // result clears the pause; a cache hit or a failure changes nothing.
+  async function recheckQuotaPause(item) {
+    if (state.busy) return;
+    if (typeof confirm === 'function' && !confirm(`用一次官方额度预检查重新确认账户「${item.label}」的额度？`)) return;
+    setBusy(true);
+    message('accountState', '正在重查额度…');
+    try {
+      await api().recheckQuotaPause(item.id);
+      await refreshStatus();
+      message('accountState', '额度预检通过，已解除暂停。');
+    } catch (error) {
+      message('accountState', `重查未通过：${formatError(error)}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function refreshStatus() {
     const raw = await api().status();
     applyStatus(raw);
@@ -1732,7 +1783,8 @@
     setDisabled('logsNext', logBusy || !state.logPage.has_more);
     for (const id of ['loadConfig']) setDisabled(id, optionalBusy('config'));
     const configLocked = optionalBusy('config') || !state.config;
-    for (const id of ['configLogsEnabled', 'configRetentionDays', 'configMaxEntries', 'saveConfig']) {
+    for (const id of ['configLogsEnabled', 'configRetentionDays', 'configMaxEntries', 'saveConfig',
+      'configPauseEnabled', 'configPauseMaxSeconds', 'savePauseConfig']) {
       setDisabled(id, configLocked);
     }
     setDisabled('loadRuntime', optionalBusy('runtime'));
@@ -2028,6 +2080,13 @@
     const enabled = $('configLogsEnabled');
     const days = $('configRetentionDays');
     const max = $('configMaxEntries');
+    const pauseEnabled = $('configPauseEnabled');
+    const pauseMax = $('configPauseMaxSeconds');
+    // `state.config` always comes from Core.normalizeConfig, but renderConfig is
+    // also reached from tests and partial states, so tolerate a missing section.
+    const pausePolicy = config && config.pause ? config.pause : null;
+    if (pauseEnabled) pauseEnabled.checked = Boolean(pausePolicy && pausePolicy.enabled);
+    if (pauseMax) pauseMax.value = pausePolicy ? String(pausePolicy.max_seconds) : '';
     if (config) {
       if (enabled) enabled.checked = config.logs.enabled !== false;
       if (days) days.value = config.logs.retention_days === null ? '' : String(config.logs.retention_days);
@@ -2059,6 +2118,37 @@
     ];
     if (config.log_level) facts.push({ label: '日志级别', value: config.log_level });
     renderFacts(container, facts);
+  }
+
+  // Saves only the plugin-owned quota-pause policy. It never changes how CPA
+  // schedules credentials and never touches an operator's disabled choice.
+  async function savePauseConfig(event) {
+    if (event) event.preventDefault();
+    if (optionalBusy('config')) return;
+    const enabled = $('configPauseEnabled');
+    const max = $('configPauseMaxSeconds');
+    const seconds = max ? Number(max.value) : NaN;
+    if (!Number.isSafeInteger(seconds) || seconds < 60 || seconds > 604800) {
+      message('configState', '额度暂停上限必须是 60 到 604800 之间的整数秒。', 'error');
+      return;
+    }
+    const generation = state.optionalGeneration;
+    setOptionalBusy('config', true);
+    message('configState', '正在保存额度暂停设置…');
+    const stillCurrent = () => generation === state.optionalGeneration;
+    try {
+      const raw = await api().updatePauseConfig({ enabled: Boolean(enabled && enabled.checked), max_seconds: seconds });
+      if (!stillCurrent()) return;
+      state.config = Core.normalizeConfig(raw);
+      renderConfig();
+      message('configState', '额度暂停设置已保存。', 'ok');
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (optionalAuthFailure(error)) return;
+      message('configState', optionalErrorText(error), 'error');
+    } finally {
+      if (stillCurrent()) setOptionalBusy('config', false);
+    }
   }
 
   async function loadConfig() {
@@ -3065,6 +3155,8 @@
     if (loadConfigButton) loadConfigButton.addEventListener('click', loadConfig);
     const logSettingsForm = $('logSettingsForm');
     if (logSettingsForm) logSettingsForm.addEventListener('submit', saveConfig);
+    const pauseSettingsForm = $('pauseSettingsForm');
+    if (pauseSettingsForm) pauseSettingsForm.addEventListener('submit', savePauseConfig);
     const loadRuntimeButton = $('loadRuntime');
     if (loadRuntimeButton) loadRuntimeButton.addEventListener('click', loadRuntime);
     const runTestButton = $('runModelTest');
@@ -3197,6 +3289,8 @@
       editAccount,
       deleteAccount,
       toggleAccount,
+      resumeQuotaPause,
+      recheckQuotaPause,
       selectAccount,
       selectCredential,
       fetchModels,
@@ -3225,6 +3319,7 @@
       previousLogsPage,
       loadConfig,
       saveConfig,
+      savePauseConfig,
       loadRuntime,
       openErrorRules,
       closeErrorRules,

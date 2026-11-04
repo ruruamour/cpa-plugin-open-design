@@ -48,6 +48,10 @@ type Service struct {
 	errorRulesLoadError  string
 	errorRuleSynced      map[string]string
 	errorRuleSyncErrors  map[string]string
+	quotaPauseErrors     map[string]string // fixed, redacted persistence failures; guarded by mu
+	quotaPauseWake       chan struct{}
+	quotaPauseStarted    bool
+	quotaPauseWorker     sync.WaitGroup
 	requestLogs          *requestLogStore
 	modelTests           map[string]modelTestRecord
 	modelTestRunning     map[string]int
@@ -84,6 +88,8 @@ func NewService() *Service {
 		errorRules:          defaultErrorRules(),
 		errorRuleSynced:     map[string]string{},
 		errorRuleSyncErrors: map[string]string{},
+		quotaPauseErrors:    map[string]string{},
+		quotaPauseWake:      make(chan struct{}, 1),
 		requestLogs:         requestLogs,
 		modelTests:          map[string]modelTestRecord{},
 		modelTestRunning:    map[string]int{},
@@ -252,6 +258,7 @@ func (s *Service) configure(raw json.RawMessage) (err error) {
 		// The host re-registers a quiesced instance when replacement fails.
 		s.stopped = false
 		s.stopCh = make(chan struct{})
+		s.quotaPauseStarted = false
 		s.ops.reopen()
 	}
 	s.cfg = cfg
@@ -269,6 +276,7 @@ func (s *Service) configure(raw json.RawMessage) (err error) {
 	s.errorRules = rules
 	s.errorRulesLoadError = loadErr
 	s.mu.Unlock()
+	s.startQuotaPauseWorker()
 	return nil
 }
 
@@ -324,6 +332,7 @@ func (s *Service) quiesce() (any, error) {
 	// Cancel host operations too: a buffered callback or a stream still waiting
 	// for headers blocks inside the host, where closing a stream id cannot help.
 	s.cancelOperations()
+	s.quotaPauseWorker.Wait()
 	s.active.Wait()
 	// Invalidate and join any deferred log task before the synchronous shutdown
 	// flush, so an old task cannot write after this lifecycle boundary.

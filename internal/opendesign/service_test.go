@@ -20,6 +20,7 @@ func newTestService(t *testing.T) (*Service, *fakeHost) {
 	s := NewService()
 	s.SetHost(host.call)
 	registrar(t, s, dir)
+	t.Cleanup(func() { _, _ = s.quiesce() })
 	return s, host
 }
 

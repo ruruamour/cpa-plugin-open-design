@@ -20,13 +20,30 @@ type configLogUpdate struct {
 	MaxEntries    *int  `json:"max_entries"`
 }
 
+// configPauseUpdate is the plugin-owned quota-pause policy. It only bounds what
+// this plugin does to its own credentials; CPA scheduling and cooldowns are
+// untouched.
+type configPauseUpdate struct {
+	Enabled    *bool `json:"enabled"`
+	MaxSeconds *int  `json:"max_seconds"`
+}
+
 type configUpdateInput struct {
-	Logs *configLogUpdate `json:"logs"`
+	Logs  *configLogUpdate   `json:"logs"`
+	Pause *configPauseUpdate `json:"pause"`
 }
 
 func configView(cfg Config, logView map[string]any) map[string]any {
+	settings := cfg.pauseSettings()
 	return map[string]any{
 		"logs": logView,
+		"pause": map[string]any{
+			"enabled":     settings.enabled,
+			"max_seconds": int64(settings.maxWindow / time.Second),
+			// The pause is plugin-owned and bounded; it never changes CPA's own
+			// scheduling or cooldown behavior.
+			"owner": "plugin",
+		},
 		"upstream": map[string]any{
 			"origin": DefaultBaseURL,
 			"fixed":  true,
@@ -68,14 +85,17 @@ func (s *Service) updateConfigRequest(r ManagementRequest) (any, error) {
 	if err := jsonUnmarshalObject(r.Body, &in); err != nil {
 		return managementError(http.StatusBadRequest, "invalid config JSON")
 	}
-	if in.Logs == nil {
+	if in.Logs == nil && in.Pause == nil {
 		return managementError(http.StatusBadRequest, "no plugin-owned config fields supplied")
 	}
-	if in.Logs.RetentionDays != nil && (*in.Logs.RetentionDays < 1 || *in.Logs.RetentionDays > maxRequestLogRetentionDays) {
+	if in.Logs != nil && in.Logs.RetentionDays != nil && (*in.Logs.RetentionDays < 1 || *in.Logs.RetentionDays > maxRequestLogRetentionDays) {
 		return managementError(http.StatusBadRequest, "logs.retention_days must be between 1 and 90")
 	}
-	if in.Logs.MaxEntries != nil && (*in.Logs.MaxEntries < 1 || *in.Logs.MaxEntries > maxRequestLogMaxEntries) {
+	if in.Logs != nil && in.Logs.MaxEntries != nil && (*in.Logs.MaxEntries < 1 || *in.Logs.MaxEntries > maxRequestLogMaxEntries) {
 		return managementError(http.StatusBadRequest, "logs.max_entries must be between 1 and 500")
+	}
+	if in.Pause != nil && in.Pause.MaxSeconds != nil && (*in.Pause.MaxSeconds < int(quotaPauseMinWindow/time.Second) || *in.Pause.MaxSeconds > int(quotaPauseMaxWindow/time.Second)) {
+		return managementError(http.StatusBadRequest, "pause.max_seconds must be between 60 and 604800")
 	}
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
@@ -86,15 +106,26 @@ func (s *Service) updateConfigRequest(r ManagementRequest) (any, error) {
 	if !loaded || strings.TrimSpace(cfg.DataDir) == "" {
 		return managementError(http.StatusConflict, "plugin is not configured")
 	}
-	if in.Logs.Enabled != nil {
-		value := *in.Logs.Enabled
-		cfg.Logs.Enabled = &value
+	if in.Logs != nil {
+		if in.Logs.Enabled != nil {
+			value := *in.Logs.Enabled
+			cfg.Logs.Enabled = &value
+		}
+		if in.Logs.RetentionDays != nil {
+			cfg.Logs.RetentionDays = *in.Logs.RetentionDays
+		}
+		if in.Logs.MaxEntries != nil {
+			cfg.Logs.MaxEntries = *in.Logs.MaxEntries
+		}
 	}
-	if in.Logs.RetentionDays != nil {
-		cfg.Logs.RetentionDays = *in.Logs.RetentionDays
-	}
-	if in.Logs.MaxEntries != nil {
-		cfg.Logs.MaxEntries = *in.Logs.MaxEntries
+	if in.Pause != nil {
+		if in.Pause.Enabled != nil {
+			value := *in.Pause.Enabled
+			cfg.Pause.Enabled = &value
+		}
+		if in.Pause.MaxSeconds != nil {
+			cfg.Pause.MaxSeconds = *in.Pause.MaxSeconds
+		}
 	}
 	if err := cfg.validate(); err != nil {
 		return managementError(statusOf(err), err.Error())
@@ -104,8 +135,10 @@ func (s *Service) updateConfigRequest(r ManagementRequest) (any, error) {
 	}
 	s.mu.Lock()
 	s.cfg.Logs = cfg.Logs
+	s.cfg.Pause = cfg.Pause
 	s.mu.Unlock()
 	s.requestLogs.setSettings(cfg.logSettings())
+	s.wakeQuotaPauseWorker()
 	return managementJSON(http.StatusOK, configView(cfg, s.requestLogs.settingsView()))
 }
 

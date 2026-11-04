@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -51,6 +52,10 @@ type APIError struct {
 	// intentionally not serialized into any management response.
 	upstreamAttempted bool
 	upstreamStatus    int
+	// These internal fields are set only for the narrowly recognized upstream
+	// quota signal. They are never serialized into the client-facing error.
+	quotaExhausted bool
+	quotaResetAt   time.Time
 }
 
 func (e *APIError) Error() string { return e.Message }
@@ -115,6 +120,17 @@ type Config struct {
 	Models   []Model   `json:"models" yaml:"models"`
 	LogLevel string    `json:"log_level,omitempty" yaml:"log_level,omitempty"`
 	Logs     LogConfig `json:"logs,omitempty" yaml:"logs,omitempty"`
+	// Pause is the plugin-owned quota-exhaustion policy. A nil Enabled keeps the
+	// built-in default (on), so an older settings.json keeps the documented
+	// behavior. It never changes how CPA schedules or cools a credential.
+	Pause PauseConfig `json:"pause,omitempty" yaml:"pause,omitempty"`
+}
+
+// PauseConfig bounds the plugin-owned quota pause. MaxSeconds caps any single
+// pause and is itself clamped to quotaPauseMaxWindow.
+type PauseConfig struct {
+	Enabled    *bool `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+	MaxSeconds int   `json:"max_seconds,omitempty" yaml:"max_seconds,omitempty"`
 }
 
 // LogConfig is the request log policy. Zero values mean "use the plugin
@@ -217,6 +233,10 @@ type Credential struct {
 	// credential, and whether the failed credential is cooled down. The plugin
 	// owns the policy; CPA owns the scheduling decision.
 	RequestScopedErrors []RequestErrorRule `json:"request_scoped_errors,omitempty"`
+	// Disabled retains the operator's setting. QuotaBlock is a separate,
+	// temporary plugin-owned scheduling restriction, following ClinePass.
+	QuotaBlock    *QuotaBlock `json:"quota_block,omitempty"`
+	QuotaRevision string      `json:"quota_revision,omitempty"`
 	// billingRevision is an opaque in-memory identity for UI cache invalidation.
 	// It is random, never derived from a key and never persisted in auth files.
 	// runtimeEpoch fences model tests against credential identity changes, even
@@ -226,7 +246,7 @@ type Credential struct {
 	extraFields     map[string]json.RawMessage
 }
 
-var credentialJSONFields = []string{"type", "id", "label", "api_key", "control_key", "workspace_id", "disabled", "base_url", "model_revision", "request_scoped_errors"}
+var credentialJSONFields = []string{"type", "id", "label", "api_key", "control_key", "workspace_id", "disabled", "base_url", "model_revision", "request_scoped_errors", "quota_block", "quota_revision"}
 
 // UnmarshalJSON keeps host- or operator-added fields so a rewrite through
 // host.auth.save cannot silently drop them.
@@ -235,6 +255,12 @@ func (c *Credential) UnmarshalJSON(raw []byte) error {
 	var decoded known
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return err
+	}
+	// CPA may persist the effective disabled flag back into the top-level JSON.
+	// Only an intact block bound to this key may restore the separate manual
+	// choice. A missing snapshot or stale key leaves the on-disk flag untouched.
+	if quotaBlockBelongsToKey(decoded.QuotaBlock, decoded.APIKey) && decoded.QuotaBlock.ManualDisabled != nil {
+		decoded.Disabled = *decoded.QuotaBlock.ManualDisabled
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {

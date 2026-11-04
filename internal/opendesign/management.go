@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -71,6 +72,9 @@ func managementRoutes() []managementRoute {
 		{Method: http.MethodGet, Path: apiBase + "/models"},
 		{Method: http.MethodPost, Path: apiBase + "/models"},
 		{Method: http.MethodPost, Path: apiBase + "/models/reasoning"},
+		{Method: http.MethodGet, Path: apiBase + "/quota-pause"},
+		{Method: http.MethodPost, Path: apiBase + "/quota-pause/resume"},
+		{Method: http.MethodPost, Path: apiBase + "/quota-pause/recheck"},
 		{Method: http.MethodPost, Path: apiBase + "/console/session"},
 	}
 }
@@ -177,6 +181,10 @@ func (s *Service) management(raw json.RawMessage) (any, error) {
 			}
 			return managementJSON(http.StatusOK, result)
 		})
+	case r.Method == http.MethodGet && path == apiBase+"/quota-pause":
+		return s.withActive(func() (any, error) { return managementJSON(http.StatusOK, s.quotaPauseResponse()) })
+	case r.Method == http.MethodPost && (path == apiBase+"/quota-pause/resume" || path == apiBase+"/quota-pause/recheck"):
+		return s.withActive(func() (any, error) { return s.quotaPauseAction(r) })
 	case r.Method == http.MethodPost && path == apiBase+"/models/reasoning":
 		return s.withActive(func() (any, error) {
 			result, err := s.saveReasoningMapping(r.Body)
@@ -193,10 +201,13 @@ func (s *Service) management(raw json.RawMessage) (any, error) {
 // statusResponse is the shape the console reads. It never contains a key.
 func (s *Service) statusResponse() (any, error) {
 	cfg := s.config()
+	// Resolve the clock before taking the read lock: quotaPauseTime takes the
+	// same lock, and a recursive RLock can deadlock behind a pending writer.
+	now := s.quotaPauseTime()
 	s.mu.RLock()
 	credentials := make([]map[string]any, 0, len(s.creds))
 	for _, c := range s.creds {
-		credentials = append(credentials, credentialView(c))
+		credentials = append(credentials, credentialView(c, now))
 	}
 	s.mu.RUnlock()
 	sortCredentials(credentials)
@@ -222,19 +233,44 @@ func stringOf(v any) string {
 	return s
 }
 
-func credentialView(c Credential) map[string]any {
-	return map[string]any{
+func credentialView(c Credential, now time.Time) map[string]any {
+	view := map[string]any{
 		"id": c.ID, "label": c.Label, "disabled": c.Disabled,
 		"billing_configured": c.ControlKey != "", "workspace_id": c.WorkspaceID,
 		"billing_revision": c.billingRevision,
 	}
+	// A quota block is a separate, plugin-owned scheduling restriction. The
+	// `disabled` field keeps the operator's own choice so the console can show
+	// the two independently, and no key fingerprint is ever exposed.
+	blocked := c.quotaBlocked()
+	view["quota_paused"] = blocked
+	view["effective_disabled"] = c.effectiveDisabled()
+	if blocked {
+		block := c.QuotaBlock
+		pause := map[string]any{
+			"reason":          block.Reason,
+			"source":          block.Source,
+			"blocked_at":      block.BlockedAt,
+			"observed_at":     block.ObservedAt,
+			"resume_at":       block.RetryAt,
+			"manual_disabled": c.Disabled,
+			"model_id":        block.ModelID,
+			"multiple_models": block.MultipleModels,
+		}
+		if remaining := block.RetryAt.Sub(now); remaining > 0 {
+			pause["remaining_seconds"] = int64(remaining / time.Second)
+		}
+		view["quota_pause"] = pause
+	}
+	return view
 }
 
 func (s *Service) listCredentials() (any, error) {
+	now := s.quotaPauseTime()
 	s.mu.RLock()
 	items := make([]map[string]any, 0, len(s.creds))
 	for _, c := range s.creds {
-		items = append(items, credentialView(c))
+		items = append(items, credentialView(c, now))
 	}
 	s.mu.RUnlock()
 	sortCredentials(items)
@@ -323,7 +359,7 @@ func (s *Service) createCredential(in credentialInput) (any, error) {
 	delete(s.revoked, c.ID)
 	s.mu.Unlock()
 	// The response deliberately omits the key.
-	return managementJSON(http.StatusCreated, credentialView(c))
+	return managementJSON(http.StatusCreated, credentialView(c, s.quotaPauseTime()))
 }
 
 func (s *Service) updateCredential(id string, in credentialInput) (any, error) {
@@ -345,6 +381,12 @@ func (s *Service) updateCredential(id string, in credentialInput) (any, error) {
 		if len(key) < 8 || strings.ContainsAny(key, "\r\n") {
 			return managementError(http.StatusBadRequest, "invalid api_key")
 		}
+		if c.APIKey != key {
+			// A quota block is bound to the inference key, not its label or ID.
+			// A failed host save leaves the old key and its block untouched.
+			c.QuotaBlock = nil
+			c.QuotaRevision = newID()
+		}
 		c.APIKey = key
 	}
 	if err := applyBillingInput(&c, in); err != nil {
@@ -352,6 +394,14 @@ func (s *Service) updateCredential(id string, in credentialInput) (any, error) {
 	}
 	if disabled != nil {
 		c.Disabled = *disabled
+		if c.quotaBlocked() {
+			// Never mutate the live pointer before host.auth.save succeeds.
+			block := cloneQuotaBlock(c.QuotaBlock)
+			manual := *disabled
+			block.ManualDisabled = &manual
+			c.QuotaBlock = block
+			c.QuotaRevision = newID()
+		}
 	}
 	if c.Label == "" {
 		c.Label = "OpenDesign"
@@ -378,7 +428,7 @@ func (s *Service) updateCredential(id string, in credentialInput) (any, error) {
 	}
 	s.authFiles[c.ID] = filename
 	s.mu.Unlock()
-	return managementJSON(http.StatusOK, credentialView(c))
+	return managementJSON(http.StatusOK, credentialView(c, s.quotaPauseTime()))
 }
 
 // deleteCredential removes the auth file and revokes the id so a queued watcher

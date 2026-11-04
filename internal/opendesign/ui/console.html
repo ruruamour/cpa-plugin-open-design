@@ -574,6 +574,21 @@
             <p class="hint" style="margin-top: 8px;">未读取配置前这些控件不会发送请求；保存只提交日志相关字段。</p>
           </div>
           <div class="read-only">
+            <h3>额度暂停</h3>
+            <form class="inline" id="pauseSettingsForm" autocomplete="off">
+              <label class="check" style="flex: 1 1 220px;">
+                <input id="configPauseEnabled" type="checkbox">
+                识别到额度耗尽时自动暂停该账户
+              </label>
+              <label class="field narrow">
+                <span>单次上限（秒，60-604800）</span>
+                <input class="control" id="configPauseMaxSeconds" type="number" min="60" max="604800" step="60" inputmode="numeric">
+              </label>
+              <button class="button primary" id="savePauseConfig" type="submit">保存额度暂停设置</button>
+            </form>
+            <p class="hint" style="margin-top: 8px;">暂停由本插件记录在凭据文件中，只影响本插件是否使用该账户；不会修改 CPA 的启用/停用选择，也不能提前结束 CPA 已给出的 402/403 冷却。到点后插件自动解除暂停，也可以在这里手动解除。</p>
+          </div>
+          <div class="read-only">
             <h3>宿主代理 / 路由（只读）</h3>
             <p class="hint">本插件没有私有代理池，也不提供代理、路由或全局冷却的增删改查。以下状态只用于说明边界。</p>
             <div class="facts" id="hostOwnedFacts" aria-live="polite"></div>

@@ -18,7 +18,9 @@ var quotaTestTime = time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
 func quotaTestClock(s *Service) func(time.Duration) {
 	var stamp atomic.Int64
 	stamp.Store(quotaTestTime.UnixNano())
+	s.mu.Lock()
 	s.quotaNow = func() time.Time { return time.Unix(0, stamp.Load()).UTC() }
+	s.mu.Unlock()
 	return func(d time.Duration) { stamp.Add(int64(d)) }
 }
 

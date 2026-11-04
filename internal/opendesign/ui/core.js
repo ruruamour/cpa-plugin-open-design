@@ -24,6 +24,39 @@
     return `HTTP ${status}${detail ? `：${detail}` : ''}`;
   }
 
+  function normalizeQuotaPause(value) {
+    const data = value && typeof value === 'object' ? value : null;
+    if (!data) return null;
+    const pause = {
+      reason: safeCode(data.reason, 40),
+      source: safeCode(data.source, 40),
+      resume_at: safeTimestamp(data.resume_at),
+      blocked_at: safeTimestamp(data.blocked_at),
+      model_id: safeIdentity(data.model_id, 512),
+      multiple_models: data.multiple_models === true,
+      manual_disabled: data.manual_disabled === true,
+      remaining_seconds: safeInteger(data.remaining_seconds, 0, 31536000),
+      error: shortText(data.error, 200),
+    };
+    return pause;
+  }
+
+  function quotaPauseRemaining(pause, now = Date.now()) {
+    if (!pause) return null;
+    const at = Date.parse(pause.resume_at || '');
+    if (!Number.isFinite(at)) return null;
+    const remaining = Math.floor((at - now) / 1000);
+    return remaining > 0 ? remaining : 0;
+  }
+
+  function quotaPauseText(pause, now = Date.now()) {
+    if (!pause) return '';
+    const remaining = quotaPauseRemaining(pause, now);
+    if (remaining === null) return '额度暂停';
+    if (remaining <= 0) return '额度暂停（即将恢复）';
+    return `额度暂停（剩余 ${formatDuration(remaining)}）`;
+  }
+
   function normalizeStatus(value) {
     const data = value && typeof value === 'object' ? value : {};
     const credentials = [];
@@ -39,6 +72,11 @@
           billing_configured: item.billing_configured === true,
           billing_revision: text(item.billing_revision),
           workspace_id: text(item.workspace_id),
+          // The quota pause is a separate, plugin-owned flag. `disabled` stays
+          // the operator's own choice, so the console never conflates the two.
+          quota_paused: item.quota_paused === true,
+          effective_disabled: item.effective_disabled === true,
+          quota_pause: normalizeQuotaPause(item.quota_pause),
         });
       }
     }
@@ -763,8 +801,17 @@
       };
     };
     const upstream = data.upstream && typeof data.upstream === 'object' ? data.upstream : {};
+    const pause = data.pause && typeof data.pause === 'object' ? data.pause : {};
+    const pauseMax = safeInteger(pause.max_seconds, 60, 604800);
     return {
       logs: normalizeRetention(data.logs),
+      // The quota pause is plugin-owned: CPA keeps its own scheduling and
+      // cooldown. `enabled` defaults to on, matching the Go zero-value policy.
+      pause: {
+        enabled: pause.enabled !== false,
+        max_seconds: pauseMax === null ? 86400 : pauseMax,
+        owner: safeCode(pause.owner, 20),
+      },
       upstream: { origin: safeURLText(upstream.origin), fixed: upstream.fixed === true },
       proxy: hostPart(data.proxy),
       routing: hostPart(data.routing),
@@ -1091,6 +1138,9 @@
     DEFAULT_BASE_URL,
     parseAPIError,
     normalizeStatus,
+    normalizeQuotaPause,
+    quotaPauseRemaining,
+    quotaPauseText,
     normalizeUpstreamModels,
     normalizeQuota,
     normalizeModelCoverage,

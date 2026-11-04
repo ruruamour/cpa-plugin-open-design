@@ -92,6 +92,10 @@ func defaultErrorRules() []RequestErrorRule {
 		{Status: http.StatusBadRequest, Match: []string{upstreamErrorMarkerFor("tier_limit_exceeded")}, Action: "continue-and-cooldown"},
 		{Status: http.StatusTooManyRequests, Match: []string{upstreamErrorMarkerFor("rate_limit_exceeded")}, Action: "continue-and-cooldown"},
 		{Status: http.StatusTooManyRequests, Match: []string{upstreamErrorMarkerFor("insufficient_quota")}, Action: "continue-and-cooldown"},
+		// A quota-blocked credential may still be selected briefly while CPA's
+		// auth-file watcher catches up. This local marker permits another account
+		// without attributing a new upstream failure or changing host cooldowns.
+		{Status: http.StatusTooManyRequests, Match: []string{quotaBlockMarker}, Action: "continue"},
 		{Status: http.StatusPaymentRequired, Match: []string{upstreamErrorMarkerFor("insufficient_quota")}, Action: "continue-and-cooldown"},
 		// OpenDesign reports a spent coding plan (with a reset time) or an
 		// uncovered wallet as 402 with its own insufficient_balance code. The

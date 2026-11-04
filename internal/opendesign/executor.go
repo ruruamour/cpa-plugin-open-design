@@ -196,7 +196,11 @@ func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel 
 		defer s.done()
 	}
 	draft := &requestLogDraft{started: time.Now()}
-	defer func() { s.recordRequestLog(draft, err) }()
+	var c Credential
+	defer func() {
+		s.observeQuotaBlock(c, draft.upstreamModel, err)
+		s.recordRequestLog(draft, err)
+	}()
 	r, err := decodeExecutorRequest(raw)
 	if err != nil {
 		return nil, reasoningDecision{}, err
@@ -215,7 +219,7 @@ func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel 
 	var captured Credential
 	_ = json.Unmarshal(r.StorageJSON, &captured)
 	draft.secrets = []string{captured.APIKey, captured.ControlKey, captured.WorkspaceID}
-	c, err := s.selectedCredential(r)
+	c, err = s.selectedCredential(r)
 	draft.secrets = append(draft.secrets, c.APIKey, c.ControlKey, c.WorkspaceID)
 	if err != nil {
 		return nil, reasoningDecision{}, err
@@ -283,10 +287,12 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 	release := sync.OnceFunc(s.done)
 	finished := false
 	draft := &requestLogDraft{started: time.Now(), stream: true}
-	// Every early return still records one metadata row. Once the goroutine takes
-	// over, it owns the draft and the release() call.
+	var c Credential
+	// Every early return records its quota observation and metadata row. Once
+	// the goroutine takes over, it owns both observations and the release call.
 	defer func() {
 		if !finished {
+			s.observeQuotaBlock(c, draft.upstreamModel, err)
 			s.recordRequestLog(draft, err)
 			release()
 		}
@@ -299,7 +305,7 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 	var captured Credential
 	_ = json.Unmarshal(r.StorageJSON, &captured)
 	draft.secrets = []string{captured.APIKey, captured.ControlKey, captured.WorkspaceID}
-	c, err := s.selectedCredential(r)
+	c, err = s.selectedCredential(r)
 	draft.secrets = append(draft.secrets, c.APIKey, c.ControlKey, c.WorkspaceID)
 	if err != nil {
 		return nil, err
@@ -365,6 +371,9 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 				streamErr = upstreamProtocolError("upstream stream processing failed")
 			}
 			draft.usage = *usage
+			// Publish the local guard before notifying the host of a terminal
+			// quota error, so an immediate retry cannot reach the exhausted key.
+			s.observeQuotaBlock(c, draft.upstreamModel, streamErr)
 			func() {
 				defer func() {
 					if recovered := recover(); recovered != nil && streamErr == nil {
