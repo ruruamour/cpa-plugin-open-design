@@ -60,6 +60,11 @@ func (s *Service) modelRegistration() any {
 			"OwnedBy":     Provider,
 			"Name":        m.UpstreamID,
 			"DisplayName": m.ID,
+			// These aliases and upstream IDs come from the operator's model
+			// mapping, not a verified OpenDesign capability catalogue. Marking
+			// them user-defined lets CPA forward reasoning parameters for the
+			// plugin/upstream to handle without asserting support for any level.
+			"UserDefined": true,
 		})
 	}
 	return map[string]any{"Provider": Provider, "Models": models}

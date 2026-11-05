@@ -239,6 +239,9 @@ func TestImportModelsRefreshesHostModelRegistration(t *testing.T) {
 	if len(models) != 1 || models[0]["ID"] != "od-large" {
 		t.Fatalf("model registration = %v", models)
 	}
+	if models[0]["UserDefined"] != true || models[0]["Thinking"] != nil {
+		t.Fatalf("operator-defined model must not assert unverified reasoning capabilities: %v", models[0])
+	}
 	// The mapping is on disk so a restart keeps it.
 	settings, err := readSettings(filepath.Join(s.config().DataDir, settingsFile))
 	if err != nil {

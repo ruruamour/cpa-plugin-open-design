@@ -1246,6 +1246,39 @@ def run_cpa_live(artifact, binary, version):
                 "status": "FAIL", "surfaced_status": exc.code,
                 "surfaced_body_head": exc.read().decode(errors="replace")[:200]}
 
+        # Exercise reasoning through the real host adapter, not just by calling
+        # the plugin executor directly. Some CPA versions strip parameters for
+        # models that do not advertise user-defined metadata.
+        status, raw, _ = request(API + "/models/reasoning", {
+            "model": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash",
+            "reasoning_mapping": {"enabled": True, "rules": [{"from": "medium", "to": "high"}]},
+        })
+        require(status == 200, "reasoning policy save returned %s" % status)
+        reasoning_checks = {}
+        for streaming in (False, True):
+            label = "stream" if streaming else "buffered"
+            try:
+                status, _, _ = request("/v1/chat/completions", {
+                    "model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}],
+                    "reasoning_effort": "medium", "stream": streaming,
+                })
+                hits = [r for r in origin.requests if r["path"].endswith("/chat/completions")]
+                sent = json.loads(hits[-1]["body"]) if hits else {}
+                passed = status == 200 and sent.get("reasoning_effort") == "high"
+                reasoning_checks[label] = {"status": "PASS" if passed else "FAIL",
+                                           "mapped_effort": sent.get("reasoning_effort")}
+                if not passed:
+                    stage_failures.append("host reasoning mapping failed for " + label)
+            except urllib.error.HTTPError as exc:
+                reasoning_checks[label] = {"status": "FAIL", "http_status": exc.code}
+                stage_failures.append("host reasoning request failed for " + label)
+        evidence["host_reasoning_mapping"] = reasoning_checks
+        status, _, _ = request(API + "/models/reasoning", {
+            "model": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash",
+            "reasoning_mapping": {"enabled": False, "rules": []},
+        })
+        require(status == 200, "reasoning policy reset returned %s" % status)
+
         # ---- 3. POST /chat/completions, streaming SSE ----
         try:
             status, raw, _ = request("/v1/chat/completions", {
@@ -2515,9 +2548,17 @@ def run_management_v03(request, origin, credential_id, work=None):
     require(page["total"] >= 1 and page["logs"], page)
     metadata_keys = {"id", "started_at", "finished_at", "duration_ms", "model", "upstream_model",
                      "credential_id", "stream", "status", "http_status", "error_kind", "input_tokens",
-                     "output_tokens", "total_tokens", "request_id", "upstream_attempted"}
+                     "output_tokens", "total_tokens", "request_id", "upstream_attempted",
+                     "reasoning_effort", "reasoning_mapping"}
+    reasoning_sources = {"unset", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
     for entry in page["logs"]:
         require(set(entry).issubset(metadata_keys), "request log grew non-metadata fields")
+        if entry.get("reasoning_effort"):
+            require(entry["reasoning_effort"] in reasoning_sources, "unsafe reasoning effort in request log")
+        if entry.get("reasoning_mapping"):
+            mapping = entry["reasoning_mapping"]
+            require(set(mapping) == {"from", "to"} and mapping["from"] in reasoning_sources and
+                    mapping["to"] in reasoning_sources - {"ultra"}, "unsafe reasoning mapping in request log")
         if entry["status"] != "success":
             require(entry["total_tokens"] is None, "missing usage became zero")
     for document in (page, runtime, test):

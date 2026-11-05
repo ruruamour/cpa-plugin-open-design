@@ -154,7 +154,7 @@ OpenDesign 生产接口：
 
 ## 思考强度映射（开发中）
 
-真实宿主兼容性尚在复核：隔离测试发现，一个本地 CPA `8.0.51-gemini-usage-hotfix.test` 构建会在插件执行前剥除部分请求的 `reasoning_effort`；控制台多标签页的并发保存也存在待修复问题。`0.4.5` 和 `0.4.6` 均未发布，不应作为生产功能使用。
+真实宿主兼容性尚在复核：隔离测试发现，一个本地 CPA `8.0.51-gemini-usage-hotfix.test` 构建会在插件执行前剥除部分请求的 `reasoning_effort`。开发分支现通过 CPA 公开 `UserDefined` 模型元数据修复该测试场景，普通和流式均已用隔离假上游验证；控制台多标签页并发保存仍在复核。`0.4.5` 和 `0.4.6` 均未发布，不应作为生产功能使用。
 
 每个模型可以单独配置一份「请求传入 → 发往上游」的思考强度映射，默认关闭：
 
@@ -164,7 +164,7 @@ OpenDesign 生产接口：
 - 请求本身带了 `thinking`／`reasoning` 且没有传 `reasoning_effort` 时，`unset → unset` 这类规则不生效，避免与客户端的显式意图冲突。
 - 上游 ID 含 `deepseek` 的模型默认预填 DeepSeek 强度表（`minimal/low → low`、`medium/high/xhigh → high`、`max/ultra → max`），仍然需要手动启用。
 - 来源集合为 `unset`/`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`，目标集合相同但不含 `ultra`；超出集合的值会被接口拒绝，不会写入报文。
-- 请求值不是字符串（例如数字）时不做映射，原样交给上游校验。
+- 插件收到的请求值不是字符串（例如数字）时不做映射；不同 CPA 宿主可能在插件执行前对请求转换，不能保证客户端原始值未经宿主处理就到达插件或上游。
 
 保存是「完整替换」：`POST /models/reasoning` 带 `model`、`upstream_id` 与整个 `reasoning_mapping`。模型不存在返回 404，上游 ID 与当前映射不一致返回 409（要求先刷新状态再配置），规则不合法返回 400。
 

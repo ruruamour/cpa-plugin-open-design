@@ -25,7 +25,7 @@
 
 **人工停用缺陷复现**：在隔离临时目录中构建并启动未修改的原版 CPA `v8.0.29`（源码提交 `5fc580b1d72d87a7bcfe5cfb6f479c1aea5625b3`），使用仅包含测试 Key 的临时配置、loopback 代理和假上游返回结构化 402。插件进入额度暂停后，通过 CPA 原生 `PATCH /v0/management/auth-files/status` 设置 `disabled=true`；接着调用插件的 `/quota-pause/resume`，观察到文件 `disabled` 从 `true` 变回 `false`，插件状态也为启用。该复现证明当前实现不能保护这种人工停用操作；它没有访问生产服务或真实密钥，也不涉及宿主补丁。
 
-**思考强度宿主兼容缺陷复现**：使用同样隔离的假上游，配置 `medium → high` 并经 CPA 的 `/v1/chat/completions` 请求，未修改原版 CPA `v8.0.29` 的上游收到 `high`；本地 `8.0.51-gemini-usage-hotfix.test` 构建的上游未收到 `reasoning_effort`。后者是本地测试构建，不代表已对原版 `8.0.51` 或生产服务完成验证；多标签页并发保存问题也仍待修复。
+**思考强度宿主兼容缺陷及修复**：使用隔离假上游，配置 `medium → high` 并经 CPA 的 `/v1/chat/completions` 请求，未修改原版 CPA `v8.0.29` 的上游收到 `high`；旧开发代码在本地 `8.0.51-gemini-usage-hotfix.test` 构建中未能发送该参数。开发分支对由用户配置的模型使用 CPA 公开的 `UserDefined` 元数据，不宣称任何模型的官方推理能力；修改后 `scripts/smoke-abi.py --cpa-live` 在这两个隔离宿主中均 PASS，普通与流式都收到 `high`。后者仍是本地测试构建，不代表已验证原版 `8.0.51` 或生产服务；多标签页并发保存仍待复核。宿主可能在插件之前转换非字符串请求值，本地测试构建将数值 `123` 转成字符串；插件不保证跨宿主原样透传。
 
 ## 0.4.4 本轮验收
 
