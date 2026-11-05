@@ -42,12 +42,20 @@
     // carry only id and upstream_id and drive the dirty badge.
     serverModels: [],
     reasoningModelKey: '',
+    // key -> { enabled, rules, baseRevision, conflict }. baseRevision is the
+    // revision the draft was first edited against; it is not moved by a status
+    // refresh, so a save can never silently overwrite another tab's change.
     reasoningDrafts: new Map(),
     reasoningSaving: false,
-    // Bumped by every logout/status refresh. A reasoning save captures it and
-    // discards its own late response once it no longer matches, so a stale
-    // answer can neither re-enable the draft nor overwrite a newer list.
+    // Bumped by every logout/status refresh and by a model-list save. A reasoning
+    // save captures it and discards its own late response once it no longer
+    // matches, so a stale answer can neither revive the draft nor overwrite a
+    // newer list.
     reasoningGeneration: 0,
+    // Bumped whenever the server model list is replaced from a response. A
+    // status answer requested before a newer list was applied is stale for the
+    // model side and must not roll its reasoning revisions back either.
+    serverModelsGeneration: 0,
     accountEdit: null,
     authCollapsed: false,
     // Quota snapshots are keyed by credential id. They are only fetched when the
@@ -218,9 +226,13 @@
       const node = $(id);
       if (node) node.disabled = state.busy;
     }
-    for (const id of ['accountList', 'upstreamList', 'mappingList', 'reasoningRows']) {
+    for (const id of ['accountList', 'upstreamList', 'mappingList']) {
       setRowButtonsDisabled($(id), state.busy);
     }
+    // Reasoning rows stay locked while a reasoning save is in flight: releasing
+    // an unrelated busy flag must not re-enable their delete buttons and let an
+    // edit disappear into the pending response.
+    setRowButtonsDisabled($('reasoningRows'), state.busy || state.reasoningSaving);
     syncFetchButton();
     syncModelTools();
     syncReasoningControls();
@@ -595,10 +607,11 @@
 
   async function loadStatus(options = {}) {
     const generation = state.optionalGeneration;
+    const serverModelsGeneration = state.serverModelsGeneration;
     try {
       const raw = await api().status();
       if (generation !== state.optionalGeneration) return false;
-      applyStatus(raw);
+      applyStatus(raw, { serverModelsGeneration });
       const source = options.source || (state.verified && state.verified.source) || '';
       if (state.verified) state.verified.source = source;
       state.candidate = null;
@@ -643,8 +656,14 @@
     state.billingSignatures = next;
   }
 
-  function applyStatus(raw) {
+  function applyStatus(raw, options = {}) {
     const incoming = Core.normalizeStatus(raw);
+    // A status answer may have been requested before a newer model-list write
+    // completed. Its credentials are still fresh enough to apply, but the older
+    // model snapshot must not replace the newer list, its reasoning revisions,
+    // or the draft pinned to them.
+    const modelsAreCurrent = options.serverModelsGeneration === undefined ||
+      options.serverModelsGeneration === state.serverModelsGeneration;
     const modelTestWasBusy = optionalBusy('modelTest');
     state.modelTestGeneration += 1;
     state.modelTest = null;
@@ -657,6 +676,24 @@
       message('modelTestState', '账户状态已刷新，正在发送的模型测试结果已失效。', 'error');
     }
     invalidateChangedQuotas(incoming.credentials);
+    // Credentials are refreshed even when the model side is stale below, so the
+    // edit form and picker still react to an account that disappeared.
+    if (state.accountEdit && !incoming.credentials.some(item => item.id === state.accountEdit.id)) {
+      resetAccountForm();
+      message('accountState', '正在编辑的账户已被删除，已取消编辑。', '');
+    }
+    if (state.selectedCredential && !incoming.credentials.some(item => item.id === state.selectedCredential)) {
+      state.selectedCredential = '';
+      invalidateModelRequest();
+    }
+    if (!modelsAreCurrent) {
+      state.status = { ...incoming, models: cloneMappings(state.serverModels) };
+      renderMeta();
+      renderAccounts();
+      renderModels();
+      renderOverview();
+      return;
+    }
     const serverModels = cloneMappings(incoming.models);
     // A status refresh (account add/update, background reload) must not silently
     // discard mapping edits the operator has not saved yet. The saved baseline is
@@ -671,15 +708,9 @@
     state.status.models = cloneMappings(serverModels);
     state.savedMappings = cloneMappings(serverModels);
     state.serverModels = Array.isArray(fullModels) ? fullModels : [];
+    state.serverModelsGeneration += 1;
     if (!dirty) state.mappings = cloneMappings(serverModels);
-    if (state.accountEdit && !incoming.credentials.some(item => item.id === state.accountEdit.id)) {
-      resetAccountForm();
-      message('accountState', '正在编辑的账户已被删除，已取消编辑。', '');
-    }
-    if (state.selectedCredential && !incoming.credentials.some(item => item.id === state.selectedCredential)) {
-      state.selectedCredential = '';
-      invalidateModelRequest();
-    }
+    reconcileReasoningDrafts();
     renderMeta();
     renderAccounts();
     renderModels();
@@ -1438,7 +1469,10 @@
     const item = { ...fallback, ...(result && typeof result === 'object' ? result : {}) };
     const credentials = state.status.credentials.filter(account => account.id !== item.id);
     if (!removed && item.id) credentials.push(item);
-    applyStatus({ ...state.status, credentials });
+    // state.status.models is the editor-shaped clone (no policy/revision), so
+    // keep the full server list here instead of letting the acknowledged
+    // account edit silently drop every model's reasoning revision.
+    applyStatus({ ...state.status, credentials, models: state.serverModels });
   }
 
   async function addAccount(event) {
@@ -1630,8 +1664,9 @@
   }
 
   async function refreshStatus() {
+    const serverModelsGeneration = state.serverModelsGeneration;
     const raw = await api().status();
-    applyStatus(raw);
+    applyStatus(raw, { serverModelsGeneration });
     markConnected((state.verified && state.verified.source) || '');
     return raw;
   }
@@ -2734,6 +2769,13 @@
 
   async function saveModels() {
     if (state.busy) return;
+    // A reasoning POST in flight can return a full model list; letting a model
+    // list save run meanwhile would let the later response replace the newer
+    // list. Wait for the pending save instead of racing it.
+    if (state.reasoningSaving) {
+      message('modelState', '思考强度映射正在保存，请等保存完成后再保存模型映射。', 'error');
+      return;
+    }
     let models;
     try {
       models = Core.buildModelsPayload(state.mappings);
@@ -2742,6 +2784,7 @@
       return;
     }
     if (!models.length && typeof confirm === 'function' && !confirm('清空所有模型映射？保存后将从 CPA 撤回本插件的模型。')) return;
+    const serverModelsGeneration = state.serverModelsGeneration;
     setBusy(true);
     message('modelState', '正在保存模型映射…');
     try {
@@ -2756,15 +2799,27 @@
       state.status.models = cloneMappings(normalized);
       state.savedMappings = cloneMappings(normalized);
       state.mappings = cloneMappings(normalized);
-      // The server echoes each model's stored policy, so the reasoning table's
-      // baseline moves with the model list instead of going stale.
-      applyServerModels(raw && Array.isArray(raw.models)
-        ? raw.models.map(item => ({
-          id: String(item.id || '').trim(),
-          upstream_id: String(item.upstream_id || '').trim(),
-          reasoning_mapping: item.reasoning_mapping || null,
-        })).filter(item => item.id && item.upstream_id)
-        : normalized);
+      // The server echoes each model's full stored state: keep reasoning_mapping
+      // *and* reasoning_revision, so a following reasoning save still carries a
+      // CAS token instead of silently falling back to last-writer-wins.
+      const responseModels = raw && Array.isArray(raw.models)
+        ? Core.normalizeStatus({ models: raw.models }).models
+        : null;
+      if (responseModels) {
+        // If another response replaced the list while this request was in
+        // flight, its policy/revision is fresher: keep it for models that still
+        // exist instead of rolling it back to this older snapshot.
+        applyServerModels(responseModels,
+          state.serverModelsGeneration === serverModelsGeneration ? {} : { merged: true });
+      } else {
+        // An older backend without the echoed list: keep any policy/revision we
+        // already have for matching aliases.
+        applyServerModels(normalized, { merged: true });
+      }
+      // A reasoning answer still in flight (in practice blocked above) belongs
+      // to the old list and must not repaint the panel.
+      state.reasoningGeneration += 1;
+      state.reasoningSaving = false;
       renderModels();
       message('modelState', `已保存 ${normalized.length} 个模型映射。`);
     } catch (error) {
@@ -2860,12 +2915,49 @@
     }
   }
 
+  // A status refresh can move a model's baseline forward while a draft is open.
+  // The draft keeps its own (older) revision so a save stays CAS-checked. If the
+  // fresh baseline already equals the draft there is nothing unsaved, so the
+  // draft can be dropped without losing an edit.
+  function reconcileReasoningDrafts() {
+    for (const [key, draft] of [...state.reasoningDrafts]) {
+      const model = state.serverModels.find(item => reasoningModelKey(item) === key);
+      if (!model) {
+        state.reasoningDrafts.delete(key);
+        continue;
+      }
+      if (Core.reasoningKey(draft) === Core.reasoningKey(reasoningBaseline(model))) {
+        state.reasoningDrafts.delete(key);
+      }
+    }
+  }
+
+  // The revision a draft is pinned to. It is captured on the first edit and
+  // survives later edits and status refreshes; only saving or an explicit
+  // overwrite/discard moves it.
+  function reasoningDraftRevision(model) {
+    const draft = state.reasoningDrafts.get(reasoningModelKey(model));
+    if (draft) return draft.baseRevision || '';
+    return String((model && model.reasoning_revision) || '');
+  }
+
+  function storeReasoningDraft(model, mapping) {
+    const key = reasoningModelKey(model);
+    const existing = state.reasoningDrafts.get(key);
+    state.reasoningDrafts.set(key, {
+      enabled: mapping.enabled,
+      rules: mapping.rules,
+      baseRevision: existing ? existing.baseRevision : String(model.reasoning_revision || ''),
+      conflict: existing ? existing.conflict === true : false,
+    });
+  }
+
   function updateReasoningRows(mutate) {
     const model = selectedReasoningModel();
     if (!model) return;
     const draft = currentReasoningMapping(model);
     mutate(draft);
-    state.reasoningDrafts.set(reasoningModelKey(model), { enabled: draft.enabled, rules: draft.rules });
+    storeReasoningDraft(model, draft);
     renderReasoning();
   }
 
@@ -2906,7 +2998,7 @@
       return;
     }
     draft.rules[index][field] = value;
-    state.reasoningDrafts.set(reasoningModelKey(model), { enabled: draft.enabled, rules: draft.rules });
+    storeReasoningDraft(model, draft);
     renderReasoning();
     message('reasoningState', '');
   }
@@ -2970,6 +3062,10 @@
     if (reset) reset.disabled = busy || !model;
     const save = $('saveReasoning');
     if (save) save.disabled = busy || !model;
+    // Saving the model list must not race a pending reasoning POST whose answer
+    // could put the old model list back.
+    const saveModelsButton = $('saveModels');
+    if (saveModelsButton) saveModelsButton.disabled = busy;
     const dirty = $('reasoningDirty');
     if (dirty) dirty.hidden = !model || !reasoningDirty();
   }
@@ -3015,22 +3111,49 @@
 
   // The reasoning panel reads the server's model list only, so a reasoning save
   // refreshes that list without touching the model editor's saved baseline.
-  function applyServerModels(models) {
-    state.serverModels = Array.isArray(models) ? models : [];
+  // Keeping policy and revision is essential: dropping either would make the
+  // next save unable to detect a competing tab.
+  function mergeServerModels(current, incoming) {
+    const existing = new Map((Array.isArray(current) ? current : []).map(model => [reasoningModelKey(model), model]));
+    return (Array.isArray(incoming) ? incoming : []).map(model => existing.get(reasoningModelKey(model)) || model);
+  }
+
+  function applyServerModels(models, options = {}) {
+    state.serverModels = options.merged === true
+      ? mergeServerModels(state.serverModels, models)
+      : (Array.isArray(models) ? models : []);
+    state.serverModelsGeneration += 1;
+    reconcileReasoningDrafts();
   }
 
   async function saveReasoning() {
     const model = selectedReasoningModel();
     if (!model || state.reasoningSaving || state.busy) return;
+    const key = reasoningModelKey(model);
+    const draft = state.reasoningDrafts.get(key) || null;
+    const serverRevision = String(model.reasoning_revision || '');
+    // The first attempt always sends the revision the draft was edited against,
+    // so the backend can reject a competing tab. Only after such a rejection
+    // (conflict) does a second explicit click move the draft onto the revision
+    // just observed; that is the operator's overwrite decision.
+    if (draft && draft.conflict === true && draft.baseRevision && serverRevision
+      && draft.baseRevision !== serverRevision) {
+      if (typeof confirm === 'function'
+        && !confirm(`该模型的思考强度已在其他页面更新。继续保存会用当前草稿覆盖服务器上的版本。确定继续？`)) {
+        message('reasoningState', '已取消保存，草稿仍然保留。', '');
+        return;
+      }
+      draft.baseRevision = serverRevision;
+      state.reasoningDrafts.set(key, draft);
+    }
     const generation = state.reasoningGeneration;
     let payload;
     try {
-      payload = Core.buildReasoningPayload(model, currentReasoningMapping(model), model.reasoning_revision);
+      payload = Core.buildReasoningPayload(model, currentReasoningMapping(model), reasoningDraftRevision(model));
     } catch (error) {
       message('reasoningState', `无法保存：${error.message}`, 'error');
       return;
     }
-    const key = reasoningModelKey(model);
     state.reasoningSaving = true;
     // Every row is rebuilt disabled so a click mid-save cannot be silently lost.
     renderReasoning();
@@ -3051,7 +3174,15 @@
         clearRejectedManagementAuth();
         showAuth(error.status === 401 ? '401：管理密钥无效或已过期，映射未保存。' : `403：${formatError(error)}`);
       } else if (error.status === 409) {
-        message('reasoningState', '保存失败：模型或规则已变更，请刷新状态后重新配置。', 'error');
+        // A 409 means the server refused the CAS; never claim success and never
+        // drop the draft. A refresh surfaces the newer revision, and the next
+        // save asks before overwriting it.
+        if (draft) {
+          draft.conflict = true;
+          state.reasoningDrafts.set(key, draft);
+          renderReasoning();
+        }
+        message('reasoningState', '保存失败：模型或规则已变更，草稿已保留。请刷新状态核对后再保存。', 'error');
       } else if (error.status === 404) {
         message('reasoningState', '保存失败：模型已不存在，请刷新状态。', 'error');
       } else {

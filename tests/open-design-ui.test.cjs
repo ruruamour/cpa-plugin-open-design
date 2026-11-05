@@ -3173,6 +3173,214 @@ test('a status refresh discards an in-flight reasoning save response', async () 
     'a response for the superseded generation is not announced as a fresh save');
 });
 
+test('a status refresh keeps the draft on its first-edit revision and refuses a silent overwrite', async () => {
+  const calls = [];
+  const model = (revision, mapping) => ({
+    id: 'od-flash', upstream_id: 'open-design/flash',
+    reasoning_revision: revision, reasoning_mapping: mapping,
+  });
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        calls.push(body);
+        if (body.expected_revision === 'rev-0') return respond(409, { error: 'reasoning_revision_conflict' });
+        return respond(200, { models: [model('rev-2', { enabled: true, rules: [{ from: 'medium', to: 'high' }] })] });
+      }
+      if (url.includes('/status')) {
+        return respond(200, reasoningStatus(model('rev-0', { enabled: true, rules: [{ from: 'medium', to: 'high' }] })));
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.addReasoningRule();
+  const firstDraft = api.state.reasoningDrafts.get(api.state.reasoningModelKey);
+  assert.equal(firstDraft.baseRevision, 'rev-0', 'the draft captures the revision it was edited against');
+
+  // Another tab saves while this page's draft is open: the status refresh moves
+  // the server model to rev-1 but must not move the draft's own base revision.
+  api.render.applyStatus(reasoningStatus(model('rev-1', { enabled: true, rules: [{ from: 'low', to: 'low' }] })));
+  assert.equal(api.state.serverModels[0].reasoning_revision, 'rev-1');
+  assert.equal(api.state.reasoningDrafts.get(api.state.reasoningModelKey).baseRevision, 'rev-0');
+  assert.equal(api.render.reasoningDirty(), true, 'the unsaved draft is still visible');
+
+  // A plain save sends the draft's own revision (r0), so the backend can reject
+  // the competing tab's change instead of overwriting it with r1.
+  await api.handlers.saveReasoning();
+  assert.equal(calls.length, 1, 'the draft is posted with its original base revision');
+  assert.equal(calls[0].expected_revision, 'rev-0');
+  assert.match(view.document.getElementById('reasoningState').textContent, /草稿已保留/);
+  assert.equal(api.render.reasoningDirty(), true, 'the 409 keeps the draft');
+  assert.equal(api.state.reasoningDrafts.get(api.state.reasoningModelKey).baseRevision, 'rev-0');
+
+  // The second explicit click is the operator's overwrite decision and uses the
+  // revision just observed, so the backend can still CAS-check it.
+  await api.handlers.saveReasoning();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].expected_revision, 'rev-1');
+  assert.equal(api.render.reasoningDirty(), false, 'the confirmed save clears the draft');
+  assert.equal(api.state.serverModels[0].reasoning_revision, 'rev-2');
+});
+
+test('saving the model list keeps each reasoning revision for the next CAS save', async () => {
+  const reasoningCalls = [];
+  const model = (revision, mapping) => ({
+    id: 'od-flash', upstream_id: 'open-design/flash',
+    reasoning_revision: revision, reasoning_mapping: mapping,
+  });
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        return respond(200, { models: [model('rev-8', { enabled: true, rules: [] })] });
+      }
+      if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+        reasoningCalls.push(JSON.parse(init.body));
+        return respond(200, { models: [model('rev-9', { enabled: true, rules: [{ from: 'medium', to: 'high' }] })] });
+      }
+      if (url.includes('/status')) return respond(200, reasoningStatus(model('rev-7', { enabled: true, rules: [] })));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
+  await api.handlers.saveModels();
+  assert.equal(api.state.serverModels[0].reasoning_revision, 'rev-8',
+    'the model-list response revision is not discarded');
+  assert.equal(api.state.serverModels[0].reasoning_mapping.enabled, true);
+
+  await api.handlers.addReasoningRule();
+  await api.handlers.saveReasoning();
+  assert.equal(reasoningCalls.length, 1);
+  assert.equal(reasoningCalls[0].expected_revision, 'rev-8',
+    'a mapping save after a model-list save still carries a CAS token');
+});
+
+test('an unrelated busy transition never unlocks reasoning rows mid-save', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+        await gate;
+        return respond(200, { models: [{ id: 'od-flash', upstream_id: 'open-design/flash', reasoning_revision: 'rev-2', reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }] } }] });
+      }
+      if (url.includes('/upstream-models')) return respond(200, { data: [{ id: 'open-design/flash' }] });
+      if (url.includes('/status')) return respond(200, reasoningStatus({ id: 'od-flash', upstream_id: 'open-design/flash', reasoning_revision: 'rev-1', reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }] } }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.addReasoningRule();
+  const rowButtons = () => [...view.document.getElementById('reasoningRows').children]
+    .flatMap(row => [...row.children].flatMap(cell => [...cell.children]))
+    .filter(node => node.tagName === 'BUTTON');
+  const pending = api.handlers.saveReasoning();
+  assert.ok(rowButtons().every(node => node.disabled === true), 'rows are locked by the reasoning save');
+
+  // An unrelated operation starts and releases the shared busy flag. That must
+  // not re-enable the delete buttons while the reasoning response is pending.
+  api.state.selectedCredential = 'cred-1';
+  view.document.getElementById('modelCredential').value = 'cred-1';
+  await api.handlers.fetchModels();
+  assert.equal(api.state.reasoningSaving, true);
+  assert.ok(rowButtons().every(node => node.disabled === true),
+    'a setBusy(false) from another operation leaves the saving rows locked');
+
+  release();
+  await pending;
+  assert.ok(rowButtons().every(node => node.disabled === false), 'the rows recover once the save finishes');
+});
+
+test('a model-list save waits instead of racing a pending reasoning POST', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const models = [];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        models.push(JSON.parse(init.body));
+        return respond(200, { models: [{ id: 'new-alias', upstream_id: 'open-design/new' }] });
+      }
+      if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+        await gate;
+        return respond(200, { models: [{ id: 'od-flash', upstream_id: 'open-design/flash', reasoning_revision: 'rev-1', reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }] } }] });
+      }
+      if (url.includes('/status')) return respond(200, reasoningStatus({ id: 'od-flash', upstream_id: 'open-design/flash', reasoning_revision: 'rev-0' }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.addReasoningRule();
+  api.state.mappings = [{ id: 'new-alias', upstream_id: 'open-design/new' }];
+  const pending = api.handlers.saveReasoning();
+
+  await api.handlers.saveModels();
+  assert.equal(models.length, 0, 'the model-list POST is not sent while reasoning is saving');
+  assert.match(view.document.getElementById('modelState').textContent, /思考强度映射正在保存/);
+
+  release();
+  await pending;
+  // The delayed reasoning answer is the only applied list, so the newer model
+  // list could not be overwritten by an out-of-order response.
+  assert.equal(api.state.serverModels.length, 1);
+  assert.equal(api.state.serverModels[0].reasoning_revision, 'rev-1');
+  assert.match(view.document.getElementById('modelState').textContent, /思考强度映射正在保存/);
+});
+
+test('an old status answer cannot roll a newer reasoning save back', async () => {
+  const pendingStatus = deferred();
+  let statusCalls = 0;
+  const model = (revision, mapping) => ({
+    id: 'od-flash', upstream_id: 'open-design/flash',
+    reasoning_revision: revision, reasoning_mapping: mapping,
+  });
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.includes('/status')) {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return respond(200, reasoningStatus(model('rev-0', { enabled: true, rules: [{ from: 'medium', to: 'high' }] })));
+        }
+        return pendingStatus.promise;
+      }
+      if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+        return respond(200, { models: [model('rev-1', { enabled: true, rules: [{ from: 'medium', to: 'high' }, { from: 'low', to: 'low' }] })] });
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.addReasoningRule();
+
+  // A status read starts before the save, so its answer is older than the save.
+  const staleStatus = api.render.loadStatus();
+  await new Promise(setImmediate);
+  await api.handlers.saveReasoning();
+  assert.equal(api.state.serverModels[0].reasoning_revision, 'rev-1');
+  assert.match(view.document.getElementById('reasoningState').textContent, /已保存/);
+
+  pendingStatus.resolve(respond(200, reasoningStatus(model('rev-0', { enabled: true, rules: [{ from: 'medium', to: 'high' }] }))));
+  await staleStatus;
+  assert.equal(api.state.serverModels[0].reasoning_revision, 'rev-1',
+    'the old status snapshot did not roll the saved revision back');
+  assert.deepEqual(plain(api.render.currentReasoningMapping(api.state.serverModels[0])).rules,
+    [{ from: 'low', to: 'low' }, { from: 'medium', to: 'high' }],
+    'the saved policy stays visible instead of reverting to the stale snapshot');
+  assert.match(view.document.getElementById('reasoningState').textContent, /已保存/,
+    'the success message is not contradicted by a stale status answer');
+});
+
 // ---- 额度暂停 (plugin-owned quota pause) ------------------------------------
 
 test('quota pause is shown separately from the operator disabled switch', () => {
