@@ -323,7 +323,11 @@
       }
     }
     if (!issues.length) return false;
-    renderMappings();
+    // Render with the same revision this gate used. A draft begun on a legacy
+    // backend can be judged against a newly advertised server revision; the
+    // per-row control must still appear even though the draft's own revision
+    // is still empty.
+    renderMappings({ ambiguityRevision: revision });
     message('modelState', `保存已取消，未向服务器发送请求：${issues.join('；')}。不会去掉原行身份后按同名别名隐式绑定，草稿已保留。请先核对并复制需要的草稿；若服务器存在同名同上游行且该行确认应采用它（含其思考强度策略），点击该行的「采用服务器此行」，其他行与其他草稿不会被改动。若以服务器当前行为准，可点击「还原为已保存」，再按需编辑。`, 'error');
     return true;
   }
@@ -1822,7 +1826,7 @@
     syncModelTools();
   }
 
-  function renderMappings() {
+  function renderMappings(options = {}) {
     const list = $('mappingList');
     if (!list) return;
     const dirty = updateDirtyBadge();
@@ -1867,7 +1871,9 @@
       // control is the only explicit way to say "use the server's current row
       // (and its policy)" without touching the other draft rows or the
       // whole-list token.
-      if ((!mappingOriginalResolves(model) || unpinnedAliasConflict(model)) && serverRowForMapping(model)) {
+      if ((!mappingOriginalResolves(model) ||
+        unpinnedAliasConflict(model, options.ambiguityRevision ?? modelsSaveRevision())) &&
+        serverRowForMapping(model)) {
         actions.push(button('采用服务器此行', 'adopt-server-mapping', {
           className: 'button compact',
           disabled: state.modelsSaving,

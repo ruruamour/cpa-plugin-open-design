@@ -6382,3 +6382,33 @@ test('an unpinned new row colliding with a same-alias same-upstream row offers a
   await page.api.handlers.saveModels();
   assert.equal(page.posts.length, 1, 'the adopted row can be saved');
 });
+
+test('a legacy draft judged against a newly advertised revision still offers the per-row adopt control', async () => {
+  const page = modelSavePage({ revision: '' });
+  await page.api.render.loadStatus();
+  page.api.handlers.addMapping();
+  const draft = page.api.state.mappings[page.api.state.mappings.length - 1];
+  draft.id = 'od-ghost';
+  draft.upstream_id = 'open-design/ghost';
+  page.api.render.renderMappings();
+
+  // The draft started on a tokenless backend. Another tab adds the same
+  // alias+upstream and the backend begins advertising a whole-list revision.
+  page.setModels([...pinnedModels(), { id: 'od-ghost', upstream_id: 'open-design/ghost' }]);
+  page.setRevision('list-rev-2');
+  await page.api.render.loadStatus();
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 0, 'the legacy draft must first confirm the new whole-list token');
+  assert.match(page.view.document.getElementById('modelState').textContent, /现在提供整表版本校验/);
+
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 0, 'the same-alias collision blocks the second save');
+  assert.match(page.view.document.getElementById('modelState').textContent, /同名别名冲突/);
+  const rows = page.view.document.getElementById('mappingList').children;
+  const conflictRow = rows[rows.length - 1];
+  const adopt = Array.from(conflictRow.children)
+    .find(node => node.getAttribute('data-action') === 'adopt-server-mapping');
+  assert.ok(adopt, 'the gate revision, not the empty draft revision, drives the per-row control');
+  await adopt.emit('click');
+  assert.equal(page.api.state.mappings.at(-1).original_id, 'od-ghost');
+});
