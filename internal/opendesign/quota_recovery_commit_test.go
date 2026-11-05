@@ -2,6 +2,7 @@ package opendesign
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"strings"
@@ -172,6 +173,11 @@ func TestQuotaRecoveryAutomaticRoundAbortsWhenPolicyGenerationChanges(t *testing
 	revision := newID()
 	c.QuotaRevision = revision
 	s.creds[id] = c
+	// The fixture has a real background worker and may retain an earlier wakeup.
+	// Mark the scheduled automatic retry as not yet due under the same lock that
+	// makes the block due, so only the explicit dueOnly round below can run.
+	// This does not affect recheckQuotaBlockMode's policy-generation checks.
+	s.quotaRecheckRetryAt[id] = now.Add(time.Hour)
 	s.mu.Unlock()
 	s.credentialMu.Lock()
 	err := s.persistQuotaBlockLocked(id, revision, false)
@@ -190,8 +196,10 @@ func TestQuotaRecoveryAutomaticRoundAbortsWhenPolicyGenerationChanges(t *testing
 	s.pauseGeneration++
 	s.mu.Unlock()
 	release()
-	if err := waitRecheck(t, result); err == nil {
-		t.Fatal("a round started under the old policy committed after it changed")
+	err = waitRecheck(t, result)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != "quota_recheck_not_due" || !strings.Contains(apiErr.Message, "策略已变化") {
+		t.Fatalf("the old policy round was not aborted for the policy change: %v", err)
 	}
 	requireQuotaStillBlocked(t, s, id, path)
 	if got := host.countMethod("host.http.do"); got != 1 {
