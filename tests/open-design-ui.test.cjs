@@ -4105,6 +4105,10 @@ test('a paused account offers 解除额度暂停 and never flips the disabled sw
   assert.equal(sent.length, 1);
   assert.deepEqual(JSON.parse(sent[0].init.body), { credential_id: 'cred-1' });
   assert.equal(sent[0].init.method, 'POST');
+  // A new block can arrive before refresh; the UI must reflect the latest state
+  // rather than claiming that the account is no longer paused.
+  assert.match(view.document.getElementById('accountState').textContent, /仍处于额度暂停/);
+  assert.doesNotMatch(view.document.getElementById('accountState').textContent, /已解除插件额度暂停/);
   // The pause is cleared through the pause route only; `disabled` was never posted.
   assert.ok(!calls.some(call => call.url.endsWith('/credentials')), 'resuming a pause must not toggle the account');
 });
