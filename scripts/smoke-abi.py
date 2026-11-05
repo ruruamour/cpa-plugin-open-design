@@ -2102,6 +2102,30 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False):
             while time.monotonic() < deadline and not disk_state().get("quota_block"):
                 time.sleep(0.2)
             require(bool(disk_state().get("quota_block")), "quota block was lost after host writeback")
+            # Restart the unmodified host with the same fixture data to verify
+            # that the plugin did not only retain the pause in its own memory.
+            process.terminate()
+            process.wait(timeout=20)
+            process = subprocess.Popen(
+                [str(binary), "-config", str(work / "config.yaml"), "-local-model"],
+                cwd=str(work), stdout=log, stderr=log, start_new_session=True, env=env)
+            deadline = time.monotonic() + 60
+            restored = False
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                try:
+                    status, raw, _ = request(API + "/credentials", timeout=5)
+                    accounts = json.loads(raw).get("credentials", [])
+                    row = next((item for item in accounts if item.get("id") == credential_id), {})
+                    restored = status == 200 and row.get("quota_paused") is True
+                    if restored:
+                        break
+                except (OSError, ValueError, urllib.error.URLError):
+                    pass
+                time.sleep(0.2)
+            require(restored, "quota pause was not restored after host restart")
+            result["restart_keeps_pause"] = True
             status, _, _ = request(API + "/credentials", {"id": credential_id, "disabled": True})
             require(status == 200, "plugin manual disable failed")
             status, _, _ = request(API + "/quota-pause/resume", {"credential_id": credential_id})
