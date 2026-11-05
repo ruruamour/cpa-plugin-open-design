@@ -174,6 +174,22 @@ func (s *Service) persistQuotaBlockLocked(id, revision string, manualFromDisk bo
 	return nil
 }
 
+// resumeFailureReason maps the internal resume/sweep error to a short, fixed
+// explanation. The console needs to tell "the file changed under us" apart from
+// "the file could not be written", because only the former is fixed by refreshing.
+func resumeFailureReason(err error) string {
+	switch err.Error() {
+	case "quota state changed":
+		return "凭据状态已变化，请刷新后重试"
+	case "credential file changed":
+		return "凭据文件已被修改，请刷新后重试"
+	case "credential file unavailable":
+		return "凭据文件路径不可用"
+	default:
+		return "凭据文件写入失败，稍后会自动重试"
+	}
+}
+
 func quotaRecheckUnavailable() error {
 	return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
 }
@@ -491,7 +507,7 @@ func (s *Service) quotaPauseAction(r ManagementRequest) (any, error) {
 		err := s.resumeQuotaBlockLocked(id, current.QuotaRevision, false)
 		s.credentialMu.Unlock()
 		if err != nil {
-			return managementError(http.StatusBadGateway, "could not clear the quota pause on the credential file")
+			return managementError(http.StatusBadGateway, "无法清除凭据文件上的额度暂停："+resumeFailureReason(err))
 		}
 		return managementJSON(http.StatusOK, s.quotaPauseResponse())
 	}
