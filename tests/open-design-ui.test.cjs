@@ -4473,9 +4473,11 @@ function applyImportLikeBackend(models, body) {
       ? models.find(item => item.id === row.original_id && item.upstream_id === row.original_upstream_id)
       : models.find(item => item.id === row.id && item.upstream_id === row.upstream_id);
     const next = { id: row.id, upstream_id: row.upstream_id };
-    if (original && original.upstream_id === row.upstream_id && original.reasoning_mapping) {
-      next.reasoning_mapping = original.reasoning_mapping;
-      next.reasoning_revision = original.reasoning_revision;
+    if (original && original.upstream_id === row.upstream_id) {
+      if (original.reasoning_mapping) next.reasoning_mapping = original.reasoning_mapping;
+      // An unchanged row with no policy keeps its revision too; otherwise a
+      // different tab's unrelated table edit spuriously breaks reasoning CAS.
+      next.reasoning_revision = original.reasoning_revision || `rev-${row.id}`;
     } else {
       next.reasoning_revision = `rev-${row.id}`;
     }
@@ -4819,7 +4821,9 @@ test('the save body carries original identity only with a whole-list token', () 
 function sharedModelBackend({ models, revision = 'list-rev-1' }) {
   let rows = models.map(model => ({ ...model }));
   let currentRevision = revision;
-  let counter = 0;
+  // The initial snapshot is already revision 1: the first mutation must not
+  // accidentally reuse it, otherwise a stale CAS appears to succeed in tests.
+  let counter = 1;
   let reasoningGate = null;
   const posts = [];
   const fetchImpl = async (url, init = {}) => {
@@ -4978,6 +4982,105 @@ test('a model mapping draft survives a reasoning response and keeps its original
   assert.equal(tabs.a.api.state.modelsConflict, true, 'the competing change is surfaced as a conflict');
   assert.deepEqual(plain(tabs.a.api.state.mappings.map(row => row.id)), ['od-x-renamed'],
     'the rejected draft is kept for an explicit overwrite decision');
+});
+
+test('a reasoning response preserves a same-looking rename draft and its original identity', async () => {
+  const backend = sharedModelBackend({ models: [
+    { id: 'r', upstream_id: 'up/r', reasoning_revision: 'rr' },
+    { id: 'x', upstream_id: 'up/x', reasoning_revision: 'rx',
+      reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }] } },
+  ] });
+  const { a, b } = twoModelTabs(backend);
+  await a.api.render.loadStatus();
+  await b.api.render.loadStatus();
+  const originalRevision = a.api.state.modelsRevision;
+
+  const alias = a.view.document.getElementById('mappingList').children[1].children[0].children[1];
+  alias.value = 'y';
+  await alias.emit('input');
+  assert.equal(a.api.state.mappings[1].original_id, 'x');
+  await b.view.document.getElementById('mappingList').children[1].children[3].emit('click');
+  b.api.handlers.addMapping();
+  b.api.state.mappings[1].id = 'y';
+  b.api.state.mappings[1].upstream_id = 'up/x';
+  await b.api.handlers.saveModels();
+  assert.equal(backend.models()[1].reasoning_mapping, undefined, 'B created a distinct row without X policy');
+
+  a.api.handlers.selectReasoningModel('r\u0000up/r');
+  await a.api.handlers.addReasoningRule();
+  await a.api.handlers.saveReasoning();
+  assert.equal(a.api.state.modelsRevision, backend.revision(), `reasoning save must adopt the returned revision: ${a.view.document.getElementById('reasoningState').textContent}`);
+  assert.notEqual(a.api.state.modelsRevision, originalRevision, 'the reasoning response must be newer');
+  assert.equal(a.api.state.modelsDraftActive, true, 'an equal visible list is not an equal original identity');
+  assert.equal(a.api.state.modelsDraftRevision, originalRevision, 'keep the snapshot that owns X');
+  assert.equal(a.api.state.mappings[1].original_id, 'x', 'preserve X→Y migration intent');
+  assert.equal(a.api.state.mappings[1].original_upstream_id, 'up/x');
+  const beforeSave = backend.posts.length;
+  await a.api.handlers.saveModels();
+  assert.equal(backend.posts.length, beforeSave + 1, 'A must submit the pinned draft');
+  assert.equal(backend.posts.at(-1).expected_models_revision, originalRevision);
+  assert.equal(a.api.state.modelsConflict, true, 'the old draft must reach CAS and be rejected');
+  assert.equal(a.api.state.mappings[1].original_id, 'x', 'a rejected draft is not rebound to Y');
+});
+
+test('a status refresh preserves same-looking rows whose original identities differ', async () => {
+  const backend = sharedModelBackend({ models: [
+    { id: 'r', upstream_id: 'up/r', reasoning_revision: 'rr' },
+    { id: 'x', upstream_id: 'up/x', reasoning_revision: 'rx',
+      reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }] } },
+  ] });
+  const { a, b } = twoModelTabs(backend);
+  await a.api.render.loadStatus();
+  await b.api.render.loadStatus();
+  const originalRevision = a.api.state.modelsRevision;
+  const alias = a.view.document.getElementById('mappingList').children[1].children[0].children[1];
+  alias.value = 'y';
+  await alias.emit('input');
+  await b.view.document.getElementById('mappingList').children[1].children[3].emit('click');
+  b.api.handlers.addMapping();
+  b.api.state.mappings[1].id = 'y';
+  b.api.state.mappings[1].upstream_id = 'up/x';
+  await b.api.handlers.saveModels();
+  await a.api.render.loadStatus();
+  assert.equal(a.api.state.modelsDraftActive, true);
+  assert.equal(a.api.state.modelsDraftRevision, originalRevision);
+  assert.equal(a.api.state.mappings[1].original_id, 'x');
+  const beforeSave = backend.posts.length;
+  await a.api.handlers.saveModels();
+  assert.equal(backend.posts.length, beforeSave + 1, 'A must submit the pinned draft');
+  assert.equal(backend.posts.at(-1).expected_models_revision, originalRevision);
+  assert.equal(a.api.state.modelsConflict, true);
+});
+
+test('a reasoning response repaints mapping rows before an operator edits them', async () => {
+  const policy = { enabled: true, rules: [{ from: 'medium', to: 'high' }] };
+  const backend = sharedModelBackend({ models: [
+    { id: 'a', upstream_id: 'up/a', reasoning_revision: 'ra' },
+    { id: 'b', upstream_id: 'up/b', reasoning_revision: 'rb', reasoning_mapping: policy },
+    { id: 'c', upstream_id: 'up/c', reasoning_revision: 'rc' },
+  ] });
+  const { a, b } = twoModelTabs(backend);
+  await a.api.render.loadStatus();
+  await b.api.render.loadStatus();
+  await b.view.document.getElementById('mappingList').children[0].children[3].emit('click');
+  await b.api.handlers.saveModels();
+  a.api.handlers.selectReasoningModel('b\u0000up/b');
+  await a.api.handlers.saveReasoning();
+
+  const list = a.view.document.getElementById('mappingList');
+  assert.equal(list.children.length, 2, 'the removed row is removed from the actual DOM');
+  const alias = list.children[0].children[0].children[1];
+  const upstream = list.children[0].children[2].children[1];
+  assert.equal(alias.value, 'b');
+  assert.equal(upstream.value, 'up/b');
+  alias.value = 'b-renamed';
+  await alias.emit('input');
+  await a.api.handlers.saveModels();
+  const sent = backend.posts.at(-1).models[0];
+  assert.equal(sent.id, 'b-renamed');
+  assert.equal(sent.upstream_id, 'up/b', 'the row submitted is the one the operator saw');
+  assert.equal(sent.original_id, 'b');
+  assert.deepEqual(backend.models()[0].reasoning_mapping, policy, 'the displayed row keeps its own strategy');
 });
 
 test('a candidate key is only used to verify itself and a failed re-validation keeps the verified session', async () => {

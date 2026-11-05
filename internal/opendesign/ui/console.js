@@ -189,9 +189,15 @@
   }
 
   function mappingKey(models) {
+    // Original identities are part of the draft, not presentation metadata:
+    // a renamed row may look identical to a newly created row while referring
+    // to a different model and reasoning policy. Dropping that distinction can
+    // silently discard the user's intended migration and its older CAS token.
     return JSON.stringify((Array.isArray(models) ? models : []).map(model => [
       String(model && model.id || '').trim(),
       String(model && model.upstream_id || '').trim(),
+      String(model && model.original_id || '').trim(),
+      String(model && model.original_upstream_id || '').trim(),
     ]));
   }
 
@@ -3321,7 +3327,7 @@
         // The mapping is already on disk; only the host catalog refresh failed.
         // The saved baseline moves forward so the draft badge tells the truth.
         invalidateModelTestResult();
-        state.savedMappings = cloneMappings(models);
+        state.savedMappings = cloneMappings(submittedRows);
         // A token we sent is now stale: the next save must re-confirm instead of
         // silently overwriting whatever revision the server has now.
         if (sentRevision) {
@@ -3739,6 +3745,10 @@
         // (kept together, see adoptWholeModelList): a reasoning save can move the
         // token too, and the next model-list save must stay CAS-checked.
         adoptWholeModelList(raw.models, raw && raw.models_revision);
+        // Each rendered row handler captures its index. Repaint immediately when
+        // the adopted array changes, before a user can edit a stale DOM row that
+        // now points at a different model; this also refreshes upstream checks.
+        renderMappings();
       } else {
         // An older backend returns no list; keep the previous behaviour.
         applyServerModels(null);
