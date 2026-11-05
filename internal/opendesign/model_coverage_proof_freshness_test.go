@@ -41,7 +41,7 @@ func TestModelCoverageProofRequiresOfficialAvailableVerdict(t *testing.T) {
 			if err != nil || view.State != "available" || view.evidence == nil {
 				t.Fatalf("valid official response was rejected: %+v, %v", view, err)
 			}
-			block := &QuotaBlock{ModelID: model, ObservedAt: quotaTestTime.Add(-2 * time.Second)}
+			block := &QuotaBlock{ModelID: model, ObservedAt: quotaTestTime.Add(-10 * time.Second)}
 			if got := quotaRecoveryProven(view, block, id, workspace, quotaTestTime.Add(-time.Second), s.modelCoverageNow()); got != tc.want {
 				t.Fatalf("proof = %v, want %v", got, tc.want)
 			}
@@ -61,7 +61,7 @@ func TestModelCoverageProofSuccessReplacesPreviousEvidence(t *testing.T) {
 		t.Fatalf("first success: %+v, %v", old, err)
 	}
 	advance(time.Minute)
-	block := &QuotaBlock{ModelID: model, ObservedAt: s.modelCoverageNow().Add(-time.Second)}
+	block := &QuotaBlock{ModelID: model, ObservedAt: s.modelCoverageNow().Add(-10 * time.Second)}
 	recheck := s.modelCoverageNow()
 	advance(time.Second)
 	body := officialModelCoverage(t, workspace, model)

@@ -66,7 +66,7 @@ func TestModelCoverageProofUsesActualHostStartAfterQueueAndOperationOpen(t *test
 	opened, releaseOpen := make(chan struct{}), make(chan struct{})
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(releaseOpen) })
-	generated := quotaTestTime.Add(3750 * time.Millisecond)
+	generated := quotaTestTime.Add(8750 * time.Millisecond)
 	body := officialModelCoverage(t, workspace, model)
 	body["workspaceMemberId"] = " private-member-do-not-expose "
 	body["generatedAt"] = generated.In(time.FixedZone("upstream", 2*60*60)).Format(time.RFC3339Nano)
@@ -121,7 +121,7 @@ func TestModelCoverageProofUsesActualHostStartAfterQueueAndOperationOpen(t *test
 	case <-time.After(5 * time.Second):
 		t.Fatal("recheck did not join the pending refresh")
 	}
-	advance(1500 * time.Millisecond)
+	advance(6500 * time.Millisecond)
 	expectedStart := s.modelCoverageNow()
 	releaseOnce.Do(func() { close(releaseOpen) })
 	view := receiveCoverage(t, done)

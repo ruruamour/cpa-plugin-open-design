@@ -30,9 +30,12 @@ func quotaRecoveryProven(view modelCoverageResponse, block *QuotaBlock, credenti
 		strings.TrimSpace(evidence.workspaceMemberID) == "" || evidence.fundingCheck != "available" ||
 		evidence.requestStartedAt.IsZero() || evidence.generatedAt.IsZero() ||
 		!evidence.requestStartedAt.After(block.ObservedAt) || !evidence.requestStartedAt.After(recheckStartedAt) ||
-		evidence.requestStartedAt.After(now) || !evidence.generatedAt.After(block.ObservedAt) {
+		evidence.requestStartedAt.After(now) || !evidence.generatedAt.After(block.ObservedAt.Add(5*time.Second)) {
 		return false
 	}
+	// The official client allows server timestamps up to five seconds ahead.
+	// Apply that same margin to the observation boundary: a pre-pause response
+	// from a fast upstream clock must not masquerade as post-pause evidence.
 	age := now.Sub(evidence.generatedAt)
 	return age >= -5*time.Second && age <= 30*time.Second
 }

@@ -91,9 +91,17 @@ func TestQuotaRecoveryProofStrictConditions(t *testing.T) {
 		{"missing generatedAt", func(p *recoveryProofInput) { p.view.evidence.generatedAt = time.Time{} }, false},
 		{"generated before observation", func(p *recoveryProofInput) { p.view.evidence.generatedAt = p.block.ObservedAt.Add(-time.Nanosecond) }, false},
 		{"generated at observation", func(p *recoveryProofInput) { p.view.evidence.generatedAt = p.block.ObservedAt }, false},
-		{"generated just after observation", func(p *recoveryProofInput) {
+		{"generated just after observation can be a fast clock", func(p *recoveryProofInput) {
 			p.block.ObservedAt = p.now.Add(-20 * time.Second)
 			p.view.evidence.generatedAt = p.block.ObservedAt.Add(time.Nanosecond)
+		}, false},
+		{"generated at the five-second skew boundary", func(p *recoveryProofInput) {
+			p.block.ObservedAt = p.now.Add(-20 * time.Second)
+			p.view.evidence.generatedAt = p.block.ObservedAt.Add(5 * time.Second)
+		}, false},
+		{"generated after the five-second skew boundary", func(p *recoveryProofInput) {
+			p.block.ObservedAt = p.now.Add(-20 * time.Second)
+			p.view.evidence.generatedAt = p.block.ObservedAt.Add(5*time.Second + time.Nanosecond)
 		}, true},
 		{"30 seconds old inclusive", func(p *recoveryProofInput) { p.view.evidence.generatedAt = p.now.Add(-30 * time.Second) }, true},
 		{"too old by one nanosecond", func(p *recoveryProofInput) {
