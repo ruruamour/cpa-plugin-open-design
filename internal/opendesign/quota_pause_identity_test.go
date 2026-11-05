@@ -72,6 +72,37 @@ func TestQuotaBlockHostDisabledRoundTripPreservesManualChoice(t *testing.T) {
 	}
 }
 
+func TestQuotaBlockUnknownManualStateNeverEnables(t *testing.T) {
+	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+	const key = "fixture-inference-key"
+	block := &QuotaBlock{
+		KeyHash: quotaPauseKeyHash(key), Source: "upstream", Reason: "quota_exhausted",
+		BlockedAt: now.Add(-time.Hour), RetryAt: now.Add(time.Hour),
+	}
+	for _, disk := range []map[string]any{
+		{"type": Provider, "id": "fixture", "api_key": key, "disabled": false, "quota_block": block},
+		{"type": Provider, "id": "fixture", "api_key": key, "quota_block": block},
+	} {
+		var credential Credential
+		if err := json.Unmarshal(jsonBytes(disk), &credential); err != nil {
+			t.Fatal(err)
+		}
+		if !credential.Disabled {
+			t.Fatal("unknown manual state decoded as enabled")
+		}
+		normalized, changed := normalizeQuotaBlock(credential, now)
+		if !changed || normalized.ManualDisabled == nil || !*normalized.ManualDisabled {
+			t.Fatal("unknown manual state normalized as enabled")
+		}
+	}
+	// Normalization must also be conservative for callers that construct a
+	// Credential directly rather than going through UnmarshalJSON.
+	normalized, _ := normalizeQuotaBlock(Credential{APIKey: key, Disabled: false, QuotaBlock: block}, now)
+	if normalized.ManualDisabled == nil || !*normalized.ManualDisabled {
+		t.Fatal("directly constructed unknown state normalized as enabled")
+	}
+}
+
 func boolPointer(value bool) *bool { return &value }
 
 func TestQuotaBlockEffectiveDisabledAndExecutionGuard(t *testing.T) {

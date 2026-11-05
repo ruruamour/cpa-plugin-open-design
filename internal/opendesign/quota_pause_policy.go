@@ -58,8 +58,8 @@ func quotaBlockBelongsToKey(block *QuotaBlock, apiKey string) bool {
 }
 
 // normalizeQuotaBlock bounds persisted timestamps as well as newly received
-// hints. Missing manual snapshots are filled conservatively from the decoded
-// on-disk disabled value; they never imply permission to enable an account.
+// hints. A missing manual snapshot is unknown and therefore filled as disabled;
+// it must never be used as permission to enable an account.
 func normalizeQuotaBlock(c Credential, now time.Time) (*QuotaBlock, bool) {
 	if !quotaBlockBelongsToKey(c.QuotaBlock, c.APIKey) {
 		return c.QuotaBlock, false
@@ -67,7 +67,7 @@ func normalizeQuotaBlock(c Credential, now time.Time) (*QuotaBlock, bool) {
 	block := cloneQuotaBlock(c.QuotaBlock)
 	changed := false
 	if block.ManualDisabled == nil {
-		manual := c.Disabled
+		manual := true
 		block.ManualDisabled = &manual
 		changed = true
 	}

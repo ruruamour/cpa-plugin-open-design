@@ -84,6 +84,50 @@ func TestObserveQuotaBlockPersistsOnlyQuotaFields(t *testing.T) {
 	}
 }
 
+func TestLegacyQuotaBlockWithUnknownManualStateStaysDisabledOnExpiry(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+	setNow := setQuotaPauseFixtureClock(s, now)
+	block := &QuotaBlock{
+		KeyHash: quotaPauseKeyHash("fixture-inference-key"), Source: "upstream", Reason: "quota_exhausted",
+		BlockedAt: now, RetryAt: now.Add(time.Minute),
+	}
+	path := quotaFixtureAuthFile(t, s, host, id, map[string]any{"disabled": false, "quota_block": block})
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.parseAuth(jsonBytes(map[string]any{
+		"FileName": id + ".json", "RawJSON": raw, "Host": map[string]any{"AuthDir": host.authDir},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := liveCredential(s, id)
+	if !current.Disabled || !current.quotaBlocked() || current.QuotaBlock.ManualDisabled == nil || !*current.QuotaBlock.ManualDisabled {
+		t.Fatal("legacy pause with unknown manual choice was not treated as disabled")
+	}
+	s.credentialMu.Lock()
+	setNow(now.Add(time.Minute))
+	err = s.resumeQuotaBlockLocked(id, current.QuotaRevision, true)
+	s.credentialMu.Unlock()
+	if err != nil {
+		t.Fatalf("due recovery failed: %v", err)
+	}
+	current, _ = liveCredential(s, id)
+	if !current.Disabled || current.quotaBlocked() {
+		t.Fatal("expiry enabled a credential with unknown manual choice")
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted Credential
+	if err := json.Unmarshal(raw, &persisted); err != nil || !persisted.Disabled || persisted.QuotaBlock != nil {
+		t.Fatal("expiry failed to persist the conservative manual state")
+	}
+}
+
 func TestObserveQuotaBlockFailureKeepsLocalGuard(t *testing.T) {
 	s, host := newTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")

@@ -258,9 +258,11 @@ func (c *Credential) UnmarshalJSON(raw []byte) error {
 	}
 	// CPA may persist the effective disabled flag back into the top-level JSON.
 	// Only an intact block bound to this key may restore the separate manual
-	// choice. A missing snapshot or stale key leaves the on-disk flag untouched.
-	if quotaBlockBelongsToKey(decoded.QuotaBlock, decoded.APIKey) && decoded.QuotaBlock.ManualDisabled != nil {
-		decoded.Disabled = *decoded.QuotaBlock.ManualDisabled
+	// choice. When the snapshot is missing, its origin is unknown: fail closed
+	// rather than treating an absent or false on-disk flag as permission to
+	// re-enable this credential after the block expires.
+	if quotaBlockBelongsToKey(decoded.QuotaBlock, decoded.APIKey) {
+		decoded.Disabled = decoded.QuotaBlock.ManualDisabled == nil || *decoded.QuotaBlock.ManualDisabled
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
