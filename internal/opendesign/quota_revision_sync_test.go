@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -577,7 +578,7 @@ func TestQuotaRecoveryStaleUnversionedPauseKeepsManualDisable(t *testing.T) {
 }
 
 func TestQuotaRevisionClearRepairRefusesUnownedDisk(t *testing.T) {
-	for _, tc := range []string{"different key", "foreign block", "conflicting clear revision"} {
+	for _, tc := range []string{"different key", "foreign block", "control key conflict"} {
 		t.Run(tc, func(t *testing.T) {
 			s, host, id, path, _, paused, _ := quotaRevisionPauseResume(t)
 			quotaRevisionDeliver(t, s, host, id, path, paused)
@@ -595,9 +596,8 @@ func TestQuotaRevisionClearRepairRefusesUnownedDisk(t *testing.T) {
 				}
 				block.KeyHash = quotaPauseKeyHash("another-inference-key")
 				fields["quota_block"] = jsonBytes(block)
-			case "conflicting clear revision":
-				delete(fields, "quota_block")
-				fields["quota_revision"] = jsonBytes("other-revision")
+			case "control key conflict":
+				fields["control_key"] = jsonBytes("another-control-key")
 			}
 			body := jsonBytes(fields)
 			if err := os.WriteFile(path, body, 0600); err != nil {
@@ -623,5 +623,456 @@ func TestQuotaRevisionClearRepairRefusesUnownedDisk(t *testing.T) {
 			s.sweepQuotaBlocks(make(chan struct{}))
 			quotaRevisionAssertDiskClear(t, s, id, path)
 		})
+	}
+}
+
+// A watcher can lag behind the plugin's own newer state. If the file still
+// carries an older block for this very key, an explicit resume must not stay
+// permanently refused: the operator cannot know that a console read is the only
+// way out, and a stale revision is not evidence of a different decision.
+func TestQuotaRevisionResumeRepairsOlderOwnBlock(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		dropRevision bool
+	}{
+		{"older revision", false},
+		{"missing revision", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, host := quotaRevisionTestService(t)
+			id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+			path := quotaFixtureAuthFile(t, s, host, id, nil)
+			source, _ := liveCredential(s, id)
+			s.observeQuotaBlock(source, "model-a", &APIError{Status: http.StatusPaymentRequired, quotaExhausted: true})
+			older, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.dropRevision {
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(older, &fields); err != nil {
+					t.Fatal(err)
+				}
+				delete(fields, "quota_revision")
+				older = jsonBytes(fields)
+			}
+			// A later signal advances the live revision; the delayed host write
+			// then restores the older body before its watcher callback runs.
+			s.observeQuotaBlock(source, "model-a", &APIError{Status: http.StatusPaymentRequired, quotaExhausted: true})
+			if err := os.WriteFile(path, older, 0600); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := liveCredential(s, id)
+			if status, _, body := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil,
+				map[string]any{"credential_id": id}); status != http.StatusOK {
+				t.Fatalf("resume refused its own older block: %d %s", status, body)
+			}
+			live, _ := liveCredential(s, id)
+			if live.quotaBlocked() || live.QuotaRevision == before.QuotaRevision {
+				t.Fatal("resume did not clear the block and advance the revision")
+			}
+			var disk Credential
+			if err := json.Unmarshal(quotaRevisionRead(t, path), &disk); err != nil || disk.quotaBlocked() || disk.QuotaRevision != live.QuotaRevision {
+				t.Fatal("resume left an older block on disk")
+			}
+			if live.Disabled {
+				t.Fatal("resume invented a disable state")
+			}
+		})
+	}
+}
+
+// The relaxed rule must not let an explicit resume delete a block that belongs
+// to another inference key or control identity.
+func TestQuotaRevisionResumeRefusesForeignDisk(t *testing.T) {
+	for _, tc := range []string{"foreign block", "control key conflict"} {
+		t.Run(tc, func(t *testing.T) {
+			s, host := quotaRevisionTestService(t)
+			var extra map[string]any
+			if tc == "control key conflict" {
+				// Give live a real control key so the fence must reject two
+				// non-empty values that disagree, not just a disk-only value.
+				extra = map[string]any{"control_key": "available-control-key"}
+			}
+			id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+			path := quotaFixtureAuthFile(t, s, host, id, extra)
+			if tc == "control key conflict" {
+				if _, err := s.parseAuth(jsonBytes(map[string]any{
+					"FileName": id + ".json", "RawJSON": quotaRevisionRead(t, path),
+					"Host": map[string]any{"AuthDir": host.authDir},
+				})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source, _ := liveCredential(s, id)
+			s.observeQuotaBlock(source, "model-a", &APIError{Status: http.StatusPaymentRequired, quotaExhausted: true})
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(body, &fields); err != nil {
+				t.Fatal(err)
+			}
+			switch tc {
+			case "foreign block":
+				var block QuotaBlock
+				if err := json.Unmarshal(fields["quota_block"], &block); err != nil {
+					t.Fatal(err)
+				}
+				block.KeyHash = quotaPauseKeyHash("another-inference-key")
+				fields["quota_block"] = jsonBytes(block)
+			case "control key conflict":
+				fields["control_key"] = jsonBytes("another-control-key")
+			}
+			foreign := jsonBytes(fields)
+			if err := os.WriteFile(path, foreign, 0600); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := liveCredential(s, id)
+			beforeMarker, beforePending := quotaRevisionMarker(s, id)
+			status, _, response := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil,
+				map[string]any{"credential_id": id})
+			if status != http.StatusBadGateway {
+				t.Fatalf("resume returned %d for unowned disk state: %s", status, response)
+			}
+			if !strings.Contains(response, "凭据文件已被修改") {
+				t.Fatalf("refused resume did not report the disk conflict: %s", response)
+			}
+			if string(quotaRevisionRead(t, path)) != string(foreign) {
+				t.Fatal("refused resume still rewrote the credential file")
+			}
+			live, _ := liveCredential(s, id)
+			if !live.quotaBlocked() || live.QuotaRevision != before.QuotaRevision || live.Disabled != before.Disabled {
+				t.Fatal("refused resume changed the live quota state")
+			}
+			if marker, pending := quotaRevisionMarker(s, id); marker != beforeMarker || pending != beforePending {
+				t.Fatal("refused resume changed synchronization bookkeeping")
+			}
+		})
+	}
+}
+
+// An old cleared body can carry a revision from an even earlier resume. It must
+// not erase the published clear, and the repair must be allowed to converge the
+// two cleared bodies instead of refusing forever on the revision mismatch.
+func TestQuotaRevisionOlderClearRevisionIsRepaired(t *testing.T) {
+	for _, deliver := range []bool{false, true} {
+		name := "sweep repairs an older cleared body"
+		if deliver {
+			name = "watcher keeps the clear, then sweep repairs"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, host, id, path, _, paused, resumed := quotaRevisionPauseResume(t)
+			quotaRevisionDeliver(t, s, host, id, path, paused)
+			if marker, _ := quotaRevisionMarker(s, id); !marker {
+				t.Fatal("fixture did not arm the clear repair")
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(paused, &fields); err != nil {
+				t.Fatal(err)
+			}
+			delete(fields, "quota_block")
+			fields["quota_revision"] = jsonBytes("older-clear-revision")
+			fields["disabled"] = jsonBytes(false)
+			older := jsonBytes(fields)
+			if deliver {
+				// Drive the real watcher path: an older cleared body must not
+				// erase the published clear revision or its manual choice.
+				quotaRevisionDeliver(t, s, host, id, path, older)
+			} else if err := os.WriteFile(path, older, 0600); err != nil {
+				t.Fatal(err)
+			}
+			live, _ := liveCredential(s, id)
+			if live.quotaBlocked() || live.QuotaRevision != resumed.QuotaRevision {
+				t.Fatal("older cleared body erased the published clear revision")
+			}
+			if marker, _ := quotaRevisionMarker(s, id); !marker {
+				t.Fatal("older cleared body was not marked for repair")
+			}
+			s.sweepQuotaBlocks(make(chan struct{}))
+			quotaRevisionAssertDiskClear(t, s, id, path)
+		})
+	}
+}
+
+// A manual disable performed after resume shares the cleared revision. A late
+// host rewrite of the older enable must neither erase that revision nor turn
+// the account back on, and the repair must persist the disable.
+func TestQuotaRevisionVersionedOldClearKeepsManualDisable(t *testing.T) {
+	s, host, id, path, _, _, resumed := quotaRevisionPauseResume(t)
+	resumedRaw := quotaRevisionRead(t, path)
+	if status, _, body := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil,
+		map[string]any{"id": id, "disabled": true}); status != http.StatusOK {
+		t.Fatalf("disable: %d %s", status, body)
+	}
+	mirrorAuthFile(t, s, host, id)
+	live, _ := liveCredential(s, id)
+	if !live.Disabled || live.QuotaRevision != resumed.QuotaRevision {
+		t.Fatal("fixture did not publish a same-revision manual disable")
+	}
+	quotaRevisionDeliver(t, s, host, id, path, resumedRaw)
+	live, _ = liveCredential(s, id)
+	if !live.Disabled {
+		t.Fatal("old cleared enable undid the manual disable")
+	}
+	if live.QuotaRevision != resumed.QuotaRevision {
+		t.Fatal("old cleared body erased the published clear revision")
+	}
+	if marker, _ := quotaRevisionMarker(s, id); !marker {
+		t.Fatal("stale enable was not marked for repair")
+	}
+	s.sweepQuotaBlocks(make(chan struct{}))
+	quotaRevisionAssertDiskClear(t, s, id, path)
+	var disk Credential
+	if err := json.Unmarshal(quotaRevisionRead(t, path), &disk); err != nil || !disk.Disabled {
+		t.Fatal("repair did not preserve the manual disable")
+	}
+}
+
+// A body carrying both a live paused block and the cleared revision is not a
+// state this plugin ever writes. It must still not resurrect the pause.
+func TestQuotaRevisionPausedBodyWithClearRevisionCannotResurrect(t *testing.T) {
+	s, host, id, path, _, paused, resumed := quotaRevisionPauseResume(t)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(paused, &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["quota_revision"] = jsonBytes(resumed.QuotaRevision)
+	quotaRevisionDeliver(t, s, host, id, path, jsonBytes(fields))
+	live, _ := liveCredential(s, id)
+	if live.quotaBlocked() {
+		t.Fatal("paused body carrying the cleared revision resurrected a pause")
+	}
+	if live.QuotaRevision != resumed.QuotaRevision {
+		t.Fatal("paused body changed the published clear revision")
+	}
+	if marker, _ := quotaRevisionMarker(s, id); !marker {
+		t.Fatal("inconsistent paused body was not marked for repair")
+	}
+	s.sweepQuotaBlocks(make(chan struct{}))
+	quotaRevisionAssertDiskClear(t, s, id, path)
+}
+
+// A foreign block cannot be repaired by republishing the clear. It must not be
+// adopted into live state, and it must not leave a marker that every management
+// read retries forever.
+func TestQuotaRevisionForeignBlockDoesNotStickClearMarker(t *testing.T) {
+	s, host, id, path, _, paused, _ := quotaRevisionPauseResume(t)
+	quotaRevisionDeliver(t, s, host, id, path, paused)
+	if marker, _ := quotaRevisionMarker(s, id); !marker {
+		t.Fatal("fixture did not arm the clear repair")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(paused, &fields); err != nil {
+		t.Fatal(err)
+	}
+	var block QuotaBlock
+	if err := json.Unmarshal(fields["quota_block"], &block); err != nil {
+		t.Fatal(err)
+	}
+	block.KeyHash = quotaPauseKeyHash("another-inference-key")
+	fields["quota_block"] = jsonBytes(block)
+	delete(fields, "quota_revision")
+	quotaRevisionDeliver(t, s, host, id, path, jsonBytes(fields))
+	live, _ := liveCredential(s, id)
+	if live.quotaBlocked() || live.QuotaBlock != nil {
+		t.Fatal("foreign block was adopted into live state")
+	}
+	if marker, pending := quotaRevisionMarker(s, id); marker || pending != "" {
+		t.Fatalf("unrepairable foreign body left marker=%v pending=%q", marker, pending)
+	}
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if status, _, _ := managementCall(t, s, http.MethodGet, apiBase+"/quota-pause", nil, nil); status != http.StatusOK {
+			t.Fatal("quota read failed")
+		}
+	}
+	last, err := os.Stat(path)
+	if err != nil || !os.SameFile(first, last) {
+		t.Fatal("management read rewrote an unowned disk body")
+	}
+}
+
+// While a block exists the authoritative manual choice is the block snapshot:
+// UnmarshalJSON only trusts a top-level `disabled` that agrees with a block
+// bound to this key. An explicit resume must therefore keep the choice the
+// block records, and must not invent a disable from a projected file flag.
+func TestQuotaRevisionResumeKeepsBlockManualDisable(t *testing.T) {
+	for _, manual := range []bool{true, false} {
+		name := "block records enabled"
+		if manual {
+			name = "block records disabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, host := quotaRevisionTestService(t)
+			id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+			if status, _, body := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil,
+				map[string]any{"id": id, "disabled": manual}); status != http.StatusOK {
+				t.Fatalf("preset manual choice: %d %s", status, body)
+			}
+			path := quotaFixtureAuthFile(t, s, host, id, nil)
+			source, _ := liveCredential(s, id)
+			s.observeQuotaBlock(source, "model-a", &APIError{Status: http.StatusPaymentRequired, quotaExhausted: true})
+			live, _ := liveCredential(s, id)
+			if !live.quotaBlocked() || live.Disabled != manual ||
+				live.QuotaBlock.ManualDisabled == nil || *live.QuotaBlock.ManualDisabled != manual {
+				t.Fatalf("fixture did not publish manual=%v on the block", manual)
+			}
+			if status, _, response := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil,
+				map[string]any{"credential_id": id}); status != http.StatusOK {
+				t.Fatalf("resume: %d %s", status, response)
+			}
+			live, _ = liveCredential(s, id)
+			if live.quotaBlocked() || live.Disabled != manual {
+				t.Fatalf("resume produced blocked=%v disabled=%v, want blocked=false disabled=%v", live.quotaBlocked(), live.Disabled, manual)
+			}
+			var disk Credential
+			if err := json.Unmarshal(quotaRevisionRead(t, path), &disk); err != nil || disk.quotaBlocked() ||
+				disk.Disabled != manual || disk.QuotaRevision != live.QuotaRevision {
+				t.Fatalf("resume did not persist manual=%v: disk disabled=%v rev=%q", manual, disk.Disabled, disk.QuotaRevision)
+			}
+		})
+	}
+}
+
+// An explicit resume must not stay refused forever just because the file already
+// holds a cleared body with another revision. A cleared body has no pause to
+// erase, and the manual choice remains the conservative union.
+func TestQuotaRevisionResumeAcceptsOlderClearedBody(t *testing.T) {
+	for _, diskDisabled := range []bool{false, true} {
+		name := "older clear enabled"
+		if diskDisabled {
+			name = "older clear disabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, host := quotaRevisionTestService(t)
+			id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+			path := quotaFixtureAuthFile(t, s, host, id, nil)
+			source, _ := liveCredential(s, id)
+			s.observeQuotaBlock(source, "model-a", &APIError{Status: http.StatusPaymentRequired, quotaExhausted: true})
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(body, &fields); err != nil {
+				t.Fatal(err)
+			}
+			delete(fields, "quota_block")
+			fields["quota_revision"] = jsonBytes("older-clear-revision")
+			fields["disabled"] = jsonBytes(diskDisabled)
+			if err := os.WriteFile(path, jsonBytes(fields), 0600); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := liveCredential(s, id)
+			if !before.quotaBlocked() {
+				t.Fatal("fixture did not publish a live block")
+			}
+			if status, _, response := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil,
+				map[string]any{"credential_id": id}); status != http.StatusOK {
+				t.Fatalf("resume refused an older cleared body: %d %s", status, response)
+			}
+			live, _ := liveCredential(s, id)
+			if live.quotaBlocked() || live.Disabled != diskDisabled {
+				t.Fatalf("resume produced blocked=%v disabled=%v, want blocked=false disabled=%v", live.quotaBlocked(), live.Disabled, diskDisabled)
+			}
+			var disk Credential
+			if err := json.Unmarshal(quotaRevisionRead(t, path), &disk); err != nil || disk.quotaBlocked() ||
+				disk.Disabled != diskDisabled || disk.QuotaRevision != live.QuotaRevision {
+				t.Fatalf("resume did not converge the older cleared body: %+v", disk)
+			}
+		})
+	}
+}
+
+// Before any revision exists, a stale unversioned enable must not undo a manual
+// disable. The union is published and repaired so a restart keeps the disable.
+func TestQuotaRevisionUnversionedStaleEnableKeepsManualDisable(t *testing.T) {
+	s, host := quotaRevisionTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	path := quotaFixtureAuthFile(t, s, host, id, map[string]any{"opaque_extension": "keep"})
+	if status, _, body := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil,
+		map[string]any{"id": id, "disabled": true}); status != http.StatusOK {
+		t.Fatalf("disable: %d %s", status, body)
+	}
+	mirrorAuthFile(t, s, host, id)
+	live, _ := liveCredential(s, id)
+	if !live.Disabled || live.QuotaRevision != "" {
+		t.Fatal("fixture did not publish an unversioned manual disable")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(quotaRevisionRead(t, path), &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["disabled"] = jsonBytes(false)
+	fields["opaque_extension"] = jsonBytes("keep")
+	delete(fields, "quota_revision")
+	quotaRevisionDeliver(t, s, host, id, path, jsonBytes(fields))
+	live, _ = liveCredential(s, id)
+	if !live.Disabled {
+		t.Fatal("unversioned stale enable undid the manual disable")
+	}
+	if live.QuotaRevision == "" {
+		t.Fatal("divergent unversioned body did not publish a repair revision")
+	}
+	if marker, _ := quotaRevisionMarker(s, id); !marker {
+		t.Fatal("divergent unversioned body was not marked for repair")
+	}
+	s.sweepQuotaBlocks(make(chan struct{}))
+	quotaRevisionAssertDiskClear(t, s, id, path)
+	var disk Credential
+	if err := json.Unmarshal(quotaRevisionRead(t, path), &disk); err != nil || !disk.Disabled {
+		t.Fatal("repair did not keep the manual disable")
+	}
+}
+
+// A foreign/invalid block arriving while an unversioned credential is manually
+// disabled is not repairable by republishing the clear. It must not leave a
+// marker that every sweep retries forever, nor turn the disable back on.
+func TestQuotaRevisionUnversionedForeignBlockDoesNotStickMarker(t *testing.T) {
+	s, host := quotaRevisionTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	path := quotaFixtureAuthFile(t, s, host, id, map[string]any{"opaque_extension": "keep"})
+	if status, _, body := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil,
+		map[string]any{"id": id, "disabled": true}); status != http.StatusOK {
+		t.Fatalf("disable: %d %s", status, body)
+	}
+	mirrorAuthFile(t, s, host, id)
+	now := time.Now().UTC()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(quotaRevisionRead(t, path), &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["disabled"] = jsonBytes(false)
+	fields["quota_block"] = jsonBytes(&QuotaBlock{
+		KeyHash: quotaPauseKeyHash("another-inference-key"), ManualDisabled: boolPointer(false),
+		Source: "upstream", Reason: "quota_exhausted", BlockedAt: now, ObservedAt: now,
+		RetryAt: now.Add(time.Hour), ModelID: "model-a", ModelIDs: []string{"model-a"},
+	})
+	delete(fields, "quota_revision")
+	quotaRevisionDeliver(t, s, host, id, path, jsonBytes(fields))
+	live, _ := liveCredential(s, id)
+	if !live.Disabled || live.quotaBlocked() || live.QuotaBlock != nil {
+		t.Fatalf("foreign block body changed the manual state: disabled=%v blocked=%v block=%v", live.Disabled, live.quotaBlocked(), live.QuotaBlock)
+	}
+	if marker, pending := quotaRevisionMarker(s, id); marker || pending != "" {
+		t.Fatalf("unrepairable foreign body left marker=%v pending=%q", marker, pending)
+	}
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if status, _, _ := managementCall(t, s, http.MethodGet, apiBase+"/quota-pause", nil, nil); status != http.StatusOK {
+			t.Fatal("quota read failed")
+		}
+	}
+	last, err := os.Stat(path)
+	if err != nil || !os.SameFile(first, last) {
+		t.Fatal("management read rewrote an unowned disk body")
 	}
 }

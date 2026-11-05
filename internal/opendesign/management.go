@@ -525,6 +525,7 @@ func (s *Service) deleteCredential(credentialID string) (any, error) {
 	s.invalidateBillingLocked(credentialID)
 	delete(s.authFiles, credentialID)
 	delete(s.quotaPauseErrors, credentialID)
+	delete(s.quotaDiskStale, credentialID)
 	delete(s.quotaRecheckStatus, credentialID)
 	delete(s.quotaRecheckRetryAt, credentialID)
 	delete(s.quotaRecheckFailures, credentialID)

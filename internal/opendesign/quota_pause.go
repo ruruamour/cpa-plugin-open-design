@@ -165,7 +165,9 @@ func (s *Service) persistQuotaBlockLocked(id, revision string, manualFromDisk bo
 	if strings.TrimSpace(disk.ID) == "" {
 		disk.ID = strings.TrimSuffix(filename, ".json")
 	}
-	if disk.Type != Provider || disk.ID != id || disk.APIKey != current.APIKey {
+	if disk.Type != Provider || disk.ID != id || disk.APIKey != current.APIKey ||
+		conflictingQuotaField(disk.ControlKey, current.ControlKey) ||
+		conflictingQuotaField(disk.WorkspaceID, current.WorkspaceID) {
 		return errors.New("credential file changed")
 	}
 	// The live block owns the operator's choice. Disk `disabled` is only a
@@ -366,17 +368,18 @@ func (s *Service) persistQuotaResumeLocked(id string) error {
 	if err != nil {
 		return err
 	}
-	if disk.APIKey != current.APIKey {
+	if disk.APIKey != current.APIKey ||
+		conflictingQuotaField(disk.ControlKey, current.ControlKey) ||
+		conflictingQuotaField(disk.WorkspaceID, current.WorkspaceID) {
 		return errors.New("credential file changed")
 	}
 	manual := current.Disabled
 	if disk.QuotaBlock == nil {
-		if disk.QuotaRevision != "" {
-			// A matching cleared file needs no write. A conflicting version or
-			// manual choice is not evidence that the disk is ours to overwrite.
-			if disk.QuotaRevision != current.QuotaRevision || disk.Disabled != current.Disabled {
-				return errors.New("credential file changed")
-			}
+		// A cleared body is safe to converge: there is no pause to erase, and the
+		// manual choice below only ever preserves a disable. A different revision
+		// is an older clear, not evidence of a newer decision this repair would
+		// drop. Only an identical body can retire the marker without a write.
+		if disk.QuotaRevision == current.QuotaRevision && disk.Disabled == current.Disabled {
 			s.mu.Lock()
 			if live, ok := s.creds[id]; ok && live.APIKey == current.APIKey && live.QuotaBlock == nil &&
 				live.QuotaRevision == current.QuotaRevision && live.Disabled == current.Disabled {
@@ -385,8 +388,8 @@ func (s *Service) persistQuotaResumeLocked(id string) error {
 			s.mu.Unlock()
 			return nil
 		}
-		// An old unversioned clear lost the revision, but not necessarily a
-		// later manual disable. Never turn either side back on during repair.
+		// An older clear lost the revision, but not necessarily a later manual
+		// disable. Never turn either side back on during repair.
 		manual = manual || disk.Disabled
 	} else if !quotaBlockBelongsToKey(disk.QuotaBlock, disk.APIKey) {
 		// An invalid or foreign block is not ours to remove.
@@ -467,10 +470,25 @@ func (s *Service) resumeQuotaBlockLocked(id, expectedRevision string, dueOnly bo
 	// Optional fields are only rejected when the file carries a conflicting value,
 	// so an older file that predates them keeps working.
 	if disk.APIKey != current.APIKey ||
-		conflictingQuotaField(disk.WorkspaceID, current.WorkspaceID) ||
-		conflictingQuotaField(disk.QuotaRevision, current.QuotaRevision) {
+		conflictingQuotaField(disk.ControlKey, current.ControlKey) ||
+		conflictingQuotaField(disk.WorkspaceID, current.WorkspaceID) {
 		return errors.New("credential file changed")
 	}
+	// A block that does not belong to this exact key is not ours to remove,
+	// regardless of its revision.
+	if disk.QuotaBlock != nil && !quotaBlockBelongsToKey(disk.QuotaBlock, current.APIKey) {
+		return errors.New("credential file changed")
+	}
+	// A differing quota revision normally means another writer advanced the
+	// file. An explicit resume is the operator's own decision for this account,
+	// and this plugin keeps one process-wide state (a shared auth-dir with a
+	// second writer is outside the supported model, and those writes have no
+	// cross-process CAS). When the file carries a pause for this exact key, it
+	// can only be an older body (a host rewrite of a pre-pause snapshot or a
+	// failed persistence). A cleared body has no pause to erase, and the manual
+	// choice below only ever preserves a disable, so its revision is compatible
+	// too. Either way the operator can get unstuck; a foreign block was refused
+	// above.
 	// Keep the operator's plugin-console choice, which lives in the block. A file
 	// that still has an intact block is the better source when the live one was
 	// recorded elsewhere, but the live snapshot always wins when present.

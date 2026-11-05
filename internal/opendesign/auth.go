@@ -146,18 +146,60 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 			c.QuotaBlock = cloneQuotaBlock(current.QuotaBlock)
 			c.QuotaRevision = current.QuotaRevision
 			c.Disabled = manual
-		case current.QuotaBlock == nil && !c.quotaBlocked() && current.QuotaRevision != "" && c.QuotaRevision == "":
-			// Missing optional fields cannot erase a known cleared-state revision.
-			// In particular, a pre-pause host save may arrive after resume. Keep
-			// that evidence only for the same inference key; without evidence we
-			// must still adopt a valid incoming pause (the next case).
+		case current.APIKey == c.APIKey && !current.quotaBlocked() && current.QuotaRevision != "" && c.quotaBlocked():
+			// The live state is cleared, but the incoming body still carries a
+			// paused snapshot (a host rewrite of the pre-resume file). Never
+			// resurrect the pause, even if an external writer copied the cleared
+			// revision into an inconsistent body. Keep the live cleared state and
+			// schedule a repair so a restart does not adopt the stale block.
+			s.quotaDiskStale[c.ID] = true
+			c.QuotaBlock = nil
 			c.QuotaRevision = current.QuotaRevision
-			// An unversioned body cannot distinguish a stale enable from a real
-			// operator change. Preserve either side's disable choice.
-			c.Disabled = current.Disabled || c.Disabled
-			if c.QuotaBlock == nil {
-				// Restore the revision on disk too, so a restart after repair does
-				// not forget the clear. Do not erase an invalid/foreign block here.
+			c.Disabled = current.Disabled
+		case current.APIKey == c.APIKey && !current.quotaBlocked() && current.QuotaRevision != "":
+			// Any other body with no live block cannot advance or erase the
+			// published clear revision. A missing or differing revision is an
+			// older host body, not a newer decision this process may drop.
+			// Keep the live block (nil) rather than adopting an invalid/foreign
+			// one, and preserve either side's disable choice: an enable is
+			// recoverable from the console, an accidental enable is not safe.
+			incomingBlock, incomingRevision, incomingDisabled := c.QuotaBlock, c.QuotaRevision, c.Disabled
+			manual := current.Disabled || incomingDisabled
+			c.QuotaBlock = nil
+			c.QuotaRevision = current.QuotaRevision
+			c.Disabled = manual
+			if incomingBlock == nil {
+				if incomingRevision != current.QuotaRevision || incomingDisabled != manual {
+					// Restore the revision and manual choice on disk too, so a
+					// restart after repair does not forget the clear.
+					s.quotaDiskStale[c.ID] = true
+				}
+			} else {
+				// The disk body carries a block this plugin does not own; it is
+				// not repairable by republishing the clear. Drop a marker from an
+				// earlier divergence that this body has already replaced, instead
+				// of retrying it forever.
+				delete(s.quotaDiskStale, c.ID)
+			}
+		case current.APIKey == c.APIKey && !current.quotaBlocked() && current.QuotaRevision == "" && !c.quotaBlocked():
+			// No published clear revision exists yet, so an unversioned body cannot
+			// prove it is newer than the console. Keep the union of manual choices
+			// (an accidental enable is unsafe, a withheld enable is recoverable),
+			// and never adopt an invalid/foreign block. If the disk disagrees with
+			// that union, publish a revision and let the repair persist it so a
+			// restart does not forget the disable. A foreign/invalid block is not
+			// repairable by republishing the clear, so it must not leave a marker
+			// that every sweep would retry forever.
+			incomingBlock, incomingDisabled := c.QuotaBlock, c.Disabled
+			manual := current.Disabled || incomingDisabled
+			c.QuotaBlock = nil
+			c.Disabled = manual
+			if incomingBlock != nil {
+				delete(s.quotaDiskStale, c.ID)
+			} else if incomingDisabled != manual {
+				if c.QuotaRevision == "" {
+					c.QuotaRevision = newID()
+				}
 				s.quotaDiskStale[c.ID] = true
 			}
 		case current.APIKey == c.APIKey && c.quotaBlocked() && current.QuotaRevision == "":
@@ -176,15 +218,6 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 				s.quotaPauseErrors[c.ID] = quotaPauseSyncError
 			}
 			delete(s.quotaDiskStale, c.ID)
-		case current.APIKey == c.APIKey && c.quotaBlocked() && current.QuotaRevision != c.QuotaRevision:
-			// The opposite direction: the live state is resumed/cleared, but the
-			// incoming body still carries the paused snapshot (a host rewrite of
-			// the pre-resume file). Keep the live cleared state and schedule a
-			// repair, otherwise the stale block would come back after a restart.
-			s.quotaDiskStale[c.ID] = true
-			c.QuotaBlock = nil
-			c.QuotaRevision = current.QuotaRevision
-			c.Disabled = current.Disabled
 		}
 	} else {
 		// A deleted credential can be re-imported under the same ID. Its old
