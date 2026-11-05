@@ -1,19 +1,19 @@
 # OpenDesign 插件验证记录
 
-## 0.4.6 本轮验收（未部署）
+## 0.4.6 开发检查（未通过安全复核，禁止部署）
 
 `0.4.6` = `0.4.5` 的思考强度映射 + 三处修复（后端模型/规则快照一致性、控制台默认表与保存并发、深拷贝数据竞争）+ 额度耗尽自动暂停。`open-design-v0.4.5` 的 Release 因 macOS runner 被取消未产出资产，故 `0.4.5` 未单独发布。
 
-插件识别上游明确的额度耗尽信号后，把账户临时移出本插件调度，到点或额度恢复后自动放回。实现参照 ClinePass 的 QuotaBlock：`Credential.Disabled` 保留人工选择，暂停另存于凭据 auth 文件的 `quota_block`／`quota_revision`。
+当前实现尝试参照 ClinePass 的 QuotaBlock 记录额度暂停，但对 CPA 原生人工停用的保护存在缺陷，**不能把下面的单元测试结果理解为真实宿主验收通过**。
 
 | 检查 | 结果与范围 |
 | --- | --- |
-| 信号 | `quotaPauseSignal` 只接受 `402` + `error.code=insufficient_balance`，或 `2xx`（含 SSE）且 `error.details.coding_plan_exhausted=true`；裸 `402`、文本 `payment required`、普通 `429`、普通 `insufficient_quota` 均不触发 |
+| 信号 | `quotaPauseSignal` 只接受 `error.code=insufficient_balance` 且状态为 `402`，或同一机器码出现在 `2xx`（含 SSE）且 `error.details.coding_plan_exhausted=true` 的响应中；裸 `402`、文本 `payment required`、普通 `429`、普通 `insufficient_quota` 均不触发 |
 | 截止时间 | `quotaPauseDeadline`：缺省 30 分钟，钳制 1 分钟～7 天，受 `pause.max_seconds` 约束；`reset_at` 只取 RFC3339（允许 `resets at ` 前缀），`Retry-After` 支持秒数与 HTTP 日期，溢出按上限处理 |
-| 人工停用保护 | `quota_block.manual_disabled` 快照 + 磁盘最新值取较新者；`ManualDisabled=nil`（legacy）保守视为停用；换 Key 成功后才清除旧 block，失败保留旧 Key 与 block |
+| 人工停用保护 | 插件管理接口的启停路径有模拟测试；但 CPA 原生界面停用与插件投影的禁用无法可靠区分，到期恢复可能覆盖人工停用，**未通过**。`ManualDisabled=nil` 的保守回退另有本地修复，不能解决上述归因问题 |
 | 持久化 | 读—比对—原子替换，只改 `quota_block`／`quota_revision`／`disabled`，保留未知字段；写失败时先发布内存拦截再记 `quotaPauseSyncError`，后台任务重试 |
 | 执行路径 | `executor.execute`／`execute_stream`（含 SSE 事件）都调用 `observeQuotaBlock`；已暂停账户在 `selectedCredential` 本地返回 `429 [open-design:quota_block]`，配套 `continue` 规则允许换号，不产生新的宿主冷却归因 |
-| 恢复 | 后台 30 秒 ticker 与管理读路径只做本地到期与失败重试，**不发额度请求**；`POST /quota-pause/recheck` 仅在新于观察时间且 `funding_check=available` 时提前解除，多模型歧义返回 409；`POST /quota-pause/resume` 为操作员显式解除 |
+| 恢复 | 后台 30 秒 ticker 与管理读路径只做本地到期与失败重试，不发额度请求；提前恢复的缓存新鲜度及失败回退边界尚在复核，不应作为可用保证 |
 | 管理接口 | `GET /quota-pause`、`POST /quota-pause/resume`、`POST /quota-pause/recheck`；`GET /status`、`/credentials` 返回 `quota_paused`／`effective_disabled`／`quota_pause`（不含任何 Key 指纹） |
 | 配置 | `pause.enabled`（默认开启）与 `pause.max_seconds`（60–604800，默认 86400）；`POST /config` 只接受 `logs` 与 `pause` 两段，未知字段 400 |
 | Go 用例 | `quota_pause_deadline_test.go`、`quota_pause_signal_test.go`、`quota_pause_identity_test.go`、`quota_pause_manual_test.go`、`quota_pause_persist_test.go`、`quota_pause_executor_test.go`，共 29 个用例；含「暂停期间人工停用／启用后到期清扫不得翻转人工选择」两条 |
@@ -21,7 +21,7 @@
 | 全仓 Go | `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 通过 |
 | ABI | `scripts/smoke-abi.py`（CGO `c-shared` 构建）PASS |
 
-**未验收**：尚未在生产环境观测到真实额度耗尽事件（当时 6 个账户均有余额），因此「上游真实耗尽 → 自动暂停 → 到期恢复」的端到端链路只有单元与契约证据。插件不修改 CPA 的 `disabled`，所以 CPA 界面不会显示「已停用」；上游 `402/403` 触发的是宿主硬编码的 30 分钟冷却，插件无法提前结束。
+**未验收**：尚未在生产环境观测到真实额度耗尽事件（当时 6 个账户均有余额）。人工停用保护也未通过真实宿主复核：当前实现返回有效 `Disabled` 给宿主，宿主可能写回文件，不能区分部分原生人工停用。上游 `402/403` 触发的是宿主硬编码的 30 分钟冷却，插件无法提前结束。`0.4.6` 的 Release 运行 `41906585863` 因 macOS arm64 作业取消而失败，未生成 Release，未部署。
 
 ## 0.4.4 本轮验收
 

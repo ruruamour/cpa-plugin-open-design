@@ -7,6 +7,8 @@
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
 > `0.4.0` 在 `0.3.0` 之上增加可编辑的重试调度／错误规则，已于 2026-11-04 部署到 `nuoapi-net`；`0.4.1` 修复 Windows 上请求日志持久化与跨平台测试；`0.4.2` 把 settings.json 与错误规则文件也纳入同一条重试发布路径，并锁定裸 402 不并入额度分类；`0.4.3` 让「凭据 · 额度」标签页在打开时按账户顺序串行刷新额度；`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则。验收记录同样在该文档。
+>
+> **开发分支警告：`0.4.6` 额度暂停尚未通过安全复核，不要部署。** 现有实现可能在到期恢复时覆盖从 CPA 原生界面设置的人工停用；`0.4.6` 发布工作流失败，未生成 Release。生产仍为 `0.4.4`。
 
 ## 功能
 
@@ -79,17 +81,17 @@ GitHub Release 使用 `open-design-v0.4.4`（`0.4.0` 的 tag 因 Windows 平台�
 - `PUT /error-rules` 保存策略并逐账号推送，`POST /error-rules/sync` 只重新推送，`POST /error-rules/reset` 恢复内置默认策略。空数组表示该账户不写插件自有规则（由 CPA 配置决定）。
 - 同步只重写 `request_scoped_errors` 一个键，保留宿主或运维写入的未知字段；每个账号独立报告结果，失败的账号会列在响应里，可再次同步。
 
-### 额度耗尽自动暂停
+### 额度耗尽自动暂停（开发中，不可部署）
 
-插件识别上游**明确的**额度耗尽信号后，把该账户临时移出本插件调度，到点或额度恢复后自动放回；这是插件自有状态，不是 CPA 的启用/停用开关。
+当前开发实现尝试识别上游额度耗尽并暂时阻断账户；真实 CPA 宿主的人工停用保护仍有缺陷，不应作为已完成或可用于生产的功能。
 
-- 信号很窄：仅 `402` 且 `error.code=insufficient_balance`，或 `2xx` 响应体/SSE 事件里 `coding_plan_exhausted=true`。裸 `402`、文本 `payment required`、普通 `429`、普通 `insufficient_quota` 都不触发账户级暂停，仍按错误规则换号冷却。
-- 暂停记录在凭据 auth 文件的插件自有字段 `quota_block`／`quota_revision`（参照 ClinePass 的 QuotaBlock），只改这两个键与 `disabled`，保留未知字段；`quota_block.manual_disabled` 记录暂停开始那一刻的人工状态，恢复时取它与磁盘最新值中较新者，因此**不会打开人工停用的账户**。
+- 信号很窄：仅 `error.code=insufficient_balance` 且状态为 `402`，或者同一机器码出现在 `2xx` 响应体/SSE 事件中且 `coding_plan_exhausted=true`。裸 `402`、文本 `payment required`、普通 `429`、普通 `insufficient_quota` 都不触发账户级暂停。
+- 当前尝试把 `quota_block`／`quota_revision` 写入凭据 auth 文件，并把有效停用状态返回给宿主。CPA 可能将该状态写回 `disabled`，导致原生人工停用与插件暂停无法区分；**现有恢复路径可能重新启用人工停用的账户**，须先重新设计和验证。
 - 截止时间只取结构化 `reset_at`／`Retry-After`，缺省 30 分钟，钳制 1 分钟～7 天，并受 `pause.max_seconds` 约束；迟到的重复错误只更新观察时间。
 - 到期恢复由后台任务与管理读路径的本地清扫完成，**不发起额度网络请求**；提前恢复只能通过 `POST /quota-pause/recheck`（新鲜 `funding_check=available` 才生效，多模型歧义时 409）或操作员确认的 `POST /quota-pause/resume`。
 - 配置项：`pause.enabled`（默认开启）、`pause.max_seconds`（60–604800，默认 86400）。
 
-**限制**：插件不修改 CPA 的 `disabled`，因此 CPA 界面不会显示「已停用」；上游 `402/403` 触发的是宿主**硬编码 30 分钟**冷却，插件无法提前结束；操作员在 CPA 原生界面重复停用同一账户时，插件无法可靠归因，只保证插件自己的暂停不覆盖人工停用。
+**宿主边界**：上游 `402/403` 触发的是 CPA 宿主硬编码的 30 分钟冷却，插件无法提前结束。当前暂停实现对 CPA 原生人工停用的保护未通过复核，不能承诺安全恢复。
 
 ### 请求日志与统计
 
