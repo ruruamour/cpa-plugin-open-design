@@ -3,6 +3,7 @@ package opendesign
 import (
 	"net/http"
 	"testing"
+	"time"
 )
 
 const quotaPauseFixtureBody = `{"error":{"code":"insufficient_balance","details":{"coding_plan_exhausted":true,"reset_at":"2099-01-01T00:00:00Z"}}}`
@@ -41,6 +42,44 @@ func TestQuotaPauseExecutorBufferedPaths(t *testing.T) {
 				if host.countMethod("host.http.do") != before {
 					t.Fatal("paused credential reached the upstream")
 				}
+			}
+		})
+	}
+}
+
+func TestQuotaPauseSuccessBodyHonorsRetryAfter(t *testing.T) {
+	const body = `{"error":{"code":"insufficient_balance","details":{"coding_plan_exhausted":true}}}`
+	for _, streaming := range []bool{false, true} {
+		name := "buffered"
+		if streaming {
+			name = "sse"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, host := newQuotaPauseTestService(t)
+			id := seedModels(t, s, host)
+			quotaFixtureAuthFile(t, s, host, id, nil)
+			headers := http.Header{"Retry-After": []string{"120"}}
+			req := executorPayload{AuthID: id, Model: "od-large", Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`)}
+			if streaming {
+				req.StreamID = "quota-hint-stream"
+				host.doStreams = append(host.doStreams, scriptedStream{status: 200, headers: headers, chunks: [][]byte{[]byte("data: " + body + "\n\n")}})
+				if _, err := executeStream(t, s, req); err != nil {
+					t.Fatalf("stream did not open: %v", err)
+				}
+				s.waitIdle()
+			} else {
+				host.doResponses = append(host.doResponses, fakeHTTPResponse{Status: 200, Headers: headers, Body: []byte(body)})
+				if _, err := execute(t, s, req); err == nil {
+					t.Fatal("quota error was returned as success")
+				}
+			}
+			current, _ := liveCredential(s, id)
+			if !current.quotaBlocked() {
+				t.Fatal("structured error did not create a quota block")
+			}
+			delay := current.QuotaBlock.RetryAt.Sub(current.QuotaBlock.BlockedAt)
+			if delay < 115*time.Second || delay > 121*time.Second {
+				t.Fatalf("Retry-After was lost: delay = %s", delay)
 			}
 		})
 	}

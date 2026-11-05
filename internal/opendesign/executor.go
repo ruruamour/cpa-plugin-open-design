@@ -268,7 +268,7 @@ func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel 
 		return nil, decision, upstreamProtocolError("upstream returned a non-JSON completion body", status)
 	}
 	// A 200 carrying a top-level error is an upstream failure, not a completion.
-	if errBody := successBodyError(root, status, respBody, keys...); errBody != nil {
+	if errBody := successBodyError(root, status, headers, respBody, keys...); errBody != nil {
 		return nil, decision, errBody
 	}
 	// Only an upstream usage object may populate token counts; a missing or
@@ -435,7 +435,7 @@ func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string
 				// The event body is upstream-controlled: parse it with both the keys
 				// this request was sent with and every key known right now, so a code
 				// that carries a secret cannot become the error kind or message.
-				return upstreamErrorFromResponseObserved(status, stream.StatusCode, nil, event.Data, s.redactionKeys(keys...)...)
+				return upstreamErrorFromResponseObserved(status, stream.StatusCode, stream.Headers, event.Data, s.redactionKeys(keys...)...)
 			}
 			tracker.observe(root)
 			if usage != nil {
@@ -538,7 +538,7 @@ func choiceIndex(choice map[string]any) int64 {
 
 // successBodyError converts a 2xx body that actually carries an error into the
 // matching APIError, so a 200-with-error cannot be returned as a completion.
-func successBodyError(root map[string]any, status int, raw []byte, keys ...string) error {
+func successBodyError(root map[string]any, status int, headers http.Header, raw []byte, keys ...string) error {
 	if root["error"] == nil && root["success"] != false {
 		return nil
 	}
@@ -546,7 +546,7 @@ func successBodyError(root map[string]any, status int, raw []byte, keys ...strin
 	if status < 400 {
 		status = http.StatusBadGateway
 	}
-	return upstreamErrorFromResponseObserved(status, observedStatus, nil, raw, keys...)
+	return upstreamErrorFromResponseObserved(status, observedStatus, headers, raw, keys...)
 }
 
 // readStreamError reads a non-2xx upstream body and converts it into the matching
