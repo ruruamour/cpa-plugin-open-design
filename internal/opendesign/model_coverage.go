@@ -15,6 +15,10 @@ const (
 	modelCoverageRefreshInterval = time.Minute
 	modelCoverageBudget          = 30 * time.Second
 	modelCoverageCacheCapacity   = 256
+	// quotaRecoveryBudget bounds one multi-model recovery round. It is shorter
+	// than the 30-second evidence freshness window, so a round cannot accept
+	// evidence that expires while the remaining models are checked.
+	quotaRecoveryBudget = 25 * time.Second
 )
 
 // modelCoverageResponse is deliberately smaller than quotaResponse. A model
@@ -90,6 +94,14 @@ func (s *Service) modelCoverageRequest(r ManagementRequest) (any, error) {
 }
 
 func (s *Service) readModelCoverage(credentialID, modelID, callbackID string, refresh bool) (modelCoverageResponse, error) {
+	return s.readModelCoverageContext(context.Background(), credentialID, modelID, callbackID, refresh)
+}
+
+// readModelCoverageContext bounds one refresh read (including waiting for a
+// shared in-flight refresh) by the caller's deadline. Joining a shared refresh
+// stays cancellable: expiry falls back to the cached view, which never counts as
+// fresh evidence for a recovery decision.
+func (s *Service) readModelCoverageContext(ctx context.Context, credentialID, modelID, callbackID string, refresh bool) (modelCoverageResponse, error) {
 	key := modelCoverageKey{CredentialID: credentialID, ModelID: modelID}
 	s.mu.Lock()
 	entry := s.modelCoverage[key]
@@ -125,6 +137,7 @@ func (s *Service) readModelCoverage(credentialID, modelID, callbackID string, re
 			return s.joinedModelCoverage(key, entry, done)
 		case <-invalidated:
 		case <-stop:
+		case <-ctx.Done():
 		}
 		return s.cachedModelCoverage(key)
 	}
@@ -139,7 +152,7 @@ func (s *Service) readModelCoverage(credentialID, modelID, callbackID string, re
 	stop := s.stopCh
 	s.mu.Unlock()
 
-	view := s.fetchModelCoverage(callbackID, c, modelID, entry, key, stop)
+	view := s.fetchModelCoverage(ctx, callbackID, c, modelID, entry, key, stop)
 	s.mu.Lock()
 	published := s.modelCoverage[key] == entry && entry.epoch == s.billingEpoch[credentialID] && view != nil
 	if published {
@@ -270,8 +283,10 @@ func (s *Service) modelCoverageCurrent(key modelCoverageKey, entry *modelCoverag
 	return !s.stopped && s.modelCoverage[key] == entry && entry.epoch == s.billingEpoch[key.CredentialID]
 }
 
-func (s *Service) fetchModelCoverage(callbackID string, c Credential, modelID string, entry *modelCoverageEntry, key modelCoverageKey, stop <-chan struct{}) *modelCoverageResponse {
-	ctx, cancel := context.WithTimeout(context.Background(), s.modelCoverageBudget)
+func (s *Service) fetchModelCoverage(parent context.Context, callbackID string, c Credential, modelID string, entry *modelCoverageEntry, key modelCoverageKey, stop <-chan struct{}) *modelCoverageResponse {
+	// The per-request budget is unchanged; it is clamped by the caller's own
+	// deadline so one recovery round cannot exceed its total budget.
+	ctx, cancel := context.WithTimeout(parent, s.modelCoverageBudget)
 	defer cancel()
 	s.mu.Lock()
 	if s.stopped || s.modelCoverage[key] != entry || entry.epoch != s.billingEpoch[key.CredentialID] {

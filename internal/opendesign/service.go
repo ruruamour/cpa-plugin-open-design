@@ -74,6 +74,16 @@ type Service struct {
 	quotaInflight map[quotaInFlightKey]int
 	// Recovery checks are serialized across accounts without limiting inference.
 	quotaRecoveryGate chan struct{}
+	// quotaCommitGate serializes a quota-file commit with quiesce marking the
+	// plugin stopped. It is never taken on an inference path, so it adds no
+	// concurrency limit or queue to requests.
+	quotaCommitGate chan struct{}
+	// pauseGeneration changes whenever the effective pause policy changes.
+	// Automatic recheck rounds capture it and abort before writing when the
+	// operator toggled the policy (including off -> on) meanwhile. Guarded by mu.
+	pauseGeneration uint64
+	// quotaRecoveryBudget bounds one automatic/manual multi-model round.
+	quotaRecoveryBudget time.Duration
 	// quotaInFlightTestHook is nil in production. It is per instance so a test
 	// can observe admission/release interleaving without any global state.
 	quotaInFlightTestHook atomic.Pointer[quotaInFlightTestHook]
@@ -103,6 +113,8 @@ func NewService() *Service {
 		quotaRecheckStatus:  map[string]string{},
 		quotaInflight:       map[quotaInFlightKey]int{},
 		quotaRecoveryGate:   make(chan struct{}, 1),
+		quotaCommitGate:     make(chan struct{}, 1),
+		quotaRecoveryBudget: quotaRecoveryBudget,
 		quotaPauseWake:      make(chan struct{}, 1),
 		requestLogs:         requestLogs,
 		modelTests:          map[string]modelTestRecord{},
@@ -274,6 +286,12 @@ func (s *Service) configure(raw json.RawMessage) (err error) {
 		s.stopCh = make(chan struct{})
 		s.quotaPauseStarted = false
 		s.ops.reopen()
+		// A round that started before quiesce must not resume under the new
+		// lifecycle.
+		s.pauseGeneration++
+	}
+	if s.cfg.Pause.Enabled != cfg.Pause.Enabled || s.cfg.Pause.MaxSeconds != cfg.Pause.MaxSeconds {
+		s.pauseGeneration++
 	}
 	s.cfg = cfg
 	s.loaded = true
@@ -330,6 +348,11 @@ func (s *Service) waitIdle() {
 func (s *Service) quiesce() (any, error) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	// Serialize with a quota-file commit: once stopped is published, no commit
+	// may still write a cleared block to disk. Holding the gate only while
+	// publishing the stopped flag keeps the wait short and cannot deadlock: a
+	// blocked commit re-checks stopped under the same gate and aborts.
+	s.quotaCommitGate <- struct{}{}
 	s.mu.Lock()
 	if !s.stopped {
 		close(s.stopCh)
@@ -340,6 +363,7 @@ func (s *Service) quiesce() (any, error) {
 		streams = append(streams, id)
 	}
 	s.mu.Unlock()
+	<-s.quotaCommitGate
 	for _, id := range streams {
 		s.closeUpstream(id)
 	}

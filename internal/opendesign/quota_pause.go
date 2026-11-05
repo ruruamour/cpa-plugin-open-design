@@ -2,6 +2,7 @@ package opendesign
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -154,47 +155,76 @@ func (s *Service) persistQuotaBlockLocked(id, revision string) error {
 	return nil
 }
 
-// resumeQuotaBlockLocked clears only the plugin-owned block. The caller holds
-// credentialMu; expectedRevision fences timer and preflight results against a
-// newer upstream error or manual edit. If dueOnly is true, an updated deadline
-// is checked again under the same lock, not just when scheduling the sweep.
-func (s *Service) resumeQuotaBlockLocked(id, expectedRevision string, dueOnly bool) error {
-	s.authFileMu.Lock()
-	defer s.authFileMu.Unlock()
-	s.mu.RLock()
-	current, exists := s.creds[id]
-	dir, filename := s.authDir, s.authFiles[id]
-	revoked := s.revoked[id]
-	s.mu.RUnlock()
-	if !exists || revoked || current.QuotaRevision != expectedRevision || !current.quotaBlocked() {
-		return errors.New("quota state changed")
+func quotaRecheckUnavailable() error {
+	return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
+}
+
+// quotaCommitSnapshot is everything a quota-file write must re-check after it
+// acquired authFileMu. A watcher may publish a new identity while a recheck waits
+// for that lock, and an operator may edit the file directly without the watcher
+// having reported it yet, so the in-memory check alone is not a fence.
+type quotaCommitSnapshot struct {
+	id, apiKey, controlKey, workspaceID, quotaRevision string
+	runtimeEpoch                                       uint64
+	enabled                                            bool
+	dueOnly                                            bool
+	now                                                time.Time
+}
+
+func (s *Service) quotaCommitSnapshotLocked(id string) (quotaCommitSnapshot, bool) {
+	c, exists := s.creds[id]
+	if !exists {
+		return quotaCommitSnapshot{}, false
 	}
-	if dueOnly && current.QuotaBlock.RetryAt.After(s.quotaPauseTime()) {
-		return errors.New("quota block is not due")
-	}
+	return quotaCommitSnapshot{
+		id: c.ID, apiKey: c.APIKey, controlKey: c.ControlKey, workspaceID: c.WorkspaceID,
+		quotaRevision: c.QuotaRevision, runtimeEpoch: c.runtimeEpoch,
+	}, true
+}
+
+func credentialFilePath(dir, filename string) (string, error) {
 	if dir == "" || filename == "" || filepath.Base(filename) != filename || strings.ContainsAny(filename, `/\`) {
-		return errors.New("credential file unavailable")
+		return "", errors.New("credential file unavailable")
 	}
-	path := filepath.Join(dir, filename)
+	return filepath.Join(dir, filename), nil
+}
+
+// readQuotaAuthFile reads one auth file together with its preserved fields. The
+// caller owns authFileMu, so no plugin writer can swap the file in between.
+// readQuotaAuthFile reads one auth file together with its preserved fields. The
+// caller owns authFileMu, so no plugin writer can swap the file in between.
+func readQuotaAuthFile(path, id string) ([]byte, map[string]json.RawMessage, Credential, error) {
+	var disk Credential
 	original, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return nil, nil, disk, err
 	}
-	var disk Credential
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(original, &disk) != nil || json.Unmarshal(original, &fields) != nil || fields == nil {
-		return errors.New("credential file changed")
+		return nil, nil, disk, errors.New("credential file changed")
 	}
 	if strings.TrimSpace(disk.ID) == "" {
-		disk.ID = strings.TrimSuffix(filename, ".json")
+		disk.ID = strings.TrimSuffix(filepath.Base(path), ".json")
 	}
-	if disk.Type != Provider || disk.ID != id || disk.APIKey != current.APIKey {
-		return errors.New("credential file changed")
+	if disk.Type != Provider || disk.ID != id {
+		return nil, nil, disk, errors.New("credential file changed")
 	}
-	manual := disk.Disabled
-	newRevision := newID()
+	return original, fields, disk, nil
+}
+
+// conflictingQuotaField reports a real identity conflict. An empty value in the
+// file means the writer predates that optional field, not a change.
+func conflictingQuotaField(diskValue, liveValue string) bool {
+	return diskValue != "" && diskValue != liveValue
+}
+
+// publishQuotaResumeLocked writes the cleared block and publishes the matching
+// in-memory state. The caller holds credentialMu, quotaCommitGate and
+// authFileMu, and already verified the file's ownership and identity.
+func (s *Service) publishQuotaResumeLocked(expected quotaCommitSnapshot, path string, original []byte, fields map[string]json.RawMessage, manual bool) error {
+	revision := newID()
 	delete(fields, "quota_block")
-	fields["quota_revision"] = jsonBytes(newRevision)
+	fields["quota_revision"] = jsonBytes(revision)
 	fields["disabled"] = jsonBytes(manual)
 	latest, err := os.ReadFile(path)
 	if err != nil || !bytes.Equal(original, latest) {
@@ -204,21 +234,76 @@ func (s *Service) resumeQuotaBlockLocked(id, expectedRevision string, dueOnly bo
 		return err
 	}
 	s.mu.Lock()
-	if live, ok := s.creds[id]; ok && live.APIKey == current.APIKey && live.QuotaRevision == expectedRevision {
+	if live, ok := s.creds[expected.id]; ok && live.APIKey == expected.apiKey &&
+		live.ControlKey == expected.controlKey && live.WorkspaceID == expected.workspaceID &&
+		live.runtimeEpoch == expected.runtimeEpoch && live.QuotaRevision == expected.quotaRevision {
 		live.Disabled = manual
 		live.QuotaBlock = nil
-		live.QuotaRevision = newRevision
+		live.QuotaRevision = revision
 		// Fence errors from requests admitted before the block was cleared.
-		s.credentialEpoch[id]++
-		live.runtimeEpoch = s.credentialEpoch[id]
-		s.invalidateBillingLocked(id)
-		s.clearModelTestsLocked(id)
-		s.creds[id] = live
-		delete(s.quotaPauseErrors, id)
-		delete(s.quotaRecheckStatus, id)
+		s.credentialEpoch[expected.id]++
+		live.runtimeEpoch = s.credentialEpoch[expected.id]
+		s.invalidateBillingLocked(expected.id)
+		s.clearModelTestsLocked(expected.id)
+		s.creds[expected.id] = live
+		delete(s.quotaPauseErrors, expected.id)
+		delete(s.quotaRecheckStatus, expected.id)
 	}
 	s.mu.Unlock()
 	return nil
+}
+
+// resumeQuotaBlockLocked clears only the plugin-owned block for the explicit
+// operator resume. Caller holds credentialMu; expectedRevision fences timer and
+// preflight results against a newer upstream error or manual edit. If dueOnly is
+// true, an updated deadline is checked again under the same lock, not just when
+// scheduling the sweep.
+//
+// The explicit resume deliberately keeps its operator semantics: it does not
+// require recovery evidence, only that the identity it was requested for is
+// still the published one. It is serialized with quiesce through quotaCommitGate
+// so no file write can land after the plugin reported itself stopped.
+func (s *Service) resumeQuotaBlockLocked(id, expectedRevision string, dueOnly bool) error {
+	s.quotaCommitGate <- struct{}{}
+	defer func() { <-s.quotaCommitGate }()
+	s.authFileMu.Lock()
+	defer s.authFileMu.Unlock()
+	s.mu.RLock()
+	current, exists := s.creds[id]
+	dir, filename := s.authDir, s.authFiles[id]
+	revoked, stopped := s.revoked[id], s.stopped
+	s.mu.RUnlock()
+	if stopped {
+		// Quiesce already closed the lifecycle; a write here would land after the
+		// plugin reported itself stopped.
+		return quotaRecheckUnavailable()
+	}
+	if !exists || revoked || current.QuotaRevision != expectedRevision || !current.quotaBlocked() {
+		return errors.New("quota state changed")
+	}
+	if dueOnly && current.QuotaBlock.RetryAt.After(s.quotaPauseTime()) {
+		return errors.New("quota block is not due")
+	}
+	path, err := credentialFilePath(dir, filename)
+	if err != nil {
+		return err
+	}
+	original, fields, disk, err := readQuotaAuthFile(path, id)
+	if err != nil {
+		return err
+	}
+	// The file may have been edited (or rewritten by the host) after the last
+	// in-memory publish. Refuse to clear a block that the disk does not still
+	// describe with this exact identity. Optional fields are only rejected when
+	// the file actually carries a conflicting value, so an older file that
+	// predates them keeps working.
+	if disk.APIKey != current.APIKey || disk.QuotaBlock == nil ||
+		conflictingQuotaField(disk.WorkspaceID, current.WorkspaceID) ||
+		conflictingQuotaField(disk.QuotaRevision, current.QuotaRevision) {
+		return errors.New("credential file changed")
+	}
+	expected, _ := s.quotaCommitSnapshotLocked(id)
+	return s.publishQuotaResumeLocked(expected, path, original, fields, disk.Disabled)
 }
 
 // quotaPauseTime obtains the clock pointer under mu. Quota tests replace that
@@ -307,6 +392,14 @@ func (s *Service) quotaPauseAction(r ManagementRequest) (any, error) {
 	return managementJSON(http.StatusOK, s.quotaPauseResponse())
 }
 
+// quotaRecoveryProof is one model's successful preflight within a recovery
+// round. It is re-validated against a fresh clock at commit time.
+type quotaRecoveryProof struct {
+	view    modelCoverageResponse
+	model   string
+	started time.Time
+}
+
 // recheckQuotaBlock runs an operator-requested check even before the deadline.
 func (s *Service) recheckQuotaBlock(callbackID, id string) error {
 	return s.recheckQuotaBlockMode(callbackID, id, false)
@@ -325,8 +418,11 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 	case s.quotaRecoveryGate <- struct{}{}:
 		defer func() { <-s.quotaRecoveryGate }()
 	case <-stop:
-		return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
+		return quotaRecheckUnavailable()
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.quotaRecoveryBudget)
+	defer cancel()
 
 	now := s.quotaPauseTime()
 	s.mu.RLock()
@@ -336,10 +432,11 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 	inflight := s.quotaHasInFlightLocked(current)
 	syncPending := s.quotaPauseErrors[id] != ""
 	enabled := s.cfg.pauseSettings().enabled
+	generation := s.pauseGeneration
 	stopped := s.stopped
 	s.mu.RUnlock()
 	if stopped {
-		return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
+		return quotaRecheckUnavailable()
 	}
 	if !exists || revoked {
 		return fail(http.StatusNotFound, "credential not found")
@@ -364,19 +461,22 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 	if !complete {
 		return localFail(http.StatusConflict, "quota_recheck_ambiguous", "耗尽模型集合不完整，无法自动确认恢复")
 	}
-	type proof struct {
-		view    modelCoverageResponse
-		model   string
-		started time.Time
-	}
-	proofs := make([]proof, 0, len(models))
+	proofs := make([]quotaRecoveryProof, 0, len(models))
 	member := ""
 	for _, model := range models {
+		if err := ctx.Err(); err != nil {
+			return localFail(http.StatusConflict, "quota_recheck_timeout", "官方复查超时，请稍后重试")
+		}
+		if dueOnly && !s.quotaRecheckRoundCurrent(id, generation, billingEpoch) {
+			// The operator turned the policy off (or it was turned off and back on)
+			// while this round ran; the old round must not continue or commit.
+			return localFail(http.StatusConflict, "quota_recheck_not_due", "额度暂停策略已变化，已放弃本轮复查")
+		}
 		s.mu.RLock()
 		clock := s.modelCoverageNow
 		s.mu.RUnlock()
 		started := clock()
-		view, err := s.readModelCoverage(id, model, callbackID, true)
+		view, err := s.readModelCoverageContext(ctx, id, model, callbackID, true)
 		if err != nil {
 			return err
 		}
@@ -397,44 +497,95 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 			return localFail(http.StatusConflict, "quota_recheck_identity", "不同模型的官方复查身份不一致")
 		}
 		member = view.evidence.workspaceMemberID
-		proofs = append(proofs, proof{view: view, model: model, started: started})
+		proofs = append(proofs, quotaRecoveryProof{view: view, model: model, started: started})
 	}
 
 	// Match the global lock order used by model/config updates. No new same-key
 	// inference can be admitted while the block remains published in memory.
-	s.configMu.Lock()
-	defer s.configMu.Unlock()
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
-	now = s.quotaPauseTime()
-	s.mu.RLock()
-	live, exists := s.creds[id]
-	unchanged := exists && !s.revoked[id] && !s.stopped && live.APIKey == current.APIKey &&
-		live.ControlKey == current.ControlKey && live.WorkspaceID == current.WorkspaceID &&
-		live.runtimeEpoch == current.runtimeEpoch && live.QuotaRevision == current.QuotaRevision &&
-		s.billingEpoch[id] == billingEpoch && live.quotaBlocked() && !s.quotaHasInFlightLocked(live) && s.quotaPauseErrors[id] == ""
-	if dueOnly {
-		unchanged = unchanged && s.cfg.pauseSettings().enabled && !live.QuotaBlock.RetryAt.After(now)
+	if err := s.commitQuotaRecovery(current, block, proofs, generation, dueOnly); err != nil {
+		return err
 	}
+	return nil
+}
+
+// quotaRecheckRoundCurrent reports whether an automatic round may continue. It
+// fails closed when the policy changed, the credential identity changed, or the
+// block disappeared.
+func (s *Service) quotaRecheckRoundCurrent(id string, generation uint64, billingEpoch uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	c, exists := s.creds[id]
+	return exists && !s.revoked[id] && !s.stopped && s.cfg.pauseSettings().enabled &&
+		s.pauseGeneration == generation && s.billingEpoch[id] == billingEpoch && c.quotaBlocked()
+}
+
+// commitQuotaRecovery writes the cleared block only after re-validating every
+// fence at the actual write point: the credential identity and revision, the
+// in-flight count, the sync state, the policy generation (for automatic rounds),
+// the on-disk identity, and the freshness of every proof. The caller holds
+// credentialMu; this function takes quotaCommitGate and authFileMu.
+func (s *Service) commitQuotaRecovery(current Credential, block *QuotaBlock, proofs []quotaRecoveryProof, generation uint64, dueOnly bool) error {
+	s.quotaCommitGate <- struct{}{}
+	defer func() { <-s.quotaCommitGate }()
+	s.authFileMu.Lock()
+	defer s.authFileMu.Unlock()
+
+	now := s.quotaPauseTime()
+	s.mu.RLock()
+	live, exists := s.creds[current.ID]
+	dir, filename := s.authDir, s.authFiles[current.ID]
+	stopped := s.stopped
+	inflight := s.quotaHasInFlightLocked(live)
+	syncPending := s.quotaPauseErrors[current.ID] != ""
 	clock := s.modelCoverageNow
 	s.mu.RUnlock()
-	if !unchanged {
+	if stopped {
+		return quotaRecheckUnavailable()
+	}
+	if !exists || !live.quotaBlocked() || live.APIKey != current.APIKey ||
+		live.ControlKey != current.ControlKey || live.WorkspaceID != current.WorkspaceID ||
+		live.runtimeEpoch != current.runtimeEpoch || live.QuotaRevision != current.QuotaRevision ||
+		inflight || syncPending {
 		return localFail(http.StatusConflict, "quota_state_changed", "额度暂停状态或凭据已变化，请刷新后重试")
 	}
-	// For a large model set, also reject evidence that aged out while the other
-	// models were checked. Never extrapolate one model's result to another.
+	if dueOnly && (!s.cfg.pauseSettings().enabled || live.QuotaBlock.RetryAt.After(now) || s.pauseGeneration != generation) {
+		return localFail(http.StatusConflict, "quota_recheck_not_due", "额度暂停策略已变化，已放弃本轮复查")
+	}
+	path, err := credentialFilePath(dir, filename)
+	if err != nil {
+		return err
+	}
+	original, fields, disk, err := readQuotaAuthFile(path, current.ID)
+	if err != nil {
+		return err
+	}
+	// A direct file edit (or a delayed host rewrite) can change the identity the
+	// proof was made for without any watcher callback. Refuse to clear a block
+	// the disk no longer describes with this exact identity and revision.
+	if disk.APIKey != current.APIKey || disk.QuotaBlock == nil ||
+		conflictingQuotaField(disk.ControlKey, current.ControlKey) ||
+		conflictingQuotaField(disk.WorkspaceID, current.WorkspaceID) ||
+		conflictingQuotaField(disk.QuotaRevision, current.QuotaRevision) {
+		return localFail(http.StatusConflict, "quota_state_changed", "凭据文件与本次复查身份不一致，请刷新后重试")
+	}
+	// Re-check every proof's freshness at the write point: acquiring authFileMu
+	// may have taken long enough for the earliest model's evidence to expire.
 	finished := clock()
 	for _, item := range proofs {
 		one := cloneQuotaBlock(block)
 		one.ModelID, one.MultipleModels = item.model, false
-		if !quotaRecoveryProven(item.view, one, id, current.WorkspaceID, item.started, finished) {
+		if !quotaRecoveryProven(item.view, one, current.ID, current.WorkspaceID, item.started, finished) {
 			return localFail(http.StatusConflict, "quota_recheck_unproven", "官方复查结果已过期，请稍后重试")
 		}
 	}
-	if err := s.resumeQuotaBlockLocked(id, current.QuotaRevision, dueOnly); err != nil {
-		return localFail(http.StatusBadGateway, "host_contract_error", "额度复查通过，但凭据文件未能更新")
+	expected := quotaCommitSnapshot{
+		id: current.ID, apiKey: current.APIKey, controlKey: current.ControlKey,
+		workspaceID: current.WorkspaceID, quotaRevision: current.QuotaRevision,
+		runtimeEpoch: current.runtimeEpoch,
 	}
-	return nil
+	return s.publishQuotaResumeLocked(expected, path, original, fields, disk.Disabled)
 }
 
 // setQuotaRecheckStatus stores only allowlisted, non-sensitive reason codes and

@@ -134,6 +134,10 @@ func (s *Service) updateConfigRequest(r ManagementRequest) (any, error) {
 		return managementError(http.StatusInternalServerError, "could not persist plugin config")
 	}
 	s.mu.Lock()
+	if s.cfg.Pause.Enabled != cfg.Pause.Enabled || s.cfg.Pause.MaxSeconds != cfg.Pause.MaxSeconds {
+		// Abort any automatic recheck round that captured the old policy.
+		s.pauseGeneration++
+	}
 	s.cfg.Logs = cfg.Logs
 	s.cfg.Pause = cfg.Pause
 	s.mu.Unlock()
