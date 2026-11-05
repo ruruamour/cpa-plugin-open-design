@@ -133,16 +133,33 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 			if snapshot := current.QuotaBlock.ManualDisabled; snapshot != nil {
 				manual = *snapshot
 			}
-			delete(s.quotaDiskStale, c.ID)
 			if !resolvedFile || !c.quotaBlocked() || c.QuotaRevision != current.QuotaRevision ||
 				c.Disabled != manual || !bytes.Equal(jsonBytes(c.QuotaBlock), jsonBytes(current.QuotaBlock)) {
 				s.quotaPauseErrors[c.ID] = quotaPauseSyncError
+				// A pending clear repair still tells a concurrent new pause that
+				// this disk body's manual choice may be stale. Keep the marker
+				// until a matching paused body has actually reached disk.
 			} else {
+				delete(s.quotaDiskStale, c.ID)
 				delete(s.quotaPauseErrors, c.ID)
 			}
 			c.QuotaBlock = cloneQuotaBlock(current.QuotaBlock)
 			c.QuotaRevision = current.QuotaRevision
 			c.Disabled = manual
+		case current.QuotaBlock == nil && !c.quotaBlocked() && current.QuotaRevision != "" && c.QuotaRevision == "":
+			// Missing optional fields cannot erase a known cleared-state revision.
+			// In particular, a pre-pause host save may arrive after resume. Keep
+			// that evidence only for the same inference key; without evidence we
+			// must still adopt a valid incoming pause (the next case).
+			c.QuotaRevision = current.QuotaRevision
+			// An unversioned body cannot distinguish a stale enable from a real
+			// operator change. Preserve either side's disable choice.
+			c.Disabled = current.Disabled || c.Disabled
+			if c.QuotaBlock == nil {
+				// Restore the revision on disk too, so a restart after repair does
+				// not forget the clear. Do not erase an invalid/foreign block here.
+				s.quotaDiskStale[c.ID] = true
+			}
 		case current.APIKey == c.APIKey && c.quotaBlocked() && current.QuotaRevision == "":
 			// An unversioned live state does not prove that this on-disk block is
 			// stale. Adopt it rather than deleting a potentially legitimate pause.
@@ -169,6 +186,12 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 			c.QuotaRevision = current.QuotaRevision
 			c.Disabled = current.Disabled
 		}
+	} else {
+		// A deleted credential can be re-imported under the same ID. Its old
+		// retry markers must not attach to the new identity; normalization below
+		// may still create a fresh sync error for the newly imported block.
+		delete(s.quotaPauseErrors, c.ID)
+		delete(s.quotaDiskStale, c.ID)
 	}
 	if block, changed := normalizeQuotaBlock(c, now); changed {
 		c.QuotaBlock = block
@@ -341,7 +364,12 @@ func (s *Service) saveCredential(c Credential, filename string) error {
 	}
 	// The host accepted this body, so it is now what both disk and the host
 	// record hold. Publishing here also covers a save whose reentrant
-	// auth.parse never ran.
+	// auth.parse never ran. Retry markers belong to the previous inference key,
+	// not merely the ID, and must not follow a successful key replacement.
+	if previous, exists := s.creds[c.ID]; !exists || previous.APIKey != c.APIKey {
+		delete(s.quotaPauseErrors, c.ID)
+		delete(s.quotaDiskStale, c.ID)
+	}
 	s.storeCredentialLocked(c)
 	// The written file carries exactly this credential's rules, so the policy is
 	// known to be in sync for this account.

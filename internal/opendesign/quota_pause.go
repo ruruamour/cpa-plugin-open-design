@@ -92,10 +92,9 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 
 	sort.Slice(changed, func(i, j int) bool { return changed[i].id < changed[j].id })
 	for _, item := range changed {
-		// A brand-new block inherits the file's disable choice; an existing block
-		// keeps its recorded choice even if the file was rewritten meanwhile.
-		err := s.persistQuotaBlockLocked(item.id, item.revision, !item.existing)
-		s.setQuotaPauseSyncError(item.id, item.revision, err != nil)
+		// A brand-new block normally inherits the file's disable choice; an
+		// existing block or a known-stale file requires the conservative merge.
+		_ = s.persistQuotaBlockLocked(item.id, item.revision, !item.existing)
 	}
 	if len(changed) != 0 {
 		s.wakeQuotaPauseWorker()
@@ -106,15 +105,16 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 // file, preserving host/operator extensions.
 //
 // manualFromDisk decides where the operator's disable choice comes from. A newly
-// created block takes it from the file, because an operator may have disabled the
-// account there before the pause existed (and the plugin console is not the only
-// editor). A block that already exists takes it from the block snapshot: at that
+// created block takes it from the file unless the file is already known stale,
+// because an operator may have disabled the account there before the pause
+// existed (and the plugin console is not the only editor). A block that already
+// exists takes it from the block snapshot: at that
 // point the file may be a host rewrite of a pre-pause body whose `disabled` is
 // only CPA's projection, so trusting it would silently drop a plugin-console
 // choice that the snapshot still records.
 //
 // Caller holds credentialMu; never calls the host while holding authFileMu.
-func (s *Service) persistQuotaBlockLocked(id, revision string, manualFromDisk bool) error {
+func (s *Service) persistQuotaBlockLocked(id, revision string, manualFromDisk bool) (result error) {
 	// Follow the global order credentialMu -> quotaCommitGate -> authFileMu so a
 	// pause write cannot interleave with a recovery/resume commit.
 	s.quotaCommitGate <- struct{}{}
@@ -124,8 +124,28 @@ func (s *Service) persistQuotaBlockLocked(id, revision string, manualFromDisk bo
 	s.mu.RLock()
 	current, exists := s.creds[id]
 	dir, filename := s.authDir, s.authFiles[id]
-	revoked := s.revoked[id]
+	revoked, stale := s.revoked[id], s.quotaDiskStale[id]
 	s.mu.RUnlock()
+	// Update synchronization bookkeeping before releasing authFileMu. Otherwise
+	// a watcher can mark a newer divergence after the write, only for the old
+	// caller to clear that marker/error after the watcher has returned.
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		live, ok := s.creds[id]
+		if !ok || s.revoked[id] || live.APIKey != current.APIKey ||
+			live.QuotaRevision != revision || !live.quotaBlocked() {
+			return
+		}
+		if result != nil {
+			s.quotaPauseErrors[id] = quotaPauseSyncError
+		} else {
+			delete(s.quotaPauseErrors, id)
+			// A successfully persisted new block supersedes a pending repair of
+			// the old cleared state. On failure, retain it and retry the block.
+			delete(s.quotaDiskStale, id)
+		}
+	}()
 	if !exists || revoked || current.QuotaRevision != revision || !current.quotaBlocked() {
 		return errors.New("quota state changed")
 	}
@@ -151,7 +171,10 @@ func (s *Service) persistQuotaBlockLocked(id, revision string, manualFromDisk bo
 	// The live block owns the operator's choice. Disk `disabled` is only a
 	// projection that CPA may have rewritten (including from a pre-pause
 	// snapshot), so trusting it here would silently drop a plugin-console disable.
-	manual := manualChoice(current.QuotaBlock, disk, manualFromDisk)
+	// A new block normally takes the latest manual choice from disk. If the
+	// cleared file was already known stale, however, that disk body can be an
+	// older pause or pre-pause save; retain the restrictive union instead.
+	manual := manualChoice(current.QuotaBlock, disk, manualFromDisk && !stale)
 	block := cloneQuotaBlock(current.QuotaBlock)
 	block.ManualDisabled = &manual
 	fields["disabled"] = jsonBytes(manual)
@@ -327,12 +350,12 @@ func (s *Service) persistQuotaResumeLocked(id string) error {
 	s.mu.RLock()
 	current, exists := s.creds[id]
 	dir, filename := s.authDir, s.authFiles[id]
-	revoked, stopped := s.revoked[id], s.stopped
+	revoked, stopped, stale := s.revoked[id], s.stopped, s.quotaDiskStale[id]
 	s.mu.RUnlock()
 	if stopped {
 		return errors.New("quota state changed")
 	}
-	if !exists || revoked || current.QuotaBlock != nil || current.QuotaRevision == "" {
+	if !exists || revoked || !stale || current.QuotaBlock != nil || current.QuotaRevision == "" {
 		return errors.New("quota state changed")
 	}
 	path, err := credentialFilePath(dir, filename)
@@ -346,28 +369,33 @@ func (s *Service) persistQuotaResumeLocked(id string) error {
 	if disk.APIKey != current.APIKey {
 		return errors.New("credential file changed")
 	}
+	manual := current.Disabled
 	if disk.QuotaBlock == nil {
-		// Another writer may already have restored the exact cleared state.
-		// Retire the marker without rewriting, but never treat a different manual
-		// choice or revision as proof that this is the same published state.
-		if disk.QuotaRevision != current.QuotaRevision || disk.Disabled != current.Disabled {
-			return errors.New("credential file changed")
+		if disk.QuotaRevision != "" {
+			// A matching cleared file needs no write. A conflicting version or
+			// manual choice is not evidence that the disk is ours to overwrite.
+			if disk.QuotaRevision != current.QuotaRevision || disk.Disabled != current.Disabled {
+				return errors.New("credential file changed")
+			}
+			s.mu.Lock()
+			if live, ok := s.creds[id]; ok && live.APIKey == current.APIKey && live.QuotaBlock == nil &&
+				live.QuotaRevision == current.QuotaRevision && live.Disabled == current.Disabled {
+				delete(s.quotaDiskStale, id)
+			}
+			s.mu.Unlock()
+			return nil
 		}
-		s.mu.Lock()
-		if live, ok := s.creds[id]; ok && live.APIKey == current.APIKey && live.QuotaBlock == nil &&
-			live.QuotaRevision == current.QuotaRevision && live.Disabled == current.Disabled {
-			delete(s.quotaDiskStale, id)
-		}
-		s.mu.Unlock()
-		return nil
-	}
-	if !quotaBlockBelongsToKey(disk.QuotaBlock, disk.APIKey) {
+		// An old unversioned clear lost the revision, but not necessarily a
+		// later manual disable. Never turn either side back on during repair.
+		manual = manual || disk.Disabled
+	} else if !quotaBlockBelongsToKey(disk.QuotaBlock, disk.APIKey) {
+		// An invalid or foreign block is not ours to remove.
 		return errors.New("credential file changed")
 	}
 	revision := newID()
 	delete(fields, "quota_block")
 	fields["quota_revision"] = jsonBytes(revision)
-	fields["disabled"] = jsonBytes(current.Disabled)
+	fields["disabled"] = jsonBytes(manual)
 	latest, err := os.ReadFile(path)
 	if err != nil || !bytes.Equal(original, latest) {
 		return errors.New("credential file changed")
@@ -375,14 +403,15 @@ func (s *Service) persistQuotaResumeLocked(id string) error {
 	if err := writeJSONAtomic(path, fields); err != nil {
 		return err
 	}
-	// The effective state did not change, so the runtime epochs stay untouched:
-	// this is a file repair, not a resume. Only the revision advances so a later
-	// stale body is recognised as out of date again.
+	// This is a file repair, not a resume. The revision advances so a later
+	// stale body is recognised again; if a disk-only disable was discovered,
+	// storeCredentialLocked also fences requests admitted before that change.
 	s.mu.Lock()
 	if live, ok := s.creds[id]; ok && live.APIKey == current.APIKey && live.QuotaBlock == nil &&
-		live.QuotaRevision == current.QuotaRevision {
+		live.QuotaRevision == current.QuotaRevision && live.Disabled == current.Disabled {
+		live.Disabled = manual
 		live.QuotaRevision = revision
-		s.creds[id] = live
+		s.storeCredentialLocked(live)
 		// Clear the marker in the same critical section as the revision advance.
 		// A later attempt to clear it using the old revision is correctly fenced.
 		delete(s.quotaDiskStale, id)
@@ -740,7 +769,11 @@ func (s *Service) commitQuotaRecovery(current Credential, block *QuotaBlock, pro
 		workspaceID: current.WorkspaceID, quotaRevision: current.QuotaRevision,
 		runtimeEpoch: current.runtimeEpoch,
 	}
-	return s.publishQuotaResumeLocked(expected, path, original, fields, disk.Disabled)
+	// A host can rewrite an older paused body after the console changed the
+	// manual choice, without its watcher having run yet. A missing revision is
+	// compatible, not evidence that disk's manual enable is newer than live.
+	manual := manualChoice(live.QuotaBlock, disk, false)
+	return s.publishQuotaResumeLocked(expected, path, original, fields, manual)
 }
 
 // setQuotaRecheckStatus stores only allowlisted, non-sensitive reason codes and
@@ -830,39 +863,6 @@ func (s *Service) wakeQuotaPauseWorker() {
 	}
 }
 
-// setQuotaPauseSyncError records a persistence failure for a paused credential.
-// It never clears the state of a newer block revision.
-func (s *Service) setQuotaPauseSyncError(id, revision string, failed bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	current, exists := s.creds[id]
-	if !exists || current.QuotaRevision != revision {
-		return
-	}
-	if failed {
-		s.quotaPauseErrors[id] = quotaPauseSyncError
-	} else {
-		delete(s.quotaPauseErrors, id)
-	}
-}
-
-// setQuotaDiskStale tracks whether the auth file still matches the published
-// cleared state. A later resume or a new block invalidates the marker through
-// the revision comparison.
-func (s *Service) setQuotaDiskStale(id, revision string, stale bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	current, exists := s.creds[id]
-	if !exists || current.QuotaRevision != revision {
-		return
-	}
-	if stale {
-		s.quotaDiskStale[id] = true
-	} else {
-		delete(s.quotaDiskStale, id)
-	}
-}
-
 // startQuotaPauseWorker retries failed file writes and starts serial official
 // preflights for due blocks. A deadline by itself never clears a block.
 func (s *Service) startQuotaPauseWorker() {
@@ -926,22 +926,16 @@ func (s *Service) sweepQuotaBlocks(stop <-chan struct{}) {
 		default:
 		}
 		s.credentialMu.Lock()
-		var err error
 		if item.blocked {
-			err = s.persistQuotaBlockLocked(item.id, item.revision, false)
+			_ = s.persistQuotaBlockLocked(item.id, item.revision, false)
 		} else {
 			// The live state is "no block", so the file may only be repaired by
 			// republishing that same cleared state. This is not a resume: it never
 			// removes a live block and never needs recovery evidence, it only
 			// prevents a stale paused body from resurrecting after a restart.
-			err = s.persistQuotaResumeLocked(item.id)
+			_ = s.persistQuotaResumeLocked(item.id)
 		}
 		s.credentialMu.Unlock()
-		if item.blocked {
-			s.setQuotaPauseSyncError(item.id, item.revision, err != nil)
-		} else {
-			s.setQuotaDiskStale(item.id, item.revision, err != nil)
-		}
 	}
 }
 
