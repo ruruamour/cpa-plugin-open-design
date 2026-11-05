@@ -211,7 +211,7 @@ func (s *Service) statusResponse() (any, error) {
 	s.mu.RLock()
 	credentials := make([]map[string]any, 0, len(s.creds))
 	for _, c := range s.creds {
-		credentials = append(credentials, credentialView(c, now))
+		credentials = append(credentials, credentialView(c, now, s.quotaPauseErrors[c.ID]))
 	}
 	s.mu.RUnlock()
 	sortCredentials(credentials)
@@ -238,7 +238,39 @@ func stringOf(v any) string {
 	return s
 }
 
-func credentialView(c Credential, now time.Time) map[string]any {
+// quotaPauseView builds the console-facing detail of one plugin-owned pause.
+// It carries no key material: reason/source are fixed plugin codes, and
+// syncError is only ever the fixed, redacted persistence failure recorded in
+// quotaPauseErrors. The list surface (GET /quota-pause) and the per-credential
+// views (GET /status, /credentials and mutation responses) share this shape so
+// a synchronization failure can never be visible on only one of them.
+func quotaPauseView(c Credential, now time.Time, syncError string) map[string]any {
+	block := c.QuotaBlock
+	pause := map[string]any{
+		"reason":          block.Reason,
+		"source":          block.Source,
+		"blocked_at":      block.BlockedAt,
+		"observed_at":     block.ObservedAt,
+		"resume_at":       block.RetryAt,
+		"manual_disabled": c.Disabled,
+		"model_id":        block.ModelID,
+		"multiple_models": block.MultipleModels,
+	}
+	if remaining := block.RetryAt.Sub(now); remaining > 0 {
+		pause["remaining_seconds"] = int64(remaining / time.Second)
+	} else {
+		// The deadline is a review hint, not a recovery. Report that a recheck is
+		// now due instead of a countdown, and never claim the account is enabled
+		// again: nothing in the plugin verifies the upstream quota here.
+		pause["awaiting_recheck"] = true
+	}
+	if syncError != "" {
+		pause["error"] = syncError
+	}
+	return pause
+}
+
+func credentialView(c Credential, now time.Time, syncError string) map[string]any {
 	view := map[string]any{
 		"id": c.ID, "label": c.Label, "disabled": c.Disabled,
 		"billing_configured": c.ControlKey != "", "workspace_id": c.WorkspaceID,
@@ -251,21 +283,7 @@ func credentialView(c Credential, now time.Time) map[string]any {
 	view["quota_paused"] = blocked
 	view["effective_disabled"] = c.effectiveDisabled()
 	if blocked {
-		block := c.QuotaBlock
-		pause := map[string]any{
-			"reason":          block.Reason,
-			"source":          block.Source,
-			"blocked_at":      block.BlockedAt,
-			"observed_at":     block.ObservedAt,
-			"resume_at":       block.RetryAt,
-			"manual_disabled": c.Disabled,
-			"model_id":        block.ModelID,
-			"multiple_models": block.MultipleModels,
-		}
-		if remaining := block.RetryAt.Sub(now); remaining > 0 {
-			pause["remaining_seconds"] = int64(remaining / time.Second)
-		}
-		view["quota_pause"] = pause
+		view["quota_pause"] = quotaPauseView(c, now, syncError)
 	}
 	return view
 }
@@ -275,7 +293,7 @@ func (s *Service) listCredentials() (any, error) {
 	s.mu.RLock()
 	items := make([]map[string]any, 0, len(s.creds))
 	for _, c := range s.creds {
-		items = append(items, credentialView(c, now))
+		items = append(items, credentialView(c, now, s.quotaPauseErrors[c.ID]))
 	}
 	s.mu.RUnlock()
 	sortCredentials(items)
@@ -362,9 +380,11 @@ func (s *Service) createCredential(in credentialInput) (any, error) {
 	c = s.creds[c.ID]
 	s.authFiles[c.ID] = filename
 	delete(s.revoked, c.ID)
+	syncError := s.quotaPauseErrors[c.ID]
 	s.mu.Unlock()
-	// The response deliberately omits the key.
-	return managementJSON(http.StatusCreated, credentialView(c, s.quotaPauseTime()))
+	// The response deliberately omits the key; a pause sync failure is reported
+	// with the same fixed, redacted text as GET /status.
+	return managementJSON(http.StatusCreated, credentialView(c, s.quotaPauseTime(), syncError))
 }
 
 func (s *Service) updateCredential(id string, in credentialInput) (any, error) {
@@ -432,8 +452,9 @@ func (s *Service) updateCredential(id string, in credentialInput) (any, error) {
 		s.invalidateBillingLocked(c.ID)
 	}
 	s.authFiles[c.ID] = filename
+	syncError := s.quotaPauseErrors[c.ID]
 	s.mu.Unlock()
-	return managementJSON(http.StatusOK, credentialView(c, s.quotaPauseTime()))
+	return managementJSON(http.StatusOK, credentialView(c, s.quotaPauseTime(), syncError))
 }
 
 // deleteCredential removes the auth file and revokes the id so a queued watcher

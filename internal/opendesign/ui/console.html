@@ -586,7 +586,15 @@
               </label>
               <button class="button primary" id="savePauseConfig" type="submit">保存额度暂停设置</button>
             </form>
-            <p class="hint" style="margin-top: 8px;">开发中：人工停用保护尚未通过 CPA 宿主安全复核，请勿在生产启用。CPA 自身的 402/403 冷却也不会因插件解除暂停而提前结束。</p>
+            <p class="hint" style="margin-top: 8px;">
+              开发中，请勿在生产启用。暂停只拦截插件的本地调度，不代表官方额度已恢复：恢复必须由一次官方新鲜复查确认，并不是到点必定启用；到点自动复查尚未实现，到点后仍需人工复查或解除。
+            </p>
+            <p class="hint" style="margin-top: 8px;">
+              暂停期间请在本控制台启用/停用账户，不要使用 CPA 原生界面：原生入口和并发文件改写会直接写入同一份凭据文件，插件无法可靠区分一次停用是插件引发、宿主引发还是人工操作，两边同时改动可能让暂停与启用状态互相覆盖。未配置官方 controlKey（或缺少 Workspace ID）时无法自动复查额度，仍须人工处理。
+            </p>
+            <p class="hint" style="margin-top: 8px;">
+              CPA 自身的 402/403 冷却属于宿主，不会因插件解除暂停而提前结束；额度恢复后仍以 CPA 的实际调度结果为准。
+            </p>
           </div>
           <div class="read-only">
             <h3>宿主代理 / 路由（只读）</h3>

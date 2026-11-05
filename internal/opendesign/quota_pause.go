@@ -244,20 +244,10 @@ func (s *Service) quotaPauseResponse() map[string]any {
 		if s.revoked[id] || !c.quotaBlocked() {
 			continue
 		}
-		block := c.QuotaBlock
-		pause := map[string]any{
-			"credential_id": c.ID, "label": c.Label,
-			"reason": block.Reason, "source": block.Source,
-			"blocked_at": block.BlockedAt, "observed_at": block.ObservedAt, "resume_at": block.RetryAt,
-			"manual_disabled": c.Disabled, "effective_disabled": c.effectiveDisabled(),
-			"model_id": block.ModelID, "multiple_models": block.MultipleModels,
-		}
-		if remaining := block.RetryAt.Sub(now); remaining > 0 {
-			pause["remaining_seconds"] = int64(remaining / time.Second)
-		}
-		if detail := s.quotaPauseErrors[id]; detail != "" {
-			pause["error"] = detail
-		}
+		pause := quotaPauseView(c, now, s.quotaPauseErrors[id])
+		pause["credential_id"] = c.ID
+		pause["label"] = c.Label
+		pause["effective_disabled"] = c.effectiveDisabled()
 		pauses = append(pauses, pause)
 	}
 	s.mu.RUnlock()

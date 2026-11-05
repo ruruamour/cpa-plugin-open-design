@@ -49,12 +49,12 @@ OpenDesign 生产接口：
 
 | 方法与路径 | 用途 |
 | --- | --- |
-| `GET /status` | 插件状态、模型映射与账户的额度暂停字段 |
+| `GET /status` | 插件状态、模型映射与账户的额度暂停字段（含暂停同步失败提示；不含任何 key 或指纹） |
 | `GET` / `POST` / `DELETE /credentials` | 账户列表、创建或更新、删除 |
 | `GET /upstream-models` | 读取 OpenDesign `GET /models` 候选 |
 | `GET` / `POST /models` | 读取或保存模型映射 |
 | `POST /models/reasoning` | 保存单个模型的思考强度映射（完整替换） |
-| `GET /quota-pause` | 当前额度暂停列表（只读；顺带重试失败的本地写入） |
+| `GET /quota-pause` | 当前额度暂停列表（只读；顺带重试失败的本地写入，不查询官方额度） |
 | `POST /quota-pause/resume` | 手动解除某个账户的额度暂停（只清插件标记） |
 | `POST /quota-pause/recheck` | 用一次官方模型预检证明额度恢复后提前解除暂停 |
 | `GET /quota?credential_id=<id>` | 共享钱包／套餐窗口缓存；`refresh=1` 手动查询 |
@@ -70,6 +70,13 @@ OpenDesign 生产接口：
 | `POST /model-test` | 显式单次非流式模型测试 |
 
 `/logs`、`/logs/stats`、`/logs/clear` 是日志路由的别名。
+
+额度暂停在控制台的分工（限制说明，不是承诺）：
+
+- 暂停详情（`quota_pause`）同时出现在 `GET /status`、`GET /credentials` 以及创建／更新凭据的响应里，字段一致且不含 key；`quotaPauseErrors` 只以固定的脱敏文案出现在 `error` 中，用于控制台的「同步待重试」徽标。
+- 记录的恢复时间只是复查提示：到点不会自动启用账户，也不会自动查询官方额度。控制台按本地时钟把徽标从「剩余 …」切换为「等待复查」，页面内倒计时不发起任何网络请求。
+- 目标是只有官方新鲜复查确认有余量才自动恢复；当前复查的新鲜度和并发校验仍在完善，不可用于生产。未配置同一账号的 controlKey 或缺少 Workspace ID 时无法复查，只能人工处理。
+- 暂停期间请在插件控制台启用／停用账户。CPA 原生入口和并发文件改写会写同一份凭据文件，插件无法可靠区分停用来源，两边同时改动可能互相覆盖。
 
 ## 控制台布局
 

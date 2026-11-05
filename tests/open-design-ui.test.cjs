@@ -3868,3 +3868,182 @@ test('额度自动暂停在旧配置或旧后端缺失该选项时默认关闭',
   assert.deepEqual(JSON.parse(sent[0].init.body), { pause: { enabled: false, max_seconds: 3600 } });
   assert.equal(view.document.getElementById('configPauseEnabled').checked, false);
 });
+
+// ---- 额度暂停：同步待重试、等待复查与本地倒计时 --------------------------------
+
+const pauseStatus = (overrides = {}) => statusBody({
+  credentials: [{
+    id: 'cred-1', label: '主账户', disabled: false,
+    billing_configured: true, workspace_id: 'ws-1',
+    quota_paused: true, effective_disabled: true,
+    quota_pause: {
+      reason: 'quota_exhausted', source: 'upstream',
+      resume_at: new Date(Date.now() + 3600_000).toISOString(),
+      observed_at: new Date().toISOString(),
+      manual_disabled: false, model_id: 'open-design/flash',
+      ...overrides,
+    },
+  }],
+});
+
+test('同步失败在账户行显示“同步待重试”，并说明不会泄漏细节', async () => {
+  const view = fakePage({
+    fetchImpl: async (url) => respond(url.endsWith('/status')
+      ? 200
+      : 404, url.endsWith('/status') ? pauseStatus({ error: '额度暂停状态未能同步到凭据文件；插件会重试。' }) : { error: 'not found' }),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const row = view.document.getElementById('accountList').children[0];
+  assert.match(row.textContent, /同步待重试/, '/status 的暂停详情必须能驱动同步失败徽标');
+  assert.match(row.textContent, /按固定间隔重试/);
+  // A pause without a sync error must not show the badge.
+  api.render.applyStatus(pauseStatus());
+  assert.ok(!view.document.getElementById('accountList').children[0].textContent.includes('同步待重试'));
+});
+
+test('暂停期间的说明明确人工启停边界、复查要求与无授权限制', async () => {
+  const view = fakePage({
+    fetchImpl: async (url) => respond(url.endsWith('/status') ? 200 : 404,
+      url.endsWith('/status') ? pauseStatus() : { error: 'not found' }),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const note = view.document.getElementById('accountList').children[0].textContent;
+  assert.match(note, /请在本页启用\/停用/, '暂停期间必须要求通过插件控制台人工启停');
+  assert.match(note, /CPA 原生入口和并发文件改写无法可靠归因/, '必须提示宿主入口无法可靠归因');
+  assert.match(note, /复查安全校验仍在完善/);
+  assert.match(note, /到点只表示等待复查，不代表额度已恢复/);
+  assert.match(note, /到点自动复查仍在开发中/, '不能声称已实现自动复查');
+  assert.match(note, /插件当前不会在到点自动查询官方额度/, '不能虚构后台网络行为');
+
+  // No control key: the note must say recovery cannot be checked automatically.
+  api.render.applyStatus(statusBody({
+    credentials: [{
+      id: 'cred-1', label: '主账户', disabled: false, billing_configured: false,
+      quota_paused: true, effective_disabled: true,
+      quota_pause: {
+        reason: 'quota_exhausted', source: 'upstream',
+        resume_at: new Date(Date.now() + 3600_000).toISOString(),
+        manual_disabled: false, model_id: 'open-design/flash',
+      },
+    }],
+  }));
+  const bare = view.document.getElementById('accountList').children[0].textContent;
+  assert.match(bare, /未配置官方 controlKey 或 Workspace ID，无法复查额度/);
+  assert.match(bare, /仍须人工处理/);
+  assert.ok(!bare.includes('到点自动复查仍在开发中'), 'an unconfigured account has no recheck path at all');
+
+  // A control key alone is insufficient without the workspace identifier.
+  const missingWorkspace = pauseStatus();
+  missingWorkspace.credentials[0].workspace_id = '';
+  api.render.applyStatus(missingWorkspace);
+  const missing = view.document.getElementById('accountList').children[0].textContent;
+  assert.match(missing, /未配置官方 controlKey 或 Workspace ID，无法复查额度/);
+  assert.ok(!missing.includes('可点「重查额度」'), 'a missing workspace cannot be rechecked');
+});
+
+test('人工停用与额度暂停是两个独立徽标，解除暂停不会发送 disabled', async () => {
+  const calls = [];
+  const view = fakePage({
+    confirmImpl: () => true,
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, init });
+      if (url.endsWith('/quota-pause/resume')) return respond(200, { pauses: [] });
+      if (url.endsWith('/status')) {
+        return respond(200, statusBody({
+          credentials: [{
+            id: 'cred-1', label: '主账户', disabled: true, billing_configured: true,
+            quota_paused: true, effective_disabled: true,
+            quota_pause: {
+              reason: 'quota_exhausted', source: 'upstream',
+              resume_at: new Date(Date.now() + 3600_000).toISOString(),
+              manual_disabled: true, model_id: 'open-design/flash',
+            },
+          }],
+        }));
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const row = view.document.getElementById('accountList').children[0];
+  assert.match(row.textContent, /已停用/, '人工停用状态单独显示');
+  assert.match(row.textContent, /额度暂停/, '额度暂停状态单独显示');
+  assert.match(row.textContent, /已停用/);
+  const actionTexts = [...row.children[1].children].map(node => node.textContent);
+  assert.ok(actionTexts.includes('启用'), 'the operator switch reflects the manual disable');
+
+  await api.handlers.resumeQuotaPause(api.state.status.credentials[0]);
+  assert.equal(calls.filter(call => call.url.endsWith('/quota-pause/resume')).length, 1);
+  assert.ok(!calls.some(call => call.url.endsWith('/credentials')), '解除暂停不得改写人工停用');
+  assert.match(view.document.getElementById('accountState').textContent, /不会查询或证明额度已恢复/);
+});
+
+test('暂停倒计时在页面内本地变化，且不发出任何网络请求', async () => {
+  const calls = [];
+  const resumeAt = new Date(Date.now() + 65_000).toISOString();
+  const view = fakePage({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      if (url.endsWith('/status')) {
+        return respond(200, statusBody({
+          credentials: [{
+            id: 'cred-1', label: '主账户', disabled: false, billing_configured: true,
+            quota_paused: true, effective_disabled: true,
+            quota_pause: {
+              reason: 'quota_exhausted', source: 'upstream', resume_at: resumeAt,
+              manual_disabled: false, model_id: 'open-design/flash',
+            },
+          }],
+        }));
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  // Only the badge row is inspected: the pause footer legitimately contains the
+  // words "不代表额度已恢复", so the badge itself must stay free of any
+  // recovered/expiring wording.
+  const readBadge = () => view.document.getElementById('accountList').children[0].children[0].textContent;
+  assert.match(readBadge(), /额度暂停（剩余/);
+  const requestsAfterLoad = calls.length;
+
+  // The scheduled tick is local: it re-renders through the same renderer with no
+  // fetch, no quota route and no status reload.
+  const before = readBadge();
+  api.render.renderAccounts();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(calls.length, requestsAfterLoad, '本地倒计时不得发出网络请求');
+  assert.equal(readBadge(), before);
+
+  // Past the deadline the badge reads as waiting for a recheck, never as
+  // recovered, and applying the same status again still issues no request.
+  api.state.status.credentials[0].quota_pause.resume_at = new Date(Date.now() - 1_000).toISOString();
+  api.render.renderAccounts();
+  const overdue = readBadge();
+  assert.match(overdue, /等待复查/, '到期必须是等待复查');
+  assert.ok(!/即将恢复|已恢复/.test(overdue), '到期不能显示为已恢复');
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(calls.length, requestsAfterLoad, '到期渲染同样不得触发网络');
+});
+
+test('后端标记 awaiting_recheck 时即使本地时钟未到期也显示等待复查', () => {
+  const core = fakePage().context.OpenDesignCore;
+  const pause = core.normalizeQuotaPause({
+    resume_at: new Date(Date.now() + 3600_000).toISOString(),
+    awaiting_recheck: true,
+  });
+  assert.equal(pause.awaiting_recheck, true);
+  assert.equal(core.quotaPauseText(pause), '额度暂停（等待复查）');
+  // The flag wins even when the recorded deadline is missing or unparsable.
+  assert.equal(core.quotaPauseText({ resume_at: '', awaiting_recheck: true }), '额度暂停（等待复查）');
+  assert.equal(core.quotaPauseText({ resume_at: '' }), '额度暂停');
+  assert.equal(core.normalizeQuotaPause({ awaiting_recheck: 'yes' }).awaiting_recheck, false);
+});

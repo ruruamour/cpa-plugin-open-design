@@ -36,6 +36,9 @@
       multiple_models: data.multiple_models === true,
       manual_disabled: data.manual_disabled === true,
       remaining_seconds: safeInteger(data.remaining_seconds, 0, 31536000),
+      // The plugin reports this once the recorded deadline has passed. It means
+      // "a recheck is due", never "the account is enabled again".
+      awaiting_recheck: data.awaiting_recheck === true,
       error: shortText(data.error, 200),
     };
     return pause;
@@ -51,9 +54,14 @@
 
   function quotaPauseText(pause, now = Date.now()) {
     if (!pause) return '';
+    // Reaching the recorded deadline never means "resumed". The plugin marks the
+    // pause as due for an official recheck instead (and it may still need a
+    // manual resume), so that state reads as waiting for the recheck even if the
+    // recorded deadline is missing or the local clock disagrees.
+    if (pause.awaiting_recheck === true) return '额度暂停（等待复查）';
     const remaining = quotaPauseRemaining(pause, now);
     if (remaining === null) return '额度暂停';
-    if (remaining <= 0) return '额度暂停（即将恢复）';
+    if (remaining <= 0) return '额度暂停（等待复查）';
     return `额度暂停（剩余 ${formatDuration(remaining)}）`;
   }
 

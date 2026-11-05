@@ -823,6 +823,20 @@
         if (at > now) next = Math.min(next, at);
       }
     }
+    // A quota pause carries its own deadline. Ticking through it is a purely
+    // local re-render: no quota request and no network. Reaching the deadline
+    // only switches the badge to "等待复查"; the plugin does not verify the
+    // upstream quota there and does not reactivate the account.
+    for (const item of state.status.credentials) {
+      const pause = item.quota_pause;
+      if (!pause) continue;
+      const at = Date.parse(pause.resume_at || '');
+      if (Number.isFinite(at) && at > now) {
+        // Keep the displayed countdown current without querying the server.
+        const tick = at - now > 60_000 ? 60_000 : 1_000;
+        next = Math.min(next, at, now + tick);
+      }
+    }
     if (Number.isFinite(next)) {
       quotaViewTimer = setTimeout(() => {
         quotaViewTimer = null;
@@ -830,6 +844,27 @@
       }, Math.min(next - now + 25, 2147483647));
       quotaViewTimer.unref?.();
     }
+  }
+
+  // Human-readable pause footer. The recorded deadline only means "due for
+  // review": it neither proves the quota came back nor re-enables the account,
+  // and the plugin does not yet run an automatic official quota check at that
+  // point. Recovery needs a passing official recheck, and the CPA native console
+  // writes the same auth files, so a disable there cannot be attributed
+  // reliably. Nothing here may promise a background check that does not exist.
+  function quotaPauseNote(item, pause) {
+    const parts = [
+      '到点只表示等待复查，不代表额度已恢复；复查安全校验仍在完善，请勿用于生产。',
+    ];
+    if (item.billing_configured && item.workspace_id) {
+      parts.push('到点自动复查仍在开发中，插件当前不会在到点自动查询官方额度；可点「重查额度」手动发起一次官方复查。');
+    } else {
+      parts.push('未配置官方 controlKey 或 Workspace ID，无法复查额度，仍须人工处理。');
+    }
+    parts.push('暂停期间请在本页启用/停用；CPA 原生入口和并发文件改写无法可靠归因，请勿在那里改动同一账户。');
+    if (pause.multiple_models) parts.push('多个模型报告过额度耗尽，单次复查不足以证明恢复，只能人工解除。');
+    if (pause.error) parts.push('暂停状态尚未写回凭据文件，插件会按固定间隔重试；期间本地仍会拦截该账户。');
+    return parts.join('');
   }
 
   function renderAccounts() {
@@ -889,6 +924,7 @@
         return el('div', { className: 'row', attrs: { 'data-credential-id': item.id } }, [
           detail,
           actions,
+          pause ? el('p', { className: 'row-detail hint', attrs: { 'data-quota-pause-note': item.id }, text: quotaPauseNote(item, pause) }) : null,
           renderQuota(item),
         ]);
       });
@@ -1708,13 +1744,13 @@
   // exhausted account straight back into CPA scheduling.
   async function resumeQuotaPause(item) {
     if (state.busy) return;
-    if (typeof confirm === 'function' && !confirm(`解除账户「${item.label}」的额度暂停？该账户会立即重新参与 CPA 调度。`)) return;
+    if (typeof confirm === 'function' && !confirm(`解除账户「${item.label}」的额度暂停？这不会证明额度已恢复，也不会改变通过本插件设置的人工启用状态。`)) return;
     setBusy(true);
     message('accountState', '正在解除额度暂停…');
     try {
       await api().resumeQuotaPause(item.id);
       await refreshStatus();
-      message('accountState', '已解除额度暂停；账户是否调度仍由 CPA 与启用状态决定。');
+      message('accountState', '已解除插件额度暂停；这不会查询或证明额度已恢复，账户是否调度仍由 CPA 与启用状态决定。');
     } catch (error) {
       message('accountState', `解除失败：${formatError(error)}`, 'error');
     } finally {
@@ -1724,15 +1760,17 @@
 
   // Recheck runs one fresh official model preflight. Only a proven available
   // result clears the pause; a cache hit or a failure changes nothing.
+  // The deadline sweep does not do this on its own yet: auto-recheck is still
+  // under development, so the operator has to trigger it here.
   async function recheckQuotaPause(item) {
     if (state.busy) return;
-    if (typeof confirm === 'function' && !confirm(`用一次官方额度预检查重新确认账户「${item.label}」的额度？`)) return;
+    if (typeof confirm === 'function' && !confirm(`用官方额度预检查重新确认账户「${item.label}」的额度？复查安全校验仍在完善，请勿用于生产。`)) return;
     setBusy(true);
     message('accountState', '正在重查额度…');
     try {
       await api().recheckQuotaPause(item.id);
       await refreshStatus();
-      message('accountState', '额度预检通过，已解除暂停。');
+      message('accountState', '本次官方复查通过，已解除插件本地额度暂停；账户是否调度仍由 CPA 与启用状态决定。');
     } catch (error) {
       message('accountState', `重查未通过：${formatError(error)}`, 'error');
     } finally {
