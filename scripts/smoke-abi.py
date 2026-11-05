@@ -148,6 +148,25 @@ def official_billing_fixture():
     }
 
 
+def stamp_funding_generated_at(billing):
+    """Return the fixture with a current `generatedAt` when the case asks for it.
+
+    A recovery proof requires an official timestamp that is demonstrably newer
+    than the pause observation and no older than 30 seconds. The frozen fixture
+    timestamp cannot satisfy that, so a recovery case must let the fake official
+    API answer with the current clock, like the real API does.
+    """
+    if not billing.get("stamp_funding_now"):
+        return billing
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    funding = dict(billing["funding"])
+    funding["generatedAt"] = now
+    plan = dict(funding.get("codingPlan") or {})
+    plan["generatedAt"] = now
+    funding["codingPlan"] = plan
+    return dict(billing, funding=funding)
+
+
 def billing_reply(billing, name):
     """Pick (status, payload) for one fake billing route.
 
@@ -164,6 +183,7 @@ def billing_reply(billing, name):
 
 
 def funding_reply(billing, path):
+    billing = stamp_funding_generated_at(billing)
     status, payload = billing_reply(billing, "funding")
     model_ids = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query).get("modelId", [])
     if status == 200 and model_ids and isinstance(payload, dict):
@@ -1081,9 +1101,39 @@ def run_cpa_live(artifact, binary, version):
         env["NO_PROXY"] = "127.0.0.1,localhost"
         env["no_proxy"] = "127.0.0.1,localhost"
         log = (work / "cpa.log").open("wb")
-        process = subprocess.Popen(
-            [str(binary), "-config", str(work / "config.yaml"), "-local-model"],
-            cwd=str(work), stdout=log, stderr=log, start_new_session=True, env=env)
+        holder = {"process": None}
+
+        def boot(timeout=60):
+            """(Re)start the unmodified host against the same fixture directory."""
+            if holder["process"] is not None and holder["process"].poll() is None:
+                holder["process"].terminate()
+                holder["process"].wait(timeout=20)
+            holder["process"] = process = subprocess.Popen(
+                [str(binary), "-config", str(work / "config.yaml"), "-local-model"],
+                cwd=str(work), stdout=log, stderr=log, start_new_session=True, env=env)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise AssertionError("case CPA exited during registration")
+                try:
+                    status, raw, _ = request("/v0/management/plugins", timeout=5)
+                    if status == 200 and any(x["id"] == PLUGIN_ID and x["registered"]
+                                             for x in json.loads(raw)["plugins"]):
+                        return
+                except Exception:  # noqa: BLE001 - startup race
+                    pass
+                time.sleep(0.25)
+            raise AssertionError("case CPA never registered the plugin")
+
+        def stop():
+            if holder["process"] is not None and holder["process"].poll() is None:
+                holder["process"].terminate()
+                try:
+                    holder["process"].wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    holder["process"].kill()
+                    holder["process"].wait(timeout=10)
+
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
         def request(path, body=None, method=None, timeout=60):
@@ -1098,21 +1148,7 @@ def run_cpa_live(artifact, binary, version):
             with opener.open(req, timeout=timeout) as resp:
                 return resp.status, resp.read(), dict(resp.headers)
 
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise AssertionError("CPA exited early; log: %s" % (work / "cpa.log"))
-            try:
-                status, raw, _ = request("/v0/management/plugins")
-                if status == 200 and any(
-                        x["id"] == PLUGIN_ID and x["registered"]
-                        for x in json.loads(raw)["plugins"]):
-                    break
-            except Exception:  # noqa: BLE001 - startup race
-                pass
-            time.sleep(0.25)
-        else:
-            raise AssertionError("CPA never registered the plugin; log: %s" % (work / "cpa.log"))
+        boot()
 
         stage_failures = []
 
@@ -1318,6 +1354,9 @@ def run_cpa_live(artifact, binary, version):
         # Test plugin-controlled manual disable while a quota block is active in
         # its own process, since the intentional 402 changes host scheduling.
         evidence["host_quota_manual_disable"] = _live_case(binary, artifact, version, quota_manual=True)
+        # A due pause is recovered only by a fresh official available check; a
+        # failing check must keep the pause and the operator's manual disable.
+        evidence["host_quota_recovery"] = _live_case(binary, artifact, version, quota_recovery=True)
 
         # ---- 6. disable -> enable must resync the runtime ----
         # If the registration never came up there is nothing to withdraw, so these
@@ -1458,6 +1497,8 @@ def run_cpa_live(artifact, binary, version):
             blockers.append("host_retry_scheduling")
         if evidence.get("host_quota_manual_disable", {}).get("status") != "PASS":
             blockers.append("host_quota_manual_disable")
+        if evidence.get("host_quota_recovery", {}).get("status") != "PASS":
+            blockers.append("host_quota_recovery")
         if not registration_live:
             blockers.append("ui_flow.registration")
         if stage_failures:
@@ -1471,13 +1512,14 @@ def run_cpa_live(artifact, binary, version):
         evidence.setdefault("failure", str(exc)[:600])
         return evidence
     finally:
-        if process is not None and process.poll() is None:
-            process.terminate()
+        final = locals().get("holder", {}).get("process")
+        if final is not None and final.poll() is None:
+            final.terminate()
             try:
-                process.wait(timeout=20)
+                final.wait(timeout=20)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+                final.kill()
+                final.wait(timeout=10)
         shutil.rmtree(work, ignore_errors=True)
 
 
@@ -1964,7 +2006,29 @@ def run_cpa_live_error(binary, artifact, code, version):
     return _live_case(binary, artifact, version, fail_status=code)
 
 
-def _live_case(binary, artifact, version, fail_status=None, quota_manual=False):
+def _rewrite_fixture_block(path, *, due):
+    """Age a fixture quota block while the CPA process is stopped.
+
+    normalizeQuotaBlock clamps future timestamps and requires
+    blocked_at <= observed_at <= retry_at, so all three are moved together and
+    the revision is refreshed. This only edits the throwaway fixture file.
+    """
+    data = json.loads(Path(path).read_text())
+    block = data.get("quota_block")
+    require(isinstance(block, dict), "fixture has no quota block to age")
+    now = dt.datetime.now(dt.timezone.utc)
+    def stamp(delta):
+        return (now - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+    block["blocked_at"] = stamp(dt.timedelta(minutes=10))
+    block["observed_at"] = stamp(dt.timedelta(minutes=5))
+    block["retry_at"] = stamp(dt.timedelta(seconds=30)) if due else stamp(dt.timedelta(minutes=-30))
+    data["quota_block"] = block
+    data["quota_revision"] = "fixture-recovery-%d" % int(time.time() * 1000)
+    Path(path).write_text(json.dumps(data, indent=2))
+    return block
+
+
+def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, quota_recovery=False):
     work = Path(tempfile.mkdtemp(prefix="opendesign-cpa-case-"))
     process = proxy = origin = log = None
     result = {"status": "FAIL"}
@@ -1975,7 +2039,7 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False):
         origin.start()
         proxy.origin_port = origin.port
         proxy.start()
-        if quota_manual:
+        if quota_manual or quota_recovery:
             fail_status = 402
             origin.fail = (402, json.dumps({"error": {"code": "insufficient_balance",
                                                      "details": {"coding_plan_exhausted": True}}}))
@@ -2008,9 +2072,17 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False):
         env["SSL_CERT_FILE"] = str(ca_crt)
         env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
         log = (work / "cpa.log").open("wb")
-        process = subprocess.Popen(
-            [str(binary), "-config", str(work / "config.yaml"), "-local-model"],
-            cwd=str(work), stdout=log, stderr=log, start_new_session=True, env=env)
+        holder = {"process": None}
+
+        def stop():
+            if holder["process"] is not None and holder["process"].poll() is None:
+                holder["process"].terminate()
+                try:
+                    holder["process"].wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    holder["process"].kill()
+                    holder["process"].wait(timeout=10)
+
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
         def request(path, body=None, method=None, timeout=60):
@@ -2023,20 +2095,27 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False):
             with opener.open(req, timeout=timeout) as resp:
                 return resp.status, resp.read(), dict(resp.headers)
 
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise AssertionError("case CPA exited early")
-            try:
-                status, raw, _ = request("/v0/management/plugins")
-                if status == 200 and any(x["id"] == PLUGIN_ID and x["registered"]
-                                         for x in json.loads(raw)["plugins"]):
-                    break
-            except Exception:  # noqa: BLE001 - startup race
-                pass
-            time.sleep(0.25)
-        else:
+        def boot(timeout=60):
+            """(Re)start the unmodified host against the same fixture directory."""
+            stop()
+            holder["process"] = process = subprocess.Popen(
+                [str(binary), "-config", str(work / "config.yaml"), "-local-model"],
+                cwd=str(work), stdout=log, stderr=log, start_new_session=True, env=env)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise AssertionError("case CPA exited during registration")
+                try:
+                    status, raw, _ = request("/v0/management/plugins", timeout=5)
+                    if status == 200 and any(x["id"] == PLUGIN_ID and x["registered"]
+                                             for x in json.loads(raw)["plugins"]):
+                        return
+                except Exception:  # noqa: BLE001 - startup race
+                    pass
+                time.sleep(0.25)
             raise AssertionError("case CPA never registered the plugin")
+
+        boot()
 
         status, raw, _ = request(API + "/credentials",
                                  {"label": "fixture", "api_key": FIXTURE_KEY})
@@ -2053,12 +2132,19 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False):
                 break
             time.sleep(0.25)
 
-        if quota_manual:
+        if quota_manual or quota_recovery:
             # The feature remains opt-in while its documented CPA-native
             # manual-disable limitation is under review; this is an isolated
             # fixture account and deliberately exercises the plugin UI path.
             status, _, _ = request(API + "/config", {"pause": {"enabled": True}})
             require(status == 200, "case could not enable experimental quota pause")
+        if quota_recovery:
+            # The official billing identity is a separate operator setting; the
+            # fixture key/workspace pair is what the recovery preflight uses.
+            status, raw, _ = request(API + "/credentials", {
+                "id": credential_id, "control_key": FIXTURE_CONTROL_KEY,
+                "workspace_id": FIXTURE_WORKSPACE_ID})
+            require(status == 200, "case billing configure %s" % status)
 
         before = len(origin.requests)
         # Some CPA versions expose the alias in /v1/models just before its
@@ -2104,16 +2190,10 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False):
             require(bool(disk_state().get("quota_block")), "quota block was lost after host writeback")
             # Restart the unmodified host with the same fixture data to verify
             # that the plugin did not only retain the pause in its own memory.
-            process.terminate()
-            process.wait(timeout=20)
-            process = subprocess.Popen(
-                [str(binary), "-config", str(work / "config.yaml"), "-local-model"],
-                cwd=str(work), stdout=log, stderr=log, start_new_session=True, env=env)
+            boot()
             deadline = time.monotonic() + 60
             restored = False
             while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    break
                 try:
                     status, raw, _ = request(API + "/credentials", timeout=5)
                     accounts = json.loads(raw).get("credentials", [])
@@ -2144,24 +2224,110 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False):
             require(status == 200 and row.get("disabled") is True and row.get("quota_paused") is False,
                     "plugin runtime did not retain manual disable after quota resume")
             result["manual_disable_preserved"] = True
+        if quota_recovery:
+            result.update(_live_quota_recovery(boot, stop, request, origin, work, credential_id))
         return result
     except AssertionError as exc:
         result.setdefault("failure", str(exc)[:300])
         return result
     finally:
-        if process is not None and process.poll() is None:
-            process.terminate()
+        final = locals().get("holder", {}).get("process")
+        if final is not None and final.poll() is None:
+            final.terminate()
             try:
-                process.wait(timeout=20)
+                final.wait(timeout=20)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+                final.kill()
+                final.wait(timeout=10)
         if log is not None:
             log.close()
         for server in (proxy, origin):
             if server is not None:
                 server.stop()
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _live_quota_recovery(boot, stop, request, origin, work, credential_id):
+    """Automatic recovery against the unmodified host and the fake official API.
+
+    The pause is a persisted plugin block, so the case ages it while the host is
+    stopped and lets the plugin's own worker run the preflight. A failing
+    official answer must keep the pause; a fresh available answer must clear it
+    while preserving the operator's plugin-console disable choice.
+
+    This is an isolated fixture account. It does not cover a CPA-native
+    re-disable (the plugin cannot attribute that), and it is not production
+    acceptance.
+    """
+    result = {"status": "FAIL"}
+    path = work / "auths" / (credential_id + ".json")
+
+    def disk_state():
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def account_row():
+        status, raw, _ = request(API + "/credentials", timeout=5)
+        accounts = json.loads(raw).get("credentials", [])
+        return next((item for item in accounts if item.get("id") == credential_id), {})
+
+    def wait_for(condition, timeout, label):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if condition():
+                    return True
+            except (OSError, ValueError, urllib.error.URLError):
+                pass
+            time.sleep(0.25)
+        return False
+
+    try:
+        require(bool(disk_state().get("quota_block")), "recovery case started without a persisted quota block")
+        status, _, _ = request(API + "/credentials", {"id": credential_id, "disabled": True})
+        require(status == 200, "plugin manual disable before recovery failed")
+
+        # 1. Due pause + failing official check -> still paused.
+        stop()
+        _rewrite_fixture_block(path, due=True)
+        origin.billing = dict(official_billing_fixture(), stamp_funding_now=True,
+                              funding=dict(official_billing_fixture()["funding"], fundingCheck="insufficient"))
+        boot()
+        before = len(billing_hits(origin))
+        saw_check = wait_for(lambda: len(billing_hits(origin)) > before, 90, "automatic funding-check")
+        require(saw_check, "the plugin never ran an automatic funding-check after the pause became due")
+        # Give the worker a moment to finish the attempt before judging the state.
+        require(wait_for(lambda: (account_row().get("quota_pause") or {}).get("recheck_status"), 30,
+                         "recheck status"),
+                "a failing official check produced no recheck status")
+        row = account_row()
+        require(row.get("quota_paused") is True, "a failing official check cleared the pause")
+        require(row.get("disabled") is True, "a failing official check changed the manual disable")
+        require(bool(disk_state().get("quota_block")), "a failing official check removed the on-disk block")
+        result["failed_check_kept_pause"] = True
+        result["failed_check_status"] = (row.get("quota_pause") or {}).get("recheck_status")
+
+        # 2. Due pause + fresh available official check -> cleared, manual disable kept.
+        stop()
+        _rewrite_fixture_block(path, due=True)
+        origin.billing = dict(official_billing_fixture(), stamp_funding_now=True)
+        boot()
+        cleared = wait_for(lambda: account_row().get("quota_paused") is False, 120, "automatic recovery")
+        require(cleared, "a fresh available official check did not clear the pause")
+        row = account_row()
+        require(row.get("disabled") is True, "automatic recovery dropped the operator's manual disable")
+        require(wait_for(lambda: not disk_state().get("quota_block"), 30, "on-disk recovery"),
+                "automatic recovery left the on-disk quota block")
+        require(disk_state().get("disabled") is True, "automatic recovery enabled a manually disabled account")
+        result["fresh_available_cleared_pause"] = True
+        result["manual_disable_preserved"] = True
+        result["status"] = "PASS"
+        return result
+    except AssertionError as exc:
+        result["failure"] = str(exc)[:300]
+        return result
 
 
 def probe_redirect(request, origin, proxy, credential_id, allow_redirect_host, disallow_host=None):
