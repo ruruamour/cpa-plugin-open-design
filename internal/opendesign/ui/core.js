@@ -141,6 +141,21 @@
   }
 
   function buildModelsPayload(rows) {
+    return buildModelsSaveBody(rows, '').models;
+  }
+
+  // The POST /models body. expected_models_revision is only attached when the
+  // server advertised a token; an older backend keeps receiving exactly the
+  // same body as before, so it is never asked to validate an unknown field.
+  //
+  // original_id/original_upstream_id describe the row this editor started from.
+  // They are sent only together with a whole-list token: the backend resolves
+  // them against that exact snapshot, so an alias-only rename can keep its
+  // reasoning mapping. A row without a captured original identity (a new row)
+  // never gets one here, and a half-filled pair is dropped rather than sent,
+  // because the backend rejects a partial identity outright.
+  function buildModelsSaveBody(rows, expectedRevision) {
+    const revision = text(expectedRevision);
     const models = [];
     const seen = new Set();
     for (const row of Array.isArray(rows) ? rows : []) {
@@ -150,17 +165,16 @@
       if (!id || !upstreamID) throw new Error('模型别名和上游模型 ID 都不能为空');
       if (seen.has(id)) throw new Error(`模型别名重复：${id}`);
       seen.add(id);
-      models.push({ id, upstream_id: upstreamID });
+      const model = { id, upstream_id: upstreamID };
+      const originalID = text(row && row.original_id);
+      const originalUpstreamID = text(row && row.original_upstream_id);
+      if (revision && originalID && originalUpstreamID) {
+        model.original_id = originalID;
+        model.original_upstream_id = originalUpstreamID;
+      }
+      models.push(model);
     }
-    return models;
-  }
-
-  // The POST /models body. expected_models_revision is only attached when the
-  // server advertised a token; an older backend keeps receiving exactly the
-  // same body as before, so it is never asked to validate an unknown field.
-  function buildModelsSaveBody(rows, expectedRevision) {
-    const body = { models: buildModelsPayload(rows) };
-    const revision = text(expectedRevision);
+    const body = { models };
     if (revision) body.expected_models_revision = revision;
     return body;
   }

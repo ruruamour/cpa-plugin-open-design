@@ -4386,3 +4386,372 @@ test('后端标记 awaiting_recheck 时即使本地时钟未到期也显示等�
   assert.equal(core.quotaPauseText({ resume_at: '' }), '额度暂停');
   assert.equal(core.normalizeQuotaPause({ awaiting_recheck: 'yes' }).awaiting_recheck, false);
 });
+
+// --- model row original identity (whole-list CAS) --------------------------
+//
+// The backend resolves original_id/original_upstream_id against the snapshot
+// named by expected_models_revision. Sending them is what lets an alias-only
+// rename keep its thinking-strength policy; a row the console created itself
+// must never claim to be an existing server row.
+
+const pinnedModels = () => [
+  {
+    id: 'od-flash',
+    upstream_id: 'open-design/flash',
+    reasoning_revision: 'rev-flash',
+    reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }] },
+  },
+  {
+    id: 'od-pro',
+    upstream_id: 'open-design/pro',
+    reasoning_revision: 'rev-pro',
+    reasoning_mapping: { enabled: true, rules: [{ from: 'low', to: 'low' }] },
+  },
+];
+
+// Mirrors 883929e's whole-table semantics for the parts the console depends on:
+// an explicit original identity keeps the stored policy only while the upstream
+// is unchanged, and a new row simply has no policy.
+function applyImportLikeBackend(models, body) {
+  return (body.models || []).map(row => {
+    const original = (row.original_id && row.original_upstream_id)
+      ? models.find(item => item.id === row.original_id && item.upstream_id === row.original_upstream_id)
+      : models.find(item => item.id === row.id && item.upstream_id === row.upstream_id);
+    const next = { id: row.id, upstream_id: row.upstream_id };
+    if (original && original.upstream_id === row.upstream_id && original.reasoning_mapping) {
+      next.reasoning_mapping = original.reasoning_mapping;
+      next.reasoning_revision = original.reasoning_revision;
+    } else {
+      next.reasoning_revision = `rev-${row.id}`;
+    }
+    return next;
+  });
+}
+
+function modelSavePage(options = {}) {
+  const posts = [];
+  const confirmations = [];
+  let models = options.models || pinnedModels();
+  let revision = options.revision === undefined ? 'list-rev-1' : options.revision;
+  const view = fakePage({
+    confirmImpl: message => {
+      confirmations.push(message);
+      return options.confirmImpl ? options.confirmImpl(message, confirmations.length) : true;
+    },
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        posts.push(body);
+        const result = options.onSave ? options.onSave(body, posts.length) : null;
+        if (result) {
+          if (result.models) models = result.models;
+          if (result.revision !== undefined) revision = result.revision;
+          return respond(result.status || 200, result.body || { models, models_revision: revision });
+        }
+        models = applyImportLikeBackend(models, body);
+        return respond(200, { models, models_revision: revision });
+      }
+      if (url.includes('/status')) {
+        return respond(200, statusBody({ models, models_revision: revision }));
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  return {
+    view, api, posts, confirmations,
+    setModels: next => { models = next; },
+    setRevision: next => { revision = next; },
+  };
+}
+
+test('an alias-only rename sends the original identity so the policy survives', async () => {
+  const { view, api, posts, confirmations } = modelSavePage();
+  await api.render.loadStatus();
+  assert.equal(api.state.mappings[0].original_id, 'od-flash');
+  assert.equal(api.state.mappings[0].original_upstream_id, 'open-design/flash');
+
+  const alias = view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'od-flash-fast';
+  alias.emit('input');
+
+  await api.handlers.saveModels();
+  assert.equal(confirmations.length, 0, 'a rename drops nothing, so nothing is asked');
+  assert.deepEqual(posts[0], {
+    models: [
+      { id: 'od-flash-fast', upstream_id: 'open-design/flash', original_id: 'od-flash', original_upstream_id: 'open-design/flash' },
+      { id: 'od-pro', upstream_id: 'open-design/pro', original_id: 'od-pro', original_upstream_id: 'open-design/pro' },
+    ],
+    expected_models_revision: 'list-rev-1',
+  });
+  // Only the success message may claim the policy was kept, and only because the
+  // echoed list actually still carries it.
+  assert.match(view.document.getElementById('modelState').textContent, /思考强度映射已按原模型保留/);
+  assert.equal(api.state.mappings[0].original_id, 'od-flash-fast', 'the saved row is pinned to the new identity');
+  assert.equal(api.state.serverModels[0].reasoning_revision, 'rev-flash');
+});
+
+test('the console never claims a policy was kept when the echo does not carry one', async () => {
+  const { view, api } = modelSavePage({
+    // The backend cleared the policy: the success note must not pretend it stayed.
+    onSave: body => ({
+      models: body.models.map(row => ({ id: row.id, upstream_id: row.upstream_id, reasoning_revision: 'rev-new' })),
+    }),
+  });
+  await api.render.loadStatus();
+  const alias = view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'od-flash-fast';
+  alias.emit('input');
+  await api.handlers.saveModels();
+  const text = view.document.getElementById('modelState').textContent;
+  assert.match(text, /已保存 2 个模型映射/);
+  assert.ok(!text.includes('思考强度映射已按原模型保留'), 'no unsupported claim about the dropped policy');
+});
+
+test('changing the upstream asks first and never carries the old policy silently', async () => {
+  let warnings = 0;
+  const page = modelSavePage({
+    confirmImpl: message => {
+      if (!message.includes('不会沿用原来的思考强度映射')) return true;
+      warnings += 1;
+      // Decline the warning once, then accept it.
+      return warnings > 1;
+    },
+  });
+  await page.api.render.loadStatus();
+  const upstream = page.view.document.getElementById('mappingList').children[0].children[2].children[1];
+  upstream.value = 'open-design/flash-2';
+  upstream.emit('input');
+
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 0, 'a declined warning sends nothing');
+  assert.equal(page.confirmations.length, 1);
+  assert.match(page.confirmations[0], /od-flash → open-design\/flash-2/);
+  assert.match(page.view.document.getElementById('modelState').textContent, /草稿仍然保留/);
+  assert.equal(page.api.state.mappings[0].upstream_id, 'open-design/flash-2', 'the row is untouched');
+
+  // Accepting sends the row without a mapping and without an opt-in, which is
+  // exactly the backend's "clear the old policy" default.
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 1);
+  assert.equal(page.posts[0].models[0].reasoning_mapping, undefined);
+  assert.equal(page.posts[0].models[0].carry_reasoning_mapping, undefined);
+  assert.equal(page.posts[0].models[0].original_id, 'od-flash');
+  assert.equal(page.posts[0].models[0].upstream_id, 'open-design/flash-2');
+  assert.equal(warnings, 2);
+  // The server cleared the policy: the console must not claim otherwise.
+  assert.ok(!page.view.document.getElementById('modelState').textContent.includes('思考强度映射已按原模型保留'));
+});
+
+test('a row added in the console never invents an original identity', async () => {
+  const { api, posts } = modelSavePage();
+  await api.render.loadStatus();
+  api.handlers.addMapping();
+  api.state.mappings[2].id = 'custom';
+  api.state.mappings[2].upstream_id = 'open-design/custom';
+  await api.handlers.saveModels();
+  const added = posts[0].models[2];
+  assert.deepEqual(added, { id: 'custom', upstream_id: 'open-design/custom' });
+  assert.equal('original_id' in added, false);
+  assert.equal('original_upstream_id' in added, false);
+  // The rows read from the server stay pinned.
+  assert.equal(posts[0].models[0].original_id, 'od-flash');
+});
+
+test('an upstream checkbox row is a new row, not a pinned server row', async () => {
+  const { view, api, posts } = modelSavePage();
+  await api.render.loadStatus();
+  api.state.upstream = [{ id: 'open-design/gamma', owned_by: 'vela' }];
+  api.state.upstreamFor = 'cred-1';
+  api.render.renderUpstream();
+  const checkbox = view.document.getElementById('upstreamList').children[0].children[0];
+  assert.equal(checkbox.tagName, 'INPUT');
+  checkbox.checked = true;
+  await checkbox.emit('change');
+  assert.deepEqual(plain(api.state.mappings[2]), { id: 'open-design-open-design/gamma', upstream_id: 'open-design/gamma' });
+
+  await api.handlers.saveModels();
+  const added = posts[0].models[2];
+  assert.deepEqual(added, { id: 'open-design-open-design/gamma', upstream_id: 'open-design/gamma' });
+  assert.equal('original_id' in added, false);
+  assert.equal('original_upstream_id' in added, false);
+});
+
+test('a rejected save keeps every original identity for the retry', async () => {
+  const page = modelSavePage({
+    onSave: (body, count) => {
+      if (count === 1) return { status: 409, body: { error: 'models_revision_conflict' } };
+      return null;
+    },
+  });
+  await page.api.render.loadStatus();
+  const alias = page.view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'od-flash-fast';
+  alias.emit('input');
+
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts[0].models[0].original_id, 'od-flash');
+  assert.equal(page.api.state.modelsConflict, true);
+  assert.equal(page.api.state.mappings[0].original_id, 'od-flash', 'the draft keeps its pin');
+
+  // A fresh token is required before the overwrite confirmation.
+  page.setRevision('list-rev-2');
+  await page.api.render.loadStatus();
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 2);
+  assert.equal(page.posts[1].expected_models_revision, 'list-rev-2');
+  assert.equal(page.posts[1].models[0].original_id, 'od-flash');
+  assert.equal(page.posts[1].models[0].original_upstream_id, 'open-design/flash');
+});
+
+test('a conflict retry drops a pin whose original row vanished from the snapshot', async () => {
+  const page = modelSavePage({
+    onSave: (body, count) => {
+      if (count === 1) return { status: 409, body: { error: 'models_revision_conflict' } };
+      return null;
+    },
+  });
+  await page.api.render.loadStatus();
+  const alias = page.view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'od-flash-fast';
+  alias.emit('input');
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 1);
+
+  // Another tab deleted that row, so the identity can no longer be resolved.
+  page.setModels([{ id: 'od-pro', upstream_id: 'open-design/pro' }]);
+  page.setRevision('list-rev-2');
+  await page.api.render.loadStatus();
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 2);
+  const resent = page.posts[1].models.find(row => row.id === 'od-flash-fast');
+  assert.equal(resent.original_id, undefined, 'an identity the snapshot cannot resolve is not resent');
+  assert.equal(resent.original_upstream_id, undefined);
+  assert.ok(page.confirmations.some(text => /原行已不存在/.test(text)),
+    'the operator is told the old row is gone instead of silently losing the link');
+});
+
+test('deleting or reordering rows keeps every remaining row pinned to its own server row', async () => {
+  const { view, api, posts } = modelSavePage();
+  await api.render.loadStatus();
+
+  // Reverse the two rows: each keeps the identity of the server row it came
+  // from, so the backend still knows which stored policy belongs to which row.
+  api.state.mappings = [api.state.mappings[1], api.state.mappings[0]];
+  api.render.renderMappings();
+  assert.deepEqual(plain(api.state.mappings.map(row => [row.id, row.original_id])), [
+    ['od-pro', 'od-pro'],
+    ['od-flash', 'od-flash'],
+  ]);
+  await api.handlers.saveModels();
+  assert.deepEqual(posts[0].models.map(row => [row.id, row.original_id]), [
+    ['od-pro', 'od-pro'],
+    ['od-flash', 'od-flash'],
+  ]);
+
+  // Delete the first (now reordered) row through its own button.
+  const removeFirst = view.document.getElementById('mappingList').children[0].children[3];
+  assert.equal(removeFirst.textContent, '删除');
+  await removeFirst.emit('click');
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), ['od-flash']);
+  await api.handlers.saveModels();
+  assert.deepEqual(posts[1].models, [
+    { id: 'od-flash', upstream_id: 'open-design/flash', original_id: 'od-flash', original_upstream_id: 'open-design/flash' },
+  ]);
+});
+
+test('an alias swap is refused locally instead of arming an unresolvable 409', async () => {
+  const { view, api, posts } = modelSavePage();
+  await api.render.loadStatus();
+  // Swap the two aliases: each row's new alias is the other row's original.
+  api.state.mappings[0].id = 'od-pro';
+  api.state.mappings[1].id = 'od-flash';
+  await api.handlers.saveModels();
+  assert.equal(posts.length, 0, 'the unresolvable list is not sent');
+  assert.match(view.document.getElementById('modelState').textContent, /原始模型身份/);
+  assert.equal(api.state.mappings[0].id, 'od-pro', 'the draft is kept for the operator to fix');
+});
+
+test('an old backend without a token gets no original identity and warns before a rename', async () => {
+  const page = modelSavePage({ revision: '' });
+  await page.api.render.loadStatus();
+  assert.equal(page.api.state.modelsRevision, '');
+  const alias = page.view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'od-flash-fast';
+  alias.emit('input');
+
+  await page.api.handlers.saveModels();
+  assert.equal(page.confirmations.length, 1);
+  assert.match(page.confirmations[0], /当前后端不支持按原行关联/);
+  assert.deepEqual(page.posts[0], {
+    models: [
+      { id: 'od-flash-fast', upstream_id: 'open-design/flash' },
+      { id: 'od-pro', upstream_id: 'open-design/pro' },
+    ],
+  });
+  assert.equal('expected_models_revision' in page.posts[0], false);
+});
+
+test('a session switch re-pins the editor rows to the new snapshot only', async () => {
+  const oldModels = pinnedModels();
+  const newModels = [{ id: 'od-next', upstream_id: 'open-design/next', reasoning_revision: 'rev-next' }];
+  let statusCalls = 0;
+  const view = fakePage({
+    fetchImpl: async url => {
+      if (!url.includes('/status')) return respond(404, { error: 'not found' });
+      statusCalls += 1;
+      if (statusCalls === 1) {
+        return respond(200, statusBody({ models: oldModels, models_revision: 'old-rev' }));
+      }
+      return respond(200, statusBody({
+        models: newModels,
+        models_revision: 'new-rev',
+        credentials: [{ id: 'cred-1', label: '主账户', disabled: false }],
+      }));
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  assert.equal(api.state.mappings[0].original_id, 'od-flash');
+
+  view.document.getElementById('managementKey').value = 'replacement-management-key';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  assert.deepEqual(plain(api.state.mappings), [
+    { id: 'od-next', upstream_id: 'open-design/next', original_id: 'od-next', original_upstream_id: 'open-design/next' },
+  ], 'the new session inherits no identity from the old one');
+  assert.equal(api.state.modelsRevision, 'new-rev');
+});
+
+test('the save body carries original identity only with a whole-list token', () => {
+  const core = fakePage().context.OpenDesignCore;
+  const rows = [{
+    id: 'renamed',
+    upstream_id: 'open-design/flash',
+    original_id: 'od-flash',
+    original_upstream_id: 'open-design/flash',
+  }];
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(core.buildModelsSaveBody(rows, 'rev-1'))),
+    {
+      models: [{ id: 'renamed', upstream_id: 'open-design/flash', original_id: 'od-flash', original_upstream_id: 'open-design/flash' }],
+      expected_models_revision: 'rev-1',
+    },
+  );
+  // Without a token the backend cannot resolve an identity, so it is omitted.
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(core.buildModelsSaveBody(rows, ''))),
+    { models: [{ id: 'renamed', upstream_id: 'open-design/flash' }] },
+  );
+  // A half-filled pair is never sent.
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(core.buildModelsSaveBody([{ id: 'a', upstream_id: 'b', original_id: 'a' }], 'rev-1'))),
+    { models: [{ id: 'a', upstream_id: 'b' }], expected_models_revision: 'rev-1' },
+  );
+  // The plain payload shape is unchanged for older callers.
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(core.buildModelsPayload(rows))),
+    [{ id: 'renamed', upstream_id: 'open-design/flash' }],
+  );
+});

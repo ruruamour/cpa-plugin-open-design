@@ -187,8 +187,142 @@
     ]));
   }
 
+  // Editor rows may carry the identity of the server row they were read from.
+  // Both fields travel with the row so an alias-only rename can still be linked
+  // to its stored thinking-strength policy; a row created in the console never
+  // has them. They are never invented here: only editorRowsFromServer attaches
+  // them, and only from an actual server snapshot.
   function cloneMappings(models) {
-    return (Array.isArray(models) ? models : []).map(model => ({ id: model.id, upstream_id: model.upstream_id }));
+    return (Array.isArray(models) ? models : []).map(model => {
+      const row = { id: model.id, upstream_id: model.upstream_id };
+      const originalID = String(model && model.original_id || '').trim();
+      const originalUpstreamID = String(model && model.original_upstream_id || '').trim();
+      if (originalID && originalUpstreamID) {
+        row.original_id = originalID;
+        row.original_upstream_id = originalUpstreamID;
+      }
+      return row;
+    });
+  }
+
+  // The editor's view of one server snapshot: every row is pinned to the exact
+  // id/upstream pair it was read as, which is what the backend resolves an
+  // original identity against. A manual row or an upstream checkbox item is
+  // created through Core.addUpstream/addMapping and therefore stays unpinned.
+  function editorRowsFromServer(models) {
+    const rows = [];
+    for (const model of Array.isArray(models) ? models : []) {
+      const id = String(model && model.id || '').trim();
+      const upstreamID = String(model && model.upstream_id || '').trim();
+      if (!id || !upstreamID) continue;
+      rows.push({ id, upstream_id: upstreamID, original_id: id, original_upstream_id: upstreamID });
+    }
+    return rows;
+  }
+
+  // A pinned identity is only meaningful against the snapshot named by the
+  // whole-list token that is about to be sent. When an explicit overwrite moves
+  // the draft onto a newer snapshot, re-resolve every pin there: keep it when
+  // that exact row still exists (so a rename still keeps its policy) and drop
+  // it when the row is gone, instead of posting an identity the backend would
+  // reject on every retry.
+  function rebaseMappingOriginals(models) {
+    const snapshot = Array.isArray(state.serverModels) ? state.serverModels : [];
+    return (Array.isArray(models) ? models : []).map(model => {
+      const row = { id: model.id, upstream_id: model.upstream_id };
+      const originalID = String(model && model.original_id || '').trim();
+      const originalUpstreamID = String(model && model.original_upstream_id || '').trim();
+      if (!originalID || !originalUpstreamID) return row;
+      const stillPresent = snapshot.some(item =>
+        String(item && item.id || '').trim() === originalID &&
+        String(item && item.upstream_id || '').trim() === originalUpstreamID);
+      if (stillPresent) {
+        row.original_id = originalID;
+        row.original_upstream_id = originalUpstreamID;
+      }
+      return row;
+    });
+  }
+
+  // Rows whose stored thinking-strength policy is about to be dropped. An
+  // alias-only rename on a backend with a whole-list token keeps the policy (the
+  // original identity is matched by upstream too), so it is not reported there.
+  // A real upstream change always drops it: the backend clears the old mapping
+  // by default and this console never opts in silently. On an old backend there
+  // is no original identity to send, so even a rename cannot be linked to its
+  // stored row and the policy is lost as well. A row whose original identity is
+  // no longer in the snapshot also loses it, because the backend refuses to
+  // resolve an identity it cannot see.
+  function mappingsLosingReasoning(models = state.mappings, revision = modelsSaveRevision()) {
+    const snapshot = Array.isArray(state.serverModels) ? state.serverModels : [];
+    const lost = [];
+    for (const row of Array.isArray(models) ? models : []) {
+      const originalID = String(row && row.original_id || '').trim();
+      const originalUpstreamID = String(row && row.original_upstream_id || '').trim();
+      const alias = String(row && row.id || '').trim();
+      const upstreamID = String(row && row.upstream_id || '').trim();
+      if (!originalID || !originalUpstreamID || !alias || !upstreamID) continue;
+      const original = snapshot.find(item =>
+        String(item && item.id || '').trim() === originalID &&
+        String(item && item.upstream_id || '').trim() === originalUpstreamID);
+      if (!original) {
+        // The pinned row disappeared from the server snapshot this save is based
+        // on, so the identity cannot be matched at all.
+        lost.push(`${originalID} → ${alias}（原行已不存在）`);
+        continue;
+      }
+      if (!original.reasoning_mapping) continue;
+      if (upstreamID !== originalUpstreamID) {
+        lost.push(`${originalID} → ${upstreamID}（上游已改）`);
+      } else if (alias !== originalID && !String(revision || '').trim()) {
+        lost.push(`${originalID} → ${alias}（当前后端不支持按原行关联）`);
+      }
+    }
+    return lost;
+  }
+
+  // Alias-only renames whose policy the server actually kept, verified against
+  // the echoed list. Used only for a success note; never inferred from intent.
+  function renamedRowsKeepingReasoning(submitted, models) {
+    const byKey = new Map((Array.isArray(models) ? models : []).map(model => [reasoningModelKey(model), model]));
+    const kept = [];
+    for (const row of Array.isArray(submitted) ? submitted : []) {
+      const originalID = String(row && row.original_id || '').trim();
+      const originalUpstreamID = String(row && row.original_upstream_id || '').trim();
+      const alias = String(row && row.id || '').trim();
+      const upstreamID = String(row && row.upstream_id || '').trim();
+      if (!originalID || !originalUpstreamID || !alias || !upstreamID) continue;
+      if (alias === originalID || upstreamID !== originalUpstreamID) continue;
+      const saved = byKey.get(reasoningModelKey({ id: alias, upstream_id: upstreamID }));
+      if (saved && saved.reasoning_mapping) kept.push(`${originalID} → ${alias}`);
+    }
+    return kept;
+  }
+
+  // The backend rejects a whole-table save whose rows cannot be told apart:
+  // two rows claiming the same original row, or a row whose alias equals
+  // another row's original alias. That is exactly what an alias swap (a ↔ b)
+  // produces. Refusing locally keeps the draft editable instead of arming a
+  // retry gate the server can never accept.
+  function mappingIdentityConflict(models = state.mappings) {
+    const rows = Array.isArray(models) ? models : [];
+    const claimed = new Map();
+    for (const row of rows) {
+      const originalID = String(row && row.original_id || '').trim();
+      const originalUpstreamID = String(row && row.original_upstream_id || '').trim();
+      if (!originalID || !originalUpstreamID) continue;
+      const key = `${originalID}\u0000${originalUpstreamID}`;
+      if (claimed.has(key)) return true;
+      claimed.set(key, row);
+    }
+    const originalIDs = new Map();
+    for (const [key, row] of claimed) originalIDs.set(key.split('\u0000')[0], row);
+    for (const row of rows) {
+      const alias = String(row && row.id || '').trim();
+      const owner = originalIDs.get(alias);
+      if (owner && owner !== row) return true;
+    }
+    return false;
   }
 
   // The first edit pins the server's whole-list revision so a later status
@@ -805,7 +939,7 @@
       return;
     }
     const previousServerModels = state.serverModels;
-    const serverModels = cloneMappings(incoming.models);
+    const serverModels = editorRowsFromServer(incoming.models);
     // A status refresh (account add/update, background reload) must not silently
     // discard mapping edits the operator has not saved yet. The saved baseline is
     // always refreshed; an active draft is kept even when its rows happen to look
@@ -3013,7 +3147,6 @@
     }
     if (!models.length && typeof confirm === 'function' && !confirm('清空所有模型映射？保存后将从 CPA 撤回本插件的模型。')) return;
     const sessionGeneration = state.sessionGeneration;
-    const submittedKey = mappingKey(state.mappings);
     const sentDraftRevision = state.modelsDraftActive ? state.modelsDraftRevision : state.modelsRevision;
     const serverRevision = state.modelsRevision;
     // The backend started advertising a whole-list token after this draft was
@@ -3025,6 +3158,18 @@
       state.modelsConflictSeenRevision = serverRevision;
       renderMappings();
       message('modelState', '保存已取消：服务器现在提供整表版本校验，但当前草稿是在此之前开始编辑的。草稿已保留；再次点击「保存模型映射」可按当前服务器版本确认覆盖。', 'error');
+      return;
+    }
+    // Changing the upstream clears the stored policy by default on the backend.
+    // Never carry it silently and never claim it was kept: the operator has to
+    // see which rows drop their thinking-strength rules first. Rows that only
+    // had their alias renamed keep them and are therefore not listed. This runs
+    // before the overwrite confirmation re-pins the rows, so a row whose original
+    // identity is about to fall away is still reported.
+    const losingReasoning = mappingsLosingReasoning();
+    if (losingReasoning.length && typeof confirm === 'function'
+      && !confirm(`保存后以下模型不会沿用原来的思考强度映射，需要重新配置：${losingReasoning.join('；')}。确定继续保存？`)) {
+      message('modelState', '已取消保存，草稿仍然保留。保存后这些模型不会沿用原来的思考强度映射。', '');
       return;
     }
     // A 409 (or a server revision that moved under the draft) must be confirmed
@@ -3046,7 +3191,20 @@
       state.modelsDraftActive = true;
       state.modelsDraftRevision = serverRevision;
       state.modelsConflict = false;
+      // The confirmation re-bases the draft onto the token just read, so every
+      // original identity must describe that snapshot before it is sent.
+      state.mappings = rebaseMappingOriginals(state.mappings);
     }
+    // A whole-table save carries the rows' original identities, and the backend
+    // rejects a list where two rows claim the same original row or an alias
+    // reuses another row's original alias (an alias swap). Detect that here so
+    // the operator gets a clear instruction instead of an unresolvable 409.
+    if (modelsSaveRevision() && mappingIdentityConflict()) {
+      renderMappings();
+      message('modelState', '保存已取消：多行改别名后互相占用了对方的原始模型身份，服务器会拒绝整表保存。草稿已保留；请分两次保存，或先还原后重排。', 'error');
+      return;
+    }
+    const submittedKey = mappingKey(state.mappings);
     let body;
     try {
       body = Core.buildModelsSaveBody(state.mappings, modelsSaveRevision());
@@ -3055,6 +3213,7 @@
       return;
     }
     const sentRevision = body.expected_models_revision || '';
+    const submittedRows = state.mappings.map(row => ({ ...row }));
     const serverModelsGeneration = state.serverModelsGeneration;
     state.modelsSaving = true;
     setBusy(true);
@@ -3069,15 +3228,18 @@
       const saved = raw && Array.isArray(raw.models) ? raw.models : models;
       const normalized = saved.map(item => ({ id: String(item.id || '').trim(), upstream_id: String(item.upstream_id || '').trim() }))
         .filter(item => item.id && item.upstream_id);
-      state.status.models = cloneMappings(normalized);
-      state.savedMappings = cloneMappings(normalized);
+      const responseModels = raw && Array.isArray(raw.models)
+        ? Core.normalizeStatus({ models: raw.models }).models
+        : null;
+      // Only an echoed list describes a real snapshot to pin against. An older
+      // backend that returns no list leaves the submitted rows' own pins intact.
+      const savedRows = responseModels ? editorRowsFromServer(normalized) : cloneMappings(submittedRows);
+      state.status.models = cloneMappings(savedRows);
+      state.savedMappings = cloneMappings(savedRows);
       const responseRevision = raw && typeof raw.models_revision === 'string' ? raw.models_revision.trim() : '';
       // The server echoes each model's full stored state: keep reasoning_mapping
       // *and* reasoning_revision, so a following reasoning save still carries a
       // CAS token instead of silently falling back to last-writer-wins.
-      const responseModels = raw && Array.isArray(raw.models)
-        ? Core.normalizeStatus({ models: raw.models }).models
-        : null;
       if (responseModels) {
         // If another response replaced the list while this request was in
         // flight, its policy/revision is fresher: keep it for models that still
@@ -3095,7 +3257,7 @@
       state.reasoningSaving = false;
       const rowsStillMatchSubmission = mappingKey(state.mappings) === submittedKey;
       if (rowsStillMatchSubmission) {
-        state.mappings = cloneMappings(normalized);
+        state.mappings = cloneMappings(savedRows);
         state.modelsRevision = responseRevision || state.modelsRevision;
         resetMappingsDraft(state.modelsRevision);
       } else {
@@ -3107,8 +3269,11 @@
         if (responseRevision) state.modelsRevision = responseRevision;
       }
       renderModels();
+      const keptReasoning = rowsStillMatchSubmission && responseModels
+        ? renamedRowsKeepingReasoning(submittedRows, responseModels)
+        : [];
       message('modelState', rowsStillMatchSubmission
-        ? `已保存 ${normalized.length} 个模型映射。`
+        ? `已保存 ${normalized.length} 个模型映射。${keptReasoning.length ? `其中 ${keptReasoning.join('、')} 只改了别名，思考强度映射已按原模型保留。` : ''}`
         : '模型映射已保存；保存期间的新编辑已保留为草稿。');
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
