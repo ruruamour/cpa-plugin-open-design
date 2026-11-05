@@ -115,8 +115,13 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 	}
 	if current, exists := s.creds[c.ID]; exists {
 		if current.APIKey == c.APIKey && current.QuotaRevision != "" && current.QuotaRevision != c.QuotaRevision {
-			// A watcher can have read an old snapshot just before a quota write.
-			// Keep the live plugin-owned block while still accepting other fields.
+			// CPA can persist an old StorageJSON after the quota write, not only
+			// deliver a stale watcher callback. Retain the live block and make a
+			// missing on-disk revision visible to the retry worker, so it repairs
+			// the file instead of losing the block at the next restart.
+			if current.quotaBlocked() {
+				s.quotaPauseErrors[c.ID] = quotaPauseSyncError
+			}
 			c.QuotaBlock = cloneQuotaBlock(current.QuotaBlock)
 			c.QuotaRevision = current.QuotaRevision
 		} else if current.APIKey != c.APIKey {

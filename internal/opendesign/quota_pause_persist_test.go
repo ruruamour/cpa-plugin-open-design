@@ -254,6 +254,56 @@ func TestQuotaBlockSurvivesStaleWatcherAfterFailedWrite(t *testing.T) {
 	}
 }
 
+// CPA may save a pre-pause StorageJSON after the plugin has already written a
+// block. The watcher must keep the in-memory guard AND schedule another write;
+// retaining only memory would silently lose the pause after process restart.
+func TestQuotaBlockRepairsHostStaleFileWrite(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	path := quotaFixtureAuthFile(t, s, host, id, nil)
+	old, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, _ := liveCredential(s, id)
+	s.observeQuotaBlock(source, "fixture-model", &APIError{Status: 402, quotaExhausted: true})
+	current, _ := liveCredential(s, id)
+	if !current.quotaBlocked() {
+		t.Fatal("fixture did not enter quota pause")
+	}
+	// Serialize the simulated host overwrite and callback against the worker's
+	// writes, as though the host wrote its older runtime snapshot immediately
+	// after observeQuotaBlock persisted the new revision.
+	s.credentialMu.Lock()
+	if err := os.WriteFile(path, old, 0600); err != nil {
+		s.credentialMu.Unlock()
+		t.Fatal(err)
+	}
+	_, err = s.parseAuth(jsonBytes(map[string]any{
+		"FileName": id + ".json", "RawJSON": old, "Host": map[string]any{"AuthDir": host.authDir},
+	}))
+	if err != nil {
+		s.credentialMu.Unlock()
+		t.Fatal(err)
+	}
+	s.mu.RLock()
+	pending := s.quotaPauseErrors[id]
+	s.mu.RUnlock()
+	s.credentialMu.Unlock()
+	if pending == "" {
+		t.Fatal("stale host write was not scheduled for repair")
+	}
+	s.sweepQuotaBlocks(make(chan struct{}))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted Credential
+	if err := json.Unmarshal(raw, &persisted); err != nil || !persisted.quotaBlocked() {
+		t.Fatal("worker did not repair the quota block on disk")
+	}
+}
+
 func TestObserveQuotaBlockUsesLatestManualState(t *testing.T) {
 	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
