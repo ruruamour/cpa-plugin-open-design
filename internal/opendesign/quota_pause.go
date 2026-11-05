@@ -14,90 +14,84 @@ import (
 
 const quotaPauseSyncError = "额度暂停状态未能同步到凭据文件；插件会重试。"
 
-// observeQuotaBlock records an account-level block only for the narrow,
-// structured upstream signal. A request for an old key or an old manual state
-// may finish late and must not re-pause the current credential.
+// observeQuotaBlock records only the narrow structured upstream signal. A late
+// error may not recreate a block after an explicit resume or identity change.
+// Existing blocks for the same inference key, including other credential IDs,
+// must nevertheless observe the model: those records share the upstream key.
 func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, requestErr error) {
 	var apiErr *APIError
-	if !errors.As(requestErr, &apiErr) || apiErr == nil || !apiErr.quotaExhausted || source.ID == "" || source.APIKey == "" {
+	if !errors.As(requestErr, &apiErr) || apiErr == nil || !apiErr.quotaExhausted || source.APIKey == "" {
 		return
 	}
-	// Resolve the policy before taking mu: config() takes mu.RLock and the block
-	// below is built while holding the write lock.
 	settings := s.config().pauseSettings()
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
 
+	type changedBlock struct{ id, revision string }
+	var changed []changedBlock
 	now := s.quotaPauseTime().UTC()
 	s.mu.Lock()
-	current, exists := s.creds[source.ID]
-	if !exists || s.revoked[source.ID] || current.APIKey != source.APIKey {
-		s.mu.Unlock()
-		return
-	}
-	// Disabling the policy stops new blocks, not the collection of late errors
-	// from requests already in flight for an existing block. Otherwise turning
-	// the policy off and back on could lose an exhausted model before recovery.
-	if !settings.enabled && !current.quotaBlocked() {
-		s.mu.Unlock()
-		return
-	}
-	if current.runtimeEpoch != source.runtimeEpoch && !current.quotaBlocked() {
-		// An explicit resume or key/account edit fences old requests from
-		// creating a *new* block. While an existing block is active, however,
-		// a late 402 from the same inference key may name another failed model;
-		// merge it even if the operator changed the manual switch meanwhile.
-		s.mu.Unlock()
-		return
-	}
-	var block *QuotaBlock
-	if current.quotaBlocked() {
-		block = cloneQuotaBlock(current.QuotaBlock)
-		seen := block.ModelID == upstreamModel
-		for _, model := range block.ModelIDs {
-			seen = seen || model == upstreamModel
+	for id, current := range s.creds {
+		if s.revoked[id] || current.APIKey != source.APIKey {
+			continue
 		}
-		addQuotaBlockModel(block, upstreamModel)
-		if now.After(block.ObservedAt) {
-			block.ObservedAt = now
+		active := current.quotaBlocked()
+		if !active && (source.ID == "" || id != source.ID || !settings.enabled || current.runtimeEpoch != source.runtimeEpoch) {
+			// Never create a new block for another record, an unknown source, an
+			// explicitly resumed account, or a disabled policy. Existing blocks
+			// still collect late signals even after the policy is switched off.
+			continue
 		}
-		// A distinct model or an explicit later upstream reset can postpone the
-		// first recheck, but only within the cap measured from the first block.
-		// Repeated errors without a reset hint must not extend it indefinitely.
-		if !seen || !apiErr.quotaResetAt.IsZero() {
-			retry := quotaPauseDeadline(now, apiErr.quotaResetAt, settings)
-			if latest := block.BlockedAt.Add(settings.maxWindow); retry.After(latest) {
-				retry = latest
+		var block *QuotaBlock
+		if active {
+			block = cloneQuotaBlock(current.QuotaBlock)
+			seen := block.ModelID == upstreamModel
+			for _, model := range block.ModelIDs {
+				seen = seen || model == upstreamModel
 			}
-			if retry.After(block.RetryAt) {
-				block.RetryAt = retry
+			addQuotaBlockModel(block, upstreamModel)
+			if now.After(block.ObservedAt) {
+				block.ObservedAt = now
 			}
+			// Distinct models or an explicit reset can postpone a recheck, but
+			// repeated errors without a reset hint cannot extend it indefinitely.
+			if !seen || !apiErr.quotaResetAt.IsZero() {
+				retry := quotaPauseDeadline(now, apiErr.quotaResetAt, settings)
+				if latest := block.BlockedAt.Add(settings.maxWindow); retry.After(latest) {
+					retry = latest
+				}
+				if retry.After(block.RetryAt) {
+					block.RetryAt = retry
+				}
+			}
+		} else {
+			manual := current.Disabled
+			block = &QuotaBlock{
+				KeyHash: quotaPauseKeyHash(current.APIKey), ManualDisabled: &manual,
+				Source: "upstream", Reason: "quota_exhausted", BlockedAt: now,
+				ObservedAt: now, RetryAt: quotaPauseDeadline(now, apiErr.quotaResetAt, settings),
+				ModelID: strings.TrimSpace(upstreamModel),
+			}
+			addQuotaBlockModel(block, upstreamModel)
 		}
-	} else {
-		manual := current.Disabled
-		block = &QuotaBlock{
-			KeyHash: quotaPauseKeyHash(current.APIKey), ManualDisabled: &manual,
-			Source: "upstream", Reason: "quota_exhausted", BlockedAt: now,
-			ObservedAt: now, RetryAt: quotaPauseDeadline(now, apiErr.quotaResetAt, settings),
-			ModelID: strings.TrimSpace(upstreamModel),
-		}
-		addQuotaBlockModel(block, upstreamModel)
+		current.QuotaBlock = block
+		current.QuotaRevision = newID()
+		delete(s.quotaRecheckStatus, id)
+		// Publish every in-memory guard before writing any of the files.
+		s.creds[id] = current
+		s.clearModelTestsLocked(id)
+		changed = append(changed, changedBlock{id: id, revision: current.QuotaRevision})
 	}
-	current.QuotaBlock = block
-	current.QuotaRevision = newID()
-	delete(s.quotaRecheckStatus, current.ID)
-	// Publish the local guard first. If writing fails, no new request will reach
-	// the exhausted upstream even if the host watcher still has an old snapshot.
-	s.creds[current.ID] = current
-	s.clearModelTestsLocked(current.ID)
 	s.mu.Unlock()
 
-	if err := s.persistQuotaBlockLocked(current.ID, current.QuotaRevision); err != nil {
-		s.setQuotaPauseSyncError(current.ID, current.QuotaRevision, true)
-	} else {
-		s.setQuotaPauseSyncError(current.ID, current.QuotaRevision, false)
+	sort.Slice(changed, func(i, j int) bool { return changed[i].id < changed[j].id })
+	for _, item := range changed {
+		err := s.persistQuotaBlockLocked(item.id, item.revision)
+		s.setQuotaPauseSyncError(item.id, item.revision, err != nil)
 	}
-	s.wakeQuotaPauseWorker()
+	if len(changed) != 0 {
+		s.wakeQuotaPauseWorker()
+	}
 }
 
 // persistQuotaBlockLocked merges plugin-owned quota fields into the latest auth
