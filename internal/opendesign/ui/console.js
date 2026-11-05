@@ -176,6 +176,32 @@
   let authAttemptSequence = 0;
   let activeAuthAttempt = 0;
 
+  // Status reads share one order across verification, ordinary loads and
+  // post-mutation refreshes. A confirmed account mutation is a separate CAS:
+  // even a later-issued verification may have captured its snapshot before it.
+  let statusRequestSequence = 0;
+  let appliedStatusSequence = 0;
+  let accountResultGeneration = 0;
+
+  function captureStatusRead() {
+    return {
+      sequence: ++statusRequestSequence,
+      accountGeneration: accountResultGeneration,
+      serverModelsGeneration: state.serverModelsGeneration,
+    };
+  }
+
+  function statusReadCurrent(read) {
+    return read.accountGeneration === accountResultGeneration && read.sequence > appliedStatusSequence;
+  }
+
+  function applyStatusRead(raw, read, newIdentity = false) {
+    if (!newIdentity && !statusReadCurrent(read)) return false;
+    appliedStatusSequence = read.sequence;
+    applyStatus(raw, { serverModelsGeneration: newIdentity ? state.serverModelsGeneration : read.serverModelsGeneration });
+    return true;
+  }
+
   let client = null;
   function api() {
     if (!client) {
@@ -740,6 +766,7 @@
     // 401s) must be invalidated instead of logging the new session out.
     state.sessionGeneration += 1;
     state.authGeneration += 1;
+    accountResultGeneration += 1;
     invalidateQuota();
     // An upstream-model fetch from the replaced session must not keep a slot or
     // a selection in the new one.
@@ -898,21 +925,24 @@
     const generation = state.optionalGeneration;
     const sessionGeneration = state.sessionGeneration;
     const authGeneration = state.authGeneration;
-    const serverModelsGeneration = state.serverModelsGeneration;
+    const read = captureStatusRead();
     try {
       const raw = await api().status();
       if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration || authGeneration !== state.authGeneration) return false;
-      applyStatus(raw, { serverModelsGeneration });
+      if (!applyStatusRead(raw, read)) return false;
       const source = options.source || (state.verified && state.verified.source) || '';
       if (state.verified) state.verified.source = source;
       markConnected(source);
       message('authState', '');
       return true;
     } catch (error) {
-      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration || authGeneration !== state.authGeneration) return false;
+      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return false;
+      // Data freshness and auth freshness are independent. An older status read
+      // can still carry a rejection from the currently verified generation.
       if (managementAuthFailure(error, error.status === 401
         ? '401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。'
         : '403：管理请求被拒绝，请确认管理密钥和来源 IP。')) return false;
+      if (authGeneration !== state.authGeneration || !statusReadCurrent(read)) return false;
       if (isUpstreamSource(error) && isAuthStatus(error.status)) {
         message('authState', `读取状态失败（上游）：${formatError(error)}`, 'error');
       } else {
@@ -1834,6 +1864,9 @@
   // Reflect an acknowledged mutation immediately. If the following status GET
   // fails, the page must still show what the server already confirmed.
   function applyAccountResult(result, fallback, removed = false) {
+    // Invalidate snapshots requested before this acknowledged mutation, even if
+    // the response contains no id and only a later refresh can fill the list.
+    accountResultGeneration += 1;
     const item = { ...fallback, ...(result && typeof result === 'object' ? result : {}) };
     const credentials = state.status.credentials.filter(account => account.id !== item.id);
     if (!removed && item.id) credentials.push(item);
@@ -1848,6 +1881,15 @@
       // status snapshot: a later save would silently lose its CAS lock.
       models_revision: state.modelsRevision,
     });
+  }
+
+  // A separate in-flight action (for example a quota read) can have posted a
+  // newer account notice while the status refresh was pending. Keep that notice
+  // as well as the confirmed mutation; never echo a refresh error's raw body.
+  function reportAccountRefreshFailure(text) {
+    const node = $('accountState');
+    const previous = node && !node.hidden ? node.textContent : '';
+    message('accountState', previous ? `${previous} ${text}` : text, 'error');
   }
 
   async function addAccount(event) {
@@ -1922,14 +1964,18 @@
       renderAccounts();
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
-      const prefix = saved ? '账户已保存，但读取最新状态时认证失效。' : '';
-      if (managementAuthFailure(error, prefix + (error.status === 401 ? '401：管理密钥无效或已过期，请重新验证。' : `403：${formatError(error)}`))) {
+      const retryWarning = `请刷新状态确认，不要重复${editing ? '提交' : '添加'}。`;
+      if (staleManagementRejection(error)) {
+        // An obsolete proof says nothing about this request's outcome. A failed
+        // write is still uncertain, but the old test/contract keeps the pending
+        // message for it; only a confirmed mutation must not be hidden.
+        if (saved) reportAccountRefreshFailure(`账户已保存，但读取最新状态失败。${retryWarning}`);
         return;
-      } else {
-        message('accountState', saved
-          ? `账户已保存，但读取最新状态失败：${formatError(error)}。请刷新状态确认，不要重复添加。`
-          : `${editing ? '保存修改' : '保存'}请求失败，服务器结果尚未确认：${formatError(error)}。密钥输入已清空，请先刷新状态确认后再试。`, 'error');
       }
+      const prefix = saved ? `账户已保存，但读取最新状态时认证失效。请重新验证并刷新状态确认，不要重复${editing ? '提交' : '添加'}。` : '';
+      if (managementAuthFailure(error, prefix + (error.status === 401 ? '401：管理密钥无效或已过期，请重新验证。' : '403：管理请求被拒绝，请确认管理密钥和来源 IP。'))) return;
+      if (saved) reportAccountRefreshFailure(`账户已保存，但读取最新状态失败。${retryWarning}`);
+      else message('accountState', `${editing ? '保存修改' : '保存'}请求失败，服务器结果尚未确认：${formatError(error)}。密钥输入已清空，请先刷新状态确认后再试。`, 'error');
     } finally {
       // A stale response from a replaced session must not release a lock the new
       // session now owns.
@@ -1963,10 +2009,14 @@
       await refreshStatus();
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
-      if (managementAuthFailure(error, `${deleted ? '账户已删除，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`)) {
+      if (staleManagementRejection(error)) {
+        if (deleted) reportAccountRefreshFailure('账户已删除，但读取最新状态失败。请刷新状态确认。');
+        return;
+      }
+      if (managementAuthFailure(error, `${deleted ? '账户已删除，但读取最新状态时认证失效，请重新验证并刷新状态确认。' : ''}401/403：管理请求被拒绝，请重新验证。`)) {
         return;
       } else if (deleted) {
-        message('accountState', `账户已删除，但读取最新状态失败：${formatError(error)}。请刷新状态确认。`, 'error');
+        reportAccountRefreshFailure('账户已删除，但读取最新状态失败。请刷新状态确认。');
       } else if (partialCompletion(formatError(error)) === 'credential-disabled') {
         // The backend already disabled the credential before the unlink failed:
         // its models are withdrawn but the record remains. Reflect that state
@@ -2001,11 +2051,13 @@
       await refreshStatus();
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
-      if (managementAuthFailure(error, `${updated ? '账户状态已更新，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`)) {
+      if (staleManagementRejection(error)) {
+        if (updated) reportAccountRefreshFailure(`账户已${item.disabled ? '启用' : '停用'}，但读取最新状态失败。请刷新状态确认。`);
         return;
-      } else message('accountState', updated
-        ? `账户已${item.disabled ? '启用' : '停用'}，但读取最新状态失败：${formatError(error)}。请刷新状态确认。`
-        : `更新失败：${formatError(error)}`, 'error');
+      }
+      if (managementAuthFailure(error, `${updated ? '账户状态已更新，但读取最新状态时认证失效，请重新验证并刷新状态确认。' : ''}401/403：管理请求被拒绝，请重新验证。`)) return;
+      if (updated) reportAccountRefreshFailure(`账户已${item.disabled ? '启用' : '停用'}，但读取最新状态失败。请刷新状态确认。`);
+      else message('accountState', `更新失败：${formatError(error)}`, 'error');
     } finally {
       if (sessionGeneration === state.sessionGeneration) setBusy(false);
     }
@@ -2078,12 +2130,12 @@
   async function refreshStatus() {
     const generation = state.optionalGeneration;
     const sessionGeneration = state.sessionGeneration;
-    const serverModelsGeneration = state.serverModelsGeneration;
+    const read = captureStatusRead();
     const raw = await api().status();
-    // A refresh started under an older management identity must not repaint the
-    // session that replaced it (logout or another key).
+    // A refresh started under an older identity or before a newer account result
+    // must not repaint the page, even if its authentication is still valid.
     if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return null;
-    applyStatus(raw, { serverModelsGeneration });
+    if (!applyStatusRead(raw, read)) return null;
     markConnected((state.verified && state.verified.source) || '');
     return raw;
   }
@@ -2126,8 +2178,14 @@
         : '账户可用，但 OpenDesign 没有返回模型。可稍后重试或手动添加映射。');
     } catch (error) {
       if (!stillCurrent()) return;
-      if (staleManagementRejection(error)) return;
-      if (isUpstreamSource(error) && isAuthStatus(error.status)) {
+      // A legacy untagged 401 may be an upstream account rejection, so a newer
+      // management proof cannot make the entire business result disappear.
+      if (error.status === 401 && !error.source) {
+        message('modelState', staleManagementRejection(error)
+          ? '401：旧版服务未区分管理认证和 OpenDesign API key。管理密钥已重新验证，请检查账户 key；必要时再次验证管理密钥。'
+          : '401：管理认证失效，或该 OpenDesign API key 无效。请先重新验证管理密钥，再检查账户 key。', 'error');
+      } else if (staleManagementRejection(error)) return;
+      else if (isUpstreamSource(error) && isAuthStatus(error.status)) {
         // The management session is fine; the selected OpenDesign account key was
         // rejected upstream. Keep CPA auth and any loaded list, and point at the
         // account instead of asking for the management key again.
@@ -2135,9 +2193,6 @@
         message('modelState', error.status === 401
           ? `账户「${account ? account.label : credentialID}」的 OpenDesign Key 被上游拒绝${detail}。请编辑该账户替换 Key 后重试；管理认证仍有效。`
           : `上游拒绝读取该账户的模型列表（403）${detail}。请确认该 OpenDesign Key 的权限；管理认证仍有效。`, 'error');
-      } else if (error.status === 401 && !error.source) {
-        // Older backends cannot distinguish the management and account keys.
-        message('modelState', '401：管理认证失效，或该 OpenDesign API key 无效。请先重新验证管理密钥，再检查账户 key。', 'error');
       } else if (isManagementAuthError(error)) {
         // An explicitly tagged management rejection is unambiguous. Preserve
         // the legacy combined warning only for an untagged 401 above.
@@ -3794,10 +3849,12 @@
       renderReasoning();
       message('reasoningState', `已保存 ${model.id} 的思考强度映射${payload.reasoning_mapping.enabled ? '（已启用）' : '（当前关闭，不生效）'}。`);
     } catch (error) {
-      if (generation !== state.reasoningGeneration || sessionGeneration !== state.sessionGeneration) return;
-      if (managementAuthFailure(error, error.status === 401 ? '401：管理密钥无效或已过期，映射未保存。' : `403：${formatError(error)}`)) {
-        return;
-      } else if (error.status === 409) {
+      if (sessionGeneration !== state.sessionGeneration) return;
+      if (managementAuthFailure(error, error.status === 401 ? '401：管理密钥无效或已过期，映射未保存。' : `403：${formatError(error)}`)) return;
+      // A status refresh invalidates the reasoning result, not a current auth
+      // rejection. Only non-auth business errors are fenced by this generation.
+      if (generation !== state.reasoningGeneration) return;
+      if (error.status === 409) {
         // A 409 means the server refused the CAS; never claim success and never
         // drop the draft. A refresh surfaces the newer revision, and the next
         // save asks before overwriting it.
@@ -3961,7 +4018,7 @@
     }
     const generation = state.optionalGeneration;
     const sessionGeneration = state.sessionGeneration;
-    const serverModelsGeneration = state.serverModelsGeneration;
+    const read = captureStatusRead();
     const candidate = { headers: Auth.candidateHeaders(key, type) };
     // Re-validating the same key keeps the current session: its drafts and CAS
     // tokens are still valid. A different key starts a fresh session.
@@ -3987,29 +4044,20 @@
       Auth.saveAuth(key, type, remember);
       state.verified = { headers: candidate.headers, source: 'manual' };
       if (keyInput) keyInput.value = '';
-      // The answer was requested with the key that just became the verified one,
-      // so for a same-key re-validation it must not roll a newer model write back
-      // (that is the generation fence below). A different key starts a new
-      // session whose model side *is* this answer, so the fence is re-based onto
-      // the session reset instead of comparing across two identities.
-      let modelsGeneration = serverModelsGeneration;
+      // A key switch rebases this snapshot onto the new session. For the same
+      // key, authentication can succeed even if its older status snapshot is no
+      // longer safe to apply to confirmed account or model state.
       if (!sameIdentity) {
-        // A management-key switch owns a fresh session: old drafts, CAS tokens
-        // and any unsubmitted account secret in the form must go with it.
         resetManagementData();
         resetAccountForm();
-        modelsGeneration = state.serverModelsGeneration;
       }
-      // A same-key re-validation may answer after a newer model write (or a
-      // reasoning save) landed. Its model side must then not roll the list,
-      // its tokens or a draft pinned to them back.
-      applyStatus(status, { serverModelsGeneration: modelsGeneration });
+      applyStatusRead(status, read, !sameIdentity);
       setAuthCollapsed(true);
       markConnected('manual');
       message('modelState', !sameIdentity && hadDrafts
         ? '管理密钥已切换，未保存的模型映射/思考强度草稿已清除。'
         : '');
-      message('accountState', '');
+      if (!sameIdentity) message('accountState', '');
       message('authState', '管理密钥验证成功，已开始读取账户和模型。', 'ok');
     } catch (error) {
       if (activeAuthAttempt !== attempt || generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return;

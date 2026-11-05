@@ -5409,7 +5409,7 @@ test('auth race: same-key revalidation fences old management rejections at real 
     ['model fetch', url => url.includes('/upstream-models'), f => {
       f.api.handlers.selectCredential('cred-1');
       return f.api.handlers.fetchModels();
-    }, 'modelState'],
+    }, 'modelState', 'management'],
     ['model coverage', url => url.includes('/model-coverage'), f => {
       f.api.handlers.selectCredential('cred-1');
       f.api.state.upstreamFor = 'cred-1';
@@ -5421,7 +5421,7 @@ test('auth race: same-key revalidation fences old management rejections at real 
     ['optional config', url => url.endsWith('/config'), f => f.api.handlers.loadConfig(), 'configState'],
     ['optional logs', url => url.includes('/request-logs'), f => f.api.handlers.loadRequestLogs({ reset: true }), 'logsState'],
   ];
-  for (const [name, matches, invoke, messageID] of cases) {
+  for (const [name, matches, invoke, messageID, source] of cases) {
     for (const status of [401, 403]) await t.test(`${name} ${status}`, async () => {
       const f = authRaceFixture();
       await authRaceLogin(f);
@@ -5436,7 +5436,7 @@ test('auth race: same-key revalidation fences old management rejections at real 
       const beforeMappings = plain(f.api.state.mappings);
       const beforeDrafts = plain([...f.api.state.reasoningDrafts]);
       const beforeStorage = [...f.view.sessionStorage.map];
-      f.pending.resolve(respond(status, { error: 'old management rejection' }));
+      f.pending.resolve(respond(status, { error: source ? { source, message: 'old management rejection' } : 'old management rejection' }));
       await flight;
       assert.equal(f.api.state.verified?.headers.Authorization, `Bearer ${managementKey}`);
       assert.equal(f.view.document.getElementById('accountsPanel').hidden, false);
@@ -5835,6 +5835,252 @@ test('auth race: asynchronous auth resolution carries only a local request gener
   assert.ok(!JSON.stringify({ url: view.calls[0].url, ...view.calls[0].init, headers: {} }).includes(managementKey));
   assert.ok(!JSON.stringify(view.calls[0].init).includes('authGeneration'));
   assert.equal(view.calls[0].url.includes(managementKey), false);
+});
+
+test('account race: a delayed same-key proof cannot undo an acknowledged save or hide its failed refresh', async t => {
+  for (const status of [401, 403, 500]) await t.test(`follow-up ${status}`, async () => {
+    const verification = deferred(), refresh = deferred();
+    let statusCalls = 0;
+    const oldStatus = statusBody({ credentials: [{ id: 'cred-1', label: '原账户' }] });
+    const view = fakePage({ fetchImpl: (url, init) => {
+      if (url.endsWith('/status')) {
+        statusCalls++;
+        if (statusCalls === 2) return verification.promise;
+        if (statusCalls === 3) return refresh.promise;
+        return respond(200, oldStatus);
+      }
+      if (url.endsWith('/credentials') && init.method === 'POST') return respond(201, { id: 'cred-2', label: '新账户' });
+      return respond(404, {});
+    } });
+    const api = view.context.OpenDesignConsole;
+    const login = () => {
+      view.document.getElementById('managementKey').value = managementKey;
+      return api.handlers.submitAuth({ preventDefault() {} });
+    };
+    await login();
+    const revalidating = login();
+    await new Promise(setImmediate);
+    view.document.getElementById('accountLabel').value = '新账户';
+    view.document.getElementById('accountKey').value = key;
+    view.document.getElementById('accountControlKey').value = 'fixture-control-secret';
+    const saving = api.handlers.addAccount({ preventDefault() {} });
+    await new Promise(setImmediate);
+    assert.equal(statusCalls, 3, 'the acknowledged POST has launched its follow-up');
+    assert.deepEqual(plain(api.state.status.credentials.map(item => item.id)), ['cred-1', 'cred-2']);
+    assert.match(view.document.getElementById('accountState').textContent, /账户已保存/);
+    verification.resolve(respond(200, oldStatus));
+    await revalidating;
+    assert.deepEqual(plain(api.state.status.credentials.map(item => item.id)), ['cred-1', 'cred-2'], 'an older proof cannot undo the saved account');
+    assert.match(view.document.getElementById('accountState').textContent, /账户已保存/, 'verification must not erase a completed operation');
+    refresh.resolve(respond(status, { error: 'refresh rejected' }));
+    await saving;
+    assert.ok(api.state.verified, 'an obsolete rejection must not revoke the reverified key');
+    const notice = view.document.getElementById('accountState').textContent;
+    assert.match(notice, /账户已保存/);
+    assert.match(notice, /刷新状态/);
+    assert.match(notice, /不要重复添加/);
+    assert.deepEqual(plain(api.state.status.credentials.map(item => item.id)), ['cred-1', 'cred-2']);
+    assert.equal(api.state.busy, false);
+    assert.equal(view.document.getElementById('accountKey').value, '');
+    assert.equal(view.document.getElementById('accountControlKey').value, '');
+    assert.ok(!JSON.stringify(api.state).includes(key));
+    assert.ok(!JSON.stringify(api.state).includes('fixture-control-secret'));
+    assert.ok(!view.calls.some(call => [key, managementKey, 'fixture-control-secret'].some(secret => call.url.includes(secret))));
+    assert.ok(!notice.includes(key) && !notice.includes(managementKey) && !notice.includes('fixture-control-secret'));
+    assert.equal(view.calls.filter(call => call.url.endsWith('/credentials')).length, 1, 'there is no automatic retry');
+  });
+});
+
+test('account race: an older refresh cannot roll back a newer status or erase a newer business notice', async t => {
+  for (const result of [200, 500]) await t.test(`follow-up ${result}`, async () => {
+    const refresh = deferred(), quota = deferred();
+    let statusCalls = 0;
+    const original = { id: 'cred-1', label: '原账户', billing_configured: true, workspace_id: 'ws-1' };
+    const view = fakePage({ fetchImpl: (url, init) => {
+      if (url.endsWith('/status')) {
+        statusCalls++;
+        if (statusCalls === 2) return refresh.promise;
+        return respond(200, statusBody({ credentials: statusCalls === 1
+          ? [original] : [original, { id: 'cred-2', label: '新状态中的账户', disabled: true }] }));
+      }
+      if (url.includes('/quota?')) return quota.promise;
+      if (url.endsWith('/credentials') && init.method === 'POST') return respond(201, { id: 'cred-2', label: '刚保存的账户' });
+      return respond(404, {});
+    } });
+    const api = view.context.OpenDesignConsole;
+    const login = () => {
+      view.document.getElementById('managementKey').value = managementKey;
+      return api.handlers.submitAuth({ preventDefault() {} });
+    };
+    await login();
+    const checkingQuota = api.handlers.refreshQuota(api.state.status.credentials[0]);
+    await new Promise(setImmediate);
+    view.document.getElementById('accountKey').value = key;
+    const saving = api.handlers.addAccount({ preventDefault() {} });
+    await new Promise(setImmediate);
+    assert.equal(statusCalls, 2);
+    await login();
+    assert.match(view.document.getElementById('accountState').textContent, /账户已保存/);
+    quota.resolve(respond(200, quotaContract()));
+    await checkingQuota;
+    const newerNotice = view.document.getElementById('accountState').textContent;
+    assert.match(newerNotice, /额度已更新/);
+    refresh.resolve(respond(result, result === 200
+      ? statusBody({ credentials: [original, { id: 'cred-2', label: '旧快照', disabled: false }] })
+      : { error: 'old refresh failed' }));
+    await saving;
+    const updated = api.state.status.credentials.find(item => item.id === 'cred-2');
+    assert.equal(updated.label, '新状态中的账户');
+    assert.equal(updated.disabled, true);
+    const notice = view.document.getElementById('accountState').textContent;
+    assert.ok(notice.includes(newerNotice), 'a late refresh must not erase a newer business notice');
+    if (result === 500) {
+      assert.match(notice, /账户已保存/);
+      assert.match(notice, /刷新状态/);
+      assert.match(notice, /不要重复添加/);
+    }
+    assert.match(view.document.getElementById('authState').textContent, /验证成功/);
+    assert.ok(api.state.verified);
+  });
+});
+
+test('account race: acknowledged edit, delete and toggle survive an older proof and stale refresh rejection', async t => {
+  for (const action of ['edit', 'delete', 'toggle']) await t.test(action, async () => {
+    const verification = deferred(), refresh = deferred();
+    let statusCalls = 0;
+    const oldStatus = statusBody({ credentials: [{ id: 'cred-1', label: '原账户', disabled: false }] });
+    const view = fakePage({ fetchImpl: (url, init) => {
+      if (url.endsWith('/status')) {
+        statusCalls++;
+        return statusCalls === 2 ? verification.promise : statusCalls === 3 ? refresh.promise : respond(200, oldStatus);
+      }
+      if (url.includes('/credentials')) return respond(200, action === 'edit'
+        ? { id: 'cred-1', label: '改名' } : { id: 'cred-1', label: '原账户', disabled: true });
+      return respond(404, {});
+    } });
+    const api = view.context.OpenDesignConsole;
+    const login = () => {
+      view.document.getElementById('managementKey').value = managementKey;
+      return api.handlers.submitAuth({ preventDefault() {} });
+    };
+    await login();
+    const proof = login();
+    await new Promise(setImmediate);
+    const item = api.state.status.credentials[0];
+    let flight;
+    if (action === 'edit') {
+      api.handlers.editAccount(item);
+      view.document.getElementById('accountLabel').value = '改名';
+      flight = api.handlers.addAccount({ preventDefault() {} });
+    } else if (action === 'delete') flight = api.handlers.deleteAccount(item);
+    else flight = api.handlers.toggleAccount(item);
+    await new Promise(setImmediate);
+    verification.resolve(respond(200, oldStatus));
+    await proof;
+    refresh.resolve(respond(401, { error: 'old rejection' }));
+    await flight;
+    assert.ok(api.state.verified);
+    if (action === 'edit') assert.equal(api.state.status.credentials[0].label, '改名');
+    else if (action === 'delete') assert.equal(api.state.status.credentials.length, 0);
+    else assert.equal(api.state.status.credentials[0].disabled, true);
+    const notice = view.document.getElementById('accountState').textContent;
+    assert.match(notice, action === 'edit' ? /已保存/ : action === 'delete' ? /已删除/ : /已停用/);
+    assert.match(notice, /刷新状态/);
+    assert.equal(api.state.busy, false);
+  });
+});
+
+test('status race: newer status results fence older success and errors without hiding current auth rejection', async t => {
+  for (const result of [200, 500, 401, 403]) await t.test(String(result), async () => {
+    const old = deferred(), newer = deferred();
+    let count = 0;
+    const view = fakePage({ fetchImpl: url => {
+      if (!url.endsWith('/status')) return respond(404, {});
+      count++;
+      if (count === 2) return old.promise;
+      if (count === 3) return newer.promise;
+      return respond(200, statusBody());
+    } });
+    const api = view.context.OpenDesignConsole;
+    view.document.getElementById('managementKey').value = managementKey;
+    await api.handlers.submitAuth({ preventDefault() {} });
+    const first = api.render.loadStatus();
+    const second = api.render.loadStatus();
+    await new Promise(setImmediate);
+    newer.resolve(respond(200, statusBody({ credentials: [{ id: 'fresh', label: '新账户' }] })));
+    await second;
+    old.resolve(respond(result, result === 200
+      ? statusBody({ credentials: [{ id: 'old', label: '旧账户' }] }) : { error: 'old response' }));
+    await first;
+    if (result === 401 || result === 403) {
+      assert.equal(api.state.verified, null, 'current-generation auth errors must still revoke the session');
+      assert.match(view.document.getElementById('authState').textContent, new RegExp(String(result)));
+    } else {
+      assert.ok(api.state.verified);
+      assert.equal(api.state.status.credentials[0].id, 'fresh');
+      assert.doesNotMatch(view.document.getElementById('authState').textContent, /读取状态失败/);
+    }
+  });
+});
+
+test('reasoning race: current auth rejection is handled even after a status invalidates its result', async t => {
+  for (const status of [401, 403]) await t.test(String(status), async () => {
+    const reasoning = deferred();
+    const view = fakePage({ fetchImpl: url => {
+      if (url.endsWith('/models/reasoning')) return reasoning.promise;
+      if (url.endsWith('/status')) return respond(200, statusBody({ models_revision: 'list-1' }));
+      return respond(404, {});
+    } });
+    const api = view.context.OpenDesignConsole;
+    view.document.getElementById('managementKey').value = managementKey;
+    await api.handlers.submitAuth({ preventDefault() {} });
+    await api.handlers.addReasoningRule();
+    const saving = api.handlers.saveReasoning();
+    await new Promise(setImmediate);
+    await api.render.loadStatus();
+    assert.match(view.document.getElementById('reasoningState').textContent, /结果已失效/);
+    reasoning.resolve(respond(status, { error: 'current management rejection' }));
+    await saving;
+    assert.equal(api.state.verified, null);
+    assert.match(view.document.getElementById('authState').textContent, new RegExp(String(status)));
+    assert.equal(view.sessionStorage.keys().length, 0);
+  });
+});
+
+test('auth race: old untagged upstream-model 401 stays ambiguous after same-key revalidation', async () => {
+  const f = authRaceFixture();
+  await authRaceLogin(f);
+  f.api.handlers.selectCredential('cred-1');
+  f.hold(url => url.includes('/upstream-models'));
+  const flight = f.api.handlers.fetchModels();
+  await new Promise(setImmediate);
+  await authRaceLogin(f);
+  f.pending.resolve(respond(401, { error: 'legacy backend rejection' }));
+  await flight;
+  assert.ok(f.api.state.verified);
+  const notice = f.view.document.getElementById('modelState').textContent;
+  assert.match(notice, /401/);
+  assert.match(notice, /OpenDesign.*[Kk]ey/);
+  assert.doesNotMatch(notice, /管理密钥无效或已过期/);
+});
+
+test('account race: current follow-up 401 reports the acknowledged save on the auth screen', async () => {
+  let calls = 0;
+  const view = fakePage({ fetchImpl: url => {
+    if (url.endsWith('/status')) return ++calls === 1 ? respond(200, statusBody()) : respond(401, { error: 'expired' });
+    if (url.endsWith('/credentials')) return respond(201, { id: 'cred-2', label: '新账户' });
+    return respond(404, {});
+  } });
+  const api = view.context.OpenDesignConsole;
+  view.document.getElementById('managementKey').value = managementKey;
+  await api.handlers.submitAuth({ preventDefault() {} });
+  view.document.getElementById('accountKey').value = key;
+  await api.handlers.addAccount({ preventDefault() {} });
+  assert.equal(api.state.verified, null);
+  const notice = view.document.getElementById('authState').textContent;
+  assert.match(notice, /账户已保存/);
+  assert.match(notice, /刷新状态/);
+  assert.match(notice, /不要重复添加/);
 });
 
 test('api.saveModels keeps the legacy body and only adds a revision when explicitly given one', async () => {
