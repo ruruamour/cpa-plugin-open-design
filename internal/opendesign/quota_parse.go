@@ -56,7 +56,11 @@ func parseQuotaFundingForModel(body []byte, workspaceID string, modelID *string)
 		return nil, false
 	}
 	member, ok := quotaString(m["workspaceMemberId"])
-	if !ok || strings.TrimSpace(member) == "" || !quotaTimeField(m["generatedAt"]) {
+	if !ok || strings.TrimSpace(member) == "" {
+		return nil, false
+	}
+	generatedAt, ok := quotaTimestamp(m["generatedAt"])
+	if !ok {
 		return nil, false
 	}
 	balance, ok := quotaString(m["balanceUsd"])
@@ -112,7 +116,8 @@ func parseQuotaFundingForModel(body []byte, workspaceID string, modelID *string)
 		windows = append(windows, window)
 	}
 	return &quotaFundingData{BalanceUSD: balance, Funding: funding, ModelCovered: covered,
-		FundingCheck: fundingCheck, CodingPlan: quotaCodingPlan{Tier: tier, Windows: windows}}, true
+		FundingCheck: fundingCheck, CodingPlan: quotaCodingPlan{Tier: tier, Windows: windows},
+		generatedAt: generatedAt, workspaceMemberID: member}, true
 }
 
 func parseQuotaWindow(raw []byte) (quotaWindow, bool) {
@@ -206,8 +211,17 @@ func quotaBool(raw json.RawMessage) (bool, bool) {
 }
 
 func quotaTimeField(raw json.RawMessage) bool {
-	_, ok := quotaNullableTime(raw, false)
-	return ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+	_, ok := quotaTimestamp(raw)
+	return ok
+}
+
+func quotaTimestamp(raw json.RawMessage) (time.Time, bool) {
+	value, ok := quotaString(raw)
+	if !ok {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	return parsed, err == nil
 }
 
 func quotaNullableTime(raw json.RawMessage, allowMissing bool) (*string, bool) {

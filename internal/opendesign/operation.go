@@ -137,7 +137,14 @@ func (e *hostOperationError) Unwrap() error { return e.err }
 // doOperationContext bounds cancellable host work without adding transport ABI
 // fields. Bounded calls require the operation bridge: an uncancellable fallback
 // could block past the context deadline. Unbounded callers keep their fallback.
-func (s *Service) doOperationContext(ctx context.Context, callbackID, method string, payload map[string]any, out any) (err error) {
+func (s *Service) doOperationContext(ctx context.Context, callbackID, method string, payload map[string]any, out any) error {
+	return s.doOperationContextOnStart(ctx, callbackID, method, payload, out, nil)
+}
+
+// doOperationContextOnStart calls onStart immediately before the actual host
+// call, after operation_open and cancellation checks. It is not called if the
+// operation never reaches the host.
+func (s *Service) doOperationContextOnStart(ctx context.Context, callbackID, method string, payload map[string]any, out any, onStart func()) (err error) {
 	attempted := false
 	defer func() {
 		if err != nil {
@@ -195,6 +202,9 @@ func (s *Service) doOperationContext(ctx context.Context, callbackID, method str
 		if ctx.Done() != nil {
 			return errors.New("host HTTP operations are required for bounded requests")
 		}
+		if onStart != nil {
+			onStart()
+		}
 		attempted = true
 		return s.call(method, payload, out)
 	}
@@ -225,6 +235,9 @@ func (s *Service) doOperationContext(ctx context.Context, callbackID, method str
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	if onStart != nil {
+		onStart()
 	}
 	attempted = true
 	err = s.call(method, payload, out)

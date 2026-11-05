@@ -32,6 +32,23 @@ type modelCoverageResponse struct {
 	FundingCheck      *string     `json:"funding_check"`
 	Funding           *string     `json:"funding"`
 	Error             *quotaError `json:"error"`
+
+	// Evidence is immutable and belongs to the last validated successful HTTP
+	// response. It is never serialized, including when the view becomes stale.
+	evidence *modelCoverageEvidence
+	// True only on the result of the read that started or joined this refresh;
+	// it is never stored in the cache or serialized.
+	refreshedForRead bool
+}
+
+type modelCoverageEvidence struct {
+	credentialID      string
+	workspaceID       string
+	workspaceMemberID string // exact validated value; never serialize or log
+	modelID           string
+	fundingCheck      string
+	requestStartedAt  time.Time
+	generatedAt       time.Time
 }
 
 type modelCoverageKey struct {
@@ -45,6 +62,7 @@ type modelCoverageEntry struct {
 	lastAttempt time.Time
 	lastAccess  time.Time
 	inflight    chan struct{}
+	completed   chan struct{} // last published attempt, for fencing joined reads
 	invalidated chan struct{}
 }
 
@@ -104,6 +122,7 @@ func (s *Service) readModelCoverage(credentialID, modelID, callbackID string, re
 		s.mu.Unlock()
 		select {
 		case <-done:
+			return s.joinedModelCoverage(key, entry, done)
 		case <-invalidated:
 		case <-stop:
 		}
@@ -122,12 +141,15 @@ func (s *Service) readModelCoverage(credentialID, modelID, callbackID string, re
 
 	view := s.fetchModelCoverage(callbackID, c, modelID, entry, key, stop)
 	s.mu.Lock()
-	if current := s.modelCoverage[key]; current == entry && current.epoch == s.billingEpoch[credentialID] && view != nil {
+	published := s.modelCoverage[key] == entry && entry.epoch == s.billingEpoch[credentialID] && view != nil
+	if published {
 		entry.view = *view
+		entry.completed = done
 	}
 	entry.inflight = nil
 	close(done)
 	result, resultErr := s.modelCoverageViewLocked(key)
+	result.refreshedForRead = resultErr == nil && published
 	s.mu.Unlock()
 	return result, resultErr
 }
@@ -136,6 +158,17 @@ func (s *Service) cachedModelCoverage(key modelCoverageKey) (modelCoverageRespon
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.modelCoverageViewLocked(key)
+}
+
+// A waiter may wake after invalidation or after a different refresh completed.
+// Only the result actually published by the joined attempt is non-cached.
+func (s *Service) joinedModelCoverage(key modelCoverageKey, entry *modelCoverageEntry, done chan struct{}) (modelCoverageResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	view, err := s.modelCoverageViewLocked(key)
+	view.refreshedForRead = err == nil && s.modelCoverage[key] == entry &&
+		entry.epoch == s.billingEpoch[key.CredentialID] && entry.completed == done
+	return view, err
 }
 
 func (s *Service) modelCoverageViewLocked(key modelCoverageKey) (modelCoverageResponse, error) {
@@ -154,6 +187,7 @@ func (s *Service) modelCoverageViewLocked(key modelCoverageKey) (modelCoverageRe
 }
 
 func modelCoverageViewAt(view modelCoverageResponse, _ time.Time) modelCoverageResponse {
+	view.refreshedForRead = false
 	return view
 }
 
@@ -268,7 +302,7 @@ func (s *Service) fetchModelCoverage(callbackID string, c Credential, modelID st
 		len(c.WorkspaceID) > 512 || strings.IndexFunc(c.WorkspaceID, unicode.IsControl) >= 0 {
 		return modelCoverageFailureView(view, modelCoverageFailure("malformed"))
 	}
-	body, failure := s.modelCoverageGET(ctx, callbackID, c, modelID)
+	body, requestStartedAt, failure := s.modelCoverageGET(ctx, callbackID, c, modelID)
 	if failure == nil {
 		data, valid := parseModelCoverageFunding(body, c.WorkspaceID, modelID)
 		if valid {
@@ -280,6 +314,14 @@ func (s *Service) fetchModelCoverage(callbackID string, c Credential, modelID st
 			funding := data.Funding
 			view.Funding = &funding
 			view.Error = nil
+			check := ""
+			if data.FundingCheck != nil {
+				check = *data.FundingCheck
+			}
+			view.evidence = &modelCoverageEvidence{
+				credentialID: key.CredentialID, workspaceID: c.WorkspaceID, workspaceMemberID: data.workspaceMemberID,
+				modelID: modelID, fundingCheck: check, requestStartedAt: requestStartedAt, generatedAt: data.generatedAt,
+			}
 		} else {
 			failure = modelCoverageFailure("malformed")
 		}
@@ -300,46 +342,47 @@ func modelCoverageFailureView(view modelCoverageResponse, failure *quotaError) *
 	return &view
 }
 
-func (s *Service) modelCoverageGET(ctx context.Context, callbackID string, c Credential, modelID string) ([]byte, *quotaError) {
+func (s *Service) modelCoverageGET(ctx context.Context, callbackID string, c Credential, modelID string) ([]byte, time.Time, *quotaError) {
 	query := url.Values{}
 	query.Set("modelId", modelID)
 	address := billingAPIURL + "/api/v1/workspaces/" + url.PathEscape(c.WorkspaceID) + "/billing/funding-check?" + query.Encode()
 	var out upstreamCall
-	if err := s.doOperationContext(ctx, callbackID, "host.http.do", map[string]any{
+	var requestStartedAt time.Time
+	if err := s.doOperationContextOnStart(ctx, callbackID, "host.http.do", map[string]any{
 		"host_callback_id": callbackID,
 		"method":           http.MethodGet,
 		"url":              address,
 		"headers":          upstreamHeaders(c.ControlKey),
-	}, &out); err != nil {
+	}, &out, func() { requestStartedAt = s.modelCoverageNow() }); err != nil {
 		if s.ops.isClosed() {
-			return nil, modelCoverageFailure("stopped")
+			return nil, time.Time{}, modelCoverageFailure("stopped")
 		}
 		var timeout net.Error
 		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout() ||
 			strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") ||
 			strings.Contains(strings.ToLower(err.Error()), "timed out") ||
 			strings.Contains(strings.ToLower(err.Error()), "timeout") {
-			return nil, modelCoverageFailure("timeout")
+			return nil, time.Time{}, modelCoverageFailure("timeout")
 		}
-		return nil, modelCoverageFailure("network")
+		return nil, time.Time{}, modelCoverageFailure("network")
 	}
 	switch out.StatusCode {
 	case http.StatusUnauthorized:
-		return nil, modelCoverageFailure("unauthorized")
+		return nil, time.Time{}, modelCoverageFailure("unauthorized")
 	case http.StatusForbidden:
-		return nil, modelCoverageFailure("forbidden")
+		return nil, time.Time{}, modelCoverageFailure("forbidden")
 	case http.StatusTooManyRequests:
-		return nil, modelCoverageFailure("rate_limited")
+		return nil, time.Time{}, modelCoverageFailure("rate_limited")
 	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
-		return nil, modelCoverageFailure("timeout")
+		return nil, time.Time{}, modelCoverageFailure("timeout")
 	}
 	if out.StatusCode < 200 || out.StatusCode >= 300 {
-		return nil, modelCoverageFailure("upstream")
+		return nil, time.Time{}, modelCoverageFailure("upstream")
 	}
 	if len(out.Body) > maxQuotaBody {
-		return nil, modelCoverageFailure("malformed")
+		return nil, time.Time{}, modelCoverageFailure("malformed")
 	}
-	return out.Body, nil
+	return out.Body, requestStartedAt, nil
 }
 
 func modelCoverageFailure(kind string) *quotaError {

@@ -45,6 +45,10 @@ type quotaFundingData struct {
 	ModelCovered *bool           `json:"modelCovered"`
 	FundingCheck *string         `json:"fundingCheck,omitempty"`
 	CodingPlan   quotaCodingPlan `json:"codingPlan"`
+
+	// Validated official values; never included in management JSON or logs.
+	generatedAt       time.Time
+	workspaceMemberID string
 }
 
 type quotaCodingPlan struct {
