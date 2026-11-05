@@ -1315,6 +1315,10 @@ def run_cpa_live(artifact, binary, version):
             case = run_cpa_live_error(binary, artifact, code, version)
             evidence["host_http_status"][str(code)] = case
 
+        # Test plugin-controlled manual disable while a quota block is active in
+        # its own process, since the intentional 402 changes host scheduling.
+        evidence["host_quota_manual_disable"] = _live_case(binary, artifact, version, quota_manual=True)
+
         # ---- 6. disable -> enable must resync the runtime ----
         # If the registration never came up there is nothing to withdraw, so these
         # legs are reported as skipped instead of inventing a verdict.
@@ -1452,6 +1456,8 @@ def run_cpa_live(artifact, binary, version):
             blockers.append("host_http_redirect")
         if evidence.get("host_retry_scheduling", {}).get("status") != "PASS":
             blockers.append("host_retry_scheduling")
+        if evidence.get("host_quota_manual_disable", {}).get("status") != "PASS":
+            blockers.append("host_quota_manual_disable")
         if not registration_live:
             blockers.append("ui_flow.registration")
         if stage_failures:
@@ -1958,7 +1964,7 @@ def run_cpa_live_error(binary, artifact, code, version):
     return _live_case(binary, artifact, version, fail_status=code)
 
 
-def _live_case(binary, artifact, version, fail_status=None):
+def _live_case(binary, artifact, version, fail_status=None, quota_manual=False):
     work = Path(tempfile.mkdtemp(prefix="opendesign-cpa-case-"))
     process = proxy = origin = log = None
     result = {"status": "FAIL"}
@@ -1969,7 +1975,11 @@ def _live_case(binary, artifact, version, fail_status=None):
         origin.start()
         proxy.origin_port = origin.port
         proxy.start()
-        if fail_status is not None:
+        if quota_manual:
+            fail_status = 402
+            origin.fail = (402, json.dumps({"error": {"code": "insufficient_balance",
+                                                     "details": {"coding_plan_exhausted": True}}}))
+        elif fail_status is not None:
             origin.fail = (fail_status, json.dumps(
                 {"error": {"message": "denied %d" % fail_status,
                            "type": "auth_error" if fail_status == 401 else "rate_limit"}}))
@@ -2043,15 +2053,31 @@ def _live_case(binary, artifact, version, fail_status=None):
                 break
             time.sleep(0.25)
 
+        if quota_manual:
+            # The feature remains opt-in while its documented CPA-native
+            # manual-disable limitation is under review; this is an isolated
+            # fixture account and deliberately exercises the plugin UI path.
+            status, _, _ = request(API + "/config", {"pause": {"enabled": True}})
+            require(status == 200, "case could not enable experimental quota pause")
+
         before = len(origin.requests)
-        try:
-            status, raw, _ = request("/v1/chat/completions", {
-                "model": "deepseek-flash",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": False})
-            body = raw
-        except urllib.error.HTTPError as exc:
-            status, body = exc.code, exc.read()
+        # Some CPA versions expose the alias in /v1/models just before its
+        # executor is routable. Retry only this local model-not-found startup
+        # race, and only while the fake upstream has not been contacted.
+        ready_deadline = time.monotonic() + 10
+        while True:
+            try:
+                status, raw, _ = request("/v1/chat/completions", {
+                    "model": "deepseek-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False})
+                body = raw
+            except urllib.error.HTTPError as exc:
+                status, body = exc.code, exc.read()
+            if not (status == 400 and b"model_not_found" in body and
+                    len(origin.requests) == before and time.monotonic() < ready_deadline):
+                break
+            time.sleep(0.2)
         result = {
             "status": "PASS" if status == fail_status else "FAIL",
             "upstream_status": fail_status,
@@ -2065,6 +2091,35 @@ def _live_case(binary, artifact, version, fail_status=None):
         require(status == fail_status,
                 "upstream %d surfaced as %s: %s"
                 % (fail_status, status, result["body_head"]))
+        if quota_manual:
+            path = work / "auths" / (credential_id + ".json")
+            def disk_state():
+                try:
+                    return json.loads(path.read_text())
+                except (OSError, ValueError):
+                    return {}
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and not disk_state().get("quota_block"):
+                time.sleep(0.2)
+            require(bool(disk_state().get("quota_block")), "quota block was lost after host writeback")
+            status, _, _ = request(API + "/credentials", {"id": credential_id, "disabled": True})
+            require(status == 200, "plugin manual disable failed")
+            status, _, _ = request(API + "/quota-pause/resume", {"credential_id": credential_id})
+            require(status == 200, "plugin quota resume failed")
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                stored = disk_state()
+                if stored.get("disabled") is True and not stored.get("quota_block"):
+                    break
+                time.sleep(0.2)
+            require(stored.get("disabled") is True and not stored.get("quota_block"),
+                    "quota resume did not preserve plugin-controlled manual disable")
+            status, raw, _ = request(API + "/credentials")
+            accounts = json.loads(raw).get("credentials", [])
+            row = next((item for item in accounts if item.get("id") == credential_id), {})
+            require(status == 200 and row.get("disabled") is True and row.get("quota_paused") is False,
+                    "plugin runtime did not retain manual disable after quota resume")
+            result["manual_disable_preserved"] = True
         return result
     except AssertionError as exc:
         result.setdefault("failure", str(exc)[:300])
