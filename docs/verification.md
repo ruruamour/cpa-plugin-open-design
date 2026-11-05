@@ -19,6 +19,7 @@
 | Go 用例 | `quota_pause_deadline_test.go`、`quota_pause_signal_test.go`、`quota_pause_identity_test.go`、`quota_pause_manual_test.go`、`quota_pause_persist_test.go`、`quota_pause_executor_test.go`；覆盖到期不构成恢复证明及插件内人工启停后显式恢复等行为 |
 | Node 用例 | 额度徽标与人工开关分离、解除按钮不发 `/credentials`、重查未通过提示、暂停配置默认值与越界拒绝 |
 | 真实宿主恢复 | `scripts/smoke-abi.py --cpa-live` 新增隔离场景：结构化 402 建立暂停、重启后仍保留、官方预检失败保持暂停、官方新鲜 `available` 后清除插件暂停且插件控制台人工停用保持。原版 v8.0.29 隔离构建与本地 `8.0.51` 测试构建均 PASS；原版构建 `--version` 自述 `dev`，不能从二进制自证版本 |
+| 真实宿主恢复缺陷与修复 | `--cpa-live` 曾稳定卡在「官方已 `available` 但复查判为未证明」。定位到两处：复查读取复用 60 秒模型级缓存/节流窗口，或加入控制台已发起的查询，拿到的是复查开始前发出的证据；策略比较用 `*bool` 指针身份，宿主重注册用新解码配置重跑 `configure` 使每轮自动复查被判成策略变化。改为复查强制新发请求（在途则先等其结束）并比较 `pauseSettings()` 有效值后，原版与本地 hotfix 构建的 `host_quota_recovery` 均 PASS。回归用例：`TestQuotaRecoveryRejectsCachedEvidence`、`TestQuotaRecoveryProofDoesNotJoinOlderRefresh`、`quota_recheck_policy_generation_test.go` |
 | 全仓 Go | `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 通过 |
 | ABI | `scripts/smoke-abi.py`（CGO `c-shared` 构建）PASS |
 
