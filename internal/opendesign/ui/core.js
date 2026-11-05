@@ -35,7 +35,7 @@
       model_id: safeIdentity(data.model_id, 512),
       multiple_models: data.multiple_models === true,
       // Older servers did not expose the complete model set; be conservative.
-      models_ambiguous: data.models_ambiguous === true || (data.models_ambiguous === undefined && data.multiple_models === true),
+      models_ambiguous: data.models_ambiguous === true || (data.models_ambiguous !== false && data.multiple_models === true),
       recheck_status: safeCode(data.recheck_status, 40),
       manual_disabled: data.manual_disabled === true,
       remaining_seconds: safeInteger(data.remaining_seconds, 0, 31536000),

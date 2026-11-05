@@ -4218,6 +4218,50 @@ const pauseStatus = (overrides = {}) => statusBody({
   }],
 });
 
+test('仅完整模型集合与有效额度配置显示重查按钮，多个模型也可重查', async () => {
+  const calls = [];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, init });
+      if (url.endsWith('/quota-pause/recheck')) return respond(200, { pauses: [] });
+      if (url.endsWith('/status')) return respond(200, pauseStatus({ multiple_models: true, models_ambiguous: false }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const row = () => view.document.getElementById('accountList').children[0];
+  const recheckButton = () => [...row().children[1].children].find(node => node.textContent === '重查额度');
+  assert.ok(recheckButton(), '完整的多模型集合应允许主动复查');
+  assert.match(row().textContent, /须逐一复查并确认属于同一 Workspace 成员/);
+  await recheckButton().emit('click');
+  const sent = calls.filter(call => call.url.endsWith('/quota-pause/recheck'));
+  assert.equal(sent.length, 1);
+  assert.deepEqual(JSON.parse(sent[0].init.body), { credential_id: 'cred-1' });
+
+  // A legacy multi-model result without the completeness flag is ambiguous and
+  // must not invite a preflight that cannot prove recovery.
+  api.render.applyStatus(pauseStatus({ multiple_models: true }));
+  assert.equal(recheckButton(), undefined);
+  assert.ok(!row().textContent.includes('可点「重查额度」'));
+  api.render.applyStatus(pauseStatus({ multiple_models: true, models_ambiguous: true }));
+  assert.equal(recheckButton(), undefined);
+  assert.ok(!row().textContent.includes('可点「重查额度」'));
+  api.render.applyStatus(pauseStatus({ multiple_models: true, models_ambiguous: null }));
+  assert.equal(recheckButton(), undefined, '非布尔完整性标记不得被当成已确认');
+
+  const unconfigured = pauseStatus();
+  unconfigured.credentials[0].billing_configured = false;
+  api.render.applyStatus(unconfigured);
+  assert.equal(recheckButton(), undefined);
+  api.render.applyStatus(pauseStatus({ model_id: '', multiple_models: false }));
+  assert.equal(recheckButton(), undefined);
+  assert.ok(!row().textContent.includes('可点「重查额度」'));
+  api.render.applyStatus(pauseStatus());
+  assert.ok(recheckButton(), '已配置的单模型暂停仍可重查');
+});
+
 test('同步失败在账户行显示“同步待重试”，并说明不会泄漏细节', async () => {
   const view = fakePage({
     fetchImpl: async (url) => respond(url.endsWith('/status')

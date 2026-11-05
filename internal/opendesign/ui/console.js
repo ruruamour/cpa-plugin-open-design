@@ -1034,6 +1034,17 @@
     }
   }
 
+  // A complete multi-model set can be rechecked too: the backend checks every
+  // recorded model serially. Older servers lacking a completeness flag are
+  // normalized as ambiguous for multiple models by Core.normalizeQuotaPause.
+  function quotaPauseHasModels(pause) {
+    return Boolean(pause && !pause.models_ambiguous && (pause.model_id || pause.multiple_models));
+  }
+
+  function canRecheckQuotaPause(item, pause) {
+    return Boolean(item.billing_configured && item.workspace_id && quotaPauseHasModels(pause));
+  }
+
   // The deadline starts an official recheck, not an unconditional recovery.
   // CPA's native console shares the auth file, so disable provenance there is
   // not reliable. The two separately configured keys cannot be linked by API.
@@ -1042,12 +1053,13 @@
       '到点只表示应复查，不代表额度已恢复；开启自动暂停时，插件会逐账号串行复查，只有新鲜官方结果确认可用才解除，失败继续暂停。',
     ];
     if (item.billing_configured && item.workspace_id) {
-      parts.push('可点「重查额度」提前发起复查。请确认 controlKey 和推理 key 属于同一账号；插件无法自动验证归属。');
+      if (canRecheckQuotaPause(item, pause)) parts.push('可点「重查额度」提前发起复查。');
+      parts.push('请确认 controlKey 和推理 key 属于同一账号；插件无法自动验证归属。');
     } else {
       parts.push('未配置官方 controlKey 或 Workspace ID，无法复查额度，仍须人工处理。');
     }
     parts.push('暂停期间请在本页启用/停用；CPA 原生入口和并发文件改写无法可靠归因，请勿在那里改动同一账户。');
-    if (pause.models_ambiguous) parts.push('耗尽模型集合不完整，无法自动确认恢复，只能人工解除。');
+    if (!quotaPauseHasModels(pause)) parts.push('耗尽模型集合不完整，无法自动确认恢复，只能人工解除。');
     else if (pause.multiple_models) parts.push('多个模型报告过额度耗尽，须逐一复查并确认属于同一 Workspace 成员。');
     const recheckMessages = {
       inflight: '仍有同一推理密钥的请求在途，结束后再复查。',
@@ -1110,7 +1122,7 @@
             className: 'button compact',
             on: () => resumeQuotaPause(item),
           }) : null,
-          pause && !pause.multiple_models && pause.model_id ? button('重查额度', 'recheck-quota-pause', {
+          canRecheckQuotaPause(item, pause) ? button('重查额度', 'recheck-quota-pause', {
             className: 'button compact',
             on: () => recheckQuotaPause(item),
           }) : null,
