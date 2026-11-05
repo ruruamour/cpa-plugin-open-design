@@ -48,11 +48,22 @@
     modelsDraftRevision: '',
     modelsDraftActive: false,
     modelsConflict: false,
+    // A whole-table POST answered 502 after persisting the mapping. The page
+    // cannot know the stored snapshot, so an unpinned row must not silently
+    // inherit a same-named server row's policy either; a fresh status read plus
+    // an explicit per-row decision is required.
+    modelsPersistedPartial: false,
     // The token the server had when the conflict was raised, and the token a
     // later status read supplied. A retry is only allowed once seen === live
     // revision, so a 409 can never spin on the same stale token.
     modelsConflictRevision: '',
     modelsConflictSeenRevision: '',
+    // Per-upstream rows this page removed from the editor, captured with their
+    // original identities and the server policy they pointed at. Re-checking
+    // the same upstream within this page restores those exact rows (and their
+    // pins) instead of creating an unpinned "new" row. This is page-local
+    // intent, so it can never claim a same-named row another page created.
+    removedUpstreamRows: new Map(),
     // True while a POST /models write is in flight. A status answer landing in
     // that window must not replace the rows the response is about to confirm.
     modelsSaving: false,
@@ -275,9 +286,11 @@
   // row by alias and can inherit a different model's policy. The same ambiguity
   // exists for a genuinely new row when another tab creates its alias before a
   // confirmed overwrite. Fail closed and keep the draft rather than inventing a
-  // new binding. Legacy servers have no whole-list CAS or pin semantics.
+  // new binding. A pin whose original row no longer exists is always an error,
+  // on any backend: the console never strips it and lets an alias match decide.
+  // Legacy servers have no whole-list CAS, so the collision check for a row that
+  // never had a pin only runs after a known partial persistence.
   function blockAmbiguousMappingIdentities(revision = modelsSaveRevision()) {
-    if (!revision) return false;
     const snapshot = Array.isArray(state.serverModels) ? state.serverModels : [];
     const rows = Array.isArray(state.mappings) ? state.mappings : [];
     const claimedIDs = new Set(rows.map(row => String(row && row.original_id || '').trim()).filter(Boolean));
@@ -292,15 +305,135 @@
           String(item && item.id || '').trim() === originalID &&
           String(item && item.upstream_id || '').trim() === originalUpstream);
         if (!found) issues.push(`${alias} → ${upstream}（原行 ${originalID} → ${originalUpstream} 已不存在或无法确认）`);
-      } else if (alias && !claimedIDs.has(alias) && snapshot.some(item => String(item && item.id || '').trim() === alias)) {
+      } else if ((revision || state.modelsPersistedPartial) && alias && !claimedIDs.has(alias)
+        && snapshot.some(item => String(item && item.id || '').trim() === alias)) {
         issues.push(`${alias} → ${upstream}（新行与服务器的同名别名冲突）`);
       }
     }
     if (!issues.length) return false;
     renderMappings();
-    message('modelState', `保存已取消，未向服务器发送请求：${issues.join('；')}。去掉原行身份或直接覆盖可能沿用当前同名行的思考强度策略，草稿已保留。请先核对并复制需要的草稿；如以服务器当前行为准，请点击「还原为已保存」，再按需编辑模型和思考强度映射。`, 'error');
+    message('modelState', `保存已取消，未向服务器发送请求：${issues.join('；')}。不会去掉原行身份后按同名别名隐式绑定，草稿已保留。请先核对并复制需要的草稿；若服务器存在同名同上游行且该行确认应采用它（含其思考强度策略），点击该行的「采用服务器此行」，其他行与其他草稿不会被改动。若以服务器当前行为准，可点击「还原为已保存」，再按需编辑。`, 'error');
     return true;
   }
+
+  function mappingOriginalResolves(row) {
+    const originalID = String(row && row.original_id || '').trim();
+    const originalUpstream = String(row && row.original_upstream_id || '').trim();
+    if (!originalID || !originalUpstream) return true;
+    return (Array.isArray(state.serverModels) ? state.serverModels : []).some(item =>
+      String(item && item.id || '').trim() === originalID &&
+      String(item && item.upstream_id || '').trim() === originalUpstream);
+  }
+
+  // The exact current server row this draft row would adopt. Only an exact
+  // alias+upstream match is offered: adopting a different upstream would drop
+  // the stored policy, which must never look like a simple repair.
+  function serverRowForMapping(row) {
+    const alias = String(row && row.id || '').trim();
+    const upstream = String(row && row.upstream_id || '').trim();
+    if (!alias || !upstream) return null;
+    const matches = (Array.isArray(state.serverModels) ? state.serverModels : []).filter(item =>
+      String(item && item.id || '').trim() === alias &&
+      String(item && item.upstream_id || '').trim() === upstream);
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  // Explicit, single-row resolution for a pin that no longer resolves. It is the
+  // operator's stated intent to bind this draft row to the server's current row,
+  // so it is confirmed and never inferred from an alias match. Other drafts and
+  // the whole-list token are left untouched; a later save still runs the normal
+  // CAS/overwrite confirmation.
+  function adoptServerMapping(index) {
+    if (state.busy || state.modelsSaving) return;
+    const row = state.mappings[index];
+    if (!row) return;
+    const server = serverRowForMapping(row);
+    if (!server) return;
+    const originalID = String(row.original_id || '').trim();
+    const originalUpstream = String(row.original_upstream_id || '').trim();
+    const alias = String(row.id || '').trim();
+    const upstream = String(row.upstream_id || '').trim();
+    const legacyNote = !modelsSaveRevision()
+      ? '当前后端没有整表版本校验，之后保存会直接整表覆盖。'
+      : '仅此行会改用服务器身份，整表版本和保存所依据的旧版本不会被自动替换；之后保存仍需按冲突流程确认覆盖。';
+    const policyNote = server.reasoning_mapping ? '该服务器行已有思考强度映射，将按服务器当前策略。' : '该服务器行当前没有已保存的思考强度映射。';
+    if (typeof confirm === 'function' && !confirm(`仅此行：将「${alias} → ${upstream}」的原草稿身份 ${originalID} → ${originalUpstream} 改为采用服务器当前行 ${String(server.id).trim()} → ${String(server.upstream_id).trim()}。${policyNote}其他草稿行不会被改动。${legacyNote}确定继续？`)) {
+      message('modelState', '已取消逐行采用，草稿和原行身份均保留。', '');
+      return;
+    }
+    row.original_id = String(server.id).trim();
+    row.original_upstream_id = String(server.upstream_id).trim();
+    noteMappingsEdited();
+    renderMappings();
+    message('modelState', `仅此行已改为采用服务器当前行 ${String(server.id).trim()} → ${String(server.upstream_id).trim()}（含其思考强度策略）；其他草稿行未改动。保存前仍请核对整表内容。`, '');
+  }
+
+  // Re-checking an upstream within this page restores exactly the rows the page
+  // itself removed seconds ago, including their original pins. That keeps an
+  // immediate undo a true no-op (same rows, same CAS token) instead of a
+  // look-alike draft that later overwrites another page's list. The memory is
+  // page-local and per upstream: it can never claim a same-named row another
+  // page created, and it is cleared on save/logout.
+  function captureRemovedUpstreamRows(upstreamIDs) {
+    const wanted = new Set((Array.isArray(upstreamIDs) ? upstreamIDs : []).map(value => String(value || '').trim()).filter(Boolean));
+    if (!wanted.size) return;
+    for (const upstream of wanted) {
+      // Keep the first capture for this upstream: an immediate re-check then
+      // restores exactly the rows the operator just unchecked, and a second
+      // removal of an already absent upstream cannot drop that memory.
+      if (state.removedUpstreamRows.has(upstream)) continue;
+      const captured = [];
+      state.mappings.forEach((row, index) => {
+        if (String(row && row.upstream_id || '').trim() !== upstream) return;
+        captured.push({ index, row: cloneMappings([row])[0] });
+      });
+      if (captured.length) state.removedUpstreamRows.set(upstream, captured);
+    }
+  }
+
+  function restoreRemovedUpstreamRows(upstream) {
+    const captured = state.removedUpstreamRows.get(upstream) || null;
+    state.removedUpstreamRows.delete(upstream);
+    if (!captured || !captured.length) return false;
+    if (Core.hasUpstream(state.mappings, upstream)) return false;
+    const rows = state.mappings.map(row => ({ ...row }));
+    let unresolved = false;
+    for (const entry of captured.slice().sort((left, right) => left.index - right.index)) {
+      const row = { ...entry.row };
+      if (!mappingOriginalResolves(row)) {
+        // Keep the explicit old pin instead of dropping it and letting the
+        // backend match by alias. Saving stays blocked until the operator adopts
+        // a current server row explicitly or reverts the draft.
+        unresolved = true;
+      }
+      rows.splice(Math.min(entry.index, rows.length), 0, row);
+    }
+    state.mappings = rows;
+    return unresolved;
+  }
+
+  // Returns true only when a restored row's original identity is already gone
+  // from the server snapshot, which the caller has to surface to the operator.
+  function setUpstreamSelected(upstreams, selected) {
+    const ids = (Array.isArray(upstreams) ? upstreams : [upstreams])
+      .map(value => String(value || '').trim())
+      .filter(Boolean);
+    if (!ids.length) return false;
+    let unresolved = false;
+    if (selected) {
+      for (const upstream of ids) {
+        if (restoreRemovedUpstreamRows(upstream)) unresolved = true;
+      }
+      state.mappings = Core.addUpstreams(state.mappings, ids);
+    } else {
+      captureRemovedUpstreamRows(ids);
+      state.mappings = Core.removeUpstreams(state.mappings, ids);
+    }
+    noteMappingsEdited();
+    return unresolved;
+  }
+
+  const restoreUnresolvedText = '已恢复本页此前移除的模型行和原行身份，但该原行在当前服务器快照中已不存在。保存会被阻止：请先刷新状态核对；如服务器已有同名同上游行，可选择该行的「采用服务器此行」（会按服务器当前思考强度策略），否则请删除该草稿行或还原为已保存。不会自动去掉原行身份后按同名别名绑定。';
 
   // Rows whose stored thinking-strength policy is about to be dropped. An
   // alias-only rename on a backend with a whole-list token keeps the policy (the
@@ -401,6 +534,10 @@
     state.modelsConflict = false;
     state.modelsConflictRevision = '';
     state.modelsConflictSeenRevision = '';
+    // Releasing a draft means the editor is back on a saved baseline, so no
+    // page-local undo memory or partial-persistence note may survive it.
+    state.removedUpstreamRows.clear();
+    state.modelsPersistedPartial = false;
   }
 
   function modelsSaveRevision() {
@@ -786,6 +923,8 @@
     state.modelsConflict = false;
     state.modelsConflictRevision = '';
     state.modelsConflictSeenRevision = '';
+    state.modelsPersistedPartial = false;
+    state.removedUpstreamRows.clear();
     state.modelsSaving = false;
     state.serverModels = [];
     state.reasoningModelKey = '';
@@ -1640,11 +1779,9 @@
     const rows = visible.map(item => {
       const box = el('input', { type: 'checkbox', checked: Core.hasUpstream(state.mappings, item.id), disabled: state.modelsSaving });
       box.addEventListener('change', () => {
-        state.mappings = box.checked
-          ? Core.addUpstream(state.mappings, item.id)
-          : Core.removeUpstream(state.mappings, item.id);
-        noteMappingsEdited();
+        const unresolved = setUpstreamSelected([item.id], box.checked);
         renderMappings();
+        if (unresolved) message('modelState', restoreUnresolvedText, 'error');
       });
       const details = [el('span', { className: 'mono', text: item.id })];
       if (item.owned_by) details.push(el('span', { className: 'muted small', text: item.owned_by }));
@@ -1709,11 +1846,24 @@
           renderModels();
         },
       });
+      const actions = [remove];
+      // A pin that the current snapshot cannot resolve is never dropped or
+      // rebound automatically. This single-row control is the only explicit way
+      // to say "use the server's current row (and its policy)" without touching
+      // the other draft rows or the whole-list token.
+      const pinned = String(model && model.original_id || '').trim() || String(model && model.original_upstream_id || '').trim();
+      if (pinned && !mappingOriginalResolves(model) && serverRowForMapping(model)) {
+        actions.push(button('采用服务器此行', 'adopt-server-mapping', {
+          className: 'button compact',
+          disabled: state.modelsSaving,
+          on: () => adoptServerMapping(index),
+        }));
+      }
       return el('div', { className: 'mapping-row', attrs: { 'data-mapping-index': index } }, [
         el('label', { className: 'field' }, [el('span', { text: '对外别名' }), alias]),
         el('span', { className: 'arrow', text: '→' }),
         el('label', { className: 'field' }, [el('span', { text: '上游模型 ID' }), upstream]),
-        remove,
+        ...actions,
       ]);
     });
     list.replaceChildren(...rows);
@@ -1743,11 +1893,12 @@
       message('modelState', '当前没有可操作的上游模型。', 'error');
       return;
     }
-    state.mappings = selected
-      ? Core.addUpstreams(state.mappings, ids)
-      : Core.removeUpstreams(state.mappings, ids);
-    noteMappingsEdited();
+    const unresolved = setUpstreamSelected(ids, selected);
     renderMappings();
+    if (unresolved) {
+      message('modelState', restoreUnresolvedText, 'error');
+      return;
+    }
     message('modelState', selected
       ? `已勾选当前可见的 ${ids.length} 个上游模型，仍在编辑中，需保存。`
       : `已取消当前可见的 ${ids.length} 个上游模型，仍在编辑中，需保存。`, '');
@@ -3385,6 +3536,10 @@
       // to the old list and must not repaint the panel.
       state.reasoningGeneration += 1;
       state.reasoningSaving = false;
+      // The echoed list confirms this save, so the partial-persistence note no
+      // longer applies and the page-local undo memory is stale.
+      state.modelsPersistedPartial = false;
+      state.removedUpstreamRows.clear();
       const rowsStillMatchSubmission = mappingKey(state.mappings) === submittedKey;
       if (rowsStillMatchSubmission) {
         state.mappings = cloneMappings(savedRows);
@@ -3413,20 +3568,31 @@
         message('modelState', `保存失败（上游）：${formatError(error)}`, 'error');
       } else if (partialCompletion(formatError(error)) === 'mapping-persisted') {
         // The mapping is already on disk; only the host catalog refresh failed.
-        // The saved baseline moves forward so the draft badge tells the truth.
+        // No list was echoed, so this page only knows the rows it actually sent:
+        // unsent blank rows are not saved, and no original pin is confirmed.
         invalidateModelTestResult();
-        state.savedMappings = cloneMappings(submittedRows);
-        // A token we sent is now stale: the next save must re-confirm instead of
-        // silently overwriting whatever revision the server has now.
+        // Only the rows actually present in the payload can be saved. Unsent
+        // blank rows stay a draft, and the original pins of sent rows are kept
+        // as the baseline because no echoed list can confirm them here.
+        const sentKeys = new Set(models.map(row => `${row.id}\u0000${row.upstream_id}`));
+        state.savedMappings = cloneMappings(submittedRows.filter(row =>
+          sentKeys.has(`${String(row.id || '').trim()}\u0000${String(row.upstream_id || '').trim()}`)));
+        state.modelsPersistedPartial = true;
+        // Keep the exact draft (including pins and unsent rows). Without a token
+        // a legacy backend also needs an explicit row decision before the next
+        // save, because an alias match there would otherwise silently inherit
+        // whatever policy the server's current row holds.
+        state.modelsDraftActive = true;
+        state.modelsDraftRevision = sentRevision;
         if (sentRevision) {
-          state.modelsDraftActive = true;
-          state.modelsDraftRevision = sentRevision;
+          // The token we sent is now stale: the next save must re-confirm instead
+          // of silently overwriting whatever revision the server has now.
           state.modelsConflict = true;
           state.modelsConflictRevision = state.modelsRevision;
           state.modelsConflictSeenRevision = '';
         }
         renderMappings();
-        message('modelState', `模型映射已保存，但宿主刷新模型目录失败：${formatError(error)}。可先刷新状态确认，再重试保存或启用账户触发刷新。`, 'error');
+        message('modelState', `模型映射已保存，但宿主刷新模型目录失败：${formatError(error)}。已确认保存的只有实际发送的 ${models.length} 行；未发送的空白行和其他草稿仍保留。请先刷新状态核对服务器当前行，再保存。若某行原身份已不存在，不会按同名别名隐式沿用策略，需在该行点击「采用服务器此行」明确确认；其他草稿行不会被改动。`, 'error');
       } else if (error.status === 409 && !sentRevision && !state.modelsRevision) {
         // An older backend has no whole-list token, so a 409 is not a CAS
         // conflict here. Keep the previous wording instead of arming a retry
@@ -3484,6 +3650,8 @@
     if (state.busy || !mappingsDirty()) return;
     state.mappings = cloneMappings(state.savedMappings);
     resetMappingsDraft();
+    state.modelsPersistedPartial = false;
+    state.removedUpstreamRows.clear();
     renderModels();
     message('modelState', '已还原为最近一次保存的模型映射。', '');
   }

@@ -4581,6 +4581,101 @@ function modelSavePage(options = {}) {
   };
 }
 
+test('a persisted 502 keeps blank rows unsaved and requires explicit per-row server adoption after refresh', async () => {
+  let acceptRow = false;
+  const page = modelSavePage({
+    confirmImpl: text => text.includes('仅此行') ? acceptRow : true,
+    onSave: (body, count) => count === 1 ? {
+      status: 502,
+      models: applyImportLikeBackend(pinnedModels(), body),
+      revision: 'list-rev-2',
+      body: { error: { code: 'host_contract_error', source: 'local', message: 'model mapping saved but the host model refresh failed: host rejected the refresh' } },
+    } : null,
+  });
+  await page.api.render.loadStatus();
+  const alias = page.view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'renamed';
+  await alias.emit('input');
+  page.api.handlers.addMapping(); // buildModelsPayload intentionally omits this blank row
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 1);
+  assert.equal(page.posts[0].models.length, 2);
+  assert.deepEqual(plain(page.api.state.savedMappings.map(row => row.id)), ['renamed', 'od-pro'],
+    'the unsent blank row must not appear in the saved baseline');
+  assert.equal(page.api.state.mappings.length, 3, 'the unsent blank remains an editable draft');
+  assert.equal(page.api.state.mappings[0].original_id, 'od-flash', 'a 502 has no echoed snapshot and cannot re-pin the row');
+  assert.equal(page.api.mappingsDirty(), true);
+  assert.match(page.view.document.getElementById('modelState').textContent, /刷新状态/);
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 1, 'retry requires an actual status read');
+
+  // A competing page changes the just-saved policy and adds another row before
+  // this page reads it. Adopting Y must be explicit, never inferred from 502.
+  const replacementPolicy = { enabled: true, rules: [{ from: 'low', to: 'max' }] };
+  page.setModels([
+    { id: 'renamed', upstream_id: 'open-design/flash', reasoning_mapping: replacementPolicy },
+    pinnedModels()[1],
+    { id: 'other-tab', upstream_id: 'up/other' },
+  ]);
+  page.setRevision('list-rev-3');
+  await page.api.render.loadStatus();
+  assert.equal(page.api.state.mappings[0].original_id, 'od-flash');
+  assert.equal(page.api.state.modelsDraftRevision, 'list-rev-1');
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 1, 'the old pin is not stripped or automatically rebound');
+  assert.match(page.view.document.getElementById('modelState').textContent, /原行.*不存在/);
+  assert.match(page.view.document.getElementById('modelState').textContent, /此行|逐行/);
+  const row = page.view.document.getElementById('mappingList').children[0];
+  const adopt = Array.from(row.children).find(node => node.getAttribute('data-action') === 'adopt-server-mapping');
+  assert.ok(adopt, 'a real row control offers an explicit, testable resolution');
+  await adopt.emit('click');
+  assert.equal(page.api.state.mappings[0].original_id, 'od-flash', 'declining retains the original pin');
+  assert.match(page.confirmations.at(-1), /仅此行/);
+  assert.match(page.confirmations.at(-1), /思考强度/);
+  acceptRow = true;
+  await adopt.emit('click');
+  assert.equal(page.api.state.mappings[0].original_id, 'renamed');
+  assert.equal(page.api.state.mappings[0].original_upstream_id, 'open-design/flash');
+  assert.equal(page.api.state.mappings.length, 3, 'other unsent rows are not discarded');
+  assert.equal(page.api.state.modelsDraftRevision, 'list-rev-1', 'row adoption does not silently rebase the whole draft');
+  assert.match(page.view.document.getElementById('modelState').textContent, /仅此行/);
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 2);
+  assert.equal(page.posts[1].expected_models_revision, 'list-rev-3');
+  assert.equal(page.posts[1].models[0].original_id, 'renamed');
+  assert.equal(page.posts[1].models.length, 2, 'the blank row is still not sent');
+  assert.ok(page.confirmations.some(text => /覆盖服务器/.test(text)), 'the whole-table overwrite still needs confirmation');
+  assert.deepEqual(plain(page.api.state.serverModels[0].reasoning_mapping), replacementPolicy);
+});
+
+test('a 502 on a legacy backend also blocks the unresolved old pin until an explicit row decision', async () => {
+  const page = modelSavePage({
+    revision: '',
+    onSave: (body, count) => count === 1 ? {
+      status: 502,
+      models: applyImportLikeBackend(pinnedModels(), body),
+      revision: '',
+      body: { error: 'model mapping saved but the host model refresh failed: host rejected the refresh' },
+    } : null,
+  });
+  await page.api.render.loadStatus();
+  const alias = page.view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'renamed';
+  await alias.emit('input');
+  await page.api.handlers.saveModels();
+  await page.api.render.loadStatus();
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 1, 'legacy alias matching must not silently adopt the saved row');
+  assert.equal(page.api.state.mappings[0].original_id, 'od-flash');
+  const row = page.view.document.getElementById('mappingList').children[0];
+  const adopt = Array.from(row.children).find(node => node.getAttribute('data-action') === 'adopt-server-mapping');
+  assert.ok(adopt);
+  await adopt.emit('click');
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 2);
+  assert.ok(page.confirmations.some(text => /不支持.*版本|没有.*版本/.test(text)), 'legacy overwrite limitations are explicit');
+});
+
 test('an alias-only rename sends the original identity so the policy survives', async () => {
   const { view, api, posts, confirmations } = modelSavePage();
   await api.render.loadStatus();
@@ -4873,7 +4968,7 @@ test('the save body carries original identity only with a whole-list token', () 
 // Two console pages share one in-memory backend. `applyImportLikeBackend` mirrors
 // the whole-table write, while a reasoning save returns the complete current list
 // (including rows another tab added) with a new whole-list revision.
-function sharedModelBackend({ models, revision = 'list-rev-1' }) {
+function sharedModelBackend({ models, revision = 'list-rev-1', legacy = false }) {
   let rows = models.map(model => ({ ...model }));
   let currentRevision = revision;
   // The initial snapshot is already revision 1: the first mutation must not
@@ -4895,7 +4990,7 @@ function sharedModelBackend({ models, revision = 'list-rev-1' }) {
       currentRevision = `list-rev-${++counter}`;
       return respond(200, {
         models: rows.map(item => ({ ...item })),
-        models_revision: currentRevision,
+        models_revision: legacy ? '' : currentRevision,
       });
     }
     if (url.endsWith('/models') && init.method === 'POST') {
@@ -4908,13 +5003,13 @@ function sharedModelBackend({ models, revision = 'list-rev-1' }) {
       currentRevision = `list-rev-${++counter}`;
       return respond(200, {
         models: rows.map(item => ({ ...item })),
-        models_revision: currentRevision,
+        models_revision: legacy ? '' : currentRevision,
       });
     }
     if (url.includes('/status')) {
       return respond(200, statusBody({
         models: rows.map(item => ({ ...item })),
-        models_revision: currentRevision,
+        models_revision: legacy ? '' : currentRevision,
       }));
     }
     return respond(404, { error: 'not found' });
@@ -4946,6 +5041,156 @@ function twoModelTabs(backend) {
   };
   return { a: open(), b: open() };
 }
+
+test('unchecking and rechecking an upstream restores its own pinned rows and other drafts on the original token', async () => {
+  const policy = { enabled: true, rules: [{ from: 'medium', to: 'high' }] };
+  const backend = sharedModelBackend({ models: [
+    { id: 'custom-a', upstream_id: 'up/a', reasoning_mapping: policy },
+    { id: 'custom-b', upstream_id: 'up/b' },
+    { id: 'another-a', upstream_id: 'up/a' },
+  ] });
+  const { a, b } = twoModelTabs(backend);
+  await a.api.render.loadStatus();
+  await b.api.render.loadStatus();
+  const originalRevision = a.api.state.modelsRevision;
+  const alias = a.view.document.getElementById('mappingList').children[1].children[0].children[1];
+  alias.value = 'b-draft';
+  await alias.emit('input');
+  a.api.state.upstream = [{ id: 'up/a' }];
+  a.api.state.upstreamFor = 'cred-1';
+  a.api.render.renderUpstream();
+  const checkbox = a.view.document.getElementById('upstreamList').children[0].children[0];
+  checkbox.checked = false;
+  await checkbox.emit('change');
+  checkbox.checked = true;
+  await checkbox.emit('change');
+  assert.deepEqual(plain(a.api.state.mappings.map(row => [row.id, row.original_id])), [
+    ['custom-a', 'custom-a'], ['b-draft', 'custom-b'], ['another-a', 'another-a'],
+  ], 'restore every removed row in place, not a default alias or a borrowed identity');
+  assert.equal(a.api.state.modelsDraftRevision, originalRevision);
+
+  b.api.handlers.addMapping();
+  b.api.state.mappings[3].id = 'added-by-b';
+  b.api.state.mappings[3].upstream_id = 'up/c';
+  await b.api.handlers.saveModels();
+  await a.api.render.loadStatus();
+  assert.equal(a.api.state.modelsDraftRevision, originalRevision);
+  assert.equal(a.api.state.mappings[1].id, 'b-draft');
+  await a.api.handlers.saveModels();
+  assert.equal(backend.posts.at(-1).expected_models_revision, originalRevision);
+  assert.equal(a.api.state.modelsConflict, true, 'the real CAS, not a fabricated same-alias conflict, rejects the stale draft');
+  assert.deepEqual(backend.models()[0].reasoning_mapping, policy);
+});
+
+test('a clean upstream undo on a legacy backend adopts another page’s later row instead of overwriting it', async () => {
+  const backend = sharedModelBackend({ legacy: true, models: [
+    { id: 'open-design-m', upstream_id: 'm', reasoning_mapping: { enabled: true, rules: [] } },
+  ] });
+  const { a, b } = twoModelTabs(backend);
+  await a.api.render.loadStatus();
+  await b.api.render.loadStatus();
+  a.api.state.upstream = [{ id: 'm' }];
+  a.api.state.upstreamFor = 'cred-1';
+  a.api.render.renderUpstream();
+  // Exercise the batch handlers as well as the single-checkbox handler above.
+  a.api.handlers.selectVisibleUpstream(false);
+  a.api.handlers.selectVisibleUpstream(true);
+  assert.equal(a.api.mappingsDirty(), false);
+  assert.equal(a.api.state.modelsDraftActive, false);
+  assert.equal(a.api.state.mappings[0].original_id, 'open-design-m');
+  b.api.handlers.addMapping();
+  b.api.state.mappings[1].id = 'new-from-b';
+  b.api.state.mappings[1].upstream_id = 'up/new';
+  await b.api.handlers.saveModels();
+  await a.api.render.loadStatus();
+  assert.deepEqual(plain(a.api.state.mappings.map(row => row.id)), ['open-design-m', 'new-from-b']);
+  await a.api.handlers.saveModels();
+  assert.deepEqual(backend.models().map(row => row.id), ['open-design-m', 'new-from-b']);
+});
+
+test('a checkbox row newly created in another tab is never treated as a local undo', async () => {
+  const backend = sharedModelBackend({ models: [] });
+  const { a, b } = twoModelTabs(backend);
+  await a.api.render.loadStatus();
+  await b.api.render.loadStatus();
+  for (const tab of [a, b]) {
+    tab.api.state.upstream = [{ id: 'm' }];
+    tab.api.state.upstreamFor = 'cred-1';
+    tab.api.render.renderUpstream();
+    const box = tab.view.document.getElementById('upstreamList').children[0].children[0];
+    box.checked = true;
+    await box.emit('change');
+  }
+  await b.api.handlers.saveModels();
+  b.api.handlers.selectReasoningModel('open-design-m\u0000m');
+  await b.api.handlers.setReasoningEnabled(true);
+  await b.api.handlers.saveReasoning();
+  await a.api.handlers.saveModels();
+  await a.api.render.loadStatus();
+  const before = backend.posts.length;
+  await a.api.handlers.saveModels();
+  assert.equal(backend.posts.length, before);
+  assert.equal(a.api.state.mappings[0].original_id, undefined);
+  assert.match(a.view.document.getElementById('modelState').textContent, /同名|别名/);
+  assert.equal(backend.models()[0].reasoning_mapping.enabled, true);
+});
+
+test('a completed upstream removal cannot later resurrect the deleted pin', async () => {
+  const page = modelSavePage({ models: [{ id: 'custom', upstream_id: 'm' }] });
+  await page.api.render.loadStatus();
+  page.api.state.upstream = [{ id: 'm' }];
+  page.api.state.upstreamFor = 'cred-1';
+  page.api.render.renderUpstream();
+  page.api.handlers.selectVisibleUpstream(false);
+  await page.api.handlers.saveModels();
+  page.api.handlers.selectVisibleUpstream(true);
+  assert.deepEqual(plain(page.api.state.mappings), [{ id: 'open-design-m', upstream_id: 'm' }]);
+});
+
+test('re-checking an upstream whose original server row was replaced keeps the old pin and never binds the replacement', async () => {
+  // Legacy backend: there is no whole-list token to catch the replacement row.
+  const backend = sharedModelBackend({ legacy: true, models: [
+    { id: 'custom', upstream_id: 'up/x', reasoning_mapping: { enabled: true, rules: [{ from: 'low', to: 'max' }] } },
+  ] });
+  const { a, b } = twoModelTabs(backend);
+  await a.api.render.loadStatus();
+  await b.api.render.loadStatus();
+  a.api.state.upstream = [{ id: 'up/x' }];
+  a.api.state.upstreamFor = 'cred-1';
+  a.api.render.renderUpstream();
+  a.api.handlers.selectVisibleUpstream(false);
+  assert.deepEqual(plain(a.api.state.mappings), []);
+
+  // Another page replaces the row with a default alias and its own new policy.
+  b.view.document.getElementById('mappingList').children[0].children[3].emit('click');
+  await b.api.handlers.saveModels();
+  b.api.handlers.addMapping();
+  b.api.state.mappings[0].id = 'open-design-up/x';
+  b.api.state.mappings[0].upstream_id = 'up/x';
+  await b.api.handlers.saveModels();
+  b.api.handlers.selectReasoningModel('open-design-up/x\u0000up/x');
+  await b.api.handlers.setReasoningEnabled(true);
+  await b.api.handlers.addReasoningRule();
+  await b.api.handlers.saveReasoning();
+  const replacement = backend.models()[0].reasoning_mapping;
+  assert.ok(replacement && replacement.enabled);
+
+  a.api.render.applyStatus(statusBody({ models: backend.models(), models_revision: '' }));
+  a.api.handlers.selectVisibleUpstream(true);
+  assert.deepEqual(plain(a.api.state.mappings.map(row => [row.id, row.original_id])), [['custom', 'custom']],
+    'the page restores its own row and pin instead of adopting the default alias');
+  assert.match(a.view.document.getElementById('modelState').textContent, /原行.*已不存在/);
+  const before = backend.posts.length;
+  await a.api.handlers.saveModels();
+  assert.equal(backend.posts.length, before, 'the legacy alias match must not be adopted silently');
+  assert.deepEqual(backend.models()[0].reasoning_mapping, replacement);
+  const adopt = Array.from(a.view.document.getElementById('mappingList').children[0].children)
+    .find(node => node.getAttribute('data-action') === 'adopt-server-mapping');
+  assert.equal(adopt, undefined, 'no exact server row exists, so no row-level adoption is offered');
+  a.api.handlers.revertMappings();
+  assert.deepEqual(plain(a.api.state.mappings.map(row => row.id)), ['open-design-up/x'],
+    'only the explicit revert adopts the server list');
+});
 
 test('a reasoning save adopts the returned whole list so the next model save cannot delete another tab row', async () => {
   const backend = sharedModelBackend({
