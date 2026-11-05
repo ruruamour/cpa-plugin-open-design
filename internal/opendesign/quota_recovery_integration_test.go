@@ -158,6 +158,87 @@ func TestQuotaRecoveryRejectsUnknownModelsAndInFlight(t *testing.T) {
 	}
 }
 
+func makeQuotaPauseDue(t *testing.T, s *Service, id string) {
+	t.Helper()
+	s.credentialMu.Lock()
+	defer s.credentialMu.Unlock()
+	s.mu.Lock()
+	c := s.creds[id]
+	c.QuotaBlock = cloneQuotaBlock(c.QuotaBlock)
+	c.QuotaBlock.RetryAt = time.Now().Add(-time.Second)
+	c.QuotaRevision = newID()
+	s.creds[id] = c
+	s.mu.Unlock()
+	if err := s.persistQuotaBlockLocked(id, c.QuotaRevision); err != nil {
+		t.Fatalf("make block due: %v", err)
+	}
+}
+
+func waitForRecoveryCondition(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for automatic quota recheck")
+}
+
+func TestQuotaRecoveryWorkerRechecksDueAndPreservesManualDisable(t *testing.T) {
+	s, host, id, path := quotaRecoveryFixture(t, true, "model-a")
+	queueRecoveryEvidence(t, host, "model-a", "member", "available")
+	makeQuotaPauseDue(t, s, id)
+	s.wakeQuotaPauseWorker()
+	waitForRecoveryCondition(t, func() bool {
+		c, ok := liveCredential(s, id)
+		return ok && !c.quotaBlocked()
+	})
+	c, _ := liveCredential(s, id)
+	if !c.Disabled || host.countMethod("host.http.do") != 1 {
+		t.Fatal("automatic recheck did not preserve the manual disable or was not serial")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var disk Credential
+	if json.Unmarshal(raw, &disk) != nil || disk.quotaBlocked() || !disk.Disabled {
+		t.Fatal("automatic recovery did not persist the manual disable")
+	}
+}
+
+func TestQuotaRecoveryWorkerKeepsBlockWhenOfficialCheckFails(t *testing.T) {
+	s, host, id, path := quotaRecoveryFixture(t, false, "model-a")
+	queueQuota(host, fakeHTTPResponse{Status: http.StatusUnauthorized, Body: []byte(`{"error":"unauthorized"}`)})
+	makeQuotaPauseDue(t, s, id)
+	s.wakeQuotaPauseWorker()
+	waitForRecoveryCondition(t, func() bool { return host.countMethod("host.http.do") >= 1 })
+	// Synchronize with the serial recheck so the assertion runs after it returns.
+	s.quotaRecoveryGate <- struct{}{}
+	<-s.quotaRecoveryGate
+	requireQuotaStillBlocked(t, s, id, path)
+	if host.countMethod("host.http.do") != 1 {
+		t.Fatal("failed checks bypassed the per-model retry interval")
+	}
+}
+
+func TestQuotaRecoveryWorkerDoesNotCheckWhenPolicyIsDisabled(t *testing.T) {
+	s, host, id, path := quotaRecoveryFixture(t, false, "model-a")
+	disabled := false
+	s.mu.Lock()
+	s.cfg.Pause.Enabled = &disabled
+	s.mu.Unlock()
+	queueRecoveryEvidence(t, host, "model-a", "member", "available")
+	makeQuotaPauseDue(t, s, id)
+	s.recheckDueQuotaBlocks(s.stopCh)
+	requireQuotaStillBlocked(t, s, id, path)
+	if host.countMethod("host.http.do") != 0 {
+		t.Fatal("disabled automatic policy queried the official API")
+	}
+}
+
 func TestQuotaRecoveryFencesControlKeyChangeDuringCheck(t *testing.T) {
 	s, host, id, path := quotaRecoveryFixture(t, false, "model-a")
 	queueRecoveryEvidence(t, host, "model-a", "member", "available")

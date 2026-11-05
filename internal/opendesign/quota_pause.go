@@ -329,6 +329,7 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 	revoked := s.revoked[id]
 	billingEpoch := s.billingEpoch[id]
 	inflight := s.quotaHasInFlightLocked(current)
+	syncPending := s.quotaPauseErrors[id] != ""
 	enabled := s.cfg.pauseSettings().enabled
 	stopped := s.stopped
 	s.mu.RUnlock()
@@ -346,6 +347,9 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 	}
 	if inflight {
 		return localFail(http.StatusConflict, "quota_recheck_inflight", "仍有同一推理密钥的请求在途，请稍后复查")
+	}
+	if syncPending {
+		return localFail(http.StatusConflict, "quota_sync_pending", "额度暂停尚未同步到凭据文件，请稍后复查")
 	}
 	if current.ControlKey == "" || current.WorkspaceID == "" {
 		return localFail(http.StatusConflict, "quota_recheck_unconfigured", "未配置官方额度授权或 Workspace ID，无法复查")
@@ -395,7 +399,7 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 	unchanged := exists && !s.revoked[id] && !s.stopped && live.APIKey == current.APIKey &&
 		live.ControlKey == current.ControlKey && live.WorkspaceID == current.WorkspaceID &&
 		live.runtimeEpoch == current.runtimeEpoch && live.QuotaRevision == current.QuotaRevision &&
-		s.billingEpoch[id] == billingEpoch && live.quotaBlocked() && !s.quotaHasInFlightLocked(live)
+		s.billingEpoch[id] == billingEpoch && live.quotaBlocked() && !s.quotaHasInFlightLocked(live) && s.quotaPauseErrors[id] == ""
 	if dueOnly {
 		unchanged = unchanged && s.cfg.pauseSettings().enabled && !live.QuotaBlock.RetryAt.After(now)
 	}
@@ -441,8 +445,8 @@ func (s *Service) setQuotaPauseSyncError(id, revision string, failed bool) {
 	}
 }
 
-// startQuotaPauseWorker currently performs failed-file retries only; expiration
-// does not enable a credential without a fresh, successful quota preflight.
+// startQuotaPauseWorker retries failed file writes and starts serial official
+// preflights for due blocks. A deadline by itself never clears a block.
 func (s *Service) startQuotaPauseWorker() {
 	s.mu.Lock()
 	if s.stopped || s.quotaPauseStarted {
@@ -470,14 +474,14 @@ func (s *Service) startQuotaPauseWorker() {
 			default:
 			}
 			s.sweepQuotaBlocks(stop)
+			s.recheckDueQuotaBlocks(stop)
 		}
 	}()
 	s.wakeQuotaPauseWorker()
 }
 
 // sweepQuotaBlocks retries failed persistence without treating a deadline as
-// proof of restored quota. ClinePass-style automatic recovery requires a fresh,
-// successful official preflight; that check is wired in separately.
+// proof of restored quota. It performs no network requests.
 func (s *Service) sweepQuotaBlocks(stop <-chan struct{}) {
 	type candidate struct {
 		id, revision string
@@ -504,5 +508,34 @@ func (s *Service) sweepQuotaBlocks(stop <-chan struct{}) {
 		err := s.persistQuotaBlockLocked(item.id, item.revision)
 		s.credentialMu.Unlock()
 		s.setQuotaPauseSyncError(item.id, item.revision, err != nil)
+	}
+}
+
+// recheckDueQuotaBlocks runs only on the worker, not on management reads. One
+// account is checked at a time, each model is checked serially, and failures
+// leave the block in place. The model preflight's normal refresh interval bounds
+// retry traffic even when many wakeups arrive between ticker ticks.
+func (s *Service) recheckDueQuotaBlocks(stop <-chan struct{}) {
+	now := s.quotaPauseTime()
+	s.mu.RLock()
+	if s.stopped || !s.cfg.pauseSettings().enabled {
+		s.mu.RUnlock()
+		return
+	}
+	var ids []string
+	for id, c := range s.creds {
+		if !s.revoked[id] && c.quotaBlocked() && !c.QuotaBlock.RetryAt.After(now) && s.quotaPauseErrors[id] == "" {
+			ids = append(ids, id)
+		}
+	}
+	s.mu.RUnlock()
+	sort.Strings(ids)
+	for _, id := range ids {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		_ = s.recheckQuotaBlockMode("", id, true)
 	}
 }
