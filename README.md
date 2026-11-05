@@ -225,7 +225,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 产物是 `dist/open-design.so`（Linux amd64，C shared ABI v1）。
 
-发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。开发分支的 registry 暂指已发布的 `0.4.4`，与未发布的源码版本有意不同；发布新版本时必须重新同步源码、registry 和新 tag。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布的安全 tag/版本，`github-release` 的自动“取最新”不适用于本 fork。
+发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。开发分支的 registry 暂指已发布的 `0.4.4`，与未发布的源码版本有意不同；发布新版本时必须重新同步源码、registry 和新 tag。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动“取最新”不适用于本 fork。
 
 ## 当前验证边界
 
