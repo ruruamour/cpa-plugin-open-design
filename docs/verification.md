@@ -11,7 +11,7 @@
 | 信号 | `quotaPauseSignal` 只接受 `error.code=insufficient_balance` 且状态为 `402`，或同一机器码出现在 `2xx`（含 SSE）且 `error.details.coding_plan_exhausted=true` 的响应中；裸 `402`、文本 `payment required`、普通 `429`、普通 `insufficient_quota` 均不触发 |
 | 截止时间 | `quotaPauseDeadline`：缺省 30 分钟，钳制 1 分钟～7 天，受 `pause.max_seconds` 约束；`reset_at` 只取 RFC3339（允许 `resets at ` 前缀），`Retry-After` 支持秒数与 HTTP 日期，溢出按上限处理 |
 | 人工停用保护 | 插件管理接口的启停路径有模拟测试；但 CPA 原生界面停用与插件投影的禁用无法可靠区分，到期恢复可能覆盖人工停用，**未通过**。`ManualDisabled=nil` 的保守回退另有本地修复，不能解决上述归因问题 |
-| 持久化 | 读—比对—原子替换，只改 `quota_block`／`quota_revision`／`disabled`，保留未知字段；写失败时先发布内存拦截再记 `quotaPauseSyncError`，后台任务重试 |
+| 持久化 | 读取、比对并重读后原子替换，只改 `quota_block`／`quota_revision`／`disabled`，尽量保留未知字段；插件进程内串行，跨进程没有 CAS，最后一次读取与替换之间的宿主或运维写入仍可能被覆盖。写失败时先发布内存拦截再记同步错误，后台任务重试 |
 | 执行路径 | `executor.execute`／`execute_stream`（含 SSE 事件）都调用 `observeQuotaBlock`；已暂停账户在 `selectedCredential` 本地返回 `429 [open-design:quota_block]`，配套 `continue` 规则允许换号，不产生新的宿主冷却归因 |
 | 恢复 | 开发分支的到期不再直接启用：后台按账号与模型串行请求官方预检，只有全部已知耗尽模型在最新观察之后取得新鲜 `available`、Workspace 成员一致、同一推理密钥无在途、凭据／修订未变时才解除；失败、未授权、缓存或模型集合不完整均保留暂停。复查总时长受预算限制，提交在 `authFileMu` 下复核磁盘身份与证据新鲜度 |
 | 管理接口 | `GET /quota-pause`、`POST /quota-pause/resume`、`POST /quota-pause/recheck`；`GET /status`、`/credentials` 返回 `quota_paused`／`effective_disabled`／`quota_pause`（不含任何 Key 指纹） |
@@ -19,7 +19,7 @@
 | Go 用例 | `quota_pause_deadline_test.go`、`quota_pause_signal_test.go`、`quota_pause_identity_test.go`、`quota_pause_manual_test.go`、`quota_pause_persist_test.go`、`quota_pause_executor_test.go`；覆盖到期不构成恢复证明及插件内人工启停后显式恢复等行为 |
 | Node 用例 | 额度徽标与人工开关分离、解除按钮不发 `/credentials`、重查未通过提示、暂停配置默认值与越界拒绝 |
 | 真实宿主恢复 | `scripts/smoke-abi.py --cpa-live` 新增隔离场景：结构化 402 建立暂停、重启后仍保留、官方预检失败保持暂停、官方新鲜 `available` 后清除插件暂停且插件控制台人工停用保持。针对 `bb3a452` 构建（Linux so SHA-256 `85ed994c7d9e63a9c031abe25fe63fd83fb819499bafe2523b17f49d0582b434`），原版 v8.0.29 隔离构建与本地 `8.0.51` 测试构建均 PASS；原版构建 `--version` 自述 `dev`，不能从二进制自证版本。两种宿主均连接隔离假上游，不代表生产验收。 |
-| 磁盘合并缺陷与修复 | 独立复审指出陈旧写回可能丢掉人工停用或导致暂停复活；此前修复又引入了相同暂停 body 被误报同步失败、修复后 stale 标记不清、无修订号时错误压制磁盘暂停。已分别添加复现及修复：相同内容不触发修复，同 revision 但 block 内容变化仍会修复；修复成功或文件已匹配时清除标记；无修订号不能证明已解除，因此保留磁盘有效暂停。另修复复查退避溢出及锁外读取策略。用例：`quota_stale_disk_test.go`；最新修复仍需独立复审和隔离宿主重测。 |
+| 磁盘合并缺陷与修复 | 独立复审指出陈旧写回可能丢掉人工停用或导致暂停复活；此前修复又引入相同暂停 body 被误报同步失败、修复后 stale 标记不清、无修订号时错误压制磁盘暂停。`bb3a452` 已补用例与修复，并在下述隔离宿主场景通过；后续独立复审又复现旧无 revision body 抹掉解除修订，使旧暂停复活或 stale 标记卡住并反复写文件。新问题仍在修复与复审，前述通过不代表其已解决，更不代表生产验收。 |
 | 真实宿主并发暂停（新增） | `host_quota_concurrent`：同一推理 key 两个别名指向两个上游模型，假上游挂住慢请求（`glm-5.3-flash`）、让快请求（`deepseek-v4.1-flash`）先回结构化 402。在途窗口内官方 `funding-check` 对两个模型都回 `available`，但 `POST /quota-pause/recheck` 仍 409（`在途`）且零次官方查询、暂停保留；放行慢请求后迟到 402 必须合并出 `model_ids=[deepseek-v4.1-flash, glm-5.3-flash]` 与 `multiple_models=true`；随后一模型 `available`、另一 `insufficient` 的混合答案仍 409 并保持暂停（两模型都被查过），只有两模型都新鲜 `available` 才 200 解除并清空磁盘 block。证据等待 `quotaRecoveryProven` 的 5 秒边界，不为测试放宽插件规则。插入在途请求靠假上游按上游模型名挂住 handler，不修改宿主或插件 Go 代码；对 `bb3a452` 构建，在两个隔离宿主（`/tmp/cpa-host-stock-quota-check`、`/tmp/cpa-v8051-test-build`）运行完整 `--cpa-live` 均 PASS。假上游结果不代表生产验收 |
 | 真实宿主恢复缺陷与修复 | `--cpa-live` 曾稳定卡在「官方已 `available` 但复查判为未证明」。定位到两处：复查读取复用 60 秒模型级缓存/节流窗口，或加入控制台已发起的查询，拿到的是复查开始前发出的证据；策略比较用 `*bool` 指针身份，宿主重注册用新解码配置重跑 `configure` 使每轮自动复查被判成策略变化。改为复查强制新发请求（在途则先等其结束）并比较 `pauseSettings()` 有效值后，原版与本地 hotfix 构建的 `host_quota_recovery` 均 PASS。回归用例：`TestQuotaRecoveryRejectsCachedEvidence`、`TestQuotaRecoveryProofDoesNotJoinOlderRefresh`、`quota_recheck_policy_generation_test.go` |
 | 全仓 Go | `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 通过 |
@@ -27,7 +27,7 @@
 
 **真实上游样例与验收边界**：用户报告两个账号周额度耗尽；2026-11-05 从生产相关会话和上游请求获得了结构化 `402` 样例，其中包含 `insufficient_balance`、`coding_plan_exhausted=true` 和约三天后的 `reset_at`。脱敏报文形态已加入 `TestQuotaPauseSignalMatchesObservedCodingPlanExhaustion`。默认 `pause.max_seconds` 为一天，会将首次到期提示钳制在一天；届时还须启用策略并满足复查条件才会查询，不保证等待到上游的三天重置时间。这只验证了真实错误形态，**新版本的生产暂停、自动恢复及换号行为仍未验收**；相关真实宿主测试均使用隔离 fixture。
 
-人工停用保护仍未通过全部入口的真实宿主复核：当前实现返回有效 `Disabled` 给宿主，宿主可能写回文件，不能区分部分原生人工停用；隔离真实宿主已验证插件控制台的人工停用能在自动恢复后保留，但不包括 CPA 原生入口。上游 `402/403` 的冷却由宿主控制，现有宿主为 30 分钟；本插件不主动清除宿主冷却，暂停／恢复对该冷却的副作用仍需宿主实测。`0.4.6` 的 Release 运行 `41906585863` 因 macOS arm64 作业取消而失败，未生成 Release，未部署。
+人工停用保护仍未通过全部入口及并发文件回写的真实宿主复核：当前实现返回有效 `Disabled` 给宿主，宿主可能写回文件，不能区分部分原生人工停用；隔离真实宿主的特定场景验证过插件控制台人工停用在自动恢复后保留，但不包括所有文件回写及 CPA 原生入口。上游 `402/403` 的冷却由宿主控制，现有宿主为 30 分钟；本插件不主动清除宿主冷却，暂停／恢复对该冷却的副作用仍需宿主实测。`0.4.6` 的 Release 运行 `41906585863` 因 macOS arm64 作业取消而失败，未生成 Release，未部署。
 
 **人工停用缺陷复现**：在隔离临时目录中构建并启动未修改的原版 CPA `v8.0.29`（源码提交 `5fc580b1d72d87a7bcfe5cfb6f479c1aea5625b3`），使用仅包含测试 Key 的临时配置、loopback 代理和假上游返回结构化 402。插件进入额度暂停后，通过 CPA 原生 `PATCH /v0/management/auth-files/status` 设置 `disabled=true`；接着调用插件的 `/quota-pause/resume`，观察到文件 `disabled` 从 `true` 变回 `false`，插件状态也为启用。该复现证明当前实现不能保护这种人工停用操作；它没有访问生产服务或真实密钥，也不涉及宿主补丁。
 
