@@ -4109,6 +4109,36 @@ test('a paused account offers 解除额度暂停 and never flips the disabled sw
   assert.ok(!calls.some(call => call.url.endsWith('/credentials')), 'resuming a pause must not toggle the account');
 });
 
+test('old-session quota actions cannot trigger a status refresh in a new session', async () => {
+  for (const action of ['resumeQuotaPause', 'recheckQuotaPause']) {
+    const pendingAction = deferred();
+    const calls = [];
+    const view = fakePage({
+      confirmImpl: () => true,
+      fetchImpl: async (url) => {
+        calls.push(url);
+        if (url.includes('/quota-pause/')) return pendingAction.promise;
+        if (url.includes('/status')) return respond(200, statusBody({ models_revision: 'new-session-rev' }));
+        return respond(404, { error: 'not found' });
+      },
+    });
+    const api = view.context.OpenDesignConsole;
+    api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+    await api.render.loadStatus();
+    const pending = api.handlers[action]({ id: 'cred-1', label: '主账户' });
+    await new Promise(setImmediate);
+    api.render.showAuth('请重新认证');
+    view.document.getElementById('managementKey').value = 'new-session-key';
+    await api.handlers.submitAuth({ preventDefault() {} });
+    const before = calls.filter(url => url.includes('/status')).length;
+    pendingAction.resolve(respond(200, { pauses: [] }));
+    await pending;
+    assert.equal(calls.filter(url => url.includes('/status')).length, before, `${action} unexpectedly refreshed the new session`);
+    assert.equal(api.state.modelsRevision, 'new-session-rev');
+    assert.ok(!view.document.getElementById('accountState').textContent.includes('已解除'), 'old success must not overwrite new session UI');
+  }
+});
+
 test('recheck posts the credential id and reports an unproven preflight', async () => {
   const calls = [];
   const view = fakePage({
