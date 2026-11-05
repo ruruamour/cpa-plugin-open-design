@@ -171,7 +171,11 @@ func (s *Service) management(raw json.RawMessage) (any, error) {
 		return s.upstreamModels(r)
 	case r.Method == http.MethodGet && path == apiBase+"/models":
 		return s.withActive(func() (any, error) {
-			return managementJSON(http.StatusOK, map[string]any{"models": modelViews(s.config().Models)})
+			cfg := s.config()
+			return managementJSON(http.StatusOK, map[string]any{
+				"models":          modelViews(cfg.Models),
+				"models_revision": modelsRevision(cfg.Models),
+			})
 		})
 	case r.Method == http.MethodPost && path == apiBase+"/models":
 		return s.withActive(func() (any, error) {
@@ -213,9 +217,10 @@ func (s *Service) statusResponse() (any, error) {
 	sortCredentials(credentials)
 	models := modelViews(cfg.Models)
 	return managementJSON(http.StatusOK, map[string]any{"version": Version,
-		"base_url":    cfg.BaseURL,
-		"credentials": credentials,
-		"models":      models,
+		"base_url":        cfg.BaseURL,
+		"credentials":     credentials,
+		"models":          models,
+		"models_revision": modelsRevision(cfg.Models),
 	})
 }
 

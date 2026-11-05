@@ -2,6 +2,8 @@ package opendesign
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"path/filepath"
@@ -22,6 +24,30 @@ func modelView(m Model) map[string]any {
 		view["reasoning_mapping"] = m.Reasoning
 	}
 	return view
+}
+
+// modelsRevision is a deterministic digest of the complete model list,
+// including every row's optional reasoning policy. The console echoes it back as
+// expected_models_revision when it saves the whole list, so a list rendered
+// before another tab changed the list (deleted, added, renamed, re-pointed, or
+// re-policied a row) is rejected instead of overwriting the newer state. The
+// token is opaque and only ever compared for equality.
+func modelsRevision(models []Model) string {
+	if models == nil {
+		models = []Model{}
+	}
+	// The prefix keeps this digest from ever colliding with another payload that
+	// happens to encode to the same bytes.
+	payload := append([]byte("open-design/models/v1\x00"), jsonBytes(models)...)
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+// sameReasoningMapping compares two optional policies by their canonical
+// encoding, so two equal mappings with different slice backing are treated as
+// the same policy and a nil policy is distinct from an empty one.
+func sameReasoningMapping(left, right *ReasoningMapping) bool {
+	return bytes.Equal(jsonBytes(left), jsonBytes(right))
 }
 
 func modelViews(models []Model) []map[string]any {
@@ -138,7 +164,7 @@ func (s *Service) saveReasoningMapping(raw json.RawMessage) (any, error) {
 	s.modelMappingRevision++
 	s.clearModelTestsLocked()
 	s.mu.Unlock()
-	return map[string]any{"models": modelViews(cfg.Models), "reasoning_revision": reasoningRevision(cfg.Models[index])}, nil
+	return map[string]any{"models": modelViews(cfg.Models), "reasoning_revision": reasoningRevision(cfg.Models[index]), "models_revision": modelsRevision(cfg.Models)}, nil
 }
 
 // resolveModel maps a client alias onto the upstream model ID. An unknown alias is
@@ -197,25 +223,24 @@ func (s *Service) credentialByID(id string) (Credential, error) {
 	return c, nil
 }
 
-// modelImport is one submitted model row. reasoning_revision is an optional
-// optimistic-lock token copied from GET /models: it is decoded here but never
-// stored in settings, because the revision is derived from the persisted row.
+// modelImport is one submitted model row. The embedded Model keeps the row
+// shape open to future optional fields: anything added to Model later decodes
+// and re-encodes through this adapter without an import-side list to update.
+// reasoning_revision is accepted from a row rendered by GET /models. It is only
+// checked when the submitted alias already exists, so it can still catch a
+// same-alias policy change for a caller that has not adopted
+// expected_models_revision, but it never mis-rejects a rename or a new row and it
+// cannot see deletions or additions. expected_models_revision is the whole-list
+// lock for those cases.
 type modelImport struct {
-	ID                string            `json:"id"`
-	UpstreamID        string            `json:"upstream_id"`
-	Reasoning         *ReasoningMapping `json:"reasoning_mapping"`
-	ReasoningRevision *string           `json:"reasoning_revision"`
+	Model
+	ReasoningRevision *string `json:"reasoning_revision"`
 }
 
-// checkModelImportRevisions rejects a submitted list whose rows were built from
-// an older configuration. A row that carries a non-empty revision must still
-// match the current model with that alias: a deleted row, or a policy/upstream
-// changed by another tab, makes the token stale. The token is compared to the
-// current row, so a client that loaded the current revision may still submit a
-// deliberate upstream change; the keep-existing lookup below then refuses to
-// carry the old policy onto the new upstream. The caller runs this under
-// configMu, so no save can land between the compare and the mutation that
-// follows.
+// checkModelImportRevisions is the row-level companion to checkModelsRevision.
+// It only applies to rows whose alias exists in current: a missing alias is a
+// new or renamed row, where a per-row token has no corresponding identity to
+// compare against and would otherwise reject the legitimate rename.
 func checkModelImportRevisions(current []Model, rows []modelImport) error {
 	byID := make(map[string]Model, len(current))
 	for _, model := range current {
@@ -225,18 +250,63 @@ func checkModelImportRevisions(current []Model, rows []modelImport) error {
 		if row.ReasoningRevision == nil {
 			continue
 		}
-		expected := strings.TrimSpace(*row.ReasoningRevision)
-		// An empty token is how an older console or an old draft omits the field;
-		// it keeps the previous last-writer-wins behavior.
-		if expected == "" {
+		token := strings.TrimSpace(*row.ReasoningRevision)
+		if token == "" {
 			continue
 		}
 		model, ok := byID[strings.TrimSpace(row.ID)]
-		if !ok || reasoningRevision(model) != expected {
-			return localFail(http.StatusConflict, "reasoning_revision_conflict", "model or reasoning mapping changed since this page was loaded; refresh before saving")
+		if !ok {
+			continue
+		}
+		if reasoningRevision(model) != token {
+			return localFail(http.StatusConflict, "reasoning_revision_conflict", "reasoning mapping changed since this page was loaded; refresh before saving")
 		}
 	}
 	return nil
+}
+
+// checkModelsRevision rejects a submitted list rendered before the current one.
+// The caller runs this under configMu, so no save can land between the compare
+// and the mutation that follows. A missing or empty token is how an older
+// console omits the field; it keeps the previous compatibility semantics.
+func checkModelsRevision(current []Model, expected *string) error {
+	if expected == nil {
+		return nil
+	}
+	token := strings.TrimSpace(*expected)
+	if token == "" {
+		return nil
+	}
+	if token != modelsRevision(current) {
+		return localFail(http.StatusConflict, "models_revision_conflict", "model list changed since this page was loaded; refresh before saving")
+	}
+	return nil
+}
+
+// previousModelForImport finds the row a submitted model corresponds to in the
+// previous list. The alias is the primary identity. A row whose alias was
+// renamed can still be linked through its per-row reasoning_revision when the
+// console supplied one, which lets the caller distinguish an intentional rename
+// from a new row; without that link a rename is treated as a new row.
+func previousModelForImport(previous []Model, row modelImport, alias string) (Model, bool) {
+	for _, model := range previous {
+		if strings.TrimSpace(model.ID) == alias {
+			return model, true
+		}
+	}
+	if row.ReasoningRevision == nil {
+		return Model{}, false
+	}
+	token := strings.TrimSpace(*row.ReasoningRevision)
+	if token == "" {
+		return Model{}, false
+	}
+	for _, model := range previous {
+		if reasoningRevision(model) == token {
+			return model, true
+		}
+	}
+	return Model{}, false
 }
 
 // importModels validates and persists the submitted alias→upstream mapping.
@@ -254,7 +324,8 @@ func checkModelImportRevisions(current []Model, rows []modelImport) error {
 // credential through host.auth.save.
 func (s *Service) importModels(raw json.RawMessage) (any, error) {
 	var in struct {
-		Models []modelImport `json:"models"`
+		Models                 []modelImport `json:"models"`
+		ExpectedModelsRevision *string       `json:"expected_models_revision"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, fail(http.StatusBadRequest, "invalid models JSON")
@@ -263,38 +334,47 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 	defer s.configMu.Unlock()
 
 	cfg := s.config()
+	// The whole-list check rejects delete/add/rename/re-point in one comparison,
+	// before anything is built or persisted. Row tokens then protect same-alias
+	// callers that have not adopted the whole-list field yet.
+	if err := checkModelsRevision(cfg.Models, in.ExpectedModelsRevision); err != nil {
+		return nil, err
+	}
+	if err := checkModelImportRevisions(cfg.Models, in.Models); err != nil {
+		return nil, err
+	}
 	previous := cfg.Models
 	// Canonicalize the incoming alias/upstream IDs before matching, so a
 	// whitespace-only edit cannot make the keep-existing-policy lookup miss and
 	// silently drop a saved rule table. validate() would trim them later, but by
-	// then the policy had already been decided. The revision check also uses the
-	// trimmed alias, so it matches the row GET /models rendered.
+	// then the policy had already been decided. Assigning the embedded Model as a
+	// whole also preserves any optional field a future row shape adds.
 	cfg.Models = make([]Model, 0, len(in.Models))
 	for _, imported := range in.Models {
-		cfg.Models = append(cfg.Models, Model{
-			ID:         strings.TrimSpace(imported.ID),
-			UpstreamID: strings.TrimSpace(imported.UpstreamID),
-			Reasoning:  imported.Reasoning,
-		})
-	}
-	// Reject the whole list before persisting anything when any revision is
-	// stale. Rows without a revision keep the compatibility path below.
-	if err := checkModelImportRevisions(previous, in.Models); err != nil {
-		return nil, err
+		model := imported.Model
+		model.ID = strings.TrimSpace(model.ID)
+		model.UpstreamID = strings.TrimSpace(model.UpstreamID)
+		cfg.Models = append(cfg.Models, model)
 	}
 	// An incoming list that omits the policy keeps the stored one. The upstream ID
 	// has to match as well: a rule written for one upstream must not be silently
 	// applied to another model that happens to reuse the alias. A policy sent in
-	// the body always wins.
+	// the body always wins, except when it is the exact stored policy echoed back
+	// together with an upstream change: that is an implicit migration of an old
+	// rule table, not a new-policy intent, so the echoed policy is dropped and the
+	// operator can author a new table deliberately.
 	for i := range cfg.Models {
 		if cfg.Models[i].Reasoning != nil {
+			if previousModel, linked := previousModelForImport(previous, in.Models[i], cfg.Models[i].ID); linked &&
+				cfg.Models[i].UpstreamID != strings.TrimSpace(previousModel.UpstreamID) &&
+				sameReasoningMapping(cfg.Models[i].Reasoning, previousModel.Reasoning) {
+				cfg.Models[i].Reasoning = nil
+			}
 			continue
 		}
-		for _, existing := range previous {
-			if strings.TrimSpace(existing.ID) == cfg.Models[i].ID && strings.TrimSpace(existing.UpstreamID) == cfg.Models[i].UpstreamID {
-				cfg.Models[i].Reasoning = cloneReasoningMapping(existing.Reasoning)
-				break
-			}
+		previousModel, linked := previousModelForImport(previous, in.Models[i], cfg.Models[i].ID)
+		if linked && cfg.Models[i].UpstreamID == strings.TrimSpace(previousModel.UpstreamID) {
+			cfg.Models[i].Reasoning = cloneReasoningMapping(previousModel.Reasoning)
 		}
 	}
 	if err := cfg.validate(); err != nil {
@@ -318,7 +398,7 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 	if err := s.refreshAuthModels(); err != nil {
 		return nil, localFail(http.StatusBadGateway, "host_contract_error", "model mapping saved but the host model refresh failed: host rejected the refresh")
 	}
-	return map[string]any{"models": modelViews(cfg.Models)}, nil
+	return map[string]any{"models": modelViews(cfg.Models), "models_revision": modelsRevision(cfg.Models)}, nil
 }
 
 // refreshAuthModels rewrites every live credential with a new model revision so

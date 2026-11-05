@@ -32,8 +32,8 @@ type ExecutorRequest struct {
 	UpstreamModelOverride string      `json:"-"`
 	CredentialOverride    *Credential `json:"-"`
 	// ReasoningPinned/ReasoningOverride carry an explicit policy snapshot for the
-	// explicit model test, so the policy cannot be re-resolved from a newer
-	// published configuration after the upstream ID was captured.
+	// explicit model test. Pinning is independent of the upstream override, so a
+	// pinned nil stays nil even when the latest published configuration has rules.
 	ReasoningPinned   bool              `json:"-"`
 	ReasoningOverride *ReasoningMapping `json:"-"`
 
@@ -99,15 +99,20 @@ func (s *Service) prepare(r ExecutorRequest) (map[string]any, string, modelSnaps
 			return nil, "", modelSnapshot{}, &APIError{Status: http.StatusBadRequest, Kind: "model_not_enabled", Message: "model is not enabled in the OpenDesign plugin"}
 		}
 		upstream = snapshot.upstream
-	} else if r.ReasoningPinned {
-		// The model test pins both the upstream ID and the policy it snapshotted,
-		// so a concurrent save cannot pair the old upstream with a new rule table.
-		snapshot = modelSnapshot{upstream: upstream, reasoning: cloneReasoningMapping(r.ReasoningOverride)}
-	} else if resolved, ok := s.modelSnapshotFor(r.Model); ok && resolved.upstream == upstream {
-		// An explicit override pins the upstream ID. The policy still has to come
-		// from the same row, so it is read in the same snapshot as the alias
-		// rather than re-resolved later.
-		snapshot = resolved
+	} else if !r.ReasoningPinned {
+		if resolved, ok := s.modelSnapshotFor(r.Model); ok && resolved.upstream == upstream {
+			// An explicit override pins the upstream ID. The policy still has to come
+			// from the same row, so it is read in the same snapshot as the alias
+			// rather than re-resolved later.
+			snapshot = resolved
+		}
+	}
+	if r.ReasoningPinned {
+		// The pin is explicit and independent of how the upstream ID was selected.
+		// A nil override means "no mapping", so it must not fall back to reading
+		// the current configuration.
+		snapshot.upstream = upstream
+		snapshot.reasoning = cloneReasoningMapping(r.ReasoningOverride)
 	}
 	// Payload is the provider-translated body. A host that only forwards the raw
 	// client request still works because OriginalRequest is the same shape here.
@@ -180,16 +185,18 @@ type reasoningDecision struct {
 // executePinned is used by explicit model tests to keep the credential and
 // alias mapping snapshot used for validation identical to the outbound request.
 func (s *Service) executePinned(raw json.RawMessage, upstreamModel string, credential *Credential, manageLifecycle bool) (result any, err error) {
-	result, _, err = s.executePinnedWithReasoning(raw, upstreamModel, nil, credential, manageLifecycle)
+	// Legacy helper semantics: an explicit upstream override does not pin the
+	// policy, so the executor still resolves the current row's mapping.
+	result, _, err = s.executePinnedWithReasoning(raw, upstreamModel, nil, false, credential, manageLifecycle)
 	return result, err
 }
 
 // executePinnedWithReasoning runs one pinned buffered request and also returns
-// the reasoning decision the executor reached. The policy snapshot is pinned
-// even when reasoning is nil: an explicit model test taken while a model had no
-// mapping must keep sending no mapping, rather than observing rules another tab
-// saves after the test captured its configuration.
-func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel string, reasoning *ReasoningMapping, credential *Credential, manageLifecycle bool) (result any, decision reasoningDecision, err error) {
+// the reasoning decision the executor reached. reasoningPinned is explicit and
+// separate from upstreamModel: the explicit model test sets it true so a nil
+// policy snapshot stays nil, while the legacy executePinned helper sets it false
+// and keeps resolving the current policy.
+func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel string, reasoning *ReasoningMapping, reasoningPinned bool, credential *Credential, manageLifecycle bool) (result any, decision reasoningDecision, err error) {
 	if manageLifecycle {
 		if err := s.begin(); err != nil {
 			return nil, reasoningDecision{}, err
@@ -208,9 +215,10 @@ func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel 
 	}
 	if upstreamModel != "" {
 		r.UpstreamModelOverride = upstreamModel
-		// The explicit model test pins both the upstream ID and the policy it
-		// snapshotted. Pinning nil is meaningful: it means "this model had no
-		// mapping when the test started" and must not be reinterpreted later.
+	}
+	if reasoningPinned {
+		// Pinning true with a nil reasoning is meaningful: the snapshot said this
+		// model had no mapping, and a later save must not change that.
 		r.ReasoningPinned = true
 		r.ReasoningOverride = reasoning
 	}

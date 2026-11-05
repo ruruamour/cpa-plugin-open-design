@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 )
@@ -21,6 +22,11 @@ const (
 	modelTestDefaultPrompt  = "Reply with OK."
 	maxConcurrentModelTests = 3
 )
+
+// testModelTestBeforeExecute lets a test land a configuration change between the
+// model-test snapshot and the executor's prepare step. It is nil in production;
+// only tests set it. atomic.Pointer keeps the read race-free.
+var testModelTestBeforeExecute atomic.Pointer[func()]
 
 type modelTestInput struct {
 	CredentialID string          `json:"credential_id"`
@@ -176,7 +182,10 @@ func (s *Service) modelTestRequest(r ManagementRequest) (any, error) {
 	// The executor returns the model snapshot it actually used. The probe echoes
 	// that decision instead of predicting it, so it can never claim a strength it
 	// did not send (a concurrent mapping save or a passthrough value included).
-	executed, decision, callErr := s.executePinnedWithReasoning(raw, snapshot.upstreamModel, snapshot.reasoning, &c, false)
+	if hook := testModelTestBeforeExecute.Load(); hook != nil {
+		(*hook)()
+	}
+	executed, decision, callErr := s.executePinnedWithReasoning(raw, snapshot.upstreamModel, snapshot.reasoning, true, &c, false)
 	duration := time.Since(started).Milliseconds()
 	reasoningSent := decision.effort
 	reasoningMapping := decision.mapping
