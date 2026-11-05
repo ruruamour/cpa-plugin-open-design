@@ -258,9 +258,9 @@ plugins:
 ## 发布 tag
 
 - 发布 tag 使用 `open-design-vX.Y.Z` 形式，不创建或覆盖上游 `v*` tag；不使用或复用不安全的 `open-design-v0.4.6`。
-- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对。开发分支的 registry 暂指已发布的 `0.4.4`，故有意与未发布的源码版本不同；选定安全的新版本后才同步三者。
+- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对。开发分支的 registry 暂指 `0.4.4`，但该 Release 仍是 draft，公开 latest 为 `0.4.3`，`github-release` 安装会失败；故有意与未发布的源码版本不同。选定安全的新版本后才同步三者。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本。
-- `open-design-v0.4.4` 已发布 GitHub Release；`0.4.5` 与 `0.4.6` 的发布运行均未产出资产，`0.4.6` 未部署；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release。分支与生产交付状态见验证记录。
+- `open-design-v0.4.4` 的 GitHub Release 仍是 draft（公开 latest 为 `v0.4.3`）；生产已部署 `0.4.4` 不等于该 Release 已公开。`0.4.5` 与 `0.4.6` 的发布运行均未产出资产，`0.4.6` 未部署；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release。分支与生产交付状态见验证记录。
 
 ## 上游与许可
 

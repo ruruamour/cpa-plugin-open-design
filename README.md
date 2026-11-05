@@ -2,7 +2,7 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产及已发布版本为 `0.4.4`，本开发分支的源码版本为 `0.4.6`，尚不可部署。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.4`，但该版本的 GitHub Release 仍是 draft，公开 latest 为 `0.4.3`（安装边界见下文）。本开发分支的源码版本为 `0.4.6`，尚不可部署。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
@@ -22,7 +22,7 @@
 
 `0.4.0` 于 2026-11-04 从提交 `e66497e` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台、错误规则同步和原有效插件核验通过。
 
-GitHub Release 使用 `open-design-v0.4.4`（`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release；`0.4.1`～`0.4.3` 已发布）。
+GitHub Release 使用 `open-design-v0.4.4`，但该 Release 目前仍是 draft，公开 `/releases/latest` 仍指向 `open-design-v0.4.3`（`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release；`0.4.1`～`0.4.3` 已公开）。发布 0.4.4 还是把 registry 回指 0.4.3，尚未决定。
 
 `0.3.0` 于 2026-11-03 从提交 `2601888` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台和原有效插件核验通过。
 
@@ -87,8 +87,8 @@ GitHub Release 使用 `open-design-v0.4.4`（`0.4.0` 的 tag 因 Windows 平台�
 
 - 信号很窄：仅 `error.code=insufficient_balance` 且状态为 `402`，或者同一机器码出现在 `2xx` 响应体/SSE 事件中且 `coding_plan_exhausted=true`。裸 `402`、文本 `payment required`、普通 `429`、普通 `insufficient_quota` 都不触发账户级暂停。
 - 暂停把 `quota_block`／`quota_revision` 写入凭据 auth 文件，并把有效停用状态返回给宿主。CPA 可能将该状态写回 `disabled`：暂停期间应在本插件控制台做启停，但文件回写及并发边界仍在复审；CPA 原生界面再次停用与插件投影不可区分，**恢复可能重新启用这样停用的账户**。
-- 截止时间只取结构化 `reset_at`／`Retry-After`，缺省 30 分钟，钳制 1 分钟～7 天，并受 `pause.max_seconds` 约束；迟到的重复错误只更新观察时间。
-- 到期本身不解除暂停。开启 `pause.enabled` 后，后台按账号、逐模型串行请求官方 funding-check，只有全部已知耗尽模型都在最新观察之后取得新鲜的 `available`、Workspace 成员一致、同一推理密钥无在途请求、凭据／修订未变时才解除；失败、未授权、缓存或不完整模型集合继续暂停。复查总时长受预算限制，提交时会在文件锁下重新核对磁盘身份与证据新鲜度。
+- 截止时间只取结构化 `reset_at`／`Retry-After`，缺省 30 分钟，钳制 1 分钟～7 天，并受 `pause.max_seconds` 约束；没有新 reset 提示的迟到重复错误只更新观察时间，带新提示的会重算但不超过 `BlockedAt + pause.max_seconds` 上限。
+- 到期本身不解除暂停。开启 `pause.enabled` 后，后台按账号、逐模型串行请求官方 funding-check，只有全部已知耗尽模型都在最新观察之后取得新鲜的 `available`、Workspace 成员一致、同一推理密钥无在途请求、凭据／修订未变时才解除；失败、未授权、缓存或不完整模型集合继续暂停。复查总时长受预算限制，提交时会在进程内互斥锁 `authFileMu` 下重新核对磁盘身份与证据新鲜度（没有跨进程 CAS）。
 - 必须由管理员保证 `control_key` 与推理 key 属于同一账号，插件无法自动验证；`resume` 是操作员显式解除，不验证余额。
 - 开发分支配置项：`pause.enabled`（未明确配置时默认关闭）、`pause.max_seconds`（60–604800，默认 86400）。已推送的 `0.4.6` tag 仍默认开启且不安全，不要使用。
 
@@ -167,10 +167,14 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 | `GET` / `POST /v0/management/open-design/models` | 读取或保存模型映射 |
 | `GET /v0/management/open-design/quota?credential_id=<id>` | 读取共享额度缓存；加 `&refresh=1` 查询官方钱包与套餐窗口，最小间隔 60 秒（控制台打开该标签页时按账户顺序逐个调用） |
 | `GET /v0/management/open-design/model-coverage?credential_id=<id>&model_id=<id>` | 读取模型级官方覆盖缓存；加 `&refresh=1` 手动查询官方 `funding-check`，每组合最小间隔 60 秒 |
+| `GET /v0/management/open-design/quota-pause` | 列出当前额度暂停（不含 key 指纹）；读取会触发本地文件修复重试 |
+| `POST /v0/management/open-design/quota-pause/resume` | 显式解除指定账户的插件额度暂停，body 为 `{credential_id}`；不验证余额 |
+| `POST /v0/management/open-design/quota-pause/recheck` | 对暂停账户立即发起官方复查，body 为 `{credential_id}` |
+| `GET` / `POST /v0/management/open-design/models/reasoning` | 读取或保存每个模型的思考强度映射 |
 | `GET /v0/management/open-design/request-logs` | 分页读取元数据日志，支持 `limit`、`offset`、`status`、`model`、`credential_id`、`attempted`、`since`、`until` |
 | `GET /v0/management/open-design/request-stats` | 读取汇总统计（含本地拒绝数） |
 | `DELETE /v0/management/open-design/request-logs` | 持久化清空日志（也接受 `POST /request-logs/clear`） |
-| `GET` / `POST /v0/management/open-design/config` | 读取或修改请求日志开关、保留天数与条数上限 |
+| `GET` / `POST /v0/management/open-design/config` | 读取或修改请求日志开关、保留天数与条数上限，以及 `pause.enabled`／`pause.max_seconds` |
 | `GET /v0/management/open-design/runtime` | 插件可见运行时状态；宿主账户信息不可读时标记降级 |
 | `POST /v0/management/open-design/model-test` | 显式单次非流式模型测试，body 为 `{credential_id, model_id, prompt?|messages?}` |
 | `GET` / `PUT /v0/management/open-design/error-rules` | 读取或保存错误规则策略并逐账号同步 |
@@ -225,7 +229,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 产物是 `dist/open-design.so`（Linux amd64，C shared ABI v1）。
 
-发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。开发分支的 registry 暂指已发布的 `0.4.4`，与未发布的源码版本有意不同；发布新版本时必须重新同步源码、registry 和新 tag。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动“取最新”不适用于本 fork。
+发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。开发分支的 registry 暂指 `0.4.4`，但该 Release 仍是 draft，`github-release` 安装会失败；与未发布的源码版本也有意不同。发布新版本或把 registry 回指 `0.4.3` 前必须重新同步源码、registry 和新 tag。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动“取最新”不适用于本 fork。
 
 ## 当前验证边界
 

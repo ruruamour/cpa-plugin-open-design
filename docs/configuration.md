@@ -1,5 +1,7 @@
 # 进阶配置
 
+> **上游参考文档**：本文件保留自 ClinePassBridge 上游，描述的是 Cline 套餐／CPAMP 场景，**不是**本 fork 的 OpenDesign 插件当前行为。本 fork 的额度暂停在未配置 `pause.enabled` 时默认关闭，且 CPA 原生界面的停用无法可靠归因；请以根目录 [README](../README.md) 与 [open-design.md](open-design.md) 为准。
+
 第一次使用请先看 [README](../README.md)。这里介绍日常使用之外的设置和接口。
 
 ## 登录与数据保存

@@ -50,7 +50,7 @@
 
 ### 生产部署
 
-2026-11-04 从提交 `563c6b3` 的 CI 产物（[CI 41842818883](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/41842818883)）部署到 `nuoapi-net`；Release 为 [open-design-v0.4.4](https://github.com/ruruamour/cpa-plugin-open-design/releases/tag/open-design-v0.4.4)（[发布运行 41842864324](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/41842864324) 五平台全绿），并已转为正式发布。
+2026-11-04 从提交 `563c6b3` 的 CI 产物（[CI 41842818883](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/41842818883)）部署到 `nuoapi-net`；发布运行为 [41842864324](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/41842864324)（五平台全绿）。该 Release 的 tag 是 `open-design-v0.4.4`，但截至本次核对它仍是 **draft**，公开 `/releases/latest` 仍为 `v0.4.3`，未认证访问该 tag 会 404；生产部署不等同于公开 Release。
 
 | 核验项 | 结果 |
 | --- | --- |
