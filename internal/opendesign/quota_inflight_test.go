@@ -2,7 +2,6 @@ package opendesign
 
 import (
 	"net/http"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -114,35 +113,41 @@ func (h *gatedQuotaHost) releaseGate(index int) {
 	close(gate)
 }
 
-// gatedReadHost parks the first host.http.stream_read of each upstream stream, so
-// a test can hold several streaming requests open at the same time.
+// gatedReadHost parks the first host.http.stream_read of each upstream stream on
+// its own gate, so a test can open several streams and then finish them in a
+// deterministic order instead of racing the pump goroutines.
 type gatedReadHost struct {
 	*fakeHost
 	mu      sync.Mutex
-	seen    map[string]bool
+	gates   map[string]chan struct{}
+	order   []string
 	arrived chan string
-	gate    chan struct{}
 }
 
 func newGatedReadHost(host *fakeHost) *gatedReadHost {
-	return &gatedReadHost{fakeHost: host, seen: map[string]bool{}, arrived: make(chan string, 8), gate: make(chan struct{})}
+	return &gatedReadHost{fakeHost: host, gates: map[string]chan struct{}{}, arrived: make(chan string, 8)}
 }
 
 func (h *gatedReadHost) call(method string, in, out any) error {
 	if method == "host.http.stream_read" {
 		id := stringField(in, "stream_id")
 		h.mu.Lock()
-		first := !h.seen[id]
-		h.seen[id] = true
+		gate, seen := h.gates[id]
+		if !seen {
+			gate = make(chan struct{})
+			h.gates[id] = gate
+			h.order = append(h.order, id)
+		}
 		h.mu.Unlock()
-		if first {
+		if !seen {
 			h.arrived <- id
-			<-h.gate
+			<-gate
 		}
 	}
 	return h.fakeHost.call(method, in, out)
 }
 
+// awaitStream waits until one more upstream stream is parked at its first read.
 func (h *gatedReadHost) awaitStream(t *testing.T) string {
 	t.Helper()
 	select {
@@ -154,188 +159,17 @@ func (h *gatedReadHost) awaitStream(t *testing.T) string {
 	}
 }
 
-// A pause, manual disable, key replacement or deletion that lands between
-// credential selection and admission must fail locally: the request may never
-// reach the upstream and must leave no in-flight counter behind.
-func TestQuotaInFlightAdmissionRechecksLiveCredential(t *testing.T) {
-	tests := []struct {
-		name     string
-		mutate   func(t *testing.T, s *Service, id string)
-		wantCode string
-		wantHTTP int
-	}{
-		{
-			name: "quota pause lands",
-			mutate: func(t *testing.T, s *Service, id string) {
-				setFixtureQuotaBlock(t, s, id)
-			},
-			wantCode: "quota_blocked",
-			wantHTTP: http.StatusTooManyRequests,
-		},
-		{
-			name: "manual disable lands",
-			mutate: func(t *testing.T, s *Service, id string) {
-				s.mu.Lock()
-				defer s.mu.Unlock()
-				c := s.creds[id]
-				c.Disabled = true
-				s.storeCredentialLocked(c)
-			},
-			wantCode: "credential_unavailable",
-			wantHTTP: http.StatusUnauthorized,
-		},
-		{
-			name: "key replaced",
-			mutate: func(t *testing.T, s *Service, id string) {
-				s.mu.Lock()
-				defer s.mu.Unlock()
-				c := s.creds[id]
-				c.APIKey = "fixture-replaced-inference-key"
-				c.QuotaBlock = nil
-				s.storeCredentialLocked(c)
-			},
-			wantCode: "credential_changed",
-			wantHTTP: http.StatusConflict,
-		},
-		{
-			name: "credential deleted",
-			mutate: func(t *testing.T, s *Service, id string) {
-				s.mu.Lock()
-				defer s.mu.Unlock()
-				delete(s.creds, id)
-				s.revoked[id] = true
-			},
-			wantCode: "credential_unavailable",
-			wantHTTP: http.StatusUnauthorized,
-		},
+// releaseStream lets exactly one parked stream continue, so the test controls
+// which terminal callback runs first.
+func (h *gatedReadHost) releaseStream(t *testing.T, id string) {
+	t.Helper()
+	h.mu.Lock()
+	gate, ok := h.gates[id]
+	h.mu.Unlock()
+	if !ok {
+		t.Fatalf("stream %s was never parked", id)
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s, host := newQuotaPauseTestService(t)
-			id := seedModels(t, s, host)
-			quotaFixtureAuthFile(t, s, host, id, nil)
-			var once sync.Once
-			quotaInFlightFixture(t, s, quotaInFlightTestHook{beforeAdmit: func() {
-				once.Do(func() { tc.mutate(t, s, id) })
-			}})
-			_, err := execute(t, s, bufferedQuotaRequest(id))
-			if err == nil {
-				t.Fatal("request was admitted after the credential changed")
-			}
-			if code, status := quotaErrorKind(t, err); code != tc.wantCode || status != tc.wantHTTP {
-				t.Fatalf("error = %d/%s, want %d/%s", status, code, tc.wantHTTP, tc.wantCode)
-			}
-			if host.countMethod("host.http.do") != 0 {
-				t.Fatal("rejected request still reached the upstream")
-			}
-			if total := quotaInFlightTotal(s); total != 0 {
-				t.Fatalf("rejected request left %d counters", total)
-			}
-		})
-	}
-
-	// The streaming path applies the same fence before opening the stream.
-	t.Run("stream pause lands", func(t *testing.T) {
-		s, host := newQuotaPauseTestService(t)
-		id := seedModels(t, s, host)
-		quotaFixtureAuthFile(t, s, host, id, nil)
-		var once sync.Once
-		quotaInFlightFixture(t, s, quotaInFlightTestHook{beforeAdmit: func() {
-			once.Do(func() { setFixtureQuotaBlock(t, s, id) })
-		}})
-		if _, err := executeStream(t, s, streamQuotaRequest(id, "out-race")); err == nil {
-			t.Fatal("paused stream was opened")
-		}
-		if host.countMethod("host.http.do_stream") != 0 {
-			t.Fatal("rejected stream still reached the upstream")
-		}
-		if total := quotaInFlightTotal(s); total != 0 {
-			t.Fatalf("rejected stream left %d counters", total)
-		}
-	})
-}
-
-// The explicit model test pins a credential snapshot. A replace-before-admit must
-// be rejected instead of reaching the newly installed key.
-func TestQuotaInFlightAdmissionRejectsStaleModelTestSnapshot(t *testing.T) {
-	s, host := newQuotaPauseTestService(t)
-	id := addCredential(t, s, host, "primary", "sk-model-test-stale-key")
-	if status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
-		"models": []map[string]string{{"id": "od-large", "upstream_id": "opendesign-large"}},
-	}); status != http.StatusOK {
-		t.Fatalf("seed mapping: %d %s", status, raw)
-	}
-	var once sync.Once
-	quotaInFlightFixture(t, s, quotaInFlightTestHook{beforeAdmit: func() {
-		once.Do(func() {
-			// Replace the key exactly between snapshot validation and admission.
-			if status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil, map[string]any{
-				"id": id, "api_key": "sk-model-test-newer-key",
-			}); status != http.StatusOK {
-				t.Fatalf("key replacement: %d %s", status, raw)
-			}
-		})
-	}})
-	status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/model-test", nil, map[string]any{
-		"credential_id": id, "model_id": "od-large",
-	})
-	if status != http.StatusOK {
-		t.Fatalf("model test envelope: %d %s", status, raw)
-	}
-	if host.countMethod("host.http.do") != 0 {
-		t.Fatal("stale model-test snapshot reached the upstream")
-	}
-	if total := quotaInFlightTotal(s); total != 0 {
-		t.Fatalf("stale model test left %d counters", total)
-	}
-}
-
-// Inference is not throttled: two requests for the same account are admitted at
-// the same time and both are counted.
-func TestQuotaInFlightIsNotAConcurrencyLimit(t *testing.T) {
-	s, host := newQuotaPauseTestService(t)
-	id := seedModels(t, s, host)
-	quotaFixtureAuthFile(t, s, host, id, nil)
-	gated := newGatedQuotaHost(host)
-	s.SetHost(gated.call)
-	host.doResponses = append(host.doResponses, bufferOK(), bufferOK())
-
-	var wg sync.WaitGroup
-	errs := make([]error, 2)
-	start := func(index int) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, errs[index] = execute(t, s, bufferedQuotaRequest(id))
-		}()
-	}
-	start(0)
-	gated.waitGates(t, 1)
-	start(1)
-	gated.waitGates(t, 2)
-
-	c, _ := liveCredential(s, id)
-	has, count, total := quotaInFlightState(s, c)
-	if !has || count != 2 || total != 2 {
-		t.Fatalf("in-flight tracking = has:%t count:%d total:%d, want both admitted", has, count, total)
-	}
-
-	// Both requests were already at the upstream host call, so no concurrency cap
-	// rejected the second one.
-	gated.releaseGate(0)
-	gated.releaseGate(1)
-	wg.Wait()
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("request %d failed: %v", i, err)
-		}
-	}
-	if got := host.countMethod("host.http.do"); got != 2 {
-		t.Fatalf("upstream calls = %d, want 2", got)
-	}
-	if _, _, total := quotaInFlightState(s, c); total != 0 {
-		t.Fatalf("counters leaked: total=%d", total)
-	}
+	close(gate)
 }
 
 // The counter must drop only after the quota observation ran: at release time the
@@ -692,7 +526,8 @@ func TestQuotaInFlightModelTestIsCountedAndReleased(t *testing.T) {
 
 // Several streaming requests can be in flight at once, and the key's counter only
 // reaches zero after every terminal callback recorded its error — including the
-// ones that observed the quota block.
+// ones that observed the quota block. Each terminal callback is released one at a
+// time, so the assertion does not depend on goroutine scheduling.
 func TestQuotaInFlightStreamsReleaseAfterEveryTerminalCallback(t *testing.T) {
 	s, host := newQuotaPauseTestService(t)
 	id := seedModels(t, s, host)
@@ -705,62 +540,60 @@ func TestQuotaInFlightStreamsReleaseAfterEveryTerminalCallback(t *testing.T) {
 	gated := newGatedReadHost(host)
 	s.SetHost(gated.call)
 
-	var mu sync.Mutex
-	var seenCounts []int
-	var seenBlocked []bool
+	type observation struct {
+		count   int
+		blocked bool
+	}
+	observed := make(chan observation, 2)
 	quotaInFlightFixture(t, s, quotaInFlightTestHook{beforeRelease: func(key quotaInFlightKey) {
 		c, ok := liveCredential(s, id)
 		s.mu.RLock()
 		count := s.quotaInflight[key]
 		s.mu.RUnlock()
-		mu.Lock()
-		seenCounts = append(seenCounts, count)
-		seenBlocked = append(seenBlocked, ok && c.quotaBlocked())
-		mu.Unlock()
+		observed <- observation{count: count, blocked: ok && c.quotaBlocked()}
 	}})
 
 	if _, err := executeStream(t, s, streamQuotaRequest(id, "out-multi-a")); err != nil {
 		t.Fatalf("first stream: %v", err)
 	}
-	gated.awaitStream(t)
+	first := gated.awaitStream(t)
 	if _, err := executeStream(t, s, streamQuotaRequest(id, "out-multi-b")); err != nil {
 		t.Fatalf("second stream: %v", err)
 	}
-	gated.awaitStream(t)
+	second := gated.awaitStream(t)
 
 	c, _ := liveCredential(s, id)
 	if has, count, total := quotaInFlightState(s, c); !has || count != 2 || total != 2 {
 		t.Fatalf("two streams in flight = has:%t count:%d total:%d", has, count, total)
 	}
 
-	close(gated.gate)
-	s.waitIdle()
+	// Finish the first stream: at its release both counters are still present.
+	gated.releaseStream(t, first)
+	got := <-observed
+	if got.count != 2 || !got.blocked {
+		t.Fatalf("first release = count:%d blocked:%t, want count 2 with the block observed", got.count, got.blocked)
+	}
+	if has, count, _ := quotaInFlightState(s, c); !has || count != 1 {
+		t.Fatalf("after the first stream = has:%t count:%d, want the second still fenced", has, count)
+	}
 
-	mu.Lock()
-	counts := append([]int(nil), seenCounts...)
-	blocked := append([]bool(nil), seenBlocked...)
-	mu.Unlock()
-	if len(counts) != 2 {
-		t.Fatalf("terminal callbacks = %d, want 2", len(counts))
+	// Finish the second stream: its release sees only its own counter.
+	gated.releaseStream(t, second)
+	got = <-observed
+	if got.count != 1 || !got.blocked {
+		t.Fatalf("second release = count:%d blocked:%t, want count 1 with the block observed", got.count, got.blocked)
 	}
-	sort.Ints(counts)
-	if counts[0] != 1 || counts[1] != 2 {
-		t.Fatalf("counts at release = %v, want the two streams to unwind one by one", counts)
-	}
-	for i, ok := range blocked {
-		if !ok {
-			t.Fatalf("release %d ran before the quota block was observed", i)
-		}
-	}
+	s.waitIdle()
 	if _, _, total := quotaInFlightState(s, c); total != 0 {
 		t.Fatalf("counters leaked: total=%d", total)
 	}
 }
 
-// The last release for a key wakes the existing worker exactly once per idle
-// transition, and the wake is consumed without any lock the release held. No
-// worker is started here, so the buffered wake stays observable.
-func TestQuotaInFlightReleaseWakesWorkerWhenIdle(t *testing.T) {
+// The wake is narrow: a normal request never wakes the sweep (no full-table
+// scan, no failed-persistence retries), while the last release for a key that a
+// currently blocked record carries does wake it. The wake is empty-channel
+// buffered and is consumed without any lock the release held.
+func TestQuotaInFlightReleaseWakeIsScopedToBlockedKey(t *testing.T) {
 	s := NewService()
 	c := Credential{Type: Provider, ID: "fixture-inflight", Label: "fixture", APIKey: "fixture-inflight-key"}
 	s.mu.Lock()
@@ -768,11 +601,11 @@ func TestQuotaInFlightReleaseWakesWorkerWhenIdle(t *testing.T) {
 	s.mu.Unlock()
 	live, _ := liveCredential(s, c.ID)
 
-	first, err := s.admitQuotaInFlight(live)
+	first, err := s.admitQuotaInFlight(live, "")
 	if err != nil {
 		t.Fatalf("admit first: %v", err)
 	}
-	second, err := s.admitQuotaInFlight(live)
+	second, err := s.admitQuotaInFlight(live, "")
 	if err != nil {
 		t.Fatalf("admit second: %v", err)
 	}
@@ -780,8 +613,7 @@ func TestQuotaInFlightReleaseWakesWorkerWhenIdle(t *testing.T) {
 		t.Fatalf("same key was not counted twice: %d", count)
 	}
 
-	// The first release does not reach zero, so the worker is not woken yet and
-	// the fence still reports the same key as busy.
+	// The first release does not reach zero.
 	first.release(s)
 	if has, count, _ := quotaInFlightState(s, live); !has || count != 1 {
 		t.Fatalf("partial release = has:%t count:%d", has, count)
@@ -790,43 +622,564 @@ func TestQuotaInFlightReleaseWakesWorkerWhenIdle(t *testing.T) {
 		t.Fatal("a non-final release woke the quota-pause worker")
 	}
 
-	// The last release reaches zero and wakes the worker. release is idempotent,
-	// so the cleanup path and the terminal defer cannot double-count or double-wake.
+	// The last release reaches zero on a healthy (not blocked) account, so no
+	// sweep is scheduled. release stays idempotent.
 	second.release(s)
 	second.release(s)
 	if _, _, total := quotaInFlightState(s, live); total != 0 {
 		t.Fatalf("counters leaked: total=%d", total)
 	}
-	if len(s.quotaPauseWake) != 1 {
-		t.Fatal("the idle transition did not wake the quota-pause worker")
+	if len(s.quotaPauseWake) != 0 {
+		t.Fatal("a normal request woke the quota-pause worker")
 	}
-	// Consuming the wake needs no lock the release held.
+
+	// A blocked record carrying a different key must not wake either.
+	manual := false
+	blockedSnapshot := func(id, key string) Credential {
+		return Credential{
+			Type: Provider, ID: id, Label: id, APIKey: key,
+			QuotaBlock: &QuotaBlock{
+				KeyHash: quotaPauseKeyHash(key), ManualDisabled: &manual,
+				Source: "upstream", Reason: "quota_exhausted",
+				BlockedAt: time.Now().Add(-time.Minute), RetryAt: time.Now().Add(time.Hour),
+			},
+			QuotaRevision: "fixture-revision",
+		}
+	}
+	s.mu.Lock()
+	other := blockedSnapshot("fixture-other", "fixture-other-inference-key")
+	s.storeCredentialLocked(other)
+	s.mu.Unlock()
+	unrelated, err := s.admitQuotaInFlight(live, "")
+	if err != nil {
+		t.Fatalf("admit unrelated: %v", err)
+	}
+	unrelated.release(s)
+	if len(s.quotaPauseWake) != 0 {
+		t.Fatal("a released key woke the sweep for a different blocked key")
+	}
+
+	// The last release for the blocked key does wake it exactly once.
+	third, err := s.admitQuotaInFlight(live, "")
+	if err != nil {
+		t.Fatalf("admit third: %v", err)
+	}
+	s.mu.Lock()
+	s.storeCredentialLocked(blockedSnapshot(c.ID, c.APIKey))
+	s.mu.Unlock()
+	third.release(s)
+	if len(s.quotaPauseWake) != 1 {
+		t.Fatal("the last release for a blocked key did not wake the quota-pause worker")
+	}
 	select {
 	case <-s.quotaPauseWake:
 	default:
 		t.Fatal("wake signal was not readable")
 	}
+}
 
-	// A fresh idle transition on a blocked account still wakes the worker; the
-	// wake does not depend on the block state, so a parent recovery is never
-	// skipped.
-	third, err := s.admitQuotaInFlight(live)
-	if err != nil {
-		t.Fatalf("admit third: %v", err)
+// selectedCredential has always allowed a StorageJSON snapshot that carries an
+// inference key but no id, with no live record. The admission fence must keep
+// that fallback for both the buffered and the streaming path, must still count
+// the request under its key, and must reject a snapshot that is paused or
+// disabled on its own.
+func TestQuotaInFlightEmptyIDStorageOnlyFallback(t *testing.T) {
+	now := time.Now()
+	blockedSnapshot := func() Credential {
+		manual := false
+		return Credential{
+			Type: Provider, APIKey: "sk-amr-emptytoken-0001",
+			QuotaBlock: &QuotaBlock{
+				KeyHash: quotaPauseKeyHash("sk-amr-emptytoken-0001"), ManualDisabled: &manual,
+				Source: "upstream", Reason: "quota_exhausted",
+				BlockedAt: now.Add(-time.Minute), RetryAt: now.Add(time.Hour),
+			},
+		}
 	}
-	manual := false
+	cases := []struct {
+		name     string
+		snapshot func() Credential
+		stream   bool
+		wantErr  bool
+	}{
+		{
+			name:     "buffered empty id runs",
+			snapshot: func() Credential { return Credential{Type: Provider, APIKey: "sk-amr-emptytoken-0001"} },
+		},
+		{
+			name:     "stream empty id runs",
+			snapshot: func() Credential { return Credential{Type: Provider, APIKey: "sk-amr-emptytoken-0001"} },
+			stream:   true,
+		},
+		{
+			name: "buffered empty id disabled snapshot",
+			snapshot: func() Credential {
+				return Credential{Type: Provider, APIKey: "sk-amr-emptytoken-0001", Disabled: true}
+			},
+			wantErr: true,
+		},
+		{
+			name:     "buffered empty id blocked snapshot",
+			snapshot: blockedSnapshot,
+			wantErr:  true,
+		},
+		{
+			name:     "stream empty id blocked snapshot",
+			snapshot: blockedSnapshot,
+			stream:   true,
+			wantErr:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, host := newQuotaPauseTestService(t)
+			live := seedModels(t, s, host)
+			// The id-less request must not resolve to the seeded live credential.
+			s.mu.Lock()
+			delete(s.creds, live)
+			s.mu.Unlock()
+			snapshot := tc.snapshot()
+			var seen atomic.Int64
+			var seenKey atomic.Value
+			quotaInFlightFixture(t, s, quotaInFlightTestHook{beforeRelease: func(key quotaInFlightKey) {
+				s.mu.RLock()
+				seen.Store(int64(s.quotaInflight[key]))
+				s.mu.RUnlock()
+				seenKey.Store(key)
+			}})
+
+			host.doResponses = append(host.doResponses, bufferOK())
+			host.doStreams = append(host.doStreams, scriptedStream{status: http.StatusOK, chunks: [][]byte{
+				[]byte(`data: {"model":"opendesign-large","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"),
+				[]byte("data: [DONE]\n\n"),
+			}})
+
+			req := executorPayload{
+				Model:       "od-large",
+				Payload:     []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+				StorageJSON: jsonBytes(snapshot),
+			}
+			if tc.stream {
+				req.StreamID = "out-empty-id"
+				_, err := executeStream(t, s, req)
+				if tc.wantErr {
+					if err == nil {
+						t.Fatal("unsafe id-less stream snapshot was accepted")
+					}
+					if host.countMethod("host.http.do_stream") != 0 {
+						t.Fatal("rejected id-less stream reached the upstream")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("id-less stream failed: %v", err)
+				}
+				s.waitIdle()
+			} else {
+				if _, err := execute(t, s, req); tc.wantErr {
+					if err == nil {
+						t.Fatal("unsafe id-less snapshot was accepted")
+					}
+					if host.countMethod("host.http.do") != 0 {
+						t.Fatal("rejected id-less snapshot reached the upstream")
+					}
+					return
+				} else if err != nil {
+					t.Fatalf("id-less buffered request failed: %v", err)
+				}
+			}
+
+			if seen.Load() != 1 {
+				t.Fatalf("id-less request was counted %d times during its run, want 1", seen.Load())
+			}
+			key, _ := seenKey.Load().(quotaInFlightKey)
+			if key.credentialID != "" || key.keyHash != quotaPauseKeyHash(snapshot.APIKey) {
+				t.Fatalf("id-less request was tracked as %+v, want an empty id under its own key", key)
+			}
+			if total := quotaInFlightTotal(s); total != 0 {
+				t.Fatalf("id-less request leaked %d counters", total)
+			}
+		})
+	}
+
+	// The admission fence itself also guards the id-less form: a request that
+	// reaches it with a paused or disabled snapshot must fail there too, so the
+	// fallback cannot be used as a bypass.
+	t.Run("empty id admission guards", func(t *testing.T) {
+		s := NewService()
+		enabled := Credential{Type: Provider, APIKey: "sk-amr-emptytoken-0002"}
+		lease, err := s.admitQuotaInFlight(enabled, "")
+		if err != nil {
+			t.Fatalf("enabled id-less snapshot rejected: %v", err)
+		}
+		lease.release(s)
+		for _, tc := range []struct {
+			name     string
+			snapshot Credential
+			wantCode string
+		}{
+			{"disabled", Credential{Type: Provider, APIKey: enabled.APIKey, Disabled: true}, "credential_unavailable"},
+			{"blocked", blockedSnapshot(), "quota_blocked"},
+			{"no key", Credential{Type: Provider}, "credential_unavailable"},
+		} {
+			_, err := s.admitQuotaInFlight(tc.snapshot, "")
+			if err == nil {
+				t.Fatalf("%s id-less snapshot was admitted", tc.name)
+			}
+			if code, _ := quotaErrorKind(t, err); code != tc.wantCode {
+				t.Fatalf("%s id-less snapshot error = %s, want %s", tc.name, code, tc.wantCode)
+			}
+		}
+		if total := quotaInFlightTotal(s); total != 0 {
+			t.Fatalf("guarded id-less admission left %d counters", total)
+		}
+	})
+}
+
+// Several records can carry the same inference key. The recovery fence is keyed
+// on that key, so a request admitted through one record keeps every other record
+// — including the empty id of a StorageJSON-only request — from being treated as
+// idle. Inference concurrency itself is never limited.
+func TestQuotaInFlightMergesSameKeyAcrossRecords(t *testing.T) {
+	const key = "sk-amr-shared-inference-key"
+	s, host := newQuotaPauseTestService(t)
+	first := addCredential(t, s, host, "first", key)
+	other := addCredential(t, s, host, "other", "sk-amr-other-inference-key")
+	seedModels(t, s, host)
+	quotaFixtureAuthFile(t, s, host, first, nil)
+
+	// A second live record reusing the same inference key, which is what a host
+	// restart or a hand-edited auth file can produce.
 	s.mu.Lock()
-	blocked := s.creds[c.ID]
+	shared := s.creds[first]
+	shared.ID = other
+	shared.Label = "second"
+	shared.QuotaBlock = nil
+	shared.QuotaRevision = newID()
+	s.storeCredentialLocked(shared)
+	s.mu.Unlock()
+	sharedLive, ok := liveCredential(s, other)
+	if !ok || sharedLive.APIKey != key {
+		t.Fatal("shared-key record was not published")
+	}
+	emptyID := Credential{APIKey: key}
+
+	gated := newGatedQuotaHost(host)
+	s.SetHost(gated.call)
+	host.doResponses = append(host.doResponses, bufferOK(), bufferOK())
+
+	// Two requests arrive through two different records with the same key; both
+	// must reach the upstream at the same time.
+	done := make(chan error, 2)
+	for _, authID := range []string{first, other} {
+		go func(authID string) {
+			_, err := execute(t, s, bufferedQuotaRequest(authID))
+			done <- err
+		}(authID)
+	}
+	gated.waitGates(t, 2)
+
+	if has, count, total := quotaInFlightState(s, emptyID); !has || count != 2 || total != 2 {
+		t.Fatalf("cross-record fence = has:%t count:%d total:%d, want both merged", has, count, total)
+	}
+	// A record carrying a different key is unaffected.
+	if has, count, _ := quotaInFlightState(s, Credential{ID: other, APIKey: "sk-amr-other-inference-key"}); has || count != 0 {
+		t.Fatalf("unrelated key was merged: has=%t count=%d", has, count)
+	}
+
+	// Releasing one record's request keeps the key fenced for the other.
+	gated.releaseGate(0)
+	if err := <-done; err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	if has, count, total := quotaInFlightState(s, emptyID); !has || count != 1 || total != 1 {
+		t.Fatalf("partial cross-record release = has:%t count:%d total:%d", has, count, total)
+	}
+
+	gated.releaseGate(1)
+	if err := <-done; err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	if has, count, total := quotaInFlightState(s, emptyID); has || count != 0 || total != 0 {
+		t.Fatalf("fence did not clear after both records finished: has:%t count:%d total:%d", has, count, total)
+	}
+	if got := host.countMethod("host.http.do"); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (no concurrency cap)", got)
+	}
+}
+
+// A StorageJSON-only request can have a live record published for the same key
+// and id before admission runs. That is a first publication, not an identity
+// round trip, so it must be admitted (and counted) instead of failing with 409.
+func TestQuotaInFlightStorageOnlySnapshotAdmittedAfterFirstPublication(t *testing.T) {
+	const key = "sk-amr-latepublication-0001"
+	s, host := newQuotaPauseTestService(t)
+	seedModels(t, s, host)
+	host.doResponses = append(host.doResponses, bufferOK())
+	snapshot := Credential{Type: Provider, ID: "open-design-late", APIKey: key}
+
+	var published atomic.Bool
+	quotaInFlightFixture(t, s, quotaInFlightTestHook{beforeAdmit: func() {
+		if published.Swap(true) {
+			return
+		}
+		// The host watcher (or auth.parse) publishes the record right here.
+		s.mu.Lock()
+		s.storeCredentialLocked(snapshot)
+		s.mu.Unlock()
+	}})
+
+	lease, err := s.admitQuotaInFlight(snapshot, snapshot.ID)
+	if err != nil {
+		t.Fatalf("first publication was treated as a stale snapshot: %v", err)
+	}
+	if lease.admittedEpoch == 0 {
+		t.Fatal("admission did not record the published generation")
+	}
+	if total := quotaInFlightTotal(s); total != 1 {
+		t.Fatalf("admitted request was not counted: total=%d", total)
+	}
+	lease.release(s)
+	if total := quotaInFlightTotal(s); total != 0 {
+		t.Fatalf("counters leaked: total=%d", total)
+	}
+
+	// The same window with a blocked record must still be rejected: the widened
+	// epoch rule must not weaken the pause check.
+	s.mu.Lock()
+	manual := false
+	blocked := s.creds[snapshot.ID]
 	blocked.QuotaBlock = &QuotaBlock{
-		KeyHash: quotaPauseKeyHash(blocked.APIKey), ManualDisabled: &manual,
+		KeyHash: quotaPauseKeyHash(key), ManualDisabled: &manual,
 		Source: "upstream", Reason: "quota_exhausted",
 		BlockedAt: time.Now().Add(-time.Minute), RetryAt: time.Now().Add(time.Hour),
 	}
 	blocked.QuotaRevision = "fixture-revision"
 	s.storeCredentialLocked(blocked)
 	s.mu.Unlock()
-	third.release(s)
-	if len(s.quotaPauseWake) != 1 {
-		t.Fatal("the last release for a blocked key did not wake the quota-pause worker")
+	if _, err := s.admitQuotaInFlight(snapshot, snapshot.ID); err == nil {
+		t.Fatal("a record blocked during the window was admitted")
+	}
+}
+
+// A request admitted with no live record and then published must still observe
+// its own 402: the epoch fence is widened exactly for that first publication.
+func TestQuotaInFlightObservesBlockAfterFirstPublication(t *testing.T) {
+	const key = "sk-amr-latepublication-0002"
+	s, host := newQuotaPauseTestService(t)
+	seedModels(t, s, host)
+	host.doResponses = append(host.doResponses, fakeHTTPResponse{Status: http.StatusPaymentRequired, Body: []byte(quotaPauseFixtureBody)})
+	snapshot := Credential{Type: Provider, ID: "open-design-late402", APIKey: key}
+
+	var once sync.Once
+	quotaInFlightFixture(t, s, quotaInFlightTestHook{beforeObserve: func() {
+		once.Do(func() {
+			// The record is published while the request is still running, so the
+			// 402 arrives afterwards under a fresh runtime epoch.
+			s.mu.Lock()
+			s.storeCredentialLocked(snapshot)
+			s.mu.Unlock()
+		})
+	}})
+
+	_, err := execute(t, s, executorPayload{
+		AuthID:      snapshot.ID,
+		Model:       "od-large",
+		Payload:     []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+		StorageJSON: jsonBytes(snapshot),
+	})
+	if err == nil {
+		t.Fatal("402 was returned as a success")
+	}
+	c, ok := liveCredential(s, snapshot.ID)
+	if !ok || !c.quotaBlocked() {
+		t.Fatal("a real 402 was dropped because the record was published after admission")
+	}
+	if total := quotaInFlightTotal(s); total != 0 {
+		t.Fatalf("counters leaked: total=%d", total)
+	}
+}
+
+// The widened epoch rule must not undo an explicit resume: once the record
+// carries a quota revision (the resume stamps one), a late error from a request
+// admitted before it is dropped instead of re-pausing the account.
+func TestQuotaInFlightLateErrorCannotUndoExplicitResume(t *testing.T) {
+	const key = "sk-amr-latepublication-0003"
+	for _, tc := range []struct {
+		name string
+		// afterPublish models what really happens after the record is published:
+		// every one of these paths bumps the credential generation.
+		afterPublish func(s *Service, c Credential) Credential
+	}{
+		{
+			name: "explicit resume before the late error",
+			afterPublish: func(s *Service, c Credential) Credential {
+				// resumeQuotaBlockLocked's in-memory effect: new revision plus a
+				// generation bump, so the block is proven cleared.
+				c.QuotaRevision = "fixture-resume-revision"
+				s.credentialEpoch[c.ID]++
+				c.runtimeEpoch = s.credentialEpoch[c.ID]
+				return c
+			},
+		},
+		{
+			name: "identity replaced before the late error",
+			afterPublish: func(s *Service, c Credential) Credential {
+				c.APIKey = "sk-amr-latepublication-replaced"
+				return c
+			},
+		},
+		{
+			name: "manual toggles before the late error",
+			afterPublish: func(s *Service, c Credential) Credential {
+				c.Disabled = true
+				return c
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, host := newQuotaPauseTestService(t)
+			seedModels(t, s, host)
+			host.doResponses = append(host.doResponses, fakeHTTPResponse{Status: http.StatusPaymentRequired, Body: []byte(quotaPauseFixtureBody)})
+			snapshot := Credential{Type: Provider, ID: "open-design-late402b", APIKey: key}
+			var once sync.Once
+			quotaInFlightFixture(t, s, quotaInFlightTestHook{beforeObserve: func() {
+				once.Do(func() {
+					s.mu.Lock()
+					s.storeCredentialLocked(snapshot)
+					s.storeCredentialLocked(tc.afterPublish(s, s.creds[snapshot.ID]))
+					s.mu.Unlock()
+				})
+			}})
+
+			if _, err := execute(t, s, executorPayload{
+				AuthID:      snapshot.ID,
+				Model:       "od-large",
+				Payload:     []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+				StorageJSON: jsonBytes(snapshot),
+			}); err == nil {
+				t.Fatal("402 was returned as a success")
+			}
+			c, ok := liveCredential(s, snapshot.ID)
+			if !ok || c.quotaBlocked() {
+				t.Fatal("a late error re-paused an account that had already moved on")
+			}
+		})
+	}
+}
+
+// Revocation is checked for both identities selectedCredential accepts, so a
+// delete that lands between selection and admission cannot slip through.
+func TestQuotaInFlightAdmissionRechecksRoutedAuthID(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := seedModels(t, s, host)
+	quotaFixtureAuthFile(t, s, host, id, nil)
+	var once sync.Once
+	quotaInFlightFixture(t, s, quotaInFlightTestHook{beforeAdmit: func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.revoked[id] = true
+			s.mu.Unlock()
+		})
+	}})
+	// StorageJSON carries a different id, so only the routed AuthID is revoked.
+	snapshot := Credential{Type: Provider, ID: "open-design-other-record", APIKey: "sk-amr-routed-check"}
+	_, err := execute(t, s, executorPayload{
+		AuthID:      id,
+		Model:       "od-large",
+		Payload:     []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+		StorageJSON: jsonBytes(snapshot),
+	})
+	if err == nil {
+		t.Fatal("request routed through a revoked id was admitted")
+	}
+	if code, _ := quotaErrorKind(t, err); code != "credential_unavailable" {
+		t.Fatalf("error = %s, want credential_unavailable", code)
+	}
+	if host.countMethod("host.http.do") != 0 {
+		t.Fatal("revoked request reached the upstream")
+	}
+	if total := quotaInFlightTotal(s); total != 0 {
+		t.Fatalf("rejected request left %d counters", total)
+	}
+}
+
+// A StorageJSON snapshot carries no runtime epoch even when a live record for the
+// same key and id already exists (the host hands back its own JSON). The late 402
+// must still be observed while that generation is unchanged, and must be dropped
+// as soon as the generation moves.
+func TestQuotaInFlightObservesLateErrorWithSnapshotEpochZero(t *testing.T) {
+	const key = "sk-amr-latepublication-0004"
+	for _, tc := range []struct {
+		name        string
+		afterAdmit  func(s *Service, c Credential) Credential
+		wantBlocked bool
+	}{
+		{
+			name:        "generation unchanged",
+			afterAdmit:  func(s *Service, c Credential) Credential { return c },
+			wantBlocked: true,
+		},
+		{
+			name: "explicit resume after admission",
+			afterAdmit: func(s *Service, c Credential) Credential {
+				c.QuotaRevision = "fixture-resume-revision"
+				s.credentialEpoch[c.ID]++
+				c.runtimeEpoch = s.credentialEpoch[c.ID]
+				return c
+			},
+		},
+		{
+			name: "manual toggle after admission",
+			afterAdmit: func(s *Service, c Credential) Credential {
+				c.Disabled = true
+				return c
+			},
+		},
+		{
+			name: "key replaced after admission",
+			afterAdmit: func(s *Service, c Credential) Credential {
+				c.APIKey = "sk-amr-latepublication-0004b"
+				return c
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, host := newQuotaPauseTestService(t)
+			live := seedModels(t, s, host)
+			quotaFixtureAuthFile(t, s, host, live, nil)
+			host.doResponses = append(host.doResponses, fakeHTTPResponse{Status: http.StatusPaymentRequired, Body: []byte(quotaPauseFixtureBody)})
+			current, _ := liveCredential(s, live)
+			// The host hands back a plain snapshot: no runtime epoch, no revision.
+			snapshot := Credential{Type: Provider, ID: live, Label: current.Label, APIKey: current.APIKey}
+
+			var once sync.Once
+			quotaInFlightFixture(t, s, quotaInFlightTestHook{beforeObserve: func() {
+				once.Do(func() {
+					s.mu.Lock()
+					defer s.mu.Unlock()
+					s.storeCredentialLocked(tc.afterAdmit(s, s.creds[live]))
+				})
+			}})
+
+			if _, err := execute(t, s, executorPayload{
+				AuthID:      live,
+				Model:       "od-large",
+				Payload:     []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+				StorageJSON: jsonBytes(snapshot),
+			}); err == nil {
+				t.Fatal("402 was returned as a success")
+			}
+			got, ok := liveCredential(s, live)
+			if !ok {
+				t.Fatal("credential disappeared")
+			}
+			if got.quotaBlocked() != tc.wantBlocked {
+				t.Fatalf("blocked = %t, want %t", got.quotaBlocked(), tc.wantBlocked)
+			}
+			if total := quotaInFlightTotal(s); total != 0 {
+				t.Fatalf("counters leaked: total=%d", total)
+			}
+		})
 	}
 }

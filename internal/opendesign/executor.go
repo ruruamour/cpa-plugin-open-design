@@ -210,7 +210,7 @@ func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel 
 	// cannot leave an in-flight counter that would fence recovery forever.
 	defer func() { lease.release(s) }()
 	defer func() {
-		s.observeQuotaBlock(c, draft.upstreamModel, err)
+		s.observeQuotaBlockAfterAdmission(c, lease, draft.upstreamModel, err)
 		s.recordRequestLog(draft, err)
 		// The counter drops only after the quota observation above completed, so
 		// an exhausted account is published before the fence disappears.
@@ -244,7 +244,7 @@ func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel 
 	// Admission re-verifies the live credential and counts this inference under
 	// the same lock, so a pause, key replacement or removal between selection
 	// and here fails locally instead of reaching the upstream.
-	lease, err = s.admitQuotaInFlight(c)
+	lease, err = s.admitQuotaInFlight(c, r.AuthID)
 	if err != nil {
 		return nil, reasoningDecision{}, err
 	}
@@ -324,7 +324,7 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 	}()
 	defer func() {
 		if !finished {
-			s.observeQuotaBlock(c, draft.upstreamModel, err)
+			s.observeQuotaBlockAfterAdmission(c, lease, draft.upstreamModel, err)
 			s.recordRequestLog(draft, err)
 			lease.release(s)
 			release()
@@ -345,7 +345,7 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 	}
 	// Same admission fence as the buffered path: it runs before any upstream
 	// byte is requested, so a pause that landed during selection is respected.
-	lease, err = s.admitQuotaInFlight(c)
+	lease, err = s.admitQuotaInFlight(c, r.AuthID)
 	if err != nil {
 		return nil, err
 	}
@@ -415,7 +415,7 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 			draft.usage = *usage
 			// Publish the local guard before notifying the host of a terminal
 			// quota error, so an immediate retry cannot reach the exhausted key.
-			s.observeQuotaBlock(c, draft.upstreamModel, streamErr)
+			s.observeQuotaBlockAfterAdmission(c, lease, draft.upstreamModel, streamErr)
 			func() {
 				defer func() {
 					if recovered := recover(); recovered != nil && streamErr == nil {
