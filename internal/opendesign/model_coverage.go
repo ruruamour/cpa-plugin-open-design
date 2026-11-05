@@ -102,6 +102,19 @@ func (s *Service) readModelCoverage(credentialID, modelID, callbackID string, re
 // stays cancellable: expiry falls back to the cached view, which never counts as
 // fresh evidence for a recovery decision.
 func (s *Service) readModelCoverageContext(ctx context.Context, credentialID, modelID, callbackID string, refresh bool) (modelCoverageResponse, error) {
+	return s.readModelCoverageMode(ctx, credentialID, modelID, callbackID, refresh, false)
+}
+
+// readModelCoverageForProof starts a brand-new official request instead of
+// reusing a cached view, the refresh throttle, or an attempt that was already in
+// flight. quotaRecoveryProven requires evidence requested after the recheck
+// began; a throttled cache hit or a joined older attempt can never satisfy that,
+// so a recovery read must not silently inherit either.
+func (s *Service) readModelCoverageForProof(ctx context.Context, credentialID, modelID, callbackID string) (modelCoverageResponse, error) {
+	return s.readModelCoverageMode(ctx, credentialID, modelID, callbackID, true, true)
+}
+
+func (s *Service) readModelCoverageMode(ctx context.Context, credentialID, modelID, callbackID string, refresh, forceFetch bool) (modelCoverageResponse, error) {
 	key := modelCoverageKey{CredentialID: credentialID, ModelID: modelID}
 	s.mu.Lock()
 	entry := s.modelCoverage[key]
@@ -129,6 +142,9 @@ func (s *Service) readModelCoverageContext(ctx context.Context, credentialID, mo
 		return view, nil
 	}
 	if done := entry.inflight; done != nil {
+		if forceFetch {
+			return s.readModelCoverageAfterInflight(ctx, key, entry, done, callbackID, modelID)
+		}
 		invalidated := entry.invalidated
 		stop := s.stopCh
 		s.mu.Unlock()
@@ -141,7 +157,7 @@ func (s *Service) readModelCoverageContext(ctx context.Context, credentialID, mo
 		}
 		return s.cachedModelCoverage(key)
 	}
-	if !entry.lastAttempt.IsZero() && s.modelCoverageNow().Before(entry.lastAttempt.Add(modelCoverageRefreshInterval)) {
+	if !forceFetch && !entry.lastAttempt.IsZero() && s.modelCoverageNow().Before(entry.lastAttempt.Add(modelCoverageRefreshInterval)) {
 		view := modelCoverageViewAt(entry.view, s.modelCoverageNow())
 		s.mu.Unlock()
 		return view, nil
@@ -171,6 +187,27 @@ func (s *Service) cachedModelCoverage(key modelCoverageKey) (modelCoverageRespon
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.modelCoverageViewLocked(key)
+}
+
+// readModelCoverageAfterInflight waits for the attempt that is already running
+// to finish and then starts its own, because a recovery proof cannot use evidence
+// whose request began before the recheck did. The wait is bounded by the caller's
+// deadline and the plugin lifecycle; any of those aborts the read instead of
+// falling back to the cached view.
+func (s *Service) readModelCoverageAfterInflight(ctx context.Context, key modelCoverageKey, entry *modelCoverageEntry, done chan struct{}, callbackID, modelID string) (modelCoverageResponse, error) {
+	invalidated := entry.invalidated
+	stop := s.stopCh
+	s.mu.Unlock()
+	select {
+	case <-done:
+	case <-invalidated:
+		return s.cachedModelCoverage(key)
+	case <-stop:
+		return s.cachedModelCoverage(key)
+	case <-ctx.Done():
+		return modelCoverageResponse{}, localFail(http.StatusConflict, "quota_recheck_timeout", "官方复查超时，请稍后重试")
+	}
+	return s.readModelCoverageMode(ctx, key.CredentialID, key.ModelID, callbackID, true, true)
 }
 
 // A waiter may wake after invalidation or after a different refresh completed.

@@ -2294,8 +2294,11 @@ def _live_quota_recovery(boot, stop, request, origin, work, credential_id):
         _rewrite_fixture_block(path, due=True)
         origin.billing = dict(official_billing_fixture(), stamp_funding_now=True,
                               funding=dict(official_billing_fixture()["funding"], fundingCheck="insufficient"))
-        boot()
+        # Sample the counter before the boot: the worker may run its first
+        # sweep as soon as the plugin registers, and a failed round is then
+        # deliberately backed off, so a later baseline could miss it.
         before = len(billing_hits(origin))
+        boot()
         saw_check = wait_for(lambda: len(billing_hits(origin)) > before, 90, "automatic funding-check")
         require(saw_check, "the plugin never ran an automatic funding-check after the pause became due")
         # Give the worker a moment to finish the attempt before judging the state.

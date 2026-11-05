@@ -298,7 +298,10 @@ func (s *Service) configure(raw json.RawMessage) (err error) {
 		// lifecycle.
 		s.pauseGeneration++
 	}
-	if s.cfg.Pause.Enabled != cfg.Pause.Enabled || s.cfg.Pause.MaxSeconds != cfg.Pause.MaxSeconds {
+	// Compare the effective policy values, not the *bool pointers: the host
+	// re-registers the plugin (and this re-runs) with a freshly decoded config,
+	// so pointer identity would abort an automatic round on every re-register.
+	if s.cfg.pauseSettings() != cfg.pauseSettings() {
 		s.pauseGeneration++
 	}
 	s.cfg = cfg

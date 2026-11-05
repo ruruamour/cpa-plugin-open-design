@@ -119,13 +119,60 @@ func TestQuotaRecoveryRejectsCachedEvidence(t *testing.T) {
 	if err != nil || view.State != "available" {
 		t.Fatalf("initial refresh failed: %v", err)
 	}
+	// The cache still says available and is inside the refresh interval, but a
+	// recovery round must ask the official API again: only a response requested
+	// after the round began can prove recovery.
+	queueRecoveryEvidence(t, host, "model-a", "member", "insufficient")
 	if err := s.recheckQuotaBlock("callback", id); err == nil {
 		t.Fatal("cached available response was accepted as a new recheck")
 	}
 	requireQuotaStillBlocked(t, s, id, path)
-	if got := host.countMethod("host.http.do"); got != 1 {
-		t.Fatalf("throttled cache unexpectedly started %d HTTP requests", got)
+	if got := host.countMethod("host.http.do"); got != 2 {
+		t.Fatalf("recheck reused the cached view instead of asking again: %d HTTP requests", got)
 	}
+}
+
+// A proof read started while another refresh of the same model is running must
+// wait for it and then perform its own request; joining would reuse evidence that
+// began before the round and could never prove anything.
+func TestQuotaRecoveryProofDoesNotJoinOlderRefresh(t *testing.T) {
+	s, host, id, path := quotaRecoveryFixture(t, false, "model-a")
+	for range cap(s.modelCoverageSlots) {
+		s.modelCoverageSlots <- struct{}{}
+	}
+	defer func() {
+		for {
+			select {
+			case <-s.modelCoverageSlots:
+			default:
+				return
+			}
+		}
+	}()
+	// The console's own refresh answers available, the round's own request
+	// answers insufficient: only a joined older attempt could "recover" here.
+	queueRecoveryEvidence(t, host, "model-a", "member", "available")
+	queueRecoveryEvidence(t, host, "model-a", "member", "insufficient")
+	done := make(chan coverageResult, 1)
+	go func() {
+		view, err := s.readModelCoverage(id, "model-a", "callback", true)
+		done <- coverageResult{view, err}
+	}()
+	waitCoverageAttempt(t, s, modelCoverageKey{CredentialID: id, ModelID: "model-a"})
+	result := make(chan error, 1)
+	go func() { result <- s.recheckQuotaBlock("callback", id) }()
+	<-s.modelCoverageSlots
+	receiveCoverage(t, done)
+	<-s.modelCoverageSlots
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("a joined older refresh proved recovery")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("recheck did not finish")
+	}
+	requireQuotaStillBlocked(t, s, id, path)
 }
 
 func TestQuotaRecoveryRejectsUnknownModelsAndInFlight(t *testing.T) {

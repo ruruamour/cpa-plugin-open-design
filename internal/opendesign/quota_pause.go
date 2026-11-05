@@ -480,7 +480,9 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 		clock := s.modelCoverageNow
 		s.mu.RUnlock()
 		started := clock()
-		view, err := s.readModelCoverageContext(ctx, id, model, callbackID, true)
+		// A recovery proof must come from a request started by this round, so the
+		// read never honors the shared refresh throttle or joins an older attempt.
+		view, err := s.readModelCoverageForProof(ctx, id, model, callbackID)
 		if err != nil {
 			return err
 		}
