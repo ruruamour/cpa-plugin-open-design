@@ -15,7 +15,11 @@ amr-api) so the whole path is exercised offline. The management quota route is
 covered by both modes: not_configured never touches the wire, a configured
 credential caches wallet/funding reads and refresh=1 fetches them once behind
 the 60s throttle, and clear_billing drops the cache while inference keeps
-working.
+working. --cpa-quota-snapshot runs only the isolated ordered auth-file replay;
+it briefly gates repairs using permissions on the temporary fixture auth-dir and
+requires convergence once permissions are restored. --cpa-snapshot-ungated
+uses an atomic replace without that gate, but can be inconclusive if a repair
+wins the observation race. Neither mode tests native concurrent attribution.
 
 Safety: only fixture secrets are used (sk-amr-test-fixture,
 test-od-control-key-fixture-*); the only endpoints contacted are 127.0.0.1 fake
@@ -1388,6 +1392,9 @@ def run_cpa_live(artifact, binary, version):
         # upstream models, the slow one landing a structured 402 last.
         evidence["host_quota_concurrent"] = _live_case(
             binary, artifact, version, quota_concurrent=True)
+        # Ordered file-snapshot replay, not a claim about native concurrent writes.
+        evidence["host_quota_snapshot_replay"] = _live_case(
+            binary, artifact, version, quota_snapshot_replay=True)
 
         # ---- 6. disable -> enable must resync the runtime ----
         # If the registration never came up there is nothing to withdraw, so these
@@ -1532,6 +1539,8 @@ def run_cpa_live(artifact, binary, version):
             blockers.append("host_quota_recovery")
         if evidence.get("host_quota_concurrent", {}).get("status") != "PASS":
             blockers.append("host_quota_concurrent")
+        if evidence.get("host_quota_snapshot_replay", {}).get("status") != "PASS":
+            blockers.append("host_quota_snapshot_replay")
         if not registration_live:
             blockers.append("ui_flow.registration")
         if stage_failures:
@@ -2061,8 +2070,256 @@ def _rewrite_fixture_block(path, *, due):
     return block
 
 
+class _LiveQuotaSnapshotReplay:
+    """Replay exact fixture files through the host watcher, not native write races.
+
+    Distinct, harmless labels in the two captured files prove that the plugin's
+    management state observed each replay. A host log event alone would not
+    prove auth.parse ran, and a sleep alone could hide a coalesced watcher event.
+    The internal quotaDiskStale marker is not exposed by the API; we only check
+    observable convergence and make no claim about that private marker.
+    """
+
+    def __init__(self, request, boot, work, credential_id, version, ungated=False):
+        require(re.fullmatch(r"[A-Za-z0-9_-]+", credential_id) is not None,
+                "invalid fixture credential id")
+        self.request, self.boot, self.work, self.id = request, boot, work, credential_id
+        self.version, self.ungated = version, ungated
+        self.path = work / "auths" / (credential_id + ".json")
+        self.log = work / "cpa.log"
+        self.before = None
+        self.last = None
+        self.log_offset = None
+        self.result = {"status": "FAIL", "scenario": "ordered fixture file snapshots",
+                       "replay_mode": "atomic ungated" if ungated else "fixture repair temporarily gated",
+                       "native_concurrent_attribution": "not tested",
+                       "internal_stale_marker": "not exposed by host API"}
+
+    def _json_request(self, path, body=None):
+        try:
+            status, raw, _ = self.request(path, body, timeout=3)
+        except urllib.error.HTTPError as exc:
+            raise AssertionError("fixture management %s returned HTTP %d" % (path, exc.code)) from None
+        require(status == 200, "fixture management %s returned HTTP %d" % (path, status))
+        for secret in (FIXTURE_KEY, FIXTURE_CONTROL_KEY, "smoke-case-mgmt-key", "smoke-case-client-key"):
+            require(secret.encode() not in raw, "fixture management response leaked a key")
+        return json.loads(raw)
+
+    def _sample(self):
+        raw = self.path.read_bytes()
+        stat = self.path.stat()
+        disk = json.loads(raw)
+        # Do not accidentally replay anything except the credential this case
+        # created under mkdtemp. Neither body nor key is ever put in evidence.
+        require(disk.get("id") == self.id and disk.get("api_key") == FIXTURE_KEY and
+                not disk.get("control_key"), "auth file is not the isolated fixture")
+        credentials = self._json_request(API + "/credentials").get("credentials", [])
+        status_rows = self._json_request(API + "/status").get("credentials", [])
+        pauses = self._json_request(API + "/quota-pause").get("pauses", [])
+        rows = [r for r in credentials if r.get("id") == self.id]
+        statuses = [r for r in status_rows if r.get("id") == self.id]
+        if not rows or not statuses:
+            raise ValueError("fixture not yet visible")
+        require(len(rows) == 1 and len(statuses) == 1, "fixture duplicated in management list")
+        row, status_row = rows[0], statuses[0]
+        matching_pauses = [r for r in pauses if r.get("credential_id") == self.id]
+        require(len(matching_pauses) <= 1, "fixture appears more than once in quota list")
+        sample = {"raw": raw, "disk": disk, "row": row, "status_row": status_row,
+                  "listed": bool(matching_pauses),
+                  "stat": (stat.st_ino, stat.st_mtime_ns, stat.st_size)}
+        self.last = {
+            "credential_paused": row.get("quota_paused"),
+            "status_paused": status_row.get("quota_paused"),
+            "quota_listed": sample["listed"],
+            "disk_has_block": bool(disk.get("quota_block")),
+            "disk_has_revision": bool(disk.get("quota_revision")),
+            "disabled": row.get("disabled"),
+            "effective_disabled": row.get("effective_disabled"),
+        }
+        return sample
+
+    def _wait(self, label, predicate, *, timeout=40, quiet=2, poll=0.2):
+        deadline = time.monotonic() + timeout
+        last_signature = stable_since = None
+        while time.monotonic() < deadline:
+            try:
+                sample = self._sample()
+                if predicate(sample):
+                    if quiet == 0:
+                        return sample
+                    # Observe both API and the actual file without requiring that
+                    # a conservative disabled flag be false during reconciliation.
+                    signature = (sample["raw"], sample["stat"], sample["row"].get("label"),
+                                 sample["row"].get("quota_paused"),
+                                 sample["status_row"].get("quota_paused"), sample["listed"],
+                                 self._watcher_events(self.log_offset) if self.log_offset is not None else 0)
+                    now = time.monotonic()
+                    if signature != last_signature:
+                        last_signature, stable_since = signature, now
+                    elif now - stable_since >= quiet:
+                        return sample
+                else:
+                    last_signature = stable_since = None
+            except (OSError, ValueError, urllib.error.URLError):
+                last_signature = stable_since = None
+            time.sleep(poll)
+        raise AssertionError("timed out waiting for " + label)
+
+    @staticmethod
+    def _state(sample, label, paused):
+        return ((label is None or (sample["row"].get("label") == label and
+                                   sample["status_row"].get("label") == label)) and
+                sample["row"].get("quota_paused") is paused and
+                sample["status_row"].get("quota_paused") is paused and
+                sample["listed"] is paused and
+                bool(sample["disk"].get("quota_block")) is paused)
+
+    def _label(self, label):
+        self._json_request(API + "/credentials", {"id": self.id, "label": label})
+
+    def _watcher_events(self, offset):
+        try:
+            with self.log.open("rb") as log:
+                log.seek(offset)
+                return sum(1 for line in log if b"auth file changed (" in line and
+                           self.path.name.encode() in line and b"processing incrementally" in line)
+        except OSError:
+            return 0
+
+    def _observe_replay(self, raw, label, name, offset):
+        visible = lambda s: (self._watcher_events(offset) > 0 and s["row"].get("label") == label and
+                             s["status_row"].get("label") == label)
+        self._wait(name + " exact file and plugin label", lambda s: visible(s) and s["raw"] == raw,
+                   timeout=12, quiet=0, poll=0.02)
+        # In ungated mode a successful repair can legitimately change the file
+        # after that observation; still debounce the watcher and management state.
+        sample = self._wait(name + " watcher event quiet", visible, timeout=12, quiet=1)
+        self.result[name] = {"exact_snapshot_written": True, "watcher_event_seen": True,
+                             "plugin_label_and_exact_file_observed": True,
+                             "fixture_repair_temporarily_gated": not self.ungated,
+                             "incremental_events_before_quiet": self._watcher_events(offset)}
+        return sample
+
+    def _replay(self, raw, label, name):
+        offset = self.log.stat().st_size
+        self.log_offset = offset
+        if self.ungated:
+            # This variant exercises a normal atomic replacement without any
+            # permission interference. An unobservably fast repair is not PASS.
+            temp = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=self.path.parent, prefix=".snapshot-", suffix=".tmp",
+                                                 delete=False) as stream:
+                    temp = Path(stream.name)
+                    stream.write(raw)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temp, self.path)
+            finally:
+                if temp is not None:
+                    temp.unlink(missing_ok=True)
+            return self._observe_replay(raw, label, name, offset)
+
+        # Briefly gate repairs in the *fixture* auth-dir: otherwise a correct,
+        # eager repair can replace the stale body before the test can observe the
+        # watcher callback. The pre-opened descriptor can still replay the exact
+        # bytes; the host can read but cannot create a repair file or overwrite
+        # this read-only file. Permission failures/syncing during the gate are
+        # expected, but convergence after restoring permissions is mandatory.
+        # This is an ordered replay with an artificial I/O gate, not a native
+        # concurrent-write or operator-disable attribution experiment.
+        directory = self.path.parent
+        dir_mode = directory.stat().st_mode & 0o777
+        file_mode = self.path.stat().st_mode & 0o777
+        fd = os.open(self.path, os.O_WRONLY)
+        try:
+            os.fchmod(fd, 0o400)
+            directory.chmod(0o500)
+            probe = directory / ".snapshot-write-probe"
+            try:
+                probe_fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except PermissionError:
+                pass
+            else:
+                os.close(probe_fd)
+                probe.unlink()
+                raise AssertionError("fixture auth-dir repair gate is ineffective; injection inconclusive")
+            os.ftruncate(fd, 0)
+            remaining = memoryview(raw)
+            while remaining:
+                written = os.write(fd, remaining)
+                require(written > 0, "fixture snapshot write made no progress")
+                remaining = remaining[written:]
+            os.fsync(fd)
+            return self._observe_replay(raw, label, name, offset)
+        finally:
+            try:
+                directory.chmod(dir_mode)
+            finally:
+                try:
+                    os.fchmod(fd, file_mode)
+                finally:
+                    os.close(fd)
+
+    def capture_before_pause(self):
+        require(self._json_request(API + "/status").get("version") == self.version,
+                "isolated host loaded an unexpected plugin version")
+        sample = self._wait("unpaused pre-pause fixture", lambda s:
+                            self._state(s, "fixture", False) and not s["disk"].get("quota_revision"))
+        self.before = sample["raw"]
+        self.result["pre_pause_snapshot"] = {"quota_block": False, "quota_revision_present": False}
+
+    def after_pause(self):
+        try:
+            self._wait("structured 402 persisted pause", lambda s:
+                       self._state(s, "fixture", True) and bool(s["disk"].get("quota_revision")))
+            self._label("fixture-paused")
+            sample = self._wait("paused fixture snapshot", lambda s:
+                                self._state(s, "fixture-paused", True) and
+                                bool(s["disk"].get("quota_revision")))
+            paused = sample["raw"]
+            self.result["paused_snapshot"] = {"quota_block": True, "quota_revision_present": True}
+
+            self._json_request(API + "/quota-pause/resume", {"credential_id": self.id})
+            self._wait("explicit resume", lambda s: self._state(s, "fixture-paused", False) and
+                       bool(s["disk"].get("quota_revision")))
+            self.result["explicit_resume"] = True
+            # Separate labels make each callback visible even when the quota
+            # implementation correctly ignores/reconciles the stale block.
+            self._label("fixture-resumed")
+            self._wait("post-resume fixture", lambda s: self._state(s, "fixture-resumed", False) and
+                       bool(s["disk"].get("quota_revision")))
+
+            self._replay(self.before, "fixture", "pre_pause_replay")
+            self._wait("pre-pause replay consumed without a block", lambda s:
+                       self._state(s, None, False))
+            self.result["after_pre_pause_replay"] = dict(self.last)
+            self._replay(paused, "fixture-paused", "paused_replay")
+            self.result["after_paused_replay"] = dict(self.last)
+            # Label acceptance was only a callback witness, not a requirement on
+            # the repaired account; a fix may restore other non-quota metadata.
+            # A temporary conservative disabled/syncing state is allowed here,
+            # but a live or on-disk pause after an explicit resume is not.
+            self._wait("stale paused body must not remain paused after explicit resume", lambda s:
+                       self._state(s, None, False))
+            self.result["final_before_restart"] = dict(self.last)
+            self.boot()
+            self._wait("unpaused state after host restart", lambda s:
+                       self._state(s, None, False), timeout=60)
+            self.result["restart_unpaused"] = True
+            self.result["status"] = "PASS"
+        except (AssertionError, OSError, ValueError, urllib.error.URLError) as exc:
+            self.result["failure"] = (str(exc)[:300] if isinstance(exc, AssertionError) else
+                                      "fixture I/O or management decoding failed (%s)" % type(exc).__name__)
+            if "paused_replay" not in self.result:
+                self.result["injection_verdict"] = "inconclusive: watcher/plugin delivery not fully demonstrated"
+            if self.last is not None:
+                self.result["last_observation"] = dict(self.last)
+        return self.result
+
+
 def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, quota_recovery=False,
-               quota_concurrent=False):
+               quota_concurrent=False, quota_snapshot_replay=False, quota_snapshot_ungated=False):
     work = Path(tempfile.mkdtemp(prefix="opendesign-cpa-case-"))
     process = proxy = origin = log = None
     result = {"status": "FAIL"}
@@ -2073,7 +2330,7 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
         origin.start()
         proxy.origin_port = origin.port
         proxy.start()
-        if quota_manual or quota_recovery:
+        if quota_manual or quota_recovery or quota_snapshot_replay:
             fail_status = 402
             origin.fail = (402, json.dumps({"error": {"code": "insufficient_balance",
                                                      "details": {"coding_plan_exhausted": True}}}))
@@ -2151,9 +2408,14 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
 
         boot()
 
+        if quota_snapshot_replay:
+            require(set(proxy.allow) == set(BASE_CONNECT_ALLOW), "fixture proxy allowlist changed")
+            probe_proxy_refusal(proxy)
         status, raw, _ = request(API + "/credentials",
                                  {"label": "fixture", "api_key": FIXTURE_KEY})
         require(status == 201, "case credential create %s" % status)
+        if quota_snapshot_replay:
+            require(FIXTURE_KEY.encode() not in raw, "credential create response leaked a key")
         credential_id = json.loads(raw)["id"]
         mappings = [{"id": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash"}]
         if quota_concurrent:
@@ -2170,7 +2432,7 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
                 break
             time.sleep(0.25)
 
-        if quota_manual or quota_recovery or quota_concurrent:
+        if quota_manual or quota_recovery or quota_concurrent or quota_snapshot_replay:
             # The feature remains opt-in while its documented CPA-native
             # manual-disable limitation is under review; this is an isolated
             # fixture account and deliberately exercises the plugin UI path.
@@ -2185,6 +2447,10 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
             require(status == 200, "case billing configure %s" % status)
         if quota_concurrent:
             return _live_quota_concurrent(boot, stop, request, origin, work, credential_id)
+        if quota_snapshot_replay:
+            replay = _LiveQuotaSnapshotReplay(request, boot, work, credential_id, version,
+                                             ungated=quota_snapshot_ungated)
+            replay.capture_before_pause()
 
         before = len(origin.requests)
         # Some CPA versions expose the alias in /v1/models just before its
@@ -2209,14 +2475,27 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
             "upstream_status": fail_status,
             "surfaced_status": status,
             "reached_upstream": len(origin.requests) > before,
-            "body_head": body.decode(errors="replace")[:160],
             "isolated_process": True,
         }
+        if not quota_snapshot_replay:
+            result["body_head"] = body.decode(errors="replace")[:160]
         require(result["reached_upstream"],
                 "%d was answered by the host, not upstream" % fail_status)
         require(status == fail_status,
-                "upstream %d surfaced as %s: %s"
-                % (fail_status, status, result["body_head"]))
+                "upstream %d surfaced as %s" % (fail_status, status))
+        if quota_snapshot_replay:
+            require(FIXTURE_KEY.encode() not in body, "chat response leaked a key")
+            chats = [r for r in origin.requests[before:]
+                     if r["method"] == "POST" and r["path"].endswith("/chat/completions") and
+                     r["host"] == "amr-link.open-design.ai" and r["tls"] and
+                     r["authorization"] == "Bearer " + FIXTURE_KEY and
+                     json.loads(r["body"]).get("model") == "deepseek-v4.1-flash"]
+            require(len(chats) == 1 and "amr-link.open-design.ai:443" in proxy.connects,
+                    "structured 402 did not traverse the loopback TLS fake with the fixture key")
+            replay.result.update({"reached_upstream": True, "loopback_tls_chat_count": len(chats),
+                                  "proxy_allowlist_refusal_proven": True,
+                                  "surfaced_status": status, "isolated_process": True})
+            return replay.after_pause()
         if quota_manual:
             path = work / "auths" / (credential_id + ".json")
             def disk_state():
@@ -2267,8 +2546,14 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
         if quota_recovery:
             result.update(_live_quota_recovery(boot, stop, request, origin, work, credential_id))
         return result
-    except AssertionError as exc:
-        result.setdefault("failure", str(exc)[:300])
+    except (AssertionError, OSError, ValueError, urllib.error.URLError) as exc:
+        if quota_snapshot_replay and "replay" in locals():
+            result = replay.result
+            result["injection_verdict"] = "inconclusive: replay preconditions not demonstrated"
+        result["status"] = "FAIL"
+        detail = (str(exc)[:300] if isinstance(exc, AssertionError) else
+                  "fixture I/O or management decoding failed (%s)" % type(exc).__name__)
+        result.setdefault("failure", detail)
         return result
     finally:
         final = locals().get("holder", {}).get("process")
@@ -3278,7 +3563,14 @@ def main():
                              "proxy + private-CA TLS fake origin, so upstream-models "
                              "and chat completions run end-to-end offline; defaults "
                              "to the same binary as --cpa-binary")
+    parser.add_argument("--cpa-quota-snapshot", nargs="?", const=CPA_DEFAULT, default=None,
+                        help="run only the isolated real-host quota file-snapshot replay")
+    parser.add_argument("--cpa-snapshot-ungated", action="store_true",
+                        help="use atomic replacements without the fixture repair gate; "
+                             "requires --cpa-quota-snapshot")
     args = parser.parse_args()
+    if args.cpa_snapshot_ungated and not args.cpa_quota_snapshot:
+        parser.error("--cpa-snapshot-ungated requires --cpa-quota-snapshot")
     artifact = Path(args.artifact).resolve()
     require(artifact.is_file(), "artifact not found: %s" % artifact)
     try:
@@ -3286,6 +3578,19 @@ def main():
     except (AssertionError, OSError) as exc:
         print("FAIL: cannot determine the expected plugin version: %s" % exc)
         return 1
+    if args.cpa_quota_snapshot:
+        if args.cpa_binary or args.cpa_live:
+            parser.error("--cpa-quota-snapshot is a standalone mode")
+        binary = Path(args.cpa_quota_snapshot).resolve()
+        if not binary.is_file():
+            parser.error("CPA binary not found: %s" % binary)
+        evidence = {"host_quota_snapshot_replay": _live_case(
+            binary, artifact, version, quota_snapshot_replay=True,
+            quota_snapshot_ungated=args.cpa_snapshot_ungated)}
+        if args.json_report:
+            Path(args.json_report).write_text(json.dumps(evidence, indent=2) + "\n")
+        print(json.dumps(evidence, indent=2))
+        return 0 if evidence["host_quota_snapshot_replay"]["status"] == "PASS" else 1
     evidence = {}
     failure = None
     try:
