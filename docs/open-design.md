@@ -113,7 +113,7 @@ OpenDesign 生产接口：
 日志条目只允许以下元数据：请求 ID、开始／结束时间、耗时、客户端模型、上游模型、凭据 ID、是否流式、状态、HTTP 状态、错误类型、输入／输出／总 token、`upstream_attempted`。**不保存**请求/响应正文、headers、query 字符串、API key、control key 或 Workspace ID。
 
 - 默认开启，保留 7 天、最多 500 条；可配置 1–90 天、1–500 条。超范围值在配置校验时拒绝。
-- 额度暂停同样可配：`pause.enabled`（默认开启）与 `pause.max_seconds`（60–604800，默认 86400）。`POST /config` 只接受插件自有的 `logs` 与 `pause` 两段，未知字段直接 400。
+- 开发分支的额度暂停配置为 `pause.enabled`（未明确配置时默认关闭）与 `pause.max_seconds`（60–604800，默认 86400）。已推送的 `0.4.6` tag 仍默认开启且不安全，不要使用。`POST /config` 只接受插件自有的 `logs` 与 `pause` 两段，未知字段直接 400。
 - 持久化为异步：25ms 合并写入，写失败后 2 秒重试；`plugin.quiesce`／`plugin.shutdown` 先取消延迟任务再同步 flush。
 - 清空是持久化事务：先写入 clear tombstone（同时记录保留策略），再更新内存；崩溃恢复不会让旧日志复活。
 - usage 可以是 `null`：响应没有对应 usage 时保持未知，不写成 0。

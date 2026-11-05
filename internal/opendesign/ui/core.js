@@ -805,10 +805,10 @@
     const pauseMax = safeInteger(pause.max_seconds, 60, 604800);
     return {
       logs: normalizeRetention(data.logs),
-      // The quota pause is plugin-owned: CPA keeps its own scheduling and
-      // cooldown. `enabled` defaults to on, matching the Go zero-value policy.
+      // Older servers may omit this experimental section. Never present an
+      // absent policy as enabled while manual-disable safety is under review.
       pause: {
-        enabled: pause.enabled !== false,
+        enabled: pause.enabled === true,
         max_seconds: pauseMax === null ? 86400 : pauseMax,
         owner: safeCode(pause.owner, 20),
       },

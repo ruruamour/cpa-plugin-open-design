@@ -3261,10 +3261,10 @@ test('recheck posts the credential id and reports an unproven preflight', async 
   assert.match(view.document.getElementById('accountState').textContent, /重查未通过/);
 });
 
-test('额度的自动暂停开关是可写的插件配置，默认开启', async () => {
+test('额度自动暂停在旧配置或旧后端缺失该选项时默认关闭', async () => {
   const core = fakePage().context.OpenDesignCore;
   const defaults = core.normalizeConfig({ logs: {}, upstream: { origin: 'https://x', fixed: true }, proxy: {}, routing: {} });
-  assert.equal(defaults.pause.enabled, true);
+  assert.equal(defaults.pause.enabled, false);
   assert.equal(defaults.pause.max_seconds, 86400);
   // Out-of-range values fall back instead of being sent back to the plugin.
   const clamped = core.normalizeConfig({ pause: { enabled: false, max_seconds: 1 } });

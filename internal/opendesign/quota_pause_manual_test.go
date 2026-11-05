@@ -116,7 +116,7 @@ func TestQuotaBlockFailedManualToggleKeepsSnapshot(t *testing.T) {
 }
 
 func TestQuotaPauseManagementRoutes(t *testing.T) {
-	s, host := newTestService(t)
+	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	quotaFixtureAuthFile(t, s, host, id, nil)
 	source, _ := liveCredential(s, id)
@@ -162,6 +162,12 @@ func TestQuotaPausePolicyToggleAndMaxWindow(t *testing.T) {
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	quotaFixtureAuthFile(t, s, host, id, nil)
 	source, _ := liveCredential(s, id)
+	// An older settings file lacks pause.enabled and must not silently start
+	// the experimental, not-yet-verified auto-pause on upgrade.
+	s.observeQuotaBlock(source, "fixture-model", &APIError{Status: 402, quotaExhausted: true})
+	if c, _ := liveCredential(s, id); c.quotaBlocked() {
+		t.Fatal("an unspecified pause policy activated an experimental pause")
+	}
 	disabled := false
 	s.mu.Lock()
 	s.cfg.Pause = PauseConfig{Enabled: &disabled}
@@ -204,8 +210,8 @@ func TestQuotaPauseConfigRouteRoundTrip(t *testing.T) {
 		t.Fatalf("default pause config = %#v", body["pause"])
 	}
 	wantSeconds := float64(s.config().pauseSettings().maxWindow / time.Second)
-	if pause["enabled"] != true || pause["max_seconds"] != wantSeconds {
-		t.Fatalf("default pause config = %#v", body["pause"])
+	if pause["enabled"] != false || pause["max_seconds"] != wantSeconds {
+		t.Fatalf("default pause config must be disabled while safety is under review: %#v", body["pause"])
 	}
 	// Unknown fields and out-of-range values are rejected, not clamped silently.
 	if status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/config", nil, map[string]any{"pause": map[string]any{"enabled": false, "extra": 1}}); status != http.StatusBadRequest {
@@ -231,7 +237,7 @@ func TestQuotaPauseConfigRouteRoundTrip(t *testing.T) {
 // A pause must never resurrect an account the operator turned off while it was
 // paused: the deadline sweep has to keep the newest manual choice.
 func TestQuotaBlockDeadlineSweepKeepsManualDisableSetDuringPause(t *testing.T) {
-	s, host := newTestService(t)
+	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	quotaFixtureAuthFile(t, s, host, id, nil)
 	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
@@ -266,7 +272,7 @@ func TestQuotaBlockDeadlineSweepKeepsManualDisableSetDuringPause(t *testing.T) {
 // The opposite ordering: an account the operator re-enabled while paused must
 // stay enabled after the pause expires.
 func TestQuotaBlockDeadlineSweepKeepsManualEnableSetDuringPause(t *testing.T) {
-	s, host := newTestService(t)
+	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	quotaFixtureAuthFile(t, s, host, id, map[string]any{"disabled": true})
 	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)

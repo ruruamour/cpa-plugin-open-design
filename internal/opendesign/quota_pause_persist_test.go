@@ -11,6 +11,18 @@ import (
 	"time"
 )
 
+// newQuotaPauseTestService opts in explicitly: the production zero-value policy
+// stays off until CPA-native manual-disable attribution is safe.
+func newQuotaPauseTestService(t *testing.T) (*Service, *fakeHost) {
+	t.Helper()
+	s, host := newTestService(t)
+	enabled := true
+	s.mu.Lock()
+	s.cfg.Pause.Enabled = &enabled
+	s.mu.Unlock()
+	return s, host
+}
+
 func setQuotaPauseFixtureClock(s *Service, now time.Time) func(time.Time) {
 	var stamp atomic.Int64
 	stamp.Store(now.UnixNano())
@@ -44,7 +56,7 @@ func quotaFixtureAuthFile(t *testing.T, s *Service, host *fakeHost, id string, e
 }
 
 func TestObserveQuotaBlockPersistsOnlyQuotaFields(t *testing.T) {
-	s, host := newTestService(t)
+	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	path := quotaFixtureAuthFile(t, s, host, id, map[string]any{"opaque_extension": json.Number("12345678901234567890")})
 	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
@@ -129,7 +141,7 @@ func TestLegacyQuotaBlockWithUnknownManualStateStaysDisabledOnExpiry(t *testing.
 }
 
 func TestObserveQuotaBlockFailureKeepsLocalGuard(t *testing.T) {
-	s, host := newTestService(t)
+	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	source, _ := liveCredential(s, id)
 	// The fake host reports a path but does not create a physical auth file.
@@ -154,7 +166,7 @@ func TestObserveQuotaBlockFailureKeepsLocalGuard(t *testing.T) {
 }
 
 func TestResumeQuotaBlockPreservesLatestManualState(t *testing.T) {
-	s, host := newTestService(t)
+	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	path := quotaFixtureAuthFile(t, s, host, id, nil)
 	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
@@ -223,7 +235,7 @@ func TestResumeQuotaBlockPreservesLatestManualState(t *testing.T) {
 }
 
 func TestQuotaBlockSurvivesStaleWatcherAfterFailedWrite(t *testing.T) {
-	s, host := newTestService(t)
+	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	source, _ := liveCredential(s, id)
 	stale := jsonBytes(source)
@@ -243,7 +255,7 @@ func TestQuotaBlockSurvivesStaleWatcherAfterFailedWrite(t *testing.T) {
 }
 
 func TestObserveQuotaBlockUsesLatestManualState(t *testing.T) {
-	s, host := newTestService(t)
+	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	path := quotaFixtureAuthFile(t, s, host, id, map[string]any{"disabled": true})
 	source, _ := liveCredential(s, id)
@@ -263,7 +275,7 @@ func TestObserveQuotaBlockUsesLatestManualState(t *testing.T) {
 }
 
 func TestQuotaBlockSweepExpiresOnlyDueBlocks(t *testing.T) {
-	s, host := newTestService(t)
+	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	quotaFixtureAuthFile(t, s, host, id, nil)
 	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
@@ -291,7 +303,7 @@ func TestQuotaBlockSweepExpiresOnlyDueBlocks(t *testing.T) {
 }
 
 func TestQuotaBlockSweepRetriesFailedPersistence(t *testing.T) {
-	s, host := newTestService(t)
+	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	source, _ := liveCredential(s, id)
 	// No physical file yet: the first write fails and the local guard stays.

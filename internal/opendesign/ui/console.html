@@ -546,7 +546,7 @@
         <div class="panel-head">
           <div>
             <h2 id="configTitle">插件配置</h2>
-            <p class="hint">插件只拥有请求日志开关与保留设置；上游地址固定，代理池、路由、全局冷却由 CPA 宿主拥有。读取和保存都只在点击按钮时发生。</p>
+            <p class="hint">插件可配置请求日志；额度暂停仍在开发中，不可用于生产。上游地址固定，代理池、路由和全局冷却由 CPA 宿主拥有。读取和保存都只在点击按钮时发生。</p>
           </div>
           <div class="panel-actions">
             <button class="button compact" id="loadConfig" type="button">读取配置</button>
@@ -586,7 +586,7 @@
               </label>
               <button class="button primary" id="savePauseConfig" type="submit">保存额度暂停设置</button>
             </form>
-            <p class="hint" style="margin-top: 8px;">暂停由本插件记录在凭据文件中，只影响本插件是否使用该账户；不会修改 CPA 的启用/停用选择，也不能提前结束 CPA 已给出的 402/403 冷却。到点后插件自动解除暂停，也可以在这里手动解除。</p>
+            <p class="hint" style="margin-top: 8px;">开发中：人工停用保护尚未通过 CPA 宿主安全复核，请勿在生产启用。CPA 自身的 402/403 冷却也不会因插件解除暂停而提前结束。</p>
           </div>
           <div class="read-only">
             <h3>宿主代理 / 路由（只读）</h3>

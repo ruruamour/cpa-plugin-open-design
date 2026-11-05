@@ -21,7 +21,7 @@ func TestQuotaPauseExecutorBufferedPaths(t *testing.T) {
 		{"ordinary 429", 429, `{"error":{"code":"rate_limit_exceeded"}}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, host := newTestService(t)
+			s, host := newQuotaPauseTestService(t)
 			id := seedModels(t, s, host)
 			quotaFixtureAuthFile(t, s, host, id, nil)
 			host.doResponses = append(host.doResponses, fakeHTTPResponse{Status: tc.status, Body: []byte(tc.body)})
@@ -56,7 +56,7 @@ func TestQuotaPauseExecutorStreamErrorPaths(t *testing.T) {
 		{"SSE error", 200, [][]byte{[]byte("data: " + quotaPauseFixtureBody + "\n\n")}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, host := newTestService(t)
+			s, host := newQuotaPauseTestService(t)
 			id := seedModels(t, s, host)
 			quotaFixtureAuthFile(t, s, host, id, nil)
 			host.doStreams = append(host.doStreams, scriptedStream{status: tc.status, chunks: tc.chunks})

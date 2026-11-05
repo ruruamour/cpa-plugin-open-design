@@ -119,10 +119,11 @@ type pauseSettings struct {
 	maxWindow     time.Duration
 }
 
-// pauseSettings resolves the persisted policy. A zero MaxSeconds keeps the
-// built-in cap, so an older settings.json behaves the same.
+// pauseSettings resolves the persisted policy. Until CPA-native manual-disable
+// attribution is safe, older settings without an explicit choice must not start
+// quota pauses automatically. Zero MaxSeconds keeps the built-in cap.
 func (c Config) pauseSettings() pauseSettings {
-	settings := pauseSettings{enabled: true, defaultWindow: quotaPauseDefaultWindow, maxWindow: quotaPauseDefaultMax}
+	settings := pauseSettings{enabled: false, defaultWindow: quotaPauseDefaultWindow, maxWindow: quotaPauseDefaultMax}
 	if c.Pause.Enabled != nil {
 		settings.enabled = *c.Pause.Enabled
 	}
