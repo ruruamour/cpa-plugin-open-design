@@ -302,41 +302,120 @@ func (s *Service) quotaPauseAction(r ManagementRequest) (any, error) {
 	return managementJSON(http.StatusOK, s.quotaPauseResponse())
 }
 
-// recheckQuotaBlock asks for a fresh model-level preflight and clears the block
-// only when that official check proves the model is available. A cache hit,
-// failure, unknown model, or multiple observed models cannot prove recovery.
+// recheckQuotaBlock runs an operator-requested check even before the deadline.
 func (s *Service) recheckQuotaBlock(callbackID, id string) error {
+	return s.recheckQuotaBlockMode(callbackID, id, false)
+}
+
+// recheckQuotaBlockMode serializes recovery checks without limiting inference.
+// Every known failed model must have a fresh official available result for the
+// same workspace member, and no same-key inference may still be in flight. The
+// operator must configure the control key and inference key for the same account;
+// this API cannot independently prove that relationship.
+func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) error {
+	s.mu.RLock()
+	stop := s.stopCh
+	s.mu.RUnlock()
+	select {
+	case s.quotaRecoveryGate <- struct{}{}:
+		defer func() { <-s.quotaRecoveryGate }()
+	case <-stop:
+		return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
+	}
+
+	now := s.quotaPauseTime()
 	s.mu.RLock()
 	current, exists := s.creds[id]
 	revoked := s.revoked[id]
+	billingEpoch := s.billingEpoch[id]
+	inflight := s.quotaHasInFlightLocked(current)
+	enabled := s.cfg.pauseSettings().enabled
+	stopped := s.stopped
 	s.mu.RUnlock()
+	if stopped {
+		return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
+	}
 	if !exists || revoked {
 		return fail(http.StatusNotFound, "credential not found")
 	}
 	if !current.quotaBlocked() {
 		return nil
 	}
+	if dueOnly && (!enabled || current.QuotaBlock.RetryAt.After(now)) {
+		return localFail(http.StatusConflict, "quota_recheck_not_due", "额度暂停尚未到复查时间，或自动暂停已关闭")
+	}
+	if inflight {
+		return localFail(http.StatusConflict, "quota_recheck_inflight", "仍有同一推理密钥的请求在途，请稍后复查")
+	}
+	if current.ControlKey == "" || current.WorkspaceID == "" {
+		return localFail(http.StatusConflict, "quota_recheck_unconfigured", "未配置官方额度授权或 Workspace ID，无法复查")
+	}
 	block := cloneQuotaBlock(current.QuotaBlock)
-	if block.MultipleModels || strings.TrimSpace(block.ModelID) == "" {
-		return localFail(http.StatusConflict, "quota_recheck_ambiguous", "多个模型都报告过额度耗尽，单次模型预检不足以证明恢复")
+	models, complete := quotaBlockModels(block)
+	if !complete {
+		return localFail(http.StatusConflict, "quota_recheck_ambiguous", "耗尽模型集合不完整，无法自动确认恢复")
 	}
-	view, err := s.readModelCoverage(id, block.ModelID, callbackID, true)
-	if err != nil {
-		return err
+	type proof struct {
+		view    modelCoverageResponse
+		model   string
+		started time.Time
 	}
-	if view.FetchedAt == nil || view.FetchedAt.Before(block.ObservedAt) || view.FundingCheck == nil || *view.FundingCheck != "available" {
-		return localFail(http.StatusConflict, "quota_recheck_unproven", "本次预检未能证明额度已恢复")
+	proofs := make([]proof, 0, len(models))
+	member := ""
+	for _, model := range models {
+		s.mu.RLock()
+		clock := s.modelCoverageNow
+		s.mu.RUnlock()
+		started := clock()
+		view, err := s.readModelCoverage(id, model, callbackID, true)
+		if err != nil {
+			return err
+		}
+		one := cloneQuotaBlock(block)
+		one.ModelID, one.MultipleModels = model, false
+		if !quotaRecoveryProven(view, one, id, current.WorkspaceID, started, clock()) {
+			return localFail(http.StatusConflict, "quota_recheck_unproven", "本次官方复查未能证明额度已恢复")
+		}
+		if member != "" && member != view.evidence.workspaceMemberID {
+			return localFail(http.StatusConflict, "quota_recheck_identity", "不同模型的官方复查身份不一致")
+		}
+		member = view.evidence.workspaceMemberID
+		proofs = append(proofs, proof{view: view, model: model, started: started})
 	}
+
+	// Match the global lock order used by model/config updates. No new same-key
+	// inference can be admitted while the block remains published in memory.
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
+	now = s.quotaPauseTime()
 	s.mu.RLock()
 	live, exists := s.creds[id]
-	s.mu.RUnlock()
-	if !exists || live.APIKey != current.APIKey || live.QuotaRevision != current.QuotaRevision || !live.quotaBlocked() {
-		return localFail(http.StatusConflict, "quota_state_changed", "额度暂停状态已变化，请刷新后重试")
+	unchanged := exists && !s.revoked[id] && !s.stopped && live.APIKey == current.APIKey &&
+		live.ControlKey == current.ControlKey && live.WorkspaceID == current.WorkspaceID &&
+		live.runtimeEpoch == current.runtimeEpoch && live.QuotaRevision == current.QuotaRevision &&
+		s.billingEpoch[id] == billingEpoch && live.quotaBlocked() && !s.quotaHasInFlightLocked(live)
+	if dueOnly {
+		unchanged = unchanged && s.cfg.pauseSettings().enabled && !live.QuotaBlock.RetryAt.After(now)
 	}
-	if err := s.resumeQuotaBlockLocked(id, current.QuotaRevision, false); err != nil {
-		return localFail(http.StatusBadGateway, "host_contract_error", "额度预检通过，但凭据文件未能更新")
+	clock := s.modelCoverageNow
+	s.mu.RUnlock()
+	if !unchanged {
+		return localFail(http.StatusConflict, "quota_state_changed", "额度暂停状态或凭据已变化，请刷新后重试")
+	}
+	// For a large model set, also reject evidence that aged out while the other
+	// models were checked. Never extrapolate one model's result to another.
+	finished := clock()
+	for _, item := range proofs {
+		one := cloneQuotaBlock(block)
+		one.ModelID, one.MultipleModels = item.model, false
+		if !quotaRecoveryProven(item.view, one, id, current.WorkspaceID, item.started, finished) {
+			return localFail(http.StatusConflict, "quota_recheck_unproven", "官方复查结果已过期，请稍后重试")
+		}
+	}
+	if err := s.resumeQuotaBlockLocked(id, current.QuotaRevision, dueOnly); err != nil {
+		return localFail(http.StatusBadGateway, "host_contract_error", "额度复查通过，但凭据文件未能更新")
 	}
 	return nil
 }

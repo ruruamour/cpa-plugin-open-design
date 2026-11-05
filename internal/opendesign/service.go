@@ -71,6 +71,8 @@ type Service struct {
 	// recovery fence for the parent session's automatic resume, never a
 	// concurrency limit; guarded by mu.
 	quotaInflight map[quotaInFlightKey]int
+	// Recovery checks are serialized across accounts without limiting inference.
+	quotaRecoveryGate chan struct{}
 	// quotaInFlightTestHook is nil in production. It is per instance so a test
 	// can observe admission/release interleaving without any global state.
 	quotaInFlightTestHook atomic.Pointer[quotaInFlightTestHook]
@@ -98,6 +100,7 @@ func NewService() *Service {
 		errorRuleSyncErrors: map[string]string{},
 		quotaPauseErrors:    map[string]string{},
 		quotaInflight:       map[quotaInFlightKey]int{},
+		quotaRecoveryGate:   make(chan struct{}, 1),
 		quotaPauseWake:      make(chan struct{}, 1),
 		requestLogs:         requestLogs,
 		modelTests:          map[string]modelTestRecord{},
