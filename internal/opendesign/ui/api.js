@@ -72,6 +72,8 @@
       const auth = typeof settings.resolveAuth === 'function'
         ? await settings.resolveAuth()
         : await resolveAuth();
+      // Snapshot at the same time as the headers, not when the reply arrives.
+      const authGeneration = Number.isInteger(auth && auth.authGeneration) ? auth.authGeneration : null;
       const headers = { Accept: 'application/json', ...(auth && auth.headers ? auth.headers : {}), ...(settings.headers || {}) };
       const init = { method, headers, credentials: 'same-origin', cache: 'no-store' };
       if (settings.body !== undefined) {
@@ -85,7 +87,13 @@
       if (raw) {
         try { payload = JSON.parse(raw); } catch { payload = raw; }
       }
-      if (!response.ok) throw new APIError(response.status, errorMessage(response.status, payload, raw), payload);
+      if (!response.ok) {
+        const error = new APIError(response.status, errorMessage(response.status, payload, raw), payload);
+        // Local correlation only: never send this token (or a key) over the wire.
+        // It travels with this particular request, including follow-up requests.
+        if (authGeneration !== null) error.authGeneration = authGeneration;
+        throw error;
+      }
       return payload;
     }
 

@@ -79,6 +79,9 @@
     // rejected auth). Responses captured under an older session are discarded
     // so a delayed status/refresh cannot repaint the new session.
     sessionGeneration: 0,
+    // Successful re-verification of the same key keeps drafts and in-flight
+    // work, but makes older management rejections obsolete.
+    authGeneration: 0,
     accountEdit: null,
     authCollapsed: false,
     // Quota snapshots are keyed by credential id. They are only fetched when the
@@ -168,6 +171,11 @@
   let modelRequestSeq = 0;
   let activeModelRequest = 0;
 
+  // Only the attempt that acquired this slot may release it. Logout or an auth
+  // reset cancels the owner without waiting for its network request to finish.
+  let authAttemptSequence = 0;
+  let activeAuthAttempt = 0;
+
   let client = null;
   function api() {
     if (!client) {
@@ -178,7 +186,10 @@
         // authenticate them: a rejected candidate would then take the verified
         // session (and its drafts) down with it. Verification passes its own
         // one-shot credential through request settings instead.
-        resolveAuth: () => state.verified || { headers: {} },
+        resolveAuth: () => ({
+          headers: (state.verified && state.verified.headers) || {},
+          authGeneration: state.authGeneration,
+        }),
       });
     }
     return client;
@@ -728,6 +739,7 @@
     // request captured under the old identity (including quota walks and their
     // 401s) must be invalidated instead of logging the new session out.
     state.sessionGeneration += 1;
+    state.authGeneration += 1;
     invalidateQuota();
     // An upstream-model fetch from the replaced session must not keep a slot or
     // a selection in the new one.
@@ -799,7 +811,14 @@
     try { Auth.clearAuth(rejected); } catch { /* Keep the page usable. */ }
   }
 
+  function cancelAuthAttempt() {
+    activeAuthAttempt = 0;
+    state.authSubmitting = false;
+    setDisabled('authSubmit', false);
+  }
+
   function showAuth(text, kind = 'error') {
+    cancelAuthAttempt();
     state.verified = null;
     invalidateModelRequest();
     invalidateQuota();
@@ -836,13 +855,26 @@
     return Boolean(error) && isAuthStatus(error.status) && !isUpstreamSource(error);
   }
 
-  function optionalAuthFailure(error) {
+  function staleManagementRejection(error) {
+    return isManagementAuthError(error) && Number.isInteger(error.authGeneration) &&
+      error.authGeneration !== state.authGeneration;
+  }
+
+  // Return true even for an obsolete rejection: callers must not fall through
+  // and show it as a current error. The request still releases its own lock.
+  function managementAuthFailure(error, text) {
     if (!isManagementAuthError(error)) return false;
-    clearRejectedManagementAuth();
-    showAuth(error.status === 401
+    if (!staleManagementRejection(error)) {
+      clearRejectedManagementAuth();
+      showAuth(text);
+    }
+    return true;
+  }
+
+  function optionalAuthFailure(error) {
+    return managementAuthFailure(error, error && error.status === 401
       ? '401：管理密钥无效或已过期，请重新验证后再试。'
       : '403：管理请求被拒绝，请确认管理密钥和来源 IP。');
-    return true;
   }
 
   function upstreamErrorDetail(error) {
@@ -865,10 +897,11 @@
   async function loadStatus(options = {}) {
     const generation = state.optionalGeneration;
     const sessionGeneration = state.sessionGeneration;
+    const authGeneration = state.authGeneration;
     const serverModelsGeneration = state.serverModelsGeneration;
     try {
       const raw = await api().status();
-      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return false;
+      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration || authGeneration !== state.authGeneration) return false;
       applyStatus(raw, { serverModelsGeneration });
       const source = options.source || (state.verified && state.verified.source) || '';
       if (state.verified) state.verified.source = source;
@@ -876,14 +909,12 @@
       message('authState', '');
       return true;
     } catch (error) {
-      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return false;
-      // /status is a management-only route, so a 401/403 here always means the
-      // management key, never an upstream account key.
-      if (isAuthStatus(error.status)) {
-        clearRejectedManagementAuth();
-        showAuth(error.status === 401
-          ? '401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。'
-          : '403：管理请求被拒绝，请确认管理密钥和来源 IP。');
+      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration || authGeneration !== state.authGeneration) return false;
+      if (managementAuthFailure(error, error.status === 401
+        ? '401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。'
+        : '403：管理请求被拒绝，请确认管理密钥和来源 IP。')) return false;
+      if (isUpstreamSource(error) && isAuthStatus(error.status)) {
+        message('authState', `读取状态失败（上游）：${formatError(error)}`, 'error');
       } else {
         showAuth(`读取状态失败：${formatError(error)}`);
       }
@@ -1536,12 +1567,9 @@
       state.modelCoverage[key] = coverage;
     } catch (error) {
       if (!stillCurrent()) return;
-      if (isManagementAuthError(error)) {
-        showAuth(error.status === 401
-          ? '401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。'
-          : `403：${formatError(error)}`);
-        return;
-      }
+      if (managementAuthFailure(error, error.status === 401
+        ? '401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。'
+        : `403：${formatError(error)}`)) return;
       state.modelCoverage[key] = Core.normalizeModelCoverage({
         credential_id: credentialID,
         model_id: item.id,
@@ -1894,10 +1922,9 @@
       renderAccounts();
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
-      if (isManagementAuthError(error)) {
-        clearRejectedManagementAuth();
-        const prefix = saved ? '账户已保存，但读取最新状态时认证失效。' : '';
-        showAuth(prefix + (error.status === 401 ? '401：管理密钥无效或已过期，请重新验证。' : `403：${formatError(error)}`));
+      const prefix = saved ? '账户已保存，但读取最新状态时认证失效。' : '';
+      if (managementAuthFailure(error, prefix + (error.status === 401 ? '401：管理密钥无效或已过期，请重新验证。' : `403：${formatError(error)}`))) {
+        return;
       } else {
         message('accountState', saved
           ? `账户已保存，但读取最新状态失败：${formatError(error)}。请刷新状态确认，不要重复添加。`
@@ -1936,9 +1963,8 @@
       await refreshStatus();
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
-      if (isManagementAuthError(error)) {
-        clearRejectedManagementAuth();
-        showAuth(`${deleted ? '账户已删除，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`);
+      if (managementAuthFailure(error, `${deleted ? '账户已删除，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`)) {
+        return;
       } else if (deleted) {
         message('accountState', `账户已删除，但读取最新状态失败：${formatError(error)}。请刷新状态确认。`, 'error');
       } else if (partialCompletion(formatError(error)) === 'credential-disabled') {
@@ -1975,9 +2001,8 @@
       await refreshStatus();
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
-      if (isManagementAuthError(error)) {
-        clearRejectedManagementAuth();
-        showAuth(`${updated ? '账户状态已更新，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`);
+      if (managementAuthFailure(error, `${updated ? '账户状态已更新，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`)) {
+        return;
       } else message('accountState', updated
         ? `账户已${item.disabled ? '启用' : '停用'}，但读取最新状态失败：${formatError(error)}。请刷新状态确认。`
         : `更新失败：${formatError(error)}`, 'error');
@@ -2010,6 +2035,7 @@
       }
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
+      if (optionalAuthFailure(error)) return;
       message('accountState', `解除失败：${formatError(error)}`, 'error');
     } finally {
       if (sessionGeneration === state.sessionGeneration) setBusy(false);
@@ -2042,6 +2068,7 @@
       }
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
+      if (optionalAuthFailure(error)) return;
       message('accountState', `重查未通过：${formatError(error)}`, 'error');
     } finally {
       if (sessionGeneration === state.sessionGeneration) setBusy(false);
@@ -2099,6 +2126,7 @@
         : '账户可用，但 OpenDesign 没有返回模型。可稍后重试或手动添加映射。');
     } catch (error) {
       if (!stillCurrent()) return;
+      if (staleManagementRejection(error)) return;
       if (isUpstreamSource(error) && isAuthStatus(error.status)) {
         // The management session is fine; the selected OpenDesign account key was
         // rejected upstream. Keep CPA auth and any loaded list, and point at the
@@ -2107,13 +2135,14 @@
         message('modelState', error.status === 401
           ? `账户「${account ? account.label : credentialID}」的 OpenDesign Key 被上游拒绝${detail}。请编辑该账户替换 Key 后重试；管理认证仍有效。`
           : `上游拒绝读取该账户的模型列表（403）${detail}。请确认该 OpenDesign Key 的权限；管理认证仍有效。`, 'error');
-      } else if (error.status === 401) {
-        // Older backend without source: keep the previous wording; the operator
-        // is told to check both the management key and the account key.
+      } else if (error.status === 401 && !error.source) {
+        // Older backends cannot distinguish the management and account keys.
         message('modelState', '401：管理认证失效，或该 OpenDesign API key 无效。请先重新验证管理密钥，再检查账户 key。', 'error');
-      } else if (isAuthStatus(error.status)) {
-        // Older backend without source, or a genuinely rejected management key.
-        showAuth(error.status === 401
+      } else if (isManagementAuthError(error)) {
+        // An explicitly tagged management rejection is unambiguous. Preserve
+        // the legacy combined warning only for an untagged 401 above.
+        if (error.status === 401) message('modelState', '401：管理认证失效，请重新验证管理密钥。', 'error');
+        managementAuthFailure(error, error.status === 401
           ? '401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。'
           : `403：${formatError(error)}`);
       } else {
@@ -2171,11 +2200,10 @@
       // A logout/key switch bumps both generations; the old answer (including a
       // 401) must neither repaint nor log the new session out.
       if (!stillCurrent()) return;
-      if (isManagementAuthError(error)) {
-        clearRejectedManagementAuth();
-        showAuth(error.status === 401
-          ? '401：管理密钥无效或已过期，请重新验证后再查询额度。'
-          : '403：管理请求被拒绝，请确认管理密钥和来源 IP。');
+      if (managementAuthFailure(error, error.status === 401
+        ? '401：管理密钥无效或已过期，请重新验证后再查询额度。'
+        : '403：管理请求被拒绝，请确认管理密钥和来源 IP。')) {
+        return;
       } else {
         // A transport failure leaves the last snapshot uncertain too. Preserve
         // its timestamp, but withdraw any forecast until a successful refresh.
@@ -3324,9 +3352,8 @@
         : '模型映射已保存；保存期间的新编辑已保留为草稿。');
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
-      if (isAuthStatus(error.status) && !isUpstreamSource(error)) {
-        clearRejectedManagementAuth();
-        showAuth(error.status === 401 ? '401：管理密钥无效或已过期，模型映射未保存。' : `403：${formatError(error)}`);
+      if (managementAuthFailure(error, error.status === 401 ? '401：管理密钥无效或已过期，模型映射未保存。' : `403：${formatError(error)}`)) {
+        return;
       } else if (isUpstreamSource(error)) {
         message('modelState', `保存失败（上游）：${formatError(error)}`, 'error');
       } else if (partialCompletion(formatError(error)) === 'mapping-persisted') {
@@ -3768,9 +3795,8 @@
       message('reasoningState', `已保存 ${model.id} 的思考强度映射${payload.reasoning_mapping.enabled ? '（已启用）' : '（当前关闭，不生效）'}。`);
     } catch (error) {
       if (generation !== state.reasoningGeneration || sessionGeneration !== state.sessionGeneration) return;
-      if (isAuthStatus(error.status) && !isUpstreamSource(error)) {
-        clearRejectedManagementAuth();
-        showAuth(error.status === 401 ? '401：管理密钥无效或已过期，映射未保存。' : `403：${formatError(error)}`);
+      if (managementAuthFailure(error, error.status === 401 ? '401：管理密钥无效或已过期，映射未保存。' : `403：${formatError(error)}`)) {
+        return;
       } else if (error.status === 409) {
         // A 409 means the server refused the CAS; never claim success and never
         // drop the draft. A refresh surfaces the newer revision, and the next
@@ -3940,6 +3966,8 @@
     // Re-validating the same key keeps the current session: its drafts and CAS
     // tokens are still valid. A different key starts a fresh session.
     const sameIdentity = sameAuthIdentity(state.verified && state.verified.headers, candidate.headers);
+    const attempt = ++authAttemptSequence;
+    activeAuthAttempt = attempt;
     state.authSubmitting = true;
     // Authentication owns its own flag instead of the shared busy lock, so a
     // stale model write can never keep the operator from re-verifying.
@@ -3950,7 +3978,10 @@
       // page's auth, so a concurrent ordinary request keeps using the verified
       // identity and a rejected candidate cannot end that session.
       const status = await api().status({ resolveAuth: () => candidate });
-      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return;
+      if (activeAuthAttempt !== attempt || generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return;
+      // This proof supersedes every ordinary request sent before it, even when
+      // it verifies the same key and leaves the rest of the session intact.
+      state.authGeneration += 1;
       const hadDrafts = mappingsDirty() || state.modelsDraftActive || state.reasoningDrafts.size > 0;
       // Persist only after CPA accepted the key.
       Auth.saveAuth(key, type, remember);
@@ -3981,7 +4012,7 @@
       message('accountState', '');
       message('authState', '管理密钥验证成功，已开始读取账户和模型。', 'ok');
     } catch (error) {
-      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return;
+      if (activeAuthAttempt !== attempt || generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return;
       // A rejected candidate proves nothing about the already verified identity:
       // keep that session, its models, its drafts and its CAS tokens intact.
       // Only a fresh page with no verified key falls back to the auth screen.
@@ -3999,15 +4030,14 @@
           : `验证失败：${formatError(error)}`);
       }
     } finally {
-      state.authSubmitting = false;
-      setDisabled('authSubmit', false);
+      if (activeAuthAttempt === attempt) cancelAuthAttempt();
     }
   }
 
   function clearAuth() {
     try { Auth.clearAuth(); } catch { /* Ignore blocked storage. */ }
     state.verified = null;
-    state.authSubmitting = false;
+    cancelAuthAttempt();
     state.selectedCredential = '';
     invalidateQuota();
     resetAccountForm();

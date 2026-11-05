@@ -5357,6 +5357,486 @@ test('a late /status from a same-key re-validation cannot roll back a newer reas
   assert.equal(api.render.reasoningDirty(), true);
 });
 
+// Authentication races use real console handlers and deferred network replies.
+function authRaceFixture() {
+  const pending = deferred();
+  let intercept = null;
+  const status = statusBody({
+    models: [{ id: 'od-flash', upstream_id: 'open-design/flash', reasoning_revision: 'reason-1' }],
+    models_revision: 'list-1',
+    credentials: [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: true, workspace_id: 'ws-1' }],
+  });
+  const view = fakePage({
+    fetchImpl: (url, init) => {
+      if (intercept && intercept(url, init)) {
+        intercept = null;
+        return pending.promise;
+      }
+      if (url.endsWith('/status')) return respond(200, status);
+      if (url.endsWith('/credentials') || url.includes('/credentials?')) return respond(200, { id: 'cred-1', label: '主账户' });
+      return respond(404, { error: 'unexpected request' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  return { view, api, pending, hold: matches => { intercept = matches; } };
+}
+
+async function authRaceLogin(fixture, value = managementKey) {
+  fixture.view.document.getElementById('managementKey').value = value;
+  await fixture.api.handlers.submitAuth({ preventDefault() {} });
+}
+
+async function authRaceDrafts({ view, api }) {
+  await api.handlers.addReasoningRule();
+  const alias = view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'unsaved-alias';
+  await alias.emit('input');
+  assert.equal(api.state.reasoningDrafts.size, 1);
+  assert.equal(api.state.modelsDraftActive, true);
+}
+
+test('auth race: same-key revalidation fences old management rejections at real handlers', async t => {
+  const cases = [
+    ['status', url => url.endsWith('/status'), f => f.api.render.loadStatus(), 'authState'],
+    ['model save', url => url.endsWith('/models'), f => f.api.handlers.saveModels(), 'modelState'],
+    ['reasoning save', url => url.endsWith('/models/reasoning'), f => f.api.handlers.saveReasoning(), 'reasoningState'],
+    ['account add', url => url.endsWith('/credentials'), f => {
+      f.view.document.getElementById('accountKey').value = key;
+      return f.api.handlers.addAccount({ preventDefault() {} });
+    }, 'accountState'],
+    ['account delete', url => url.includes('/credentials?'), f => f.api.handlers.deleteAccount(f.api.state.status.credentials[0]), 'accountState'],
+    ['account toggle', url => url.endsWith('/credentials'), f => f.api.handlers.toggleAccount(f.api.state.status.credentials[0]), 'accountState'],
+    ['model fetch', url => url.includes('/upstream-models'), f => {
+      f.api.handlers.selectCredential('cred-1');
+      return f.api.handlers.fetchModels();
+    }, 'modelState'],
+    ['model coverage', url => url.includes('/model-coverage'), f => {
+      f.api.handlers.selectCredential('cred-1');
+      f.api.state.upstreamFor = 'cred-1';
+      return f.api.handlers.checkModelCoverage({ id: 'open-design/flash' });
+    }, 'modelState'],
+    ['quota', url => url.includes('/quota?'), f => f.api.handlers.refreshQuota(f.api.state.status.credentials[0]), 'accountState'],
+    ['quota resume', url => url.endsWith('/quota-pause/resume'), f => f.api.handlers.resumeQuotaPause(f.api.state.status.credentials[0]), 'accountState'],
+    ['quota recheck', url => url.endsWith('/quota-pause/recheck'), f => f.api.handlers.recheckQuotaPause(f.api.state.status.credentials[0]), 'accountState'],
+    ['optional config', url => url.endsWith('/config'), f => f.api.handlers.loadConfig(), 'configState'],
+    ['optional logs', url => url.includes('/request-logs'), f => f.api.handlers.loadRequestLogs({ reset: true }), 'logsState'],
+  ];
+  for (const [name, matches, invoke, messageID] of cases) {
+    for (const status of [401, 403]) await t.test(`${name} ${status}`, async () => {
+      const f = authRaceFixture();
+      await authRaceLogin(f);
+      await authRaceDrafts(f);
+      f.hold(matches);
+      const flight = invoke(f);
+      await new Promise(setImmediate);
+      assert.ok(f.view.calls.some(call => matches(call.url, call.init)), 'the real handler sent its request');
+      await authRaceLogin(f);
+      const authMessage = f.view.document.getElementById('authState').textContent;
+      const beforeMessage = f.view.document.getElementById(messageID).textContent;
+      const beforeMappings = plain(f.api.state.mappings);
+      const beforeDrafts = plain([...f.api.state.reasoningDrafts]);
+      const beforeStorage = [...f.view.sessionStorage.map];
+      f.pending.resolve(respond(status, { error: 'old management rejection' }));
+      await flight;
+      assert.equal(f.api.state.verified?.headers.Authorization, `Bearer ${managementKey}`);
+      assert.equal(f.view.document.getElementById('accountsPanel').hidden, false);
+      assert.deepEqual(plain(f.api.state.mappings), beforeMappings);
+      assert.deepEqual(plain([...f.api.state.reasoningDrafts]), beforeDrafts);
+      assert.deepEqual([...f.view.sessionStorage.map], beforeStorage);
+      assert.equal(f.view.document.getElementById('authState').textContent, authMessage);
+      assert.equal(f.view.document.getElementById(messageID).textContent, beforeMessage, 'old rejection must not present a current error');
+      assert.equal(f.api.state.busy, false, 'the completed operation releases its own lock');
+      assert.ok(!f.view.calls.some(call => call.url.includes(managementKey) || String(call.init.body || '').includes(managementKey)), 'management key stays out of URLs and bodies');
+    });
+  }
+});
+
+test('auth race: a current-generation rejection still logs out, upstream rejection does not', async t => {
+  for (const [name, source, expectLogout] of [['management', 'management', true], ['upstream', 'upstream', false]]) {
+    for (const status of [401, 403]) await t.test(`${name} ${status}`, async () => {
+      const f = authRaceFixture();
+      await authRaceLogin(f);
+      await authRaceDrafts(f);
+      await authRaceLogin(f);
+      f.hold(url => url.endsWith('/models'));
+      const flight = f.api.handlers.saveModels();
+      await new Promise(setImmediate);
+      f.pending.resolve(respond(status, { error: { message: 'rejected', source } }));
+      await flight;
+      assert.equal(f.api.state.verified === null, expectLogout);
+      if (expectLogout) {
+        assert.match(f.view.document.getElementById('authState').textContent, new RegExp(String(status)));
+        assert.equal(f.view.sessionStorage.keys().length, 0);
+      } else {
+        assert.equal(f.api.state.reasoningDrafts.size, 1);
+        assert.match(f.view.document.getElementById('modelState').textContent, /上游/);
+      }
+    });
+  }
+});
+
+test('auth race: fresh management errors still revoke from every auth exit', async t => {
+  const cases = [
+    ['status', url => url.endsWith('/status'), f => f.api.render.loadStatus()],
+    ['account add', url => url.endsWith('/credentials'), f => {
+      f.view.document.getElementById('accountKey').value = key;
+      return f.api.handlers.addAccount({ preventDefault() {} });
+    }],
+    ['account delete', url => url.includes('/credentials?'), f => f.api.handlers.deleteAccount(f.api.state.status.credentials[0])],
+    ['account toggle', url => url.endsWith('/credentials'), f => f.api.handlers.toggleAccount(f.api.state.status.credentials[0])],
+    ['reasoning save', url => url.endsWith('/models/reasoning'), f => f.api.handlers.saveReasoning()],
+    ['model fetch (explicit management source)', url => url.includes('/upstream-models'), f => {
+      f.api.handlers.selectCredential('cred-1');
+      return f.api.handlers.fetchModels();
+    }, 'management'],
+    ['coverage', url => url.includes('/model-coverage'), f => {
+      f.api.handlers.selectCredential('cred-1');
+      f.api.state.upstreamFor = 'cred-1';
+      return f.api.handlers.checkModelCoverage({ id: 'open-design/flash' });
+    }],
+    ['quota', url => url.includes('/quota?'), f => f.api.handlers.refreshQuota(f.api.state.status.credentials[0])],
+    ['quota resume', url => url.endsWith('/quota-pause/resume'), f => f.api.handlers.resumeQuotaPause(f.api.state.status.credentials[0])],
+    ['quota recheck', url => url.endsWith('/quota-pause/recheck'), f => f.api.handlers.recheckQuotaPause(f.api.state.status.credentials[0])],
+    ['optional config', url => url.endsWith('/config'), f => f.api.handlers.loadConfig()],
+  ];
+  for (const [name, matches, invoke, source] of cases) await t.test(name, async () => {
+    const f = authRaceFixture();
+    await authRaceLogin(f);
+    await authRaceDrafts(f);
+    await authRaceLogin(f);
+    f.hold(matches);
+    const flight = invoke(f);
+    await new Promise(setImmediate);
+    assert.ok(f.view.calls.some(call => matches(call.url, call.init)));
+    f.pending.resolve(respond(401, { error: source ? { source, message: 'current key rejected' } : 'current key rejected' }));
+    await flight;
+    assert.equal(f.api.state.verified, null);
+    assert.match(f.view.document.getElementById('authState').textContent, /401/);
+    assert.equal(f.view.sessionStorage.keys().length, 0);
+  });
+});
+
+test('auth race: an upstream rejection remains an upstream error after same-key revalidation', async t => {
+  for (const status of [401, 403]) await t.test(String(status), async () => {
+    const f = authRaceFixture();
+    await authRaceLogin(f);
+    f.api.handlers.selectCredential('cred-1');
+    f.hold(url => url.includes('/upstream-models'));
+    const flight = f.api.handlers.fetchModels();
+    await new Promise(setImmediate);
+    await authRaceLogin(f);
+    f.pending.resolve(respond(status, { error: { source: 'upstream', message: 'account rejected' } }));
+    await flight;
+    assert.ok(f.api.state.verified);
+    assert.match(f.view.document.getElementById('modelState').textContent, /上游/);
+    assert.match(f.view.document.getElementById('modelState').textContent, /管理认证仍有效/);
+  });
+});
+
+test('auth race: a failed same-key verification does not supersede an earlier rejection', async () => {
+  const write = deferred();
+  let statuses = 0;
+  const view = fakePage({ fetchImpl: url => {
+    if (url.endsWith('/models')) return write.promise;
+    if (url.endsWith('/status')) return ++statuses === 1
+      ? respond(200, statusBody({ models_revision: 'list-1' }))
+      : respond(401, { error: 'candidate rejected' });
+    return respond(404, {});
+  } });
+  const api = view.context.OpenDesignConsole;
+  const input = view.document.getElementById('managementKey');
+  input.value = managementKey;
+  await api.handlers.submitAuth({ preventDefault() {} });
+  await api.handlers.addReasoningRule();
+  const pending = api.handlers.saveModels();
+  await new Promise(setImmediate);
+  input.value = managementKey;
+  await api.handlers.submitAuth({ preventDefault() {} });
+  assert.ok(api.state.verified, 'a failed candidate alone does not revoke the session');
+  assert.equal(api.state.reasoningDrafts.size, 1);
+  write.resolve(respond(401, { error: 'verified key rejected' }));
+  await pending;
+  assert.equal(api.state.verified, null, 'a failed verification did not establish a newer generation');
+  assert.match(view.document.getElementById('authState').textContent, /401/);
+});
+
+test('auth race: stale status success and transport failures cannot replace a later verification', async t => {
+  for (const result of ['success', 'server error', 'transport error']) await t.test(result, async () => {
+    const gate = deferred();
+    let statusCalls = 0;
+    const view = fakePage({ fetchImpl: url => {
+      if (!url.endsWith('/status')) return respond(404, {});
+      statusCalls += 1;
+      if (statusCalls === 2) return gate.promise;
+      return respond(200, statusBody({ credentials: [{ id: 'fresh', label: '新账户' }], models_revision: 'fresh' }));
+    } });
+    const api = view.context.OpenDesignConsole;
+    const login = async () => {
+      view.document.getElementById('managementKey').value = managementKey;
+      await api.handlers.submitAuth({ preventDefault() {} });
+    };
+    await login();
+    const old = api.render.loadStatus();
+    await new Promise(setImmediate);
+    await login();
+    if (result === 'success') gate.resolve(respond(200, statusBody({ credentials: [{ id: 'old', label: '旧账户' }], models_revision: 'old' })));
+    else if (result === 'server error') gate.resolve(respond(500, { error: 'old failure' }));
+    else gate.reject(new Error('old network failure'));
+    await old;
+    assert.ok(api.state.verified);
+    assert.equal(api.state.status.credentials[0].id, 'fresh');
+    assert.equal(api.state.modelsRevision, 'fresh');
+    assert.match(view.document.getElementById('authState').textContent, /验证成功/);
+  });
+});
+
+test('auth race: logout invalidates attempt A without letting its finally unlock B', async t => {
+  for (const aStatus of [200, 401]) await t.test(`A returns ${aStatus}`, async () => {
+    const pending = [];
+    const view = fakePage({ fetchImpl: (url, init) => {
+      const gate = deferred();
+      pending.push({ gate, url, headers: init.headers });
+      return gate.promise;
+    } });
+    const api = view.context.OpenDesignConsole;
+    const input = view.document.getElementById('managementKey');
+    input.value = 'key-A';
+    const a = api.handlers.submitAuth({ preventDefault() {} });
+    await new Promise(setImmediate);
+    api.handlers.clearAuth();
+    input.value = 'key-B';
+    const b = api.handlers.submitAuth({ preventDefault() {} });
+    await new Promise(setImmediate);
+    assert.equal(pending.length, 2);
+    pending[0].gate.resolve(respond(aStatus, aStatus === 200 ? statusBody({ models_revision: 'A' }) : { error: 'A rejected' }));
+    await a;
+    assert.equal(api.state.authSubmitting, true, 'B still owns the submit lock');
+    assert.equal(view.document.getElementById('authSubmit').disabled, true);
+    input.value = 'key-C';
+    const blocked = api.handlers.submitAuth({ preventDefault() {} });
+    await new Promise(setImmediate);
+    assert.equal(pending.length, 2, 'C cannot start while B is pending');
+    await blocked;
+    pending[1].gate.resolve(respond(200, statusBody({ models_revision: 'B' })));
+    await b;
+    assert.equal(api.state.verified?.headers.Authorization, 'Bearer key-B');
+    assert.equal(api.state.modelsRevision, 'B');
+    assert.equal(api.state.authSubmitting, false);
+    input.value = 'key-C';
+    const c = api.handlers.submitAuth({ preventDefault() {} });
+    await new Promise(setImmediate);
+    assert.equal(pending.length, 3, 'C may start after B finishes');
+    pending[2].gate.resolve(respond(200, statusBody({ models_revision: 'C' })));
+    await c;
+    assert.equal(api.state.verified?.headers.Authorization, 'Bearer key-C');
+    assert.equal(api.state.modelsRevision, 'C');
+    for (const request of pending) {
+      assert.ok(!/key-[ABC]/.test(request.url), 'candidate keys never appear in URLs');
+    }
+  });
+});
+
+test('auth race: a superseded verification cannot overwrite a later key or its busy operation', async () => {
+  const aGate = deferred();
+  const writeGate = deferred();
+  let statusCalls = 0;
+  const view = fakePage({ fetchImpl: (url, init) => {
+    if (url.endsWith('/status')) return ++statusCalls === 1 ? aGate.promise : respond(200, statusBody({ models_revision: 'B' }));
+    if (url.endsWith('/models')) return writeGate.promise;
+    return respond(404, {});
+  } });
+  const api = view.context.OpenDesignConsole;
+  const input = view.document.getElementById('managementKey');
+  input.value = 'key-A';
+  const a = api.handlers.submitAuth({ preventDefault() {} });
+  await new Promise(setImmediate);
+  api.handlers.clearAuth();
+  input.value = 'key-B';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  api.handlers.addMapping();
+  api.state.mappings.at(-1).id = 'draft';
+  api.state.mappings.at(-1).upstream_id = 'up/draft';
+  const write = api.handlers.saveModels();
+  await new Promise(setImmediate);
+  assert.equal(api.state.busy, true);
+  aGate.resolve(respond(200, statusBody({ models_revision: 'A' })));
+  await a;
+  assert.equal(api.state.verified?.headers.Authorization, 'Bearer key-B');
+  assert.equal(api.state.modelsRevision, 'B');
+  assert.equal(api.state.busy, true, 'old verification cannot release the new write');
+  assert.equal(api.state.modelsSaving, true);
+  writeGate.resolve(respond(200, { models: [], models_revision: 'B2' }));
+  await write;
+  assert.equal(api.state.modelsRevision, 'B2');
+});
+
+test('auth race: each follow-up status request uses its own generation', async t => {
+  for (const phase of ['before revalidation', 'after revalidation']) await t.test(phase, async () => {
+    const writeGate = deferred();
+    const statusGate = deferred();
+    let statusCount = 0;
+    const view = fakePage({ fetchImpl: (url, init) => {
+      if (url.endsWith('/credentials') && init.method === 'POST') return writeGate.promise;
+      if (url.endsWith('/status')) {
+        statusCount += 1;
+        if (phase === 'before revalidation' && statusCount === 2) return statusGate.promise;
+        if (phase === 'after revalidation' && statusCount === 3) return statusGate.promise;
+        return respond(200, statusBody({ models_revision: 'list-1' }));
+      }
+      return respond(404, {});
+    } });
+    const api = view.context.OpenDesignConsole;
+    const login = async () => {
+      view.document.getElementById('managementKey').value = managementKey;
+      await api.handlers.submitAuth({ preventDefault() {} });
+    };
+    await login();
+    view.document.getElementById('accountKey').value = key;
+    const flight = api.handlers.addAccount({ preventDefault() {} });
+    await new Promise(setImmediate);
+    if (phase === 'before revalidation') {
+      writeGate.resolve(respond(200, { id: 'cred-1', label: '主账户' }));
+      await new Promise(setImmediate);
+      assert.equal(statusCount, 2, 'the follow-up is in flight before revalidation');
+      await login();
+    } else {
+      await login();
+      writeGate.resolve(respond(200, { id: 'cred-1', label: '主账户' }));
+      await new Promise(setImmediate);
+      assert.equal(statusCount, 3, 'the follow-up started after revalidation');
+    }
+    statusGate.resolve(respond(401, { error: 'status rejected' }));
+    await flight;
+    assert.equal(api.state.verified === null, phase === 'after revalidation');
+    assert.equal(api.state.busy, false);
+    if (phase === 'before revalidation') assert.match(view.document.getElementById('authState').textContent, /验证成功/);
+    else assert.match(view.document.getElementById('authState').textContent, /401/);
+  });
+});
+
+test('auth race: a stale fetch cannot unlock a newer request after selection changes', async () => {
+  const requests = [];
+  const view = fakePage({ fetchImpl: url => {
+    if (url.endsWith('/status')) return respond(200, statusBody({ credentials: [
+      { id: 'cred-1', label: '主账户' }, { id: 'cred-2', label: '备用账户' },
+    ] }));
+    const gate = deferred();
+    requests.push(gate);
+    return gate.promise;
+  } });
+  const api = view.context.OpenDesignConsole;
+  const login = async () => {
+    view.document.getElementById('managementKey').value = managementKey;
+    await api.handlers.submitAuth({ preventDefault() {} });
+  };
+  await login();
+  api.handlers.selectCredential('cred-1');
+  const a = api.handlers.fetchModels();
+  await new Promise(setImmediate);
+  await login();
+  api.handlers.selectCredential('cred-2');
+  const b = api.handlers.fetchModels();
+  await new Promise(setImmediate);
+  assert.equal(requests.length, 2);
+  const text = view.document.getElementById('modelState').textContent;
+  requests[0].resolve(respond(403, { error: 'old rejection' }));
+  await a;
+  assert.ok(api.state.verified);
+  assert.equal(api.state.busy, true);
+  assert.equal(view.document.getElementById('modelState').textContent, text);
+  requests[1].resolve(respond(200, { data: [{ id: 'model-b' }] }));
+  await b;
+  assert.equal(api.state.busy, false);
+  assert.equal(api.state.upstreamFor, 'cred-2');
+});
+
+test('auth race: an old session write cannot release a newer session write lock', async () => {
+  const writes = [];
+  const view = fakePage({ fetchImpl: url => {
+    if (url.endsWith('/status')) return respond(200, statusBody({ models_revision: 'list-1' }));
+    if (url.endsWith('/models')) {
+      const gate = deferred();
+      writes.push(gate);
+      return gate.promise;
+    }
+    return respond(404, {});
+  } });
+  const api = view.context.OpenDesignConsole;
+  const input = view.document.getElementById('managementKey');
+  input.value = 'old-key';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  const old = api.handlers.saveModels();
+  await new Promise(setImmediate);
+  input.value = 'new-key';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  const current = api.handlers.saveModels();
+  await new Promise(setImmediate);
+  assert.equal(writes.length, 2);
+  writes[0].resolve(respond(401, { error: 'old key rejected' }));
+  await old;
+  assert.equal(api.state.verified?.headers.Authorization, 'Bearer new-key');
+  assert.equal(api.state.busy, true);
+  assert.equal(api.state.modelsSaving, true);
+  assert.equal(view.document.getElementById('saveModels').disabled, true);
+  writes[1].resolve(respond(200, { models: [], models_revision: 'new-saved' }));
+  await current;
+  assert.equal(api.state.busy, false);
+  assert.equal(api.state.modelsRevision, 'new-saved');
+});
+
+test('auth race: a current rejection cancels an in-flight verification and its owner', async () => {
+  const gates = [];
+  const view = fakePage({ fetchImpl: url => {
+    if (!url.endsWith('/status')) return respond(401, { error: 'expired' });
+    if (!gates.length) { gates.push(null); return respond(200, statusBody()); }
+    const gate = deferred();
+    gates.push(gate);
+    return gate.promise;
+  } });
+  const api = view.context.OpenDesignConsole;
+  const input = view.document.getElementById('managementKey');
+  input.value = managementKey;
+  await api.handlers.submitAuth({ preventDefault() {} });
+  input.value = 'key-A';
+  const a = api.handlers.submitAuth({ preventDefault() {} });
+  await new Promise(setImmediate);
+  await api.handlers.loadConfig();
+  assert.equal(api.state.verified, null);
+  input.value = 'key-B';
+  const b = api.handlers.submitAuth({ preventDefault() {} });
+  await new Promise(setImmediate);
+  gates[1].resolve(respond(200, statusBody({ models_revision: 'A' })));
+  await a;
+  assert.equal(api.state.authSubmitting, true);
+  gates[2].resolve(respond(200, statusBody({ models_revision: 'B' })));
+  await b;
+  assert.equal(api.state.verified?.headers.Authorization, 'Bearer key-B');
+  assert.equal(api.state.modelsRevision, 'B');
+});
+
+test('auth race: asynchronous auth resolution carries only a local request generation', async () => {
+  const auth = deferred();
+  const reply = deferred();
+  const view = fakePage({ fetchImpl: () => reply.promise });
+  const client = view.context.OpenDesignAPI.createClient({
+    base: '/v0/management/open-design', fetchImpl: view.fetch, resolveAuth: () => auth.promise,
+  });
+  const result = client.status().catch(error => error);
+  const resolvedAuth = { headers: { Authorization: `Bearer ${managementKey}` }, authGeneration: 17 };
+  auth.resolve(resolvedAuth);
+  await new Promise(setImmediate);
+  resolvedAuth.authGeneration = 99;
+  resolvedAuth.headers.Authorization = 'Bearer changed-after-send';
+  reply.resolve(respond(403, { error: 'denied' }));
+  const error = await result;
+  assert.equal(error.authGeneration, 17);
+  assert.equal(error.status, 403);
+  assert.equal(view.calls[0].init.headers.Authorization, `Bearer ${managementKey}`);
+  assert.ok(!JSON.stringify({ url: view.calls[0].url, ...view.calls[0].init, headers: {} }).includes(managementKey));
+  assert.ok(!JSON.stringify(view.calls[0].init).includes('authGeneration'));
+  assert.equal(view.calls[0].url.includes(managementKey), false);
+});
+
 test('api.saveModels keeps the legacy body and only adds a revision when explicitly given one', async () => {
   const calls = [];
   const view = fakePage({
