@@ -185,9 +185,10 @@ func (s *Service) executePinned(raw json.RawMessage, upstreamModel string, crede
 }
 
 // executePinnedWithReasoning runs one pinned buffered request and also returns
-// the reasoning decision the executor reached. When reasoning is non-nil the
-// policy is pinned alongside the upstream model, so a concurrent save cannot
-// apply a newer rule table to an older upstream ID.
+// the reasoning decision the executor reached. The policy snapshot is pinned
+// even when reasoning is nil: an explicit model test taken while a model had no
+// mapping must keep sending no mapping, rather than observing rules another tab
+// saves after the test captured its configuration.
 func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel string, reasoning *ReasoningMapping, credential *Credential, manageLifecycle bool) (result any, decision reasoningDecision, err error) {
 	if manageLifecycle {
 		if err := s.begin(); err != nil {
@@ -207,8 +208,9 @@ func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel 
 	}
 	if upstreamModel != "" {
 		r.UpstreamModelOverride = upstreamModel
-	}
-	if reasoning != nil {
+		// The explicit model test pins both the upstream ID and the policy it
+		// snapshotted. Pinning nil is meaningful: it means "this model had no
+		// mapping when the test started" and must not be reinterpreted later.
 		r.ReasoningPinned = true
 		r.ReasoningOverride = reasoning
 	}

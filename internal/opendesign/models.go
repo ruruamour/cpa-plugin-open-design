@@ -197,6 +197,48 @@ func (s *Service) credentialByID(id string) (Credential, error) {
 	return c, nil
 }
 
+// modelImport is one submitted model row. reasoning_revision is an optional
+// optimistic-lock token copied from GET /models: it is decoded here but never
+// stored in settings, because the revision is derived from the persisted row.
+type modelImport struct {
+	ID                string            `json:"id"`
+	UpstreamID        string            `json:"upstream_id"`
+	Reasoning         *ReasoningMapping `json:"reasoning_mapping"`
+	ReasoningRevision *string           `json:"reasoning_revision"`
+}
+
+// checkModelImportRevisions rejects a submitted list whose rows were built from
+// an older configuration. A row that carries a non-empty revision must still
+// match the current model with that alias: a deleted row, or a policy/upstream
+// changed by another tab, makes the token stale. The token is compared to the
+// current row, so a client that loaded the current revision may still submit a
+// deliberate upstream change; the keep-existing lookup below then refuses to
+// carry the old policy onto the new upstream. The caller runs this under
+// configMu, so no save can land between the compare and the mutation that
+// follows.
+func checkModelImportRevisions(current []Model, rows []modelImport) error {
+	byID := make(map[string]Model, len(current))
+	for _, model := range current {
+		byID[strings.TrimSpace(model.ID)] = model
+	}
+	for _, row := range rows {
+		if row.ReasoningRevision == nil {
+			continue
+		}
+		expected := strings.TrimSpace(*row.ReasoningRevision)
+		// An empty token is how an older console or an old draft omits the field;
+		// it keeps the previous last-writer-wins behavior.
+		if expected == "" {
+			continue
+		}
+		model, ok := byID[strings.TrimSpace(row.ID)]
+		if !ok || reasoningRevision(model) != expected {
+			return localFail(http.StatusConflict, "reasoning_revision_conflict", "model or reasoning mapping changed since this page was loaded; refresh before saving")
+		}
+	}
+	return nil
+}
+
 // importModels validates and persists the submitted alias→upstream mapping.
 //
 // The whole cycle runs under configMu so two concurrent imports cannot interleave
@@ -212,7 +254,7 @@ func (s *Service) credentialByID(id string) (Credential, error) {
 // credential through host.auth.save.
 func (s *Service) importModels(raw json.RawMessage) (any, error) {
 	var in struct {
-		Models []Model `json:"models"`
+		Models []modelImport `json:"models"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, fail(http.StatusBadRequest, "invalid models JSON")
@@ -222,14 +264,23 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 
 	cfg := s.config()
 	previous := cfg.Models
-	cfg.Models = append([]Model(nil), in.Models...)
 	// Canonicalize the incoming alias/upstream IDs before matching, so a
 	// whitespace-only edit cannot make the keep-existing-policy lookup miss and
 	// silently drop a saved rule table. validate() would trim them later, but by
-	// then the policy had already been decided.
-	for i := range cfg.Models {
-		cfg.Models[i].ID = strings.TrimSpace(cfg.Models[i].ID)
-		cfg.Models[i].UpstreamID = strings.TrimSpace(cfg.Models[i].UpstreamID)
+	// then the policy had already been decided. The revision check also uses the
+	// trimmed alias, so it matches the row GET /models rendered.
+	cfg.Models = make([]Model, 0, len(in.Models))
+	for _, imported := range in.Models {
+		cfg.Models = append(cfg.Models, Model{
+			ID:         strings.TrimSpace(imported.ID),
+			UpstreamID: strings.TrimSpace(imported.UpstreamID),
+			Reasoning:  imported.Reasoning,
+		})
+	}
+	// Reject the whole list before persisting anything when any revision is
+	// stale. Rows without a revision keep the compatibility path below.
+	if err := checkModelImportRevisions(previous, in.Models); err != nil {
+		return nil, err
 	}
 	// An incoming list that omits the policy keeps the stored one. The upstream ID
 	// has to match as well: a rule written for one upstream must not be silently
