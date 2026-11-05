@@ -278,6 +278,8 @@ func TestImportModelsAliasRenameWithCurrentModelsRevision(t *testing.T) {
 		saveReasoningTarget(t, s, "high")
 		revision, rows := fetchModels(t, s)
 
+		// Omitting the optional mapping states nothing about the old policy, so the
+		// row is a plain new row and the token has nothing left to compare.
 		renamed := cloneModelRow(t, rows[0])
 		renamed["id"] = "renamed-large"
 		delete(renamed, "reasoning_mapping")
@@ -862,6 +864,159 @@ func TestImportModelsWholeTableTokenStillRejectsStaleRowToken(t *testing.T) {
 	if mapping := s.reasoningMappingFor("od-large"); mapping == nil || mapping.Rules[0].To != "low" {
 		t.Fatalf("mixed stale row token overwrote the policy: %+v", mapping)
 	}
+}
+
+// A row that still carries the token of a row it no longer names (the alias was
+// renamed) and also submits an explicit reasoning mapping must not be treated as
+// an unrelated new row: the mapping may simply be the stored policy echoed back,
+// so binding it to a new alias/upstream would silently drop or migrate it. The
+// save fails closed with 409. The supported ways forward are the explicit
+// original identity (plus carry_reasoning_mapping when the upstream changes) or
+// dropping the row token when the row really is new.
+func TestImportModelsUnlinkedRowTokenCannotSilentlyRebindPolicy(t *testing.T) {
+	seed := func(t *testing.T) (*Service, string, map[string]any) {
+		t.Helper()
+		s, host := newTestService(t)
+		seedModels(t, s, host)
+		saveReasoningTarget(t, s, "high")
+		revision, rows := fetchModels(t, s)
+		return s, revision, cloneModelRow(t, rows[0])
+	}
+
+	// The minimal case: the row was renamed and re-pointed, the caller kept the
+	// old mapping and the old row token, and stated no original identity.
+	t.Run("renamed and re-pointed row with echoed policy is rejected", func(t *testing.T) {
+		s, revision, row := seed(t)
+		switched := cloneModelRow(t, row)
+		switched["id"] = "renamed-large"
+		switched["upstream_id"] = "opendesign-large-v2"
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{switched}, "expected_models_revision": revision,
+		})
+		if status != http.StatusConflict {
+			t.Fatalf("unlinked row token with echoed policy status = %d, want 409: %s", status, raw)
+		}
+		// POST /models reports errors as a redacted message only, so the remedy has
+		// to be spelled out there instead of through a separate code field.
+		if !strings.Contains(raw, "original_id") {
+			t.Fatalf("conflict does not point at the explicit identity remedy: %s", raw)
+		}
+		models := s.config().Models
+		if len(models) != 1 || models[0].ID != "od-large" || models[0].UpstreamID != "opendesign-large" {
+			t.Fatalf("rejected save changed the model list: %+v", models)
+		}
+		if mapping := s.reasoningMappingFor("od-large"); mapping == nil || mapping.Rules[0].To != "high" {
+			t.Fatalf("rejected save changed the policy: %+v", mapping)
+		}
+		if mapping := s.reasoningMappingFor("renamed-large"); mapping != nil {
+			t.Fatalf("the old policy was silently bound to the new alias: %+v", mapping)
+		}
+	})
+
+	t.Run("alias-only rename with explicit policy is rejected", func(t *testing.T) {
+		s, revision, row := seed(t)
+		renamed := cloneModelRow(t, row)
+		renamed["id"] = "renamed-large"
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{renamed}, "expected_models_revision": revision,
+		})
+		if status != http.StatusConflict {
+			t.Fatalf("unlinked row token with explicit policy status = %d, want 409: %s", status, raw)
+		}
+		if mapping := s.reasoningMappingFor("renamed-large"); mapping != nil {
+			t.Fatalf("rejected rename created a new row: %+v", mapping)
+		}
+	})
+
+	// The reverse must not become a new rule either: an explicit mapping that
+	// happens to equal some existing policy is still ambiguous, so it cannot be
+	// used to prove intent.
+	t.Run("mapping equal to another row's policy is still ambiguous", func(t *testing.T) {
+		s, revision, row := seed(t)
+		// Add a second row whose policy equals the first one.
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{row, map[string]any{
+				"id": "od-small", "upstream_id": "opendesign-small",
+				"reasoning_mapping": map[string]any{"enabled": true, "rules": []map[string]string{{"from": "medium", "to": "high"}}},
+			}},
+			"expected_models_revision": revision,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("seed second row: %d %s", status, raw)
+		}
+		revision, rows := fetchModels(t, s)
+		renamed := cloneModelRow(t, rows[0])
+		renamed["id"] = "renamed-large"
+		status, _, raw = managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{renamed, cloneModelRow(t, rows[1])}, "expected_models_revision": revision,
+		})
+		if status != http.StatusConflict {
+			t.Fatalf("surviving row with an equal policy status = %d, want 409: %s", status, raw)
+		}
+	})
+
+	// Regressions that must keep working: a tokenless row is a normal new row even
+	// when its explicit policy equals a stored one, an explicit original identity
+	// still carries the policy, and a row that omits the optional fields is added
+	// cleanly.
+	t.Run("new row without a token is still a normal addition", func(t *testing.T) {
+		s, revision, row := seed(t)
+		fresh := map[string]any{
+			"id": "od-small", "upstream_id": "opendesign-small",
+			"reasoning_mapping": map[string]any{"enabled": true, "rules": []map[string]string{{"from": "medium", "to": "high"}}},
+		}
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{row, fresh}, "expected_models_revision": revision,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("new row with an equal policy status = %d, want 200: %s", status, raw)
+		}
+		models := s.config().Models
+		if len(models) != 2 || models[1].ID != "od-small" || models[1].Reasoning == nil || models[1].Reasoning.Rules[0].To != "high" {
+			t.Fatalf("new row with an explicit policy was not saved: %+v", models)
+		}
+	})
+
+	t.Run("new row without optional fields is still a normal addition", func(t *testing.T) {
+		s, revision, row := seed(t)
+		fresh := map[string]any{"id": "od-small", "upstream_id": "opendesign-small"}
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{row, fresh}, "expected_models_revision": revision,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("plain new row status = %d, want 200: %s", status, raw)
+		}
+		models := s.config().Models
+		if len(models) != 2 || models[1].ID != "od-small" || models[1].Reasoning != nil {
+			t.Fatalf("plain new row was not added cleanly: %+v", models)
+		}
+		if mapping := s.reasoningMappingFor("od-large"); mapping == nil || mapping.Rules[0].To != "high" {
+			t.Fatalf("adding a row dropped the echoed policy: %+v", mapping)
+		}
+	})
+
+	t.Run("explicit original identity still carries the policy", func(t *testing.T) {
+		s, revision, row := seed(t)
+		renamed := cloneModelRow(t, row)
+		renamed["id"] = "renamed-large"
+		renamed["upstream_id"] = "opendesign-large-v2"
+		renamed["original_id"] = "od-large"
+		renamed["original_upstream_id"] = "opendesign-large"
+		renamed["carry_reasoning_mapping"] = true
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{renamed}, "expected_models_revision": revision,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("explicit carry status = %d, want 200: %s", status, raw)
+		}
+		models := s.config().Models
+		if len(models) != 1 || models[0].ID != "renamed-large" || models[0].UpstreamID != "opendesign-large-v2" {
+			t.Fatalf("explicit carry did not rename: %+v", models)
+		}
+		if mapping := s.reasoningMappingFor("renamed-large"); mapping == nil || mapping.Rules[0].To != "high" {
+			t.Fatalf("explicit carry lost the policy: %+v", mapping)
+		}
+	})
 }
 
 // The model-test route itself must pass an explicit pin. This test lands the

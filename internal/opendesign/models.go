@@ -445,10 +445,22 @@ func buildWholeTableImportedModels(current []Model, rows []modelImport) ([]Model
 		}
 		model, ok := byID[strings.TrimSpace(rows[i].ID)]
 		if !ok {
-			// With a valid whole-list token, a new or renamed alias without an
-			// explicit original identity is simply a new row. Its row token has no
-			// identity left to compare against, and inferring a rename from it would
-			// make an ambiguous identity change silently.
+			// The alias names no current row, so this row's token has nothing left to
+			// compare against locally. Without an explicit mapping the row states no
+			// policy intent, which is the ordinary new-row shape, so it stays a
+			// plain addition.
+			//
+			// An explicit mapping is different: its content cannot prove intent. It
+			// may be the stored policy simply echoed back by a caller that renamed or
+			// re-pointed the row, and a rule table can also legitimately equal another
+			// row's policy. Silently binding it to a new alias/upstream would then
+			// either drop the old policy or migrate it without the caller saying so,
+			// so this ambiguous case fails closed. The supported ways forward are an
+			// explicit original_id/original_upstream_id (plus carry_reasoning_mapping
+			// when the upstream changes) or dropping the row token.
+			if rows[i].Reasoning != nil {
+				return nil, localFail(http.StatusConflict, "reasoning_mapping_migration_conflict", "row token no longer matches any model while an explicit reasoning mapping was submitted; provide original_id and original_upstream_id, or drop the row token")
+			}
 			continue
 		}
 		if reasoningRevision(model) != token {

@@ -184,6 +184,10 @@ OpenDesign 生产接口：
 
 整表 token 与原始身份：只改 alias（`upstream_id` 不变）时，行可带 `original_id` 与 `original_upstream_id` 指向快照中的原模型，策略默认保留；只改 alias 且不提供原始身份会被当作新行，不会猜测旧策略。改 `upstream_id` 时旧策略默认清除；若要把原策略显式带到新上游，必须同时提供原始身份并设置 `carry_reasoning_mapping: true`。只回显旧策略但不设 opt-in 会返回 409，而不是静默迁移或静默丢弃。原始身份必须精确对应整表 token 指向的快照（id 与 upstream 同时匹配），不能跨快照冒用，也不允许冲突别名复用他人原始身份。
 
+行 token 与「无法识别的拷贝意图」：在带 `expected_models_revision` 的整表保存中，如果某行仍带非空 `reasoning_revision`，但它提交的 alias 已不在当前列表里（改名或直接换行），且该行还显式提交了 `reasoning_mapping`，则整单返回 409（不写盘、不发布），而不是把这个策略静默绑定到新 alias／新上游。此时后端无法判断那份 mapping 是「真实的新配置」还是「把旧策略照抄过来」：内容可能与旧行恰好相同，也可能与列表里任意一行的策略相同，因此不能按内容判定，也不能据此推断是拷贝还是本意。可选的解除方式只有两种：补上 `original_id`／`original_upstream_id`（改上游时再加 `carry_reasoning_mapping: true`）走显式身份，或去掉该行的 `reasoning_revision` 表示这就是一行新模型。
+
+兼容性边界（以下行为保持不变）：不带行 token 的新行始终是普通新增，其显式 `reasoning_mapping` 视为新策略意图并原样保存，即使内容与现有某行的策略完全相同也不拒绝（无法区分真实新配置）；缺省 `reasoning_mapping`、缺省行 token、缺省 `expected_models_revision` 的旧客户端请求语义不变；显式原始身份 + `carry_reasoning_mapping` 仍按上文允许。换句话说，本限制只在「行 token 指向的目标 alias 已不存在，且该行仍显式提交 mapping」这一种组合下触发。
+
 `GET /models` 行内的 `reasoning_revision` 仍可用于同别名（未改名）时的单模型保护。没有 `expected_models_revision` 的旧调用者保持原有严格行为：非空行 token 必须仍匹配当前同别名模型，已删除或已改名的别名不能被旧 token 复活；显式提交的 `reasoning_mapping` 仍按原来的 last-writer-wins 语义保存。
 
 映射写入 settings，对以下路径生效：正式请求（`executor.execute`／`executor.execute_stream`）、控制台的显式模型测试。模型覆盖探测走的是官方计费接口的 GET，没有请求体，因此不涉及思考强度。
