@@ -25,9 +25,6 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 	// Resolve the policy before taking mu: config() takes mu.RLock and the block
 	// below is built while holding the write lock.
 	settings := s.config().pauseSettings()
-	if !settings.enabled {
-		return
-	}
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
 
@@ -35,6 +32,13 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 	s.mu.Lock()
 	current, exists := s.creds[source.ID]
 	if !exists || s.revoked[source.ID] || current.APIKey != source.APIKey {
+		s.mu.Unlock()
+		return
+	}
+	// Disabling the policy stops new blocks, not the collection of late errors
+	// from requests already in flight for an existing block. Otherwise turning
+	// the policy off and back on could lose an exhausted model before recovery.
+	if !settings.enabled && !current.quotaBlocked() {
 		s.mu.Unlock()
 		return
 	}
