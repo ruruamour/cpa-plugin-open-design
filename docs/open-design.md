@@ -175,7 +175,11 @@ OpenDesign 生产接口：
 
 保存是「完整替换」：`POST /models/reasoning` 带 `model`、`upstream_id` 与整个 `reasoning_mapping`。模型不存在返回 404，上游 ID 与当前映射不一致返回 409（要求先刷新状态再配置），规则不合法返回 400。
 
-模型列表保存支持整表乐观锁：`GET /status`、`GET /models` 与 `POST /models` 响应都会返回 `models_revision`，它是完整模型列表（含每个模型的思考强度策略）的确定性摘要。`POST /models` 可携带 `expected_models_revision`；与当前摘要不一致时整单返回 409，且不写盘、不发布，适用于删除、新增、改名与改上游等所有列表变更。省略该字段时保持旧的兼容语义。列表里回显的旧 `reasoning_mapping` 与当前策略完全一致、同时修改了 `upstream_id` 时，该旧策略不会被隐式迁移；显式提交了不同映射才视为新策略意图。`GET /models` 行内的 `reasoning_revision` 仍用于同别名（未改名）时的单模型保存保护，改名后的新别名不再按旧行 ID 校验。
+模型列表保存支持整表乐观锁：`GET /status`、`GET /models` 与 `POST /models` 响应都会返回 `models_revision`，它是完整模型列表（含每个模型的思考强度策略）的确定性摘要。`POST /models` 可携带 `expected_models_revision`；与当前摘要不一致时整单返回 409，且不写盘、不发布，适用于删除、新增、改名与改上游等所有列表变更。省略该字段时保持旧的兼容语义。
+
+整表 token 与原始身份：只改 alias（`upstream_id` 不变）时，行可带 `original_id` 与 `original_upstream_id` 指向快照中的原模型，策略默认保留；只改 alias 且不提供原始身份会被当作新行，不会猜测旧策略。改 `upstream_id` 时旧策略默认清除；若要把原策略显式带到新上游，必须同时提供原始身份并设置 `carry_reasoning_mapping: true`。只回显旧策略但不设 opt-in 会返回 409，而不是静默迁移或静默丢弃。原始身份必须精确对应整表 token 指向的快照（id 与 upstream 同时匹配），不能跨快照冒用，也不允许冲突别名复用他人原始身份。
+
+`GET /models` 行内的 `reasoning_revision` 仍可用于同别名（未改名）时的单模型保护。没有 `expected_models_revision` 的旧调用者保持原有严格行为：非空行 token 必须仍匹配当前同别名模型，已删除或已改名的别名不能被旧 token 复活；显式提交的 `reasoning_mapping` 仍按原来的 last-writer-wins 语义保存。
 
 映射写入 settings，对以下路径生效：正式请求（`executor.execute`／`executor.execute_stream`）、控制台的显式模型测试。模型覆盖探测走的是官方计费接口的 GET，没有请求体，因此不涉及思考强度。
 

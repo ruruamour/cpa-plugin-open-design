@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -45,9 +46,11 @@ func modelsRevision(models []Model) string {
 
 // sameReasoningMapping compares two optional policies by their canonical
 // encoding, so two equal mappings with different slice backing are treated as
-// the same policy and a nil policy is distinct from an empty one.
+// the same policy and a nil policy is distinct from an empty one. Rule values
+// are normalized first: validation would otherwise canonicalize padding/case
+// after the migration decision, letting an equivalent echoed policy look new.
 func sameReasoningMapping(left, right *ReasoningMapping) bool {
-	return bytes.Equal(jsonBytes(left), jsonBytes(right))
+	return bytes.Equal(jsonBytes(normalizedReasoningMapping(left)), jsonBytes(normalizedReasoningMapping(right)))
 }
 
 func modelViews(models []Model) []map[string]any {
@@ -226,22 +229,57 @@ func (s *Service) credentialByID(id string) (Credential, error) {
 // modelImport is one submitted model row. The embedded Model keeps the row
 // shape open to future optional fields: anything added to Model later decodes
 // and re-encodes through this adapter without an import-side list to update.
-// reasoning_revision is accepted from a row rendered by GET /models. It is only
-// checked when the submitted alias already exists, so it can still catch a
-// same-alias policy change for a caller that has not adopted
-// expected_models_revision, but it never mis-rejects a rename or a new row and it
-// cannot see deletions or additions. expected_models_revision is the whole-list
-// lock for those cases.
+//
+// reasoning_revision is the per-row token from GET /models. Without
+// expected_models_revision it keeps the original strict check: a token must
+// still describe the current row with the submitted alias, so a deleted or
+// renamed row cannot be revived through a stale token.
+//
+// original_id/original_upstream_id are the explicit identity of the row in the
+// snapshot the caller rendered. They are only meaningful together with a valid
+// expected_models_revision; they let a rename keep the original row's policy
+// without guessing by alias. carry_reasoning_mapping is the explicit opt-in for
+// keeping that policy when the upstream ID itself changes.
 type modelImport struct {
 	Model
-	ReasoningRevision *string `json:"reasoning_revision"`
+	ReasoningRevision     *string `json:"reasoning_revision"`
+	OriginalID            *string `json:"original_id"`
+	OriginalUpstreamID    *string `json:"original_upstream_id"`
+	CarryReasoningMapping *bool   `json:"carry_reasoning_mapping"`
 }
 
-// checkModelImportRevisions is the row-level companion to checkModelsRevision.
-// It only applies to rows whose alias exists in current: a missing alias is a
-// new or renamed row, where a per-row token has no corresponding identity to
-// compare against and would otherwise reject the legitimate rename.
-func checkModelImportRevisions(current []Model, rows []modelImport) error {
+// normalizedReasoningMapping makes a comparison copy of a policy with the same
+// canonical rule values cfg.validate would store. Without it, rule values with
+// padding or different case could bypass an "is this the old policy?" check and
+// silently look like a new intent. Rules are also sorted and an empty list is
+// folded to nil, because neither changes what the policy does.
+func normalizedReasoningMapping(mapping *ReasoningMapping) *ReasoningMapping {
+	if mapping == nil {
+		return nil
+	}
+	copied := cloneReasoningMapping(mapping)
+	for i := range copied.Rules {
+		copied.Rules[i].From = strings.ToLower(strings.TrimSpace(copied.Rules[i].From))
+		copied.Rules[i].To = strings.ToLower(strings.TrimSpace(copied.Rules[i].To))
+	}
+	if len(copied.Rules) == 0 {
+		copied.Rules = nil
+		return copied
+	}
+	sort.Slice(copied.Rules, func(i, j int) bool {
+		if copied.Rules[i].From != copied.Rules[j].From {
+			return copied.Rules[i].From < copied.Rules[j].From
+		}
+		return copied.Rules[i].To < copied.Rules[j].To
+	})
+	return copied
+}
+
+// checkLegacyRowRevisions is the ff3c2c0 behavior for callers that do not send
+// a whole-list token: every non-empty row token must still describe the current
+// row with the submitted alias. A missing alias means the row was deleted or
+// renamed, so replaying its token must fail instead of resurrecting it.
+func checkLegacyRowRevisions(current []Model, rows []modelImport) error {
 	byID := make(map[string]Model, len(current))
 	for _, model := range current {
 		byID[strings.TrimSpace(model.ID)] = model
@@ -255,11 +293,8 @@ func checkModelImportRevisions(current []Model, rows []modelImport) error {
 			continue
 		}
 		model, ok := byID[strings.TrimSpace(row.ID)]
-		if !ok {
-			continue
-		}
-		if reasoningRevision(model) != token {
-			return localFail(http.StatusConflict, "reasoning_revision_conflict", "reasoning mapping changed since this page was loaded; refresh before saving")
+		if !ok || reasoningRevision(model) != token {
+			return localFail(http.StatusConflict, "reasoning_revision_conflict", "model or reasoning mapping changed since this page was loaded; refresh before saving")
 		}
 	}
 	return nil
@@ -267,46 +302,230 @@ func checkModelImportRevisions(current []Model, rows []modelImport) error {
 
 // checkModelsRevision rejects a submitted list rendered before the current one.
 // The caller runs this under configMu, so no save can land between the compare
-// and the mutation that follows. A missing or empty token is how an older
-// console omits the field; it keeps the previous compatibility semantics.
-func checkModelsRevision(current []Model, expected *string) error {
+// and the mutation that follows. The second return value reports whether a
+// non-empty whole-list token was supplied and matched.
+func checkModelsRevision(current []Model, expected *string) (bool, error) {
 	if expected == nil {
-		return nil
+		return false, nil
 	}
 	token := strings.TrimSpace(*expected)
 	if token == "" {
-		return nil
+		return false, nil
 	}
 	if token != modelsRevision(current) {
-		return localFail(http.StatusConflict, "models_revision_conflict", "model list changed since this page was loaded; refresh before saving")
+		return false, localFail(http.StatusConflict, "models_revision_conflict", "model list changed since this page was loaded; refresh before saving")
+	}
+	return true, nil
+}
+
+// originalModelForImport resolves the explicit original identity of a row
+// against the current snapshot. Both fields are required as a pair, and the
+// pair must name exactly one current row: an identity that is missing, partial,
+// or borrowed from another upstream is rejected instead of being guessed.
+func originalModelForImport(current []Model, row modelImport) (Model, bool, error) {
+	hasID := row.OriginalID != nil
+	hasUpstream := row.OriginalUpstreamID != nil
+	if !hasID && !hasUpstream {
+		return Model{}, false, nil
+	}
+	if !hasID || !hasUpstream {
+		return Model{}, false, localFail(http.StatusBadRequest, "invalid_request", "original_id and original_upstream_id must be provided together")
+	}
+	id := strings.TrimSpace(*row.OriginalID)
+	upstream := strings.TrimSpace(*row.OriginalUpstreamID)
+	if id == "" || upstream == "" {
+		return Model{}, false, localFail(http.StatusBadRequest, "invalid_request", "original_id and original_upstream_id must be nonempty")
+	}
+	for _, model := range current {
+		if strings.TrimSpace(model.ID) == id && strings.TrimSpace(model.UpstreamID) == upstream {
+			return model, true, nil
+		}
+	}
+	return Model{}, false, localFail(http.StatusConflict, "original_model_conflict", "original model identity does not match the current model list; refresh before saving")
+}
+
+// buildLegacyImportedModels keeps the pre-whole-list-token semantics. A row
+// token is strict; an omitted policy is kept only when both alias and upstream
+// match, while an explicit policy always wins, including across an upstream
+// change. Legacy callers therefore never see the new migration guard.
+func buildLegacyImportedModels(current []Model, rows []modelImport) ([]Model, error) {
+	if err := checkLegacyRowRevisions(current, rows); err != nil {
+		return nil, err
+	}
+	previousByID := make(map[string]Model, len(current))
+	for _, model := range current {
+		previousByID[strings.TrimSpace(model.ID)] = model
+	}
+	models := make([]Model, 0, len(rows))
+	for _, imported := range rows {
+		model := imported.Model
+		model.ID = strings.TrimSpace(model.ID)
+		model.UpstreamID = strings.TrimSpace(model.UpstreamID)
+		if model.Reasoning == nil {
+			if previousModel, ok := previousByID[model.ID]; ok && strings.TrimSpace(previousModel.UpstreamID) == model.UpstreamID {
+				model.Reasoning = cloneReasoningMapping(previousModel.Reasoning)
+			}
+		}
+		models = append(models, model)
+	}
+	return models, nil
+}
+
+// validateImportMetadata keeps the explicit original-identity fields scoped to a
+// valid whole-list snapshot. Without expected_models_revision there is no
+// snapshot to resolve them against, so they are rejected rather than silently
+// ignored; the carry opt-in also requires an explicit original identity so it
+// can never mean "carry whatever the alias happens to find".
+func validateImportMetadata(hasWholeTableToken bool, rows []modelImport) error {
+	for _, row := range rows {
+		hasOriginal := row.OriginalID != nil || row.OriginalUpstreamID != nil
+		hasCarry := row.CarryReasoningMapping != nil && *row.CarryReasoningMapping
+		// A false carry flag states no intent and stays harmless for callers that
+		// serialize it as a default value. A true flag is an opt-in and therefore
+		// needs the whole-list snapshot to resolve the original row.
+		if !hasWholeTableToken && (hasOriginal || hasCarry) {
+			return localFail(http.StatusBadRequest, "invalid_request", "original model identity requires expected_models_revision")
+		}
+		if hasCarry && !hasOriginal {
+			return localFail(http.StatusBadRequest, "invalid_request", "carry_reasoning_mapping requires original_id and original_upstream_id")
+		}
 	}
 	return nil
 }
 
-// previousModelForImport finds the row a submitted model corresponds to in the
-// previous list. The alias is the primary identity. A row whose alias was
-// renamed can still be linked through its per-row reasoning_revision when the
-// console supplied one, which lets the caller distinguish an intentional rename
-// from a new row; without that link a rename is treated as a new row.
-func previousModelForImport(previous []Model, row modelImport, alias string) (Model, bool) {
-	for _, model := range previous {
-		if strings.TrimSpace(model.ID) == alias {
-			return model, true
+// buildWholeTableImportedModels resolves explicit original identities, rejects
+// stale per-row tokens and conflicting claims, then decides each row's policy.
+// The whole-list token has already proved that current is the snapshot the
+// caller rendered, so an explicit identity can safely support a rename.
+func buildWholeTableImportedModels(current []Model, rows []modelImport) ([]Model, error) {
+	byID := make(map[string]Model, len(current))
+	for _, model := range current {
+		byID[strings.TrimSpace(model.ID)] = model
+	}
+
+	originals := make([]Model, len(rows))
+	linked := make([]bool, len(rows))
+	claimedBy := make(map[string]int, len(rows))
+	claimedIDs := make(map[string]bool, len(rows))
+	for i := range rows {
+		original, ok, err := originalModelForImport(current, rows[i])
+		if err != nil {
+			return nil, err
+		}
+		originals[i], linked[i] = original, ok
+		if !ok {
+			continue
+		}
+		key := strings.TrimSpace(original.ID) + "\x00" + strings.TrimSpace(original.UpstreamID)
+		if _, exists := claimedBy[key]; exists {
+			return nil, localFail(http.StatusConflict, "original_model_conflict", "two rows claim the same original model; refresh before saving")
+		}
+		claimedBy[key] = i
+		claimedIDs[strings.TrimSpace(original.ID)] = true
+	}
+
+	// The whole-list token has already checked the submitted rows against the
+	// snapshot. Row tokens only add detail for a same-alias row; they are ignored
+	// for a new or renamed alias, where the explicit original identity (if any) is
+	// the sole link to the old row. A token that no longer matches its explicit
+	// original is still rejected below.
+	for i := range rows {
+		if rows[i].ReasoningRevision == nil {
+			continue
+		}
+		token := strings.TrimSpace(*rows[i].ReasoningRevision)
+		if token == "" {
+			continue
+		}
+		if linked[i] {
+			if reasoningRevision(originals[i]) != token {
+				return nil, localFail(http.StatusConflict, "reasoning_revision_conflict", "original model changed since this page was loaded; refresh before saving")
+			}
+			continue
+		}
+		model, ok := byID[strings.TrimSpace(rows[i].ID)]
+		if !ok {
+			// With a valid whole-list token, a new or renamed alias without an
+			// explicit original identity is simply a new row. Its row token has no
+			// identity left to compare against, and inferring a rename from it would
+			// make an ambiguous identity change silently.
+			continue
+		}
+		if reasoningRevision(model) != token {
+			return nil, localFail(http.StatusConflict, "reasoning_revision_conflict", "model or reasoning mapping changed since this page was loaded; refresh before saving")
+		}
+		if claimedIDs[strings.TrimSpace(rows[i].ID)] {
+			return nil, localFail(http.StatusConflict, "original_model_conflict", "a row token points at an original model already claimed by another row; refresh before saving")
 		}
 	}
-	if row.ReasoningRevision == nil {
-		return Model{}, false
+
+	// An alias that names another row's original identity could shadow or
+	// impersonate the row that legitimately owns that identity. Reject the whole
+	// list instead of guessing which row the policy belongs to.
+	originalIDs := make(map[string]int, len(claimedBy))
+	for key, owner := range claimedBy {
+		originalIDs[strings.SplitN(key, "\x00", 2)[0]] = owner
 	}
-	token := strings.TrimSpace(*row.ReasoningRevision)
-	if token == "" {
-		return Model{}, false
-	}
-	for _, model := range previous {
-		if reasoningRevision(model) == token {
-			return model, true
+	for i := range rows {
+		if owner, exists := originalIDs[strings.TrimSpace(rows[i].ID)]; exists && owner != i {
+			return nil, localFail(http.StatusConflict, "original_model_conflict", "a conflicting alias reuses another row's original model; refresh before saving")
 		}
 	}
-	return Model{}, false
+
+	models := make([]Model, 0, len(rows))
+	for i, imported := range rows {
+		model := imported.Model
+		model.ID = strings.TrimSpace(model.ID)
+		model.UpstreamID = strings.TrimSpace(model.UpstreamID)
+		original, hasOriginal := originals[i], linked[i]
+		if !hasOriginal {
+			// No explicit original identity: the alias is the identity, unless another
+			// row explicitly claimed that same current row. In that case this row is a
+			// new row reusing the old alias: it gets no implicit policy, so a rename
+			// plus alias reuse (or an alias swap) cannot borrow the old rules.
+			if sameAlias, ok := byID[model.ID]; ok && !claimedIDs[model.ID] {
+				original, hasOriginal = sameAlias, true
+			}
+		}
+		carry := imported.CarryReasoningMapping
+		if carry != nil && *carry && !hasOriginal {
+			return nil, localFail(http.StatusBadRequest, "invalid_request", "carry_reasoning_mapping requires an original model identity")
+		}
+		if !hasOriginal {
+			models = append(models, model)
+			continue
+		}
+		sameUpstream := model.UpstreamID == strings.TrimSpace(original.UpstreamID)
+		if model.Reasoning == nil {
+			if sameUpstream {
+				model.Reasoning = cloneReasoningMapping(original.Reasoning)
+			} else if carry != nil && *carry {
+				// Replacing the upstream clears the policy by default. The explicit
+				// opt-in is the only way to carry it, whether the caller echoed the old
+				// table or omitted it.
+				model.Reasoning = cloneReasoningMapping(original.Reasoning)
+			}
+			models = append(models, model)
+			continue
+		}
+		// An explicit mapping normally wins. The one ambiguous case is the exact
+		// stored policy echoed back together with an upstream change: that must not
+		// be silently migrated or silently dropped. A different mapping clearly
+		// states a new policy; the same mapping needs the carry opt-in, while an
+		// explicit false clears it.
+		if !sameUpstream && sameReasoningMapping(model.Reasoning, original.Reasoning) {
+			switch {
+			case carry == nil:
+				return nil, localFail(http.StatusConflict, "reasoning_mapping_migration_conflict", "upstream changed while the old reasoning mapping was echoed back; send a new mapping, set carry_reasoning_mapping, or omit the mapping to clear it")
+			case *carry:
+				model.Reasoning = cloneReasoningMapping(original.Reasoning)
+			default:
+				model.Reasoning = nil
+			}
+		}
+		models = append(models, model)
+	}
+	return models, nil
 }
 
 // importModels validates and persists the submitted alias→upstream mapping.
@@ -335,48 +554,25 @@ func (s *Service) importModels(raw json.RawMessage) (any, error) {
 
 	cfg := s.config()
 	// The whole-list check rejects delete/add/rename/re-point in one comparison,
-	// before anything is built or persisted. Row tokens then protect same-alias
-	// callers that have not adopted the whole-list field yet.
-	if err := checkModelsRevision(cfg.Models, in.ExpectedModelsRevision); err != nil {
+	// before anything is built or persisted. Without that token the legacy
+	// row-token path below keeps ff3c2c0's strict identity check.
+	hasWholeTableToken, err := checkModelsRevision(cfg.Models, in.ExpectedModelsRevision)
+	if err != nil {
 		return nil, err
 	}
-	if err := checkModelImportRevisions(cfg.Models, in.Models); err != nil {
+	if err := validateImportMetadata(hasWholeTableToken, in.Models); err != nil {
 		return nil, err
 	}
-	previous := cfg.Models
-	// Canonicalize the incoming alias/upstream IDs before matching, so a
-	// whitespace-only edit cannot make the keep-existing-policy lookup miss and
-	// silently drop a saved rule table. validate() would trim them later, but by
-	// then the policy had already been decided. Assigning the embedded Model as a
-	// whole also preserves any optional field a future row shape adds.
-	cfg.Models = make([]Model, 0, len(in.Models))
-	for _, imported := range in.Models {
-		model := imported.Model
-		model.ID = strings.TrimSpace(model.ID)
-		model.UpstreamID = strings.TrimSpace(model.UpstreamID)
-		cfg.Models = append(cfg.Models, model)
+	var models []Model
+	if hasWholeTableToken {
+		models, err = buildWholeTableImportedModels(cfg.Models, in.Models)
+	} else {
+		models, err = buildLegacyImportedModels(cfg.Models, in.Models)
 	}
-	// An incoming list that omits the policy keeps the stored one. The upstream ID
-	// has to match as well: a rule written for one upstream must not be silently
-	// applied to another model that happens to reuse the alias. A policy sent in
-	// the body always wins, except when it is the exact stored policy echoed back
-	// together with an upstream change: that is an implicit migration of an old
-	// rule table, not a new-policy intent, so the echoed policy is dropped and the
-	// operator can author a new table deliberately.
-	for i := range cfg.Models {
-		if cfg.Models[i].Reasoning != nil {
-			if previousModel, linked := previousModelForImport(previous, in.Models[i], cfg.Models[i].ID); linked &&
-				cfg.Models[i].UpstreamID != strings.TrimSpace(previousModel.UpstreamID) &&
-				sameReasoningMapping(cfg.Models[i].Reasoning, previousModel.Reasoning) {
-				cfg.Models[i].Reasoning = nil
-			}
-			continue
-		}
-		previousModel, linked := previousModelForImport(previous, in.Models[i], cfg.Models[i].ID)
-		if linked && cfg.Models[i].UpstreamID == strings.TrimSpace(previousModel.UpstreamID) {
-			cfg.Models[i].Reasoning = cloneReasoningMapping(previousModel.Reasoning)
-		}
+	if err != nil {
+		return nil, err
 	}
+	cfg.Models = models
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}

@@ -219,11 +219,12 @@ func TestImportModelsWholeTableRevisionBlocksStaleDeleteAndAdd(t *testing.T) {
 	}
 }
 
-// A whole-list token validates the list, not the row identity, so a normal alias
-// rename is allowed. The per-row reasoning_revision is accepted but must not
-// mis-reject the new alias.
+// A whole-list token plus an explicit original identity lets a normal alias
+// rename keep the original row (and its policy when the upstream is unchanged).
+// Without the explicit original identity a rename is a new row: the old row
+// token has no identity left to match.
 func TestImportModelsAliasRenameWithCurrentModelsRevision(t *testing.T) {
-	t.Run("explicit mapping", func(t *testing.T) {
+	t.Run("explicit original keeps policy", func(t *testing.T) {
 		s, host := newTestService(t)
 		seedModels(t, s, host)
 		saveReasoningTarget(t, s, "high")
@@ -231,6 +232,9 @@ func TestImportModelsAliasRenameWithCurrentModelsRevision(t *testing.T) {
 
 		renamed := cloneModelRow(t, rows[0])
 		renamed["id"] = "renamed-large"
+		renamed["original_id"] = "od-large"
+		renamed["original_upstream_id"] = "opendesign-large"
+		delete(renamed, "reasoning_mapping")
 		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
 			"models": []any{renamed}, "expected_models_revision": revision,
 		})
@@ -242,11 +246,33 @@ func TestImportModelsAliasRenameWithCurrentModelsRevision(t *testing.T) {
 			t.Fatalf("rename did not apply: %+v", models)
 		}
 		if mapping := s.reasoningMappingFor("renamed-large"); mapping == nil || mapping.Rules[0].To != "high" {
-			t.Fatalf("rename dropped the explicit mapping: %+v", mapping)
+			t.Fatalf("rename lost the original policy: %+v", mapping)
 		}
 	})
 
-	t.Run("linked by row token", func(t *testing.T) {
+	t.Run("explicit mapping is honored", func(t *testing.T) {
+		s, host := newTestService(t)
+		seedModels(t, s, host)
+		saveReasoningTarget(t, s, "high")
+		revision, rows := fetchModels(t, s)
+
+		renamed := cloneModelRow(t, rows[0])
+		renamed["id"] = "renamed-large"
+		renamed["original_id"] = "od-large"
+		renamed["original_upstream_id"] = "opendesign-large"
+		renamed["reasoning_mapping"] = map[string]any{"enabled": true, "rules": []map[string]string{{"from": "medium", "to": "low"}}}
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{renamed}, "expected_models_revision": revision,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("rename status = %d, want 200: %s", status, raw)
+		}
+		if mapping := s.reasoningMappingFor("renamed-large"); mapping == nil || mapping.Rules[0].To != "low" {
+			t.Fatalf("explicit mapping was not saved on the renamed row: %+v", mapping)
+		}
+	})
+
+	t.Run("row token without original treats rename as a new row", func(t *testing.T) {
 		s, host := newTestService(t)
 		seedModels(t, s, host)
 		saveReasoningTarget(t, s, "high")
@@ -259,19 +285,62 @@ func TestImportModelsAliasRenameWithCurrentModelsRevision(t *testing.T) {
 			"models": []any{renamed}, "expected_models_revision": revision,
 		})
 		if status != http.StatusOK {
-			t.Fatalf("rename status = %d, want 200: %s", status, raw)
+			t.Fatalf("rename without original identity status = %d, want 200: %s", status, raw)
 		}
-		if mapping := s.reasoningMappingFor("renamed-large"); mapping == nil || mapping.Rules[0].To != "high" {
-			t.Fatalf("rename lost the policy linked by its row token: %+v", mapping)
+		if mapping := s.reasoningMappingFor("renamed-large"); mapping != nil {
+			t.Fatalf("a row token alone silently carried the policy across a rename: %+v", mapping)
+		}
+	})
+
+	t.Run("rename plus old alias reuse is a conflicting claim", func(t *testing.T) {
+		s, host := newTestService(t)
+		seedModels(t, s, host)
+		saveReasoningTarget(t, s, "high")
+		revision, rows := fetchModels(t, s)
+
+		renamed := cloneModelRow(t, rows[0])
+		renamed["id"] = "renamed-large"
+		renamed["original_id"] = "od-large"
+		renamed["original_upstream_id"] = "opendesign-large"
+		delete(renamed, "reasoning_mapping")
+		reused := map[string]any{"id": "od-large", "upstream_id": "opendesign-large"}
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{renamed, reused}, "expected_models_revision": revision,
+		})
+		if status != http.StatusConflict {
+			t.Fatalf("rename plus alias reuse status = %d, want 409: %s", status, raw)
+		}
+		models := s.config().Models
+		if len(models) != 1 || models[0].ID != "od-large" || models[0].Reasoning == nil || models[0].Reasoning.Rules[0].To != "high" {
+			t.Fatalf("conflicting claim changed the current row: %+v", models)
+		}
+	})
+
+	t.Run("current frontend shape can rename as a new row", func(t *testing.T) {
+		s, host := newTestService(t)
+		seedModels(t, s, host)
+		saveReasoningTarget(t, s, "high")
+		revision, _ := fetchModels(t, s)
+
+		// The current frontend sends id/upstream and the whole-list token only.
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models":                   []map[string]string{{"id": "renamed-large", "upstream_id": "opendesign-large"}},
+			"expected_models_revision": revision,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("frontend rename status = %d, want 200: %s", status, raw)
+		}
+		if mapping := s.reasoningMappingFor("renamed-large"); mapping != nil {
+			t.Fatalf("a rename without an original identity silently carried a policy: %+v", mapping)
 		}
 	})
 }
 
-// Changing a row's upstream must not silently migrate the exact stored policy
-// that was echoed back from GET /models. A different policy in the body is an
-// explicit new intent and is kept.
-func TestImportModelsUpstreamChangeDoesNotMigrateEchoedMapping(t *testing.T) {
-	t.Run("echoed policy is dropped", func(t *testing.T) {
+// Changing a row's upstream while echoing back the exact stored policy is
+// ambiguous: the backend must neither silently migrate it nor silently drop it.
+// The caller has to state the intent explicitly.
+func TestImportModelsUpstreamChangeRequiresExplicitPolicyIntent(t *testing.T) {
+	t.Run("echoed policy without opt-in is rejected", func(t *testing.T) {
 		s, host := newTestService(t)
 		seedModels(t, s, host)
 		saveReasoningTarget(t, s, "high")
@@ -282,12 +351,103 @@ func TestImportModelsUpstreamChangeDoesNotMigrateEchoedMapping(t *testing.T) {
 		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
 			"models": []any{switched}, "expected_models_revision": revision,
 		})
+		if status != http.StatusConflict {
+			t.Fatalf("ambiguous upstream switch status = %d, want 409: %s", status, raw)
+		}
+		models := s.config().Models
+		if len(models) != 1 || models[0].UpstreamID != "opendesign-large" || models[0].Reasoning == nil || models[0].Reasoning.Rules[0].To != "high" {
+			t.Fatalf("rejected switch changed the current row: %+v", models)
+		}
+	})
+
+	t.Run("explicit delete clears the policy", func(t *testing.T) {
+		s, host := newTestService(t)
+		seedModels(t, s, host)
+		saveReasoningTarget(t, s, "high")
+		revision, rows := fetchModels(t, s)
+
+		switched := cloneModelRow(t, rows[0])
+		switched["upstream_id"] = "opendesign-large-v2"
+		delete(switched, "reasoning_mapping")
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{switched}, "expected_models_revision": revision,
+		})
 		if status != http.StatusOK {
 			t.Fatalf("upstream switch status = %d, want 200: %s", status, raw)
 		}
 		models := s.config().Models
 		if len(models) != 1 || models[0].UpstreamID != "opendesign-large-v2" || models[0].Reasoning != nil {
-			t.Fatalf("echoed old policy migrated to the new upstream: %+v", models)
+			t.Fatalf("upstream switch kept the old policy: %+v", models)
+		}
+	})
+
+	t.Run("explicit opt-out clears the ambiguous policy", func(t *testing.T) {
+		s, host := newTestService(t)
+		seedModels(t, s, host)
+		saveReasoningTarget(t, s, "high")
+		revision, rows := fetchModels(t, s)
+
+		switched := cloneModelRow(t, rows[0])
+		switched["upstream_id"] = "opendesign-large-v2"
+		switched["original_id"] = "od-large"
+		switched["original_upstream_id"] = "opendesign-large"
+		switched["carry_reasoning_mapping"] = false
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{switched}, "expected_models_revision": revision,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("explicit opt-out status = %d, want 200: %s", status, raw)
+		}
+		models := s.config().Models
+		if len(models) != 1 || models[0].UpstreamID != "opendesign-large-v2" || models[0].Reasoning != nil {
+			t.Fatalf("explicit opt-out kept the old policy: %+v", models)
+		}
+	})
+
+	t.Run("explicit carry opt-in migrates", func(t *testing.T) {
+		s, host := newTestService(t)
+		seedModels(t, s, host)
+		saveReasoningTarget(t, s, "high")
+		revision, rows := fetchModels(t, s)
+
+		switched := cloneModelRow(t, rows[0])
+		switched["upstream_id"] = "opendesign-large-v2"
+		switched["original_id"] = "od-large"
+		switched["original_upstream_id"] = "opendesign-large"
+		switched["carry_reasoning_mapping"] = true
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{switched}, "expected_models_revision": revision,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("explicit carry status = %d, want 200: %s", status, raw)
+		}
+		models := s.config().Models
+		if len(models) != 1 || models[0].UpstreamID != "opendesign-large-v2" || models[0].Reasoning == nil || models[0].Reasoning.Rules[0].To != "high" {
+			t.Fatalf("explicit carry did not keep the policy: %+v", models)
+		}
+	})
+
+	t.Run("explicit carry opt-in works without echoing the mapping", func(t *testing.T) {
+		s, host := newTestService(t)
+		seedModels(t, s, host)
+		saveReasoningTarget(t, s, "high")
+		revision, rows := fetchModels(t, s)
+
+		switched := cloneModelRow(t, rows[0])
+		switched["upstream_id"] = "opendesign-large-v2"
+		switched["original_id"] = "od-large"
+		switched["original_upstream_id"] = "opendesign-large"
+		switched["carry_reasoning_mapping"] = true
+		delete(switched, "reasoning_mapping")
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{switched}, "expected_models_revision": revision,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("explicit carry without echo status = %d, want 200: %s", status, raw)
+		}
+		models := s.config().Models
+		if len(models) != 1 || models[0].UpstreamID != "opendesign-large-v2" || models[0].Reasoning == nil || models[0].Reasoning.Rules[0].To != "high" {
+			t.Fatalf("explicit carry without echo did not keep the policy: %+v", models)
 		}
 	})
 
@@ -312,7 +472,24 @@ func TestImportModelsUpstreamChangeDoesNotMigrateEchoedMapping(t *testing.T) {
 		}
 	})
 
-	t.Run("renamed row token prevents migration", func(t *testing.T) {
+	t.Run("padding and case cannot bypass the ambiguity check", func(t *testing.T) {
+		s, host := newTestService(t)
+		seedModels(t, s, host)
+		saveReasoningTarget(t, s, "high")
+		revision, rows := fetchModels(t, s)
+
+		switched := cloneModelRow(t, rows[0])
+		switched["upstream_id"] = "opendesign-large-v2"
+		switched["reasoning_mapping"] = map[string]any{"enabled": true, "rules": []map[string]string{{"from": " Medium ", "to": " HIGH "}}}
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{switched}, "expected_models_revision": revision,
+		})
+		if status != http.StatusConflict {
+			t.Fatalf("padded echoed mapping status = %d, want 409: %s", status, raw)
+		}
+	})
+
+	t.Run("renamed row with original identity and upstream change is ambiguous", func(t *testing.T) {
 		s, host := newTestService(t)
 		seedModels(t, s, host)
 		saveReasoningTarget(t, s, "high")
@@ -321,15 +498,35 @@ func TestImportModelsUpstreamChangeDoesNotMigrateEchoedMapping(t *testing.T) {
 		switched := cloneModelRow(t, rows[0])
 		switched["id"] = "renamed-large"
 		switched["upstream_id"] = "opendesign-large-v2"
+		switched["original_id"] = "od-large"
+		switched["original_upstream_id"] = "opendesign-large"
 		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
 			"models": []any{switched}, "expected_models_revision": revision,
 		})
-		if status != http.StatusOK {
-			t.Fatalf("rename with upstream switch status = %d, want 200: %s", status, raw)
+		if status != http.StatusConflict {
+			t.Fatalf("renamed ambiguous switch status = %d, want 409: %s", status, raw)
 		}
-		models := s.config().Models
-		if len(models) != 1 || models[0].ID != "renamed-large" || models[0].UpstreamID != "opendesign-large-v2" || models[0].Reasoning != nil {
-			t.Fatalf("renamed echoed policy migrated to the new upstream: %+v", models)
+	})
+
+	t.Run("renamed row with original identity can keep policy on same upstream", func(t *testing.T) {
+		s, host := newTestService(t)
+		seedModels(t, s, host)
+		saveReasoningTarget(t, s, "high")
+		revision, rows := fetchModels(t, s)
+
+		renamed := cloneModelRow(t, rows[0])
+		renamed["id"] = "renamed-large"
+		renamed["original_id"] = "od-large"
+		renamed["original_upstream_id"] = "opendesign-large"
+		delete(renamed, "reasoning_mapping")
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{renamed}, "expected_models_revision": revision,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("rename status = %d, want 200: %s", status, raw)
+		}
+		if mapping := s.reasoningMappingFor("renamed-large"); mapping == nil || mapping.Rules[0].To != "high" {
+			t.Fatalf("rename lost the original policy: %+v", mapping)
 		}
 	})
 }
@@ -367,6 +564,201 @@ func TestImportModelsRowsWithoutRevisionKeepLegacySemantics(t *testing.T) {
 	if mapping := s.reasoningMappingFor("od-large"); mapping == nil || mapping.Rules[0].To != "max" {
 		t.Fatalf("legacy draft mapping was not applied: %+v", mapping)
 	}
+}
+
+// Without a whole-list token, the ff3c2c0 row-token semantics stay strict: a
+// token for a deleted alias cannot resurrect it, and an explicit upstream change
+// with an explicit mapping keeps the legacy last-writer-wins behavior rather
+// than being reinterpreted by the new migration guard.
+func TestImportModelsLegacyRowTokenCannotResurrectDeletedAlias(t *testing.T) {
+	s, host := newTestService(t)
+	seedModels(t, s, host)
+	saveReasoningTarget(t, s, "high")
+	_, rows := fetchModels(t, s)
+	oldRow := cloneModelRow(t, rows[0])
+
+	if status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+		"models": []map[string]string{{"id": "od-small", "upstream_id": "opendesign-small"}},
+	}); status != http.StatusOK {
+		t.Fatalf("delete alias: %d %s", status, raw)
+	}
+
+	status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+		"models": []any{oldRow},
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("deleted alias with row token status = %d, want 409: %s", status, raw)
+	}
+	models := s.config().Models
+	if len(models) != 1 || models[0].ID != "od-small" {
+		t.Fatalf("legacy row token resurrected a deleted alias: %+v", models)
+	}
+
+	// The same old alias reused as a brand-new row without a token is a normal
+	// addition and must not inherit the deleted row's policy.
+	status, _, raw = managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+		"models": []map[string]string{
+			{"id": "od-small", "upstream_id": "opendesign-small"},
+			{"id": "od-large", "upstream_id": "opendesign-large"},
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("re-add alias without token: %d %s", status, raw)
+	}
+	if mapping := s.reasoningMappingFor("od-large"); mapping != nil {
+		t.Fatalf("reused alias inherited a deleted row's policy: %+v", mapping)
+	}
+
+	// A legacy row token for a renamed alias is still stale: without a whole-list
+	// snapshot there is no original identity to resolve it against.
+	saveReasoningTarget(t, s, "high")
+	_, rows = fetchModels(t, s)
+	renamed := cloneModelRow(t, rows[1])
+	renamed["id"] = "renamed-large"
+	status, _, raw = managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+		"models": []any{renamed},
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("legacy renamed row token status = %d, want 409: %s", status, raw)
+	}
+}
+
+func TestImportModelsLegacyExplicitMappingOnUpstreamChange(t *testing.T) {
+	s, host := newTestService(t)
+	seedModels(t, s, host)
+	saveReasoningTarget(t, s, "high")
+	_, rows := fetchModels(t, s)
+
+	// Legacy caller: an explicit mapping wins even when the upstream changes, and
+	// padding/case are normalized by validation rather than compared literally.
+	switched := cloneModelRow(t, rows[0])
+	switched["upstream_id"] = "opendesign-large-v2"
+	switched["reasoning_mapping"] = map[string]any{"enabled": true, "rules": []map[string]string{{"from": " Medium ", "to": " HIGH "}}}
+	status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+		"models": []any{switched},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("legacy explicit upstream change: %d %s", status, raw)
+	}
+	models := s.config().Models
+	if len(models) != 1 || models[0].UpstreamID != "opendesign-large-v2" || models[0].Reasoning == nil {
+		t.Fatalf("legacy explicit mapping was not kept: %+v", models)
+	}
+	if rules := models[0].Reasoning.Rules; len(rules) != 1 || rules[0].From != "medium" || rules[0].To != "high" {
+		t.Fatalf("legacy mapping was not normalized: %+v", rules)
+	}
+}
+
+// Explicit original identities are only valid against the snapshot a whole-list
+// token names. A mismatched, partial, duplicated, or conflicting claim is
+// rejected instead of guessing which row owns the policy.
+func TestImportModelsOriginalIdentityValidation(t *testing.T) {
+	seed := func(t *testing.T) (*Service, *fakeHost, string, map[string]any) {
+		t.Helper()
+		s, host := newTestService(t)
+		addCredential(t, s, host, "primary", "sk-original-identity")
+		if status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []map[string]string{
+				{"id": "od-large", "upstream_id": "opendesign-large"},
+				{"id": "od-small", "upstream_id": "opendesign-small"},
+			},
+		}); status != http.StatusOK {
+			t.Fatalf("seed models: %d %s", status, raw)
+		}
+		revision, rows := fetchModels(t, s)
+		return s, host, revision, cloneModelRow(t, rows[0])
+	}
+
+	t.Run("original identity requires whole-list token", func(t *testing.T) {
+		s, _, _, row := seed(t)
+		row["original_id"] = "od-large"
+		row["original_upstream_id"] = "opendesign-large"
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{"models": []any{row}})
+		if status != http.StatusBadRequest {
+			t.Fatalf("original identity without token status = %d, want 400: %s", status, raw)
+		}
+	})
+
+	t.Run("partial original identity", func(t *testing.T) {
+		s, _, revision, row := seed(t)
+		row["original_id"] = "od-large"
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{row}, "expected_models_revision": revision,
+		})
+		if status != http.StatusBadRequest {
+			t.Fatalf("partial original identity status = %d, want 400: %s", status, raw)
+		}
+	})
+
+	t.Run("original identity must exist in the snapshot", func(t *testing.T) {
+		s, _, revision, row := seed(t)
+		row["id"] = "renamed-large"
+		row["original_id"] = "missing"
+		row["original_upstream_id"] = "opendesign-large"
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{row}, "expected_models_revision": revision,
+		})
+		if status != http.StatusConflict {
+			t.Fatalf("unknown original identity status = %d, want 409: %s", status, raw)
+		}
+	})
+
+	t.Run("original upstream must match", func(t *testing.T) {
+		s, _, revision, row := seed(t)
+		row["id"] = "renamed-large"
+		row["original_id"] = "od-large"
+		row["original_upstream_id"] = "opendesign-other"
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{row}, "expected_models_revision": revision,
+		})
+		if status != http.StatusConflict {
+			t.Fatalf("mismatched original upstream status = %d, want 409: %s", status, raw)
+		}
+	})
+
+	t.Run("two rows cannot claim the same original", func(t *testing.T) {
+		s, _, revision, row := seed(t)
+		first := cloneModelRow(t, row)
+		first["id"] = "renamed-a"
+		first["original_id"] = "od-large"
+		first["original_upstream_id"] = "opendesign-large"
+		second := cloneModelRow(t, row)
+		second["id"] = "renamed-b"
+		second["original_id"] = "od-large"
+		second["original_upstream_id"] = "opendesign-large"
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{first, second}, "expected_models_revision": revision,
+		})
+		if status != http.StatusConflict {
+			t.Fatalf("duplicate original claim status = %d, want 409: %s", status, raw)
+		}
+	})
+
+	t.Run("conflicting alias cannot shadow another original", func(t *testing.T) {
+		s, _, revision, row := seed(t)
+		renamed := cloneModelRow(t, row)
+		renamed["id"] = "renamed-large"
+		renamed["original_id"] = "od-large"
+		renamed["original_upstream_id"] = "opendesign-large"
+		conflict := map[string]any{"id": "od-large", "upstream_id": "opendesign-large"}
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{renamed, conflict}, "expected_models_revision": revision,
+		})
+		if status != http.StatusConflict {
+			t.Fatalf("conflicting alias status = %d, want 409: %s", status, raw)
+		}
+	})
+
+	t.Run("carry opt-in requires an original identity", func(t *testing.T) {
+		s, _, revision, row := seed(t)
+		row["carry_reasoning_mapping"] = true
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+			"models": []any{row}, "expected_models_revision": revision,
+		})
+		if status != http.StatusBadRequest {
+			t.Fatalf("carry without original identity status = %d, want 400: %s", status, raw)
+		}
+	})
 }
 
 // The whole-list compare runs under configMu. A list rendered before a
@@ -428,8 +820,8 @@ func TestStaleImportWaitsForConcurrentReasoningSave(t *testing.T) {
 
 // A caller that sends only the per-row reasoning_revision (the shape the first
 // optimistic-lock revision introduced) is still protected for a same-alias
-// policy change. The row token is ignored only for new or renamed aliases, where
-// it has no identity to compare against.
+// policy change. Without a whole-list token the strict identity check applies to
+// every non-empty row token.
 func TestImportModelsSameAliasRowTokenStillGuardsPolicy(t *testing.T) {
 	s, host := newTestService(t)
 	seedModels(t, s, host)
@@ -443,6 +835,32 @@ func TestImportModelsSameAliasRowTokenStillGuardsPolicy(t *testing.T) {
 	}
 	if mapping := s.reasoningMappingFor("od-large"); mapping == nil || mapping.Rules[0].To != "low" {
 		t.Fatalf("stale row token overwrote the newer policy: %+v", mapping)
+	}
+}
+
+// A valid whole-list token does not make a stale per-row token acceptable: a
+// caller that mixes a fresh list token with an old row snapshot is rejected and
+// no partial save occurs.
+func TestImportModelsWholeTableTokenStillRejectsStaleRowToken(t *testing.T) {
+	s, host := newTestService(t)
+	seedModels(t, s, host)
+	saveReasoningTarget(t, s, "high")
+	_, staleRows := fetchModels(t, s)
+
+	saveReasoningTarget(t, s, "low")
+	currentRevision, currentRows := fetchModels(t, s)
+	mixed := cloneModelRow(t, staleRows[0])
+	mixed["id"] = currentRows[0].(map[string]any)["id"]
+	mixed["upstream_id"] = currentRows[0].(map[string]any)["upstream_id"]
+
+	status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{
+		"models": []any{mixed}, "expected_models_revision": currentRevision,
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("mixed stale row token status = %d, want 409: %s", status, raw)
+	}
+	if mapping := s.reasoningMappingFor("od-large"); mapping == nil || mapping.Rules[0].To != "low" {
+		t.Fatalf("mixed stale row token overwrote the policy: %+v", mapping)
 	}
 }
 
