@@ -13,10 +13,10 @@
 | 人工停用保护 | 插件管理接口的启停路径有模拟测试；但 CPA 原生界面停用与插件投影的禁用无法可靠区分，到期恢复可能覆盖人工停用，**未通过**。`ManualDisabled=nil` 的保守回退另有本地修复，不能解决上述归因问题 |
 | 持久化 | 读—比对—原子替换，只改 `quota_block`／`quota_revision`／`disabled`，保留未知字段；写失败时先发布内存拦截再记 `quotaPauseSyncError`，后台任务重试 |
 | 执行路径 | `executor.execute`／`execute_stream`（含 SSE 事件）都调用 `observeQuotaBlock`；已暂停账户在 `selectedCredential` 本地返回 `429 [open-design:quota_block]`，配套 `continue` 规则允许换号，不产生新的宿主冷却归因 |
-| 恢复 | 后台 30 秒 ticker 与管理读路径只做本地到期与失败重试，不发额度请求；提前恢复的缓存新鲜度及失败回退边界尚在复核，不应作为可用保证 |
+| 恢复 | 开发分支已移除仅凭到期自动启用；后台目前只重试失败写入，可信的新鲜额度复查与自动恢复仍在实现，不能用于生产 |
 | 管理接口 | `GET /quota-pause`、`POST /quota-pause/resume`、`POST /quota-pause/recheck`；`GET /status`、`/credentials` 返回 `quota_paused`／`effective_disabled`／`quota_pause`（不含任何 Key 指纹） |
 | 配置 | `0.4.6` tag 的 `pause.enabled` 默认开启，不安全；后续开发分支改为缺省关闭，但显式开启仍不安全。`pause.max_seconds` 为 60–604800 秒，默认 86400 |
-| Go 用例 | `quota_pause_deadline_test.go`、`quota_pause_signal_test.go`、`quota_pause_identity_test.go`、`quota_pause_manual_test.go`、`quota_pause_persist_test.go`、`quota_pause_executor_test.go`，共 29 个用例；含「暂停期间人工停用／启用后到期清扫不得翻转人工选择」两条 |
+| Go 用例 | `quota_pause_deadline_test.go`、`quota_pause_signal_test.go`、`quota_pause_identity_test.go`、`quota_pause_manual_test.go`、`quota_pause_persist_test.go`、`quota_pause_executor_test.go`；覆盖到期不构成恢复证明及插件内人工启停后显式恢复等行为 |
 | Node 用例 | 额度徽标与人工开关分离、解除按钮不发 `/credentials`、重查未通过提示、暂停配置默认值与越界拒绝 |
 | 全仓 Go | `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 通过 |
 | ABI | `scripts/smoke-abi.py`（CGO `c-shared` 构建）PASS |

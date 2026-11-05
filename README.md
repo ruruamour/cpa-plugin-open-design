@@ -88,7 +88,7 @@ GitHub Release 使用 `open-design-v0.4.4`（`0.4.0` 的 tag 因 Windows 平台�
 - 信号很窄：仅 `error.code=insufficient_balance` 且状态为 `402`，或者同一机器码出现在 `2xx` 响应体/SSE 事件中且 `coding_plan_exhausted=true`。裸 `402`、文本 `payment required`、普通 `429`、普通 `insufficient_quota` 都不触发账户级暂停。
 - 当前尝试把 `quota_block`／`quota_revision` 写入凭据 auth 文件，并把有效停用状态返回给宿主。CPA 可能将该状态写回 `disabled`，导致原生人工停用与插件暂停无法区分；**现有恢复路径可能重新启用人工停用的账户**，须先重新设计和验证。
 - 截止时间只取结构化 `reset_at`／`Retry-After`，缺省 30 分钟，钳制 1 分钟～7 天，并受 `pause.max_seconds` 约束；迟到的重复错误只更新观察时间。
-- 到期恢复由后台任务与管理读路径的本地清扫完成，**不发起额度网络请求**；提前恢复只能通过 `POST /quota-pause/recheck`（新鲜 `funding_check=available` 才生效，多模型歧义时 409）或操作员确认的 `POST /quota-pause/resume`。
+- 到期本身不再解除暂停；按 ClinePass 的方式用新鲜官方额度检查实现自动复查仍在开发中。现有 `recheck` 的新鲜度边界尚待修复，不能用于生产；`resume` 是操作员显式解除，不验证余额。
 - 开发分支配置项：`pause.enabled`（未明确配置时默认关闭）、`pause.max_seconds`（60–604800，默认 86400）。已推送的 `0.4.6` tag 仍默认开启且不安全，不要使用。
 
 **宿主边界**：上游 `402/403` 的冷却由 CPA 控制，现有宿主为 30 分钟；本插件不主动清除宿主冷却，也不承诺暂停／恢复对该冷却无副作用。当前暂停实现对 CPA 原生人工停用的保护未通过复核，不能承诺安全恢复。

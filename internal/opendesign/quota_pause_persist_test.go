@@ -335,7 +335,7 @@ func TestObserveQuotaBlockUsesLatestManualState(t *testing.T) {
 	}
 }
 
-func TestQuotaBlockSweepExpiresOnlyDueBlocks(t *testing.T) {
+func TestQuotaBlockDeadlineAloneDoesNotProveRecovery(t *testing.T) {
 	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	quotaFixtureAuthFile(t, s, host, id, nil)
@@ -352,14 +352,14 @@ func TestQuotaBlockSweepExpiresOnlyDueBlocks(t *testing.T) {
 	now = now.Add(time.Hour)
 	setNow(now)
 	s.sweepQuotaBlocks(stop)
-	c, _ := liveCredential(s, id)
-	if c.quotaBlocked() {
-		t.Fatal("an expired block was not resumed by the sweep")
+	if c, _ := liveCredential(s, id); !c.quotaBlocked() {
+		t.Fatal("deadline alone incorrectly proved that quota had recovered")
 	}
-	// The sweep must be a no-op once the block is gone.
+	// Repeated local sweeps without a successful official check must not
+	// convert the timestamp into permission to enable the account.
 	s.sweepQuotaBlocks(stop)
-	if c, _ := liveCredential(s, id); c.quotaBlocked() {
-		t.Fatal("sweep resurrected a cleared block")
+	if c, _ := liveCredential(s, id); !c.quotaBlocked() {
+		t.Fatal("repeated sweep removed an unproven block")
 	}
 }
 

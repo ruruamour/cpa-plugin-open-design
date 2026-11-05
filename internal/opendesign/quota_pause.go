@@ -223,8 +223,8 @@ func (s *Service) quotaPauseTime() time.Time {
 	return clock()
 }
 
-// quotaPauseResponse lists current pauses without exposing any key material. It
-// performs only the local due-sweep; it never issues a quota HTTP request.
+// quotaPauseResponse lists current pauses without exposing key material. The
+// local sweep retries failed persistence; reading the list never proves recovery.
 func (s *Service) quotaPauseResponse() map[string]any {
 	// sweepQuotaBlocks takes credentialMu per candidate itself; taking it here
 	// as well would deadlock on the first due block.
@@ -364,9 +364,8 @@ func (s *Service) setQuotaPauseSyncError(id, revision string, failed bool) {
 	}
 }
 
-// startQuotaPauseWorker performs only local expiration and failed-file retries;
-// it never makes quota HTTP requests. In particular, opening the quota tab
-// remains a strictly serial walk, with no additional background sampling.
+// startQuotaPauseWorker currently performs failed-file retries only; expiration
+// does not enable a credential without a fresh, successful quota preflight.
 func (s *Service) startQuotaPauseWorker() {
 	s.mu.Lock()
 	if s.stopped || s.quotaPauseStarted {
@@ -399,24 +398,21 @@ func (s *Service) startQuotaPauseWorker() {
 	s.wakeQuotaPauseWorker()
 }
 
-// sweepQuotaBlocks snapshots candidates but checks the revision and deadline
-// again under credentialMu before changing anything. A late upstream error or a
-// manual edit can therefore invalidate a stale timer decision.
+// sweepQuotaBlocks retries failed persistence without treating a deadline as
+// proof of restored quota. ClinePass-style automatic recovery requires a fresh,
+// successful official preflight; that check is wired in separately.
 func (s *Service) sweepQuotaBlocks(stop <-chan struct{}) {
 	type candidate struct {
 		id, revision string
-		due          bool
 	}
-	now := s.quotaPauseTime()
 	s.mu.RLock()
 	var candidates []candidate
 	for id, c := range s.creds {
 		if s.revoked[id] || !c.quotaBlocked() {
 			continue
 		}
-		due := !c.QuotaBlock.RetryAt.After(now)
-		if due || s.quotaPauseErrors[id] != "" {
-			candidates = append(candidates, candidate{id: id, revision: c.QuotaRevision, due: due})
+		if s.quotaPauseErrors[id] != "" {
+			candidates = append(candidates, candidate{id: id, revision: c.QuotaRevision})
 		}
 	}
 	s.mu.RUnlock()
@@ -428,12 +424,7 @@ func (s *Service) sweepQuotaBlocks(stop <-chan struct{}) {
 		default:
 		}
 		s.credentialMu.Lock()
-		var err error
-		if item.due {
-			err = s.resumeQuotaBlockLocked(item.id, item.revision, true)
-		} else {
-			err = s.persistQuotaBlockLocked(item.id, item.revision)
-		}
+		err := s.persistQuotaBlockLocked(item.id, item.revision)
 		s.credentialMu.Unlock()
 		s.setQuotaPauseSyncError(item.id, item.revision, err != nil)
 	}

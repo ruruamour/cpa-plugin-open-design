@@ -234,9 +234,9 @@ func TestQuotaPauseConfigRouteRoundTrip(t *testing.T) {
 	}
 }
 
-// A pause must never resurrect an account the operator turned off while it was
-// paused: the deadline sweep has to keep the newest manual choice.
-func TestQuotaBlockDeadlineSweepKeepsManualDisableSetDuringPause(t *testing.T) {
+// A pause must never resurrect an account the operator turned off through the
+// plugin while it was paused, including after an explicit manual resume.
+func TestQuotaBlockManualResumeKeepsManualDisableSetDuringPause(t *testing.T) {
 	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	quotaFixtureAuthFile(t, s, host, id, nil)
@@ -254,24 +254,28 @@ func TestQuotaBlockDeadlineSweepKeepsManualDisableSetDuringPause(t *testing.T) {
 		t.Fatal("manual disable during a pause failed")
 	}
 	mirrorAuthFile(t, s, host, id)
-	// Reaching the deadline must clear only the pause.
+	// Expiry alone leaves the block in place. An explicit resume clears only
+	// the quota block and must preserve the plugin-owned manual choice.
 	now = now.Add(30 * time.Minute)
 	setNow(now)
 	s.sweepQuotaBlocks(make(chan struct{}))
-	c, _ := liveCredential(s, id)
-	if c.quotaBlocked() {
-		t.Fatal("the sweep did not clear the expired pause")
+	if c, _ := liveCredential(s, id); !c.quotaBlocked() || !c.Disabled {
+		t.Fatal("deadline sweep changed an unproven block or manual state")
 	}
-	if !c.Disabled {
-		t.Fatal("the sweep re-enabled an account the operator had disabled")
+	if status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil, map[string]any{"credential_id": id}); status != http.StatusOK {
+		t.Fatal("explicit quota resume failed")
+	}
+	c, _ := liveCredential(s, id)
+	if c.quotaBlocked() || !c.Disabled {
+		t.Fatal("explicit resume did not keep the plugin-owned manual disable")
 	}
 	// And the persisted file must agree with memory.
 	assertPersistedQuotaState(t, s, host, id, true, true)
 }
 
 // The opposite ordering: an account the operator re-enabled while paused must
-// stay enabled after the pause expires.
-func TestQuotaBlockDeadlineSweepKeepsManualEnableSetDuringPause(t *testing.T) {
+// stay enabled after an explicit resume clears the quota block.
+func TestQuotaBlockManualResumeKeepsManualEnableSetDuringPause(t *testing.T) {
 	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
 	quotaFixtureAuthFile(t, s, host, id, map[string]any{"disabled": true})
@@ -289,9 +293,15 @@ func TestQuotaBlockDeadlineSweepKeepsManualEnableSetDuringPause(t *testing.T) {
 	now = now.Add(30 * time.Minute)
 	setNow(now)
 	s.sweepQuotaBlocks(make(chan struct{}))
+	if c, _ := liveCredential(s, id); !c.quotaBlocked() || c.Disabled {
+		t.Fatal("deadline sweep changed an unproven block or manual state")
+	}
+	if status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil, map[string]any{"credential_id": id}); status != http.StatusOK {
+		t.Fatal("explicit quota resume failed")
+	}
 	c, _ := liveCredential(s, id)
 	if c.quotaBlocked() || c.Disabled {
-		t.Fatalf("sweep produced blocked:%t disabled:%t", c.quotaBlocked(), c.Disabled)
+		t.Fatalf("resume produced blocked:%t disabled:%t", c.quotaBlocked(), c.Disabled)
 	}
 	assertPersistedQuotaState(t, s, host, id, false, true)
 }

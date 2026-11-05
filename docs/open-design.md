@@ -54,7 +54,7 @@ OpenDesign 生产接口：
 | `GET /upstream-models` | 读取 OpenDesign `GET /models` 候选 |
 | `GET` / `POST /models` | 读取或保存模型映射 |
 | `POST /models/reasoning` | 保存单个模型的思考强度映射（完整替换） |
-| `GET /quota-pause` | 当前额度暂停列表（只读；顺带做一次到期清扫） |
+| `GET /quota-pause` | 当前额度暂停列表（只读；顺带重试失败的本地写入） |
 | `POST /quota-pause/resume` | 手动解除某个账户的额度暂停（只清插件标记） |
 | `POST /quota-pause/recheck` | 用一次官方模型预检证明额度恢复后提前解除暂停 |
 | `GET /quota?credential_id=<id>` | 共享钱包／套餐窗口缓存；`refresh=1` 手动查询 |
@@ -102,8 +102,8 @@ OpenDesign 生产接口：
 - 当前实现通过 `AuthData.Disabled` 向宿主投影有效禁用状态；CPA 可能将其写回文件。暂停期间通过 CPA 原生界面再次停用时，插件无法可靠区分宿主投影和人工选择，恢复时可能错误地重新启用账户。该问题尚待重新设计和宿主验证。
 - 触发信号很窄：`error.code=insufficient_balance` 且状态为 `402`，或者同一机器码出现在 `2xx` 响应体/SSE 事件中且 `error.details.coding_plan_exhausted=true`。裸 `402`、文本里的 `payment required`、普通 `429` 与普通 `insufficient_quota` 都不会触发账户级暂停。
 - 截止时间只取结构化的 `error.details.reset_at`（RFC3339，允许 `resets at ` 前缀）或 `Retry-After`；缺省 30 分钟，钳制在 1 分钟～7 天之间，并受配置的 `pause.max_seconds` 上限约束。迟到的重复错误只更新观察时间，不会把截止时间一次次往后推。
-- 到期恢复由后台任务（30 秒 ticker）与管理读路径的清扫完成；两者都只做本地到期与失败重试，**不发起任何额度网络请求**。额度标签页的自动查询仍然是串行的，不新增后台轮询。
-- 提前恢复有两条显式路径：`POST /quota-pause/recheck` 用一次官方模型级预检，只有在暂停被观察到之后又拿到 `funding_check=available` 才清除；`POST /quota-pause/resume` 由操作员确认后直接清除。多个模型都报告过耗尽时，单次预检不构成证明，会返回 409。
+- 到期本身不再解除暂停；后台任务和管理读取目前只重试失败写入。按 ClinePass 方式进行后台新鲜额度复查的逻辑仍在开发中，不能用于生产。
+- 现有 `POST /quota-pause/recheck` 使用模型级预检，但结果的新鲜度、身份与并发边界尚在修复；`POST /quota-pause/resume` 由操作员确认后直接清除，不验证余额。这两个开发中路径均不能作为生产保证。
 - 持久化失败时本地拦截立即生效（先发布内存状态再写盘），响应与列表里会带同步错误标记，后台任务持续重试。
 
 **宿主边界**：上游 `402/403` 的冷却由 CPA 控制，现有宿主为 30 分钟。本插件不主动清除宿主冷却，也不承诺暂停／恢复对该冷却无副作用。当前实现不能保证 CPA 原生人工停用不会被恢复路径覆盖，禁止部署。
