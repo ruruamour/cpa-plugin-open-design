@@ -2371,11 +2371,11 @@ test('system color changes update the theme label and resolved value without fet
 
 const errorRulesBody = (overrides = {}) => ({
   rules: [
-    { status: 400, match: ['[open-design:tier_limit_exceeded]'], action: 'continue-and-cooldown' },
-    { status: 429, match: ['[open-design:insufficient_quota]'], action: 'continue-and-cooldown' },
+    { status: 400, match: ['[upstream:tier_limit_exceeded]'], action: 'continue-and-cooldown' },
+    { status: 429, match: ['[upstream:insufficient_quota]'], action: 'continue-and-cooldown' },
   ],
   defaults: [
-    { status: 400, match: ['[open-design:tier_limit_exceeded]'], action: 'continue-and-cooldown' },
+    { status: 400, match: ['[upstream:tier_limit_exceeded]'], action: 'continue-and-cooldown' },
   ],
   sync: { total: 2, succeeded: 2, failed: [] },
   inherits_cpa: false,
@@ -2405,10 +2405,10 @@ function ruleCard(view, index) {
 
 test('error rule explanations map known markers and never produce markup', () => {
   const Core = fakePage().context.OpenDesignCore;
-  const known = Core.explainErrorRule({ status: 400, match: ['[open-design:tier_limit_exceeded]'], action: 'continue-and-cooldown' }, 0);
+  const known = Core.explainErrorRule({ status: 400, match: ['[upstream:tier_limit_exceeded]'], action: 'continue-and-cooldown' }, 0);
   assert.match(known.name, /账号并发上限/);
   assert.match(known.detail, /tier_limit_exceeded/);
-  const balance = Core.explainErrorRule({ status: 402, match: ['[open-design:insufficient_balance]'], action: 'continue-and-cooldown' }, 0);
+  const balance = Core.explainErrorRule({ status: 402, match: ['[upstream:insufficient_balance]'], action: 'continue-and-cooldown' }, 0);
   assert.match(balance.name, /额度耗尽或余额不足/);
   assert.match(balance.detail, /insufficient_balance/);
   const fallback = Core.explainErrorRule({ status: 503, match: ['some custom text'], action: 'stop' }, 2);
@@ -2428,8 +2428,8 @@ test('error rule payload keeps both condition kinds, drops blanks and omits empt
       status: 429,
       action: 'continue-and-cooldown',
       conditions: [
-        { type: 'contains', text: '  [open-design:rate_limit_exceeded]  ' },
-        { type: 'regex', text: '^\\[open-design:' },
+        { type: 'contains', text: '  [upstream:rate_limit_exceeded]  ' },
+        { type: 'regex', text: '^\\[upstream:' },
         { type: 'contains', text: '   ' },
       ],
     },
@@ -2440,8 +2440,8 @@ test('error rule payload keeps both condition kinds, drops blanks and omits empt
   assert.deepEqual(JSON.parse(JSON.stringify(payload[0])), {
     status: 429,
     action: 'continue-and-cooldown',
-    match: ['[open-design:rate_limit_exceeded]'],
-    'match-regexr': ['^\\[open-design:'],
+    match: ['[upstream:rate_limit_exceeded]'],
+    'match-regexr': ['^\\[upstream:'],
   });
   assert.deepEqual(JSON.parse(JSON.stringify(payload[1])), { status: 500, action: 'stop', match: ['boom'] });
   assert.ok(!('match-regexr' in payload[1]), 'an empty regex list is omitted, never null');
@@ -2500,7 +2500,7 @@ test('saving error rules sends the edited policy and renders the per-account syn
   await api.handlers.submitErrorRules();
   assert.equal(bodies.length, 1);
   assert.equal(bodies[0].rules[0].status, 401);
-  assert.deepEqual(bodies[0].rules[0].match, ['[open-design:tier_limit_exceeded]']);
+  assert.deepEqual(bodies[0].rules[0].match, ['[upstream:tier_limit_exceeded]']);
   const state = view.document.getElementById('errorRulesState');
   assert.match(state.textContent, /同步完成：1\/2 个账号/);
   assert.match(state.textContent, /备用账号/);
@@ -4225,10 +4225,10 @@ test('recheck posts the credential id and reports an unproven preflight', async 
   assert.match(view.document.getElementById('accountState').textContent, /重查未通过/);
 });
 
-test('额度自动暂停在旧配置或旧后端缺失该选项时默认关闭', async () => {
+test('额度自动暂停在旧配置或旧后端缺失该选项时默认开启', async () => {
   const core = fakePage().context.OpenDesignCore;
   const defaults = core.normalizeConfig({ logs: {}, upstream: { origin: 'https://x', fixed: true }, proxy: {}, routing: {} });
-  assert.equal(defaults.pause.enabled, false);
+  assert.equal(defaults.pause.enabled, true);
   assert.equal(defaults.pause.max_seconds, 86400);
   // Out-of-range values fall back instead of being sent back to the plugin.
   const clamped = core.normalizeConfig({ pause: { enabled: false, max_seconds: 1 } });
@@ -6411,4 +6411,31 @@ test('a legacy draft judged against a newly advertised revision still offers the
   assert.ok(adopt, 'the gate revision, not the empty draft revision, drives the per-row control');
   await adopt.emit('click');
   assert.equal(page.api.state.mappings.at(-1).original_id, 'od-ghost');
+});
+
+test('a legacy draft confirmed against a new revision judges the revision it will send', async () => {
+  const page = modelSavePage({ revision: '' });
+  await page.api.render.loadStatus();
+  // Alias-only rename keeps the row pinned, so the confirmed save carries the
+  // original identity and the backend preserves the policy.
+  const alias = page.view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'od-flash-fast';
+  await alias.emit('input');
+  assert.equal(page.api.state.modelsDraftRevision, '', 'the draft started before the token existed');
+
+  page.setModels(pinnedModels());
+  page.setRevision('list-rev-2');
+  await page.api.render.loadStatus();
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 0, 'the first click only arms the overwrite confirmation');
+
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 1);
+  assert.equal(page.posts[0].expected_models_revision, 'list-rev-2',
+    'the confirmed save sends the server revision, not the empty draft token');
+  assert.equal(page.posts[0].models[0].original_id, 'od-flash');
+  assert.ok(!page.confirmations.some(text => text.includes('不会沿用原来的思考强度映射')),
+    'a rename the backend can preserve must not warn that the policy is lost');
+  assert.ok(page.confirmations.some(text => /覆盖服务器/.test(text)));
+  assert.match(page.view.document.getElementById('modelState').textContent, /已保存 2 个模型映射/);
 });

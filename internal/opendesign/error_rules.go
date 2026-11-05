@@ -78,10 +78,41 @@ type errorRulesResponse struct {
 // upstreamErrorMarker is the stable, machine-shaped prefix the plugin puts in
 // front of every classified upstream failure. CPA matches request-scoped rules
 // against the plugin error message, so this is the contract between the two.
-const upstreamErrorMarker = "[open-design:"
+// The prefix deliberately names no upstream provider: this message reaches the
+// downstream client, which must not learn which provider backs the route.
+const upstreamErrorMarker = "[upstream:"
+
+// legacyUpstreamErrorMarker is the previous provider-named prefix. Policies
+// saved by older builds are rewritten on load so upgraded credentials keep
+// matching without an operator-triggered sync.
+const legacyUpstreamErrorMarker = "[open-design:"
 
 func upstreamErrorMarkerFor(kind string) string {
 	return upstreamErrorMarker + kind + "]"
+}
+
+// migrateLegacyErrorMarkers rewrites the retired provider-named prefix in a
+// persisted policy. It returns a copy; rule text is operator-owned, so the
+// rewrite is limited to the exact legacy prefix.
+func migrateLegacyErrorMarkers(rules []RequestErrorRule) ([]RequestErrorRule, bool) {
+	out := cloneErrorRules(rules)
+	changed := false
+	rewrite := func(value string) string {
+		if !strings.Contains(value, legacyUpstreamErrorMarker) {
+			return value
+		}
+		changed = true
+		return strings.ReplaceAll(value, legacyUpstreamErrorMarker, upstreamErrorMarker)
+	}
+	for i := range out {
+		for j := range out[i].Match {
+			out[i].Match[j] = rewrite(out[i].Match[j])
+		}
+		for j := range out[i].MatchRegexr {
+			out[i].MatchRegexr[j] = rewrite(out[i].MatchRegexr[j])
+		}
+	}
+	return out, changed
 }
 
 // defaultErrorRules is the built-in policy. Every entry keys off a marker this
@@ -276,6 +307,12 @@ func loadErrorRules(dataDir string) ([]RequestErrorRule, string) {
 	rules, decodeErr := decodeErrorRules(raw)
 	if decodeErr != nil {
 		return defaultErrorRules(), "error-rules.json is invalid; using the built-in defaults until it is saved again"
+	}
+	// An upgraded policy may still name the retired provider-named marker.
+	// Rewriting it in memory is enough: auth.parse reapplies the current policy
+	// to every credential, so host-side rules migrate on the same start.
+	if migrated, changed := migrateLegacyErrorMarkers(rules); changed {
+		return migrated, ""
 	}
 	return rules, ""
 }

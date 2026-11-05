@@ -103,3 +103,13 @@ python3 scripts/smoke-abi.py dist/open-design.so --cpa-live
 
 每个错误用例都在独立进程里跑，因此不存在「先跑 401 把凭据冷却掉、后面用例被宿主拦下」的串扰；报告里每条都带 `reached_upstream`，为 `false` 就说明该用例没测到真东西。
 
+## `--cpa-quota-snapshot` — 额度暂停的旧文件回放
+
+```bash
+python3 scripts/smoke-abi.py dist/open-design.so --cpa-quota-snapshot=/tmp/cpa-host-stock-quota-check
+```
+
+只跑隔离的 auth 文件有序回放，不启动常规 `--cpa-live` 流程。脚本把旧 `pre-pause` 快照和旧 `paused` 快照按顺序写进临时 auth-dir，断言暂停不会复活、解除修订不会丢失、重启后仍是未暂停。回放用临时 fixture auth-dir 的权限短暂门闩住修复写入，恢复权限后要求收敛；该模式不测试 CPA 原生并发写归属，不代表生产验收。
+
+`--cpa-snapshot-ungated` 改用不带权限门闩的原子替换（必须与 `--cpa-quota-snapshot` 同用）；如果插件的修复先于观察写入，结果可能不确定。两种模式都只用 `sk-amr-test-fixture`／`test-od-control-key-fixture-*`，只访问 `127.0.0.1` 假上游。
+

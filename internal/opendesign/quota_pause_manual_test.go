@@ -196,16 +196,23 @@ func TestManualResumeFileFailureRequiresOperatorRetry(t *testing.T) {
 }
 
 func TestQuotaPausePolicyToggleAndMaxWindow(t *testing.T) {
-	s, host := newTestService(t)
-	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
-	quotaFixtureAuthFile(t, s, host, id, nil)
-	source, _ := liveCredential(s, id)
-	// An older settings file lacks pause.enabled and must not silently start
-	// the experimental, not-yet-verified auto-pause on upgrade.
-	s.observeQuotaBlock(source, "fixture-model", &APIError{Status: 402, quotaExhausted: true})
-	if c, _ := liveCredential(s, id); c.quotaBlocked() {
-		t.Fatal("an unspecified pause policy activated an experimental pause")
+	newFixture := func(t *testing.T) (*Service, *fakeHost, string, Credential) {
+		t.Helper()
+		s, host := newTestService(t)
+		id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+		quotaFixtureAuthFile(t, s, host, id, nil)
+		source, _ := liveCredential(s, id)
+		return s, host, id, source
 	}
+	// An older settings file lacks pause.enabled; the reviewed default is on.
+	s, _, id, source := newFixture(t)
+	s.observeQuotaBlock(source, "fixture-model", &APIError{Status: 402, quotaExhausted: true})
+	if c, _ := liveCredential(s, id); !c.quotaBlocked() {
+		t.Fatal("the reviewed default did not start automatic pauses")
+	}
+
+	// An explicit off still disables new automatic pauses.
+	s, _, id, source = newFixture(t)
 	disabled := false
 	s.mu.Lock()
 	s.cfg.Pause = PauseConfig{Enabled: &disabled}
@@ -214,6 +221,9 @@ func TestQuotaPausePolicyToggleAndMaxWindow(t *testing.T) {
 	if c, _ := liveCredential(s, id); c.quotaBlocked() {
 		t.Fatal("the plugin-wide toggle did not disable automatic pauses")
 	}
+
+	// An explicit on restores them and carries the configured cap.
+	s, _, id, source = newFixture(t)
 	enabled := true
 	s.mu.Lock()
 	s.cfg.Pause = PauseConfig{Enabled: &enabled, MaxSeconds: 120}
@@ -248,8 +258,8 @@ func TestQuotaPauseConfigRouteRoundTrip(t *testing.T) {
 		t.Fatalf("default pause config = %#v", body["pause"])
 	}
 	wantSeconds := float64(s.config().pauseSettings().maxWindow / time.Second)
-	if pause["enabled"] != false || pause["max_seconds"] != wantSeconds {
-		t.Fatalf("default pause config must be disabled while safety is under review: %#v", body["pause"])
+	if pause["enabled"] != true || pause["max_seconds"] != wantSeconds {
+		t.Fatalf("the reviewed default must enable automatic pause: %#v", body["pause"])
 	}
 	// Unknown fields and out-of-range values are rejected, not clamped silently.
 	if status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/config", nil, map[string]any{"pause": map[string]any{"enabled": false, "extra": 1}}); status != http.StatusBadRequest {

@@ -165,7 +165,7 @@ func (s *Service) openStream(callbackID, method, url string, headers http.Header
 	s.mu.Unlock()
 	if stopped {
 		s.closeUpstream(out.StreamID)
-		return out, &APIError{Status: http.StatusServiceUnavailable, Kind: "plugin_unavailable", Message: upstreamErrorMarkerFor("plugin_unavailable") + " OpenDesign plugin is shutting down", upstreamAttempted: true, upstreamStatus: out.StatusCode}
+		return out, &APIError{Status: http.StatusServiceUnavailable, Kind: "plugin_unavailable", Message: upstreamErrorMarkerFor("plugin_unavailable") + " plugin is shutting down", upstreamAttempted: true, upstreamStatus: out.StatusCode}
 	}
 	return out, nil
 }

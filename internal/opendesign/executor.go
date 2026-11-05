@@ -96,7 +96,7 @@ func (s *Service) prepare(r ExecutorRequest) (map[string]any, string, modelSnaps
 		var ok bool
 		snapshot, ok = s.modelSnapshotFor(r.Model)
 		if !ok {
-			return nil, "", modelSnapshot{}, &APIError{Status: http.StatusBadRequest, Kind: "model_not_enabled", Message: "model is not enabled in the OpenDesign plugin"}
+			return nil, "", modelSnapshot{}, &APIError{Status: http.StatusBadRequest, Kind: "model_not_enabled", Message: "model is not enabled"}
 		}
 		upstream = snapshot.upstream
 	} else if !r.ReasoningPinned {

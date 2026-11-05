@@ -1672,7 +1672,7 @@ def run_retry_scheduling(request, origin, primary_id):
         result["cooled_account_skipped"] = True
 
         # An explicit stop rule must not rotate: the caller sees the failure.
-        stop_rules = [{"status": 400, "match": ["[open-design:tier_limit_exceeded]"],
+        stop_rules = [{"status": 400, "match": ["[upstream:tier_limit_exceeded]"],
                        "action": "stop"}]
         status, raw, _ = call(API + "/error-rules", {"rules": stop_rules}, method="PUT")
         require(status == 200, "stop policy rejected: %s %s" % (status, raw[:200]))
@@ -1686,7 +1686,7 @@ def run_retry_scheduling(request, origin, primary_id):
         require(status == 400, "a stop rule still rotated: %s %s" % (status, raw[:200]))
         require(len(stop_attempts) == 1, "a stop rule made %d attempts" % len(stop_attempts))
         result["stop_action_did_not_rotate"] = True
-        require("[open-design:tier_limit_exceeded]" in raw.decode(errors="replace"),
+        require("[upstream:tier_limit_exceeded]" in raw.decode(errors="replace"),
                 "the stop response lost the marker: %s" % raw[:200])
 
         # Restore the built-in policy and remove the extra account.
@@ -3349,7 +3349,7 @@ def run_management_v03(request, origin, credential_id, work=None):
     rules = call("/error-rules")
     require(rules["rules"] and rules["defaults"] == rules["rules"] and not rules["inherits_cpa"], rules)
     require(rules["sync"]["total"] >= 1 and not rules["sync"]["failed"], rules)
-    marker = "[open-design:tier_limit_exceeded]"
+    marker = "[upstream:tier_limit_exceeded]"
     require(any(rule["status"] == 400 and marker in rule.get("match", []) and
                 rule["action"] == "continue-and-cooldown" for rule in rules["rules"]),
             "the built-in policy lost the production tier limit rule")
@@ -3363,7 +3363,7 @@ def run_management_v03(request, origin, credential_id, work=None):
          method="PUT", expected=400)
     require(len(origin.requests) == before, "error-rule validation contacted upstream")
     custom = [{"status": 400, "match": [marker], "action": "continue-and-cooldown"},
-              {"status": 502, "match-regexr": ["^\\[open-design:upstream_"], "action": "stop"}]
+              {"status": 502, "match-regexr": ["^\\[upstream:upstream_"], "action": "stop"}]
     saved = call("/error-rules", {"rules": custom}, method="PUT")
     require(saved["rules"] == custom and saved["sync"]["succeeded"] == saved["sync"]["total"] and
             not saved["sync"]["failed"], saved)

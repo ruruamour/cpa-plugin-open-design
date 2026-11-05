@@ -208,7 +208,7 @@ func (s *Service) Handle(method string, raw json.RawMessage) (any, error) {
 	case "executor.count_tokens":
 		// Stock CPA treats a missing counter as availability-neutral. Returning
 		// 501 here would cool down a perfectly usable credential.
-		return nil, &APIError{Status: http.StatusNotFound, Kind: "count_tokens_unavailable", Message: "OpenDesign does not expose a token counting endpoint"}
+		return nil, &APIError{Status: http.StatusNotFound, Kind: "count_tokens_unavailable", Message: "upstream does not expose a token counting endpoint"}
 	case "executor.http_request":
 		return nil, fail(http.StatusBadRequest, "use the OpenDesign model executor")
 	case "management.register":
@@ -341,7 +341,7 @@ func (s *Service) begin() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopped {
-		return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
+		return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "plugin is shutting down")
 	}
 	s.active.Add(1)
 	s.activeN.Add(1)

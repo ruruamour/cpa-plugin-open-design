@@ -1,44 +1,45 @@
 # OpenDesign 插件验证记录
 
-## 0.4.6 开发检查（未通过安全复核，禁止部署）
+## 0.4.7 额度暂停验收（默认开启）
 
-`0.4.6` = `0.4.5` 的思考强度映射 + 三处修复（后端模型/规则快照一致性、控制台默认表与保存并发、深拷贝数据竞争）+ 额度耗尽自动暂停。`open-design-v0.4.5` 的 Release 因 macOS runner 被取消未产出资产，故 `0.4.5` 未单独发布。
+`0.4.7` = `0.4.5` 的思考强度映射 + 三处修复（后端模型/规则快照一致性、控制台默认表与保存并发、深拷贝数据竞争）+ 额度耗尽自动暂停（默认开启）。`open-design-v0.4.5` 的 Release 因 macOS runner 被取消未产出资产，故 `0.4.5` 未单独发布；`0.4.6` tag 的恢复路径不安全，禁止使用。
 
-当前实现尝试参照 ClinePass 的 QuotaBlock 记录额度暂停，但对 CPA 原生人工停用的保护存在缺陷，**不能把下面的单元测试结果理解为真实宿主验收通过**。
+插件参照 ClinePass 的 QuotaBlock 记录额度暂停，并保护插件控制台的人工停用选择。CPA 原生界面的重复停用仍无法可靠归因，是明确保留的限制；**不能把下面的隔离与单元测试结果理解为生产额度耗尽事件验收通过**。
 
 | 检查 | 结果与范围 |
 | --- | --- |
 | 信号 | `quotaPauseSignal` 只接受 `error.code=insufficient_balance` 且状态为 `402`，或同一机器码出现在 `2xx`（含 SSE）且 `error.details.coding_plan_exhausted=true` 的响应中；裸 `402`、文本 `payment required`、普通 `429`、普通 `insufficient_quota` 均不触发 |
 | 截止时间 | `quotaPauseDeadline`：缺省 30 分钟，钳制 1 分钟～7 天，受 `pause.max_seconds` 约束；`reset_at` 只取 RFC3339（允许 `resets at ` 前缀），`Retry-After` 支持秒数与 HTTP 日期，溢出按上限处理 |
-| 人工停用保护 | 插件管理接口的启停路径有模拟测试；但 CPA 原生界面停用与插件投影的禁用无法可靠区分，到期恢复可能覆盖人工停用，**未通过**。`ManualDisabled=nil` 的保守回退另有本地修复，不能解决上述归因问题 |
+| 人工停用保护 | 插件管理接口的启停路径已覆盖：暂停中停用、暂停中启用、显式解除三种顺序都保留人工选择，暂停中停用的账户恢复后仍为停用。CPA 原生界面停用与插件投影写同一个 `disabled` 字段，仍无法可靠归因，是已知限制；`ManualDisabled=nil` 的旧数据按保守方向回退为停用 |
 | 持久化 | 读取、比对并重读后原子替换，只改 `quota_block`／`quota_revision`／`disabled`，尽量保留未知字段；插件进程内串行，跨进程没有 CAS，最后一次读取与替换之间的宿主或运维写入仍可能被覆盖。写失败时先发布内存拦截再记同步错误，后台任务重试 |
-| 执行路径 | `executor.execute`／`execute_stream`（含 SSE 事件）都调用 `observeQuotaBlock`；已暂停账户在 `selectedCredential` 本地返回 `429 [open-design:quota_block]`，配套 `continue` 规则允许换号，不产生新的宿主冷却归因 |
+| 执行路径 | `executor.execute`／`execute_stream`（含 SSE 事件）都调用 `observeQuotaBlock`；已暂停账户在 `selectedCredential` 本地返回 `429 [upstream:quota_block]`，配套 `continue` 规则允许换号，不产生新的宿主冷却归因 |
 | 恢复 | 开发分支的到期不再直接启用：后台按账号与模型串行请求官方预检，只有全部已知耗尽模型在最新观察之后取得新鲜 `available`、Workspace 成员一致、同一推理密钥无在途、凭据／修订未变时才解除；失败、未授权、缓存或模型集合不完整均保留暂停。复查总时长受预算限制，提交在 `authFileMu` 下复核磁盘身份与证据新鲜度 |
 | 管理接口 | `GET /quota-pause`、`POST /quota-pause/resume`、`POST /quota-pause/recheck`；`GET /status`、`/credentials` 返回 `quota_paused`／`effective_disabled`／`quota_pause`（不含任何 Key 指纹） |
-| 配置 | `0.4.6` tag 的 `pause.enabled` 默认开启，不安全；后续开发分支改为缺省关闭，但显式开启仍不安全。`pause.max_seconds` 为 60–604800 秒，默认 86400 |
+| 配置 | `pause.enabled` 未明确配置时默认开启（对齐 ClinePassBridge），可显式持久化 `false` 关闭；`pause.max_seconds` 为 60–604800 秒，默认 86400 |
 | Go 用例 | `quota_pause_deadline_test.go`、`quota_pause_signal_test.go`、`quota_pause_identity_test.go`、`quota_pause_manual_test.go`、`quota_pause_persist_test.go`、`quota_pause_executor_test.go`、`quota_stale_disk_test.go`、`quota_revision_sync_test.go`、`quota_recovery_commit_test.go`；覆盖到期不构成恢复证明、旧文件回放、修订/disabled 保护及插件内人工启停后显式恢复等行为 |
-| Node 用例 | 额度徽标与人工开关分离、解除按钮不发 `/credentials`、重查未通过提示、暂停配置默认值与越界拒绝；全量 `node --test tests/*.test.cjs` 323/323 通过 |
+| Node 用例 | 额度徽标与人工开关分离、解除按钮不发 `/credentials`、重查未通过提示、暂停配置默认值与越界拒绝、旧草稿按实际发送的整表修订判定；全量 `node --test tests/*.test.cjs` 324/324 通过 |
 | 真实宿主恢复 | `scripts/smoke-abi.py --cpa-live` 新增隔离场景：结构化 402 建立暂停、重启后仍保留、官方预检失败保持暂停、官方新鲜 `available` 后清除插件暂停且插件控制台人工停用保持。针对 `bb3a452` 构建（Linux so SHA-256 `85ed994c7d9e63a9c031abe25fe63fd83fb819499bafe2523b17f49d0582b434`），原版 v8.0.29 隔离构建与本地 `8.0.51` 测试构建均 PASS；原版构建 `--version` 自述 `dev`，不能从二进制自证版本。两种宿主均连接隔离假上游，不代表生产验收。 |
 | 磁盘合并缺陷与修复 | 独立复审指出陈旧写回可能丢掉人工停用或导致暂停复活；此前修复又引入相同暂停 body 被误报同步失败、修复后 stale 标记不清、无修订号时错误压制磁盘暂停。`bb3a452` 已补用例与修复。后续独立复审又复现旧无 revision body 抹掉解除修订、stale 标记卡住，以及带 revision 的旧 clear body 覆盖人工停用等同类问题；`2599cff`（合入 `5f7fcfb`）与 `d523df7` 已修复：live 解除后任何旧 body 都不能抹掉 revision／disabled，旧 paused body（即使复制了清除 revision）不复活暂停，异 key／无效 block 不采纳也不留永久标记；显式解除不再因同 key 旧 block 或 cleared body 的 revision 冲突被永久拒绝。先红后绿证据见下一行。 |
 | 解除修订修复的先红后绿 | 两个原始 P1 用例在 `16de415` 上按业务断言失败（`unversioned body erased the cleared revision`、`marker lost its cleared revision`），在 `2599cff` 上通过；带 revision 旧 clear、同 revision paused body、异 key block 卡标记、显式解除被旧修订拒绝等用例在纯 `2599cff` 上失败，在 `d523df7` 上通过。修复后 `go vet`、全量 Go、`go test -race ./...`、额度用例 `-count=200`（另在 4×40 并行批次）通过。 |
-| 最终构建与旧文件回放 | 合并 HEAD `1f47895` 的 Linux so SHA-256 `98fdbf7773b441b8373ee8e19b9537256834ad00b9f61a6ee502fc5b0c11a209`，Version 0.4.6。`--cpa-quota-snapshot` 在两套隔离宿主均 PASS：旧 pre-pause 快照回放后无 block 且保留 revision，旧 paused 快照回放最终收敛为未暂停，重启后仍未暂停。完整 `--cpa-live` 两套宿主均 PASS，含 quota recovery／concurrent／manual disable／snapshot replay。此前一次构建的首轮 stock `ui_flow` 曾在 disable→enable 的 30 秒模型刷新窗口内失败，同构建重试即 PASS，归因于宿主 reload 时序；最终构建首轮即全过。该回放带人工 I/O 门闩，不测试原生并发写归属，不代表生产验收。 |
-| 已知残余窗口 | `quotaDiskStale` 只在进程内存中：宿主把旧 paused body 覆盖已清除文件、且 watcher 未运行就重启时，新实例只能信磁盘，可能采纳该暂停。插件只在单进程内串行文件写入，跨进程没有 CAS；共享 auth-dir 的多实例不在支持模型内。 |
+| 最终构建与旧文件回放 | 0.4.7 最终构建的 Linux so SHA-256 `a59aafd021308f4d7264a407dd357439e2f83e4310cb4b543b9d9e8822a173a7`，Version 0.4.7，默认开启额度暂停。`--cpa-quota-snapshot` 在两套隔离宿主均 PASS：旧 pre-pause 快照回放后无 block 且保留 revision，旧 paused 快照回放最终收敛为未暂停，重启后仍未暂停。完整 `--cpa-live` 两套宿主均 PASS，含 quota recovery／concurrent／manual disable／snapshot replay。该回放带人工 I/O 门闩，不测试原生并发写归属，不代表生产验收。 |
+| 下游报错脱敏 | 下游客户端看到的插件错误不再包含上游提供方名称：分类 marker 由 `[open-design:<kind>]` 改为 `[upstream:<kind>]`，额度暂停 marker 为 `[upstream:quota_block]`；`plugin is shutting down`、`upstream credential …` 等客户端可见文案同步去掉提供方名称。旧 `error-rules.json` 的旧前缀在加载时迁移，`auth.parse` 会把迁移后的策略重新写回每个凭据文件，因此升级后无需手工 `sync`。`TestErrorRulesLegacyMarkerMigratesOnLoadAndParse` 覆盖。 |
+| 已知残余窗口 | `quotaDiskStale` 只在进程内存中：宿主把旧 paused body 覆盖已清除文件、且 watcher 未运行就重启时，新实例只能信磁盘，可能采纳该暂停。插件只在单进程内串行文件写入，跨进程没有 CAS；共享 auth-dir 的多实例不在支持模型内。另有一条尚未用真实宿主复现的竞争：后台整凭据保存（模型刷新、规则同步）跨过 `host.auth.save` 调用时，watcher 的 `auth.parse` 可能发布更新的暂停/停用状态，随后保存以快照回写；正常暂停、恢复与手动启停均不经过该路径。 |
 | 真实宿主并发暂停（新增） | `host_quota_concurrent`：同一推理 key 两个别名指向两个上游模型，假上游挂住慢请求（`glm-5.3-flash`）、让快请求（`deepseek-v4.1-flash`）先回结构化 402。在途窗口内官方 `funding-check` 对两个模型都回 `available`，但 `POST /quota-pause/recheck` 仍 409（`在途`）且零次官方查询、暂停保留；放行慢请求后迟到 402 必须合并出 `model_ids=[deepseek-v4.1-flash, glm-5.3-flash]` 与 `multiple_models=true`；随后一模型 `available`、另一 `insufficient` 的混合答案仍 409 并保持暂停（两模型都被查过），只有两模型都新鲜 `available` 才 200 解除并清空磁盘 block。证据等待 `quotaRecoveryProven` 的 5 秒边界，不为测试放宽插件规则。插入在途请求靠假上游按上游模型名挂住 handler，不修改宿主或插件 Go 代码；对 `bb3a452` 构建，在两个隔离宿主（`/tmp/cpa-host-stock-quota-check`、`/tmp/cpa-v8051-test-build`）运行完整 `--cpa-live` 均 PASS。假上游结果不代表生产验收 |
 | 真实宿主恢复缺陷与修复 | `--cpa-live` 曾稳定卡在「官方已 `available` 但复查判为未证明」。定位到两处：复查读取复用 60 秒模型级缓存/节流窗口，或加入控制台已发起的查询，拿到的是复查开始前发出的证据；策略比较用 `*bool` 指针身份，宿主重注册用新解码配置重跑 `configure` 使每轮自动复查被判成策略变化。改为复查强制新发请求（在途则先等其结束）并比较 `pauseSettings()` 有效值后，原版与本地 hotfix 构建的 `host_quota_recovery` 均 PASS。回归用例：`TestQuotaRecoveryRejectsCachedEvidence`、`TestQuotaRecoveryProofDoesNotJoinOlderRefresh`、`quota_recheck_policy_generation_test.go` |
 | 全仓 Go | `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 通过 |
 | ABI | `scripts/smoke-abi.py`（CGO `c-shared` 构建）PASS |
 
-**真实上游样例与验收边界**：用户报告两个账号周额度耗尽；2026-11-05 从生产相关会话和上游请求获得了结构化 `402` 样例，其中包含 `insufficient_balance`、`coding_plan_exhausted=true` 和约三天后的 `reset_at`。脱敏报文形态已加入 `TestQuotaPauseSignalMatchesObservedCodingPlanExhaustion`。默认 `pause.max_seconds` 为一天，会将首次到期提示钳制在一天；届时还须启用策略并满足复查条件才会查询，不保证等待到上游的三天重置时间。这只验证了真实错误形态，**新版本的生产暂停、自动恢复及换号行为仍未验收**；相关真实宿主测试均使用隔离 fixture。
+**真实上游样例与验收边界**：用户报告两个账号周额度耗尽；2026-11-05 从生产相关会话和上游请求获得了结构化 `402` 样例，其中包含 `insufficient_balance`、`coding_plan_exhausted=true` 和约三天后的 `reset_at`。脱敏报文形态已加入 `TestQuotaPauseSignalMatchesObservedCodingPlanExhaustion`。默认 `pause.max_seconds` 为一天，会将首次到期提示钳制在一天；届时还须满足复查条件才会查询，不保证等待到上游的三天重置时间。这只验证了真实错误形态，**生产环境的暂停、自动恢复及换号行为仍需上线后观察**；相关真实宿主测试均使用隔离 fixture。
 
-人工停用保护仍未通过全部入口及并发文件回写的真实宿主复核：当前实现返回有效 `Disabled` 给宿主，宿主可能写回文件，不能区分部分原生人工停用；隔离真实宿主的特定场景验证过插件控制台人工停用在自动恢复后保留，但不包括所有文件回写及 CPA 原生入口。上游 `402/403` 的冷却由宿主控制，现有宿主为 30 分钟；本插件不主动清除宿主冷却，暂停／恢复对该冷却的副作用仍需宿主实测。`0.4.6` 的 Release 运行 `41906585863` 因 macOS arm64 作业取消而失败，未生成 Release，未部署。
+已知限制：插件返回有效 `Disabled` 给宿主，宿主可能写回文件；CPA 原生界面对暂停中账户的再次停用与插件投影不可区分。隔离真实宿主验证过插件控制台人工停用在自动恢复后保留，但不包括 CPA 原生入口。上游 `402/403` 的冷却由宿主控制，现有宿主为 30 分钟；本插件不主动清除宿主冷却，暂停／恢复对该冷却的副作用仍需宿主实测。
 
-**人工停用缺陷复现**：在隔离临时目录中构建并启动未修改的原版 CPA `v8.0.29`（源码提交 `5fc580b1d72d87a7bcfe5cfb6f479c1aea5625b3`），使用仅包含测试 Key 的临时配置、loopback 代理和假上游返回结构化 402。插件进入额度暂停后，通过 CPA 原生 `PATCH /v0/management/auth-files/status` 设置 `disabled=true`；接着调用插件的 `/quota-pause/resume`，观察到文件 `disabled` 从 `true` 变回 `false`，插件状态也为启用。该复现证明当前实现不能保护这种人工停用操作；它没有访问生产服务或真实密钥，也不涉及宿主补丁。
+**人工停用缺陷复现（0.4.6 及更早）**：在隔离临时目录中构建并启动未修改的原版 CPA `v8.0.29`（源码提交 `5fc580b1d72d87a7bcfe5cfb6f479c1aea5625b3`），使用仅包含测试 Key 的临时配置、loopback 代理和假上游返回结构化 402。插件进入额度暂停后，通过 CPA 原生 `PATCH /v0/management/auth-files/status` 设置 `disabled=true`；接着调用插件的 `/quota-pause/resume`，观察到文件 `disabled` 从 `true` 变回 `false`，插件状态也为启用。该复现证明 0.4.6 的恢复路径不能保护这种人工停用操作；它没有访问生产服务或真实密钥，也不涉及宿主补丁。0.4.7 修复了**插件控制台**启停选择的保存与恢复，但 CPA 原生入口仍写同一个 `disabled` 字段，无法可靠归因，上述原生路径的限制继续存在。
 
 **思考强度宿主兼容缺陷及修复**：使用隔离假上游，配置 `medium → high` 并经 CPA 的 `/v1/chat/completions` 请求，未修改原版 CPA `v8.0.29` 的上游收到 `high`；旧开发代码在本地 `8.0.51-gemini-usage-hotfix.test` 构建中未能发送该参数。开发分支对由用户配置的模型使用 CPA 公开的 `UserDefined` 元数据，不宣称任何模型的官方推理能力；修改后 `scripts/smoke-abi.py --cpa-live` 在这两个隔离宿主中均 PASS，普通与流式都收到 `high`。后者仍是本地测试构建，不代表已验证原版 `8.0.51` 或生产服务；多标签页并发保存仍待复核。宿主可能在插件之前转换非字符串请求值，本地测试构建将数值 `123` 转成字符串；插件不保证跨宿主原样透传。
 
 ## 0.4.4 本轮验收
 
-2026-11-04 发布 `0.4.4`。唯一改动是上游额度耗尽报文的分类：OpenDesign 的 `402` 报文带自有机器码 `insufficient_balance`（`error.code` 或 `[code=...]` 文本）时归类并换号冷却；不带机器码的裸 `402` 仍不分类。
+2026-11-04 交付并部署 `0.4.4`。唯一改动是上游额度耗尽报文的分类：OpenDesign 的 `402` 报文带自有机器码 `insufficient_balance`（`error.code` 或 `[code=...]` 文本）时归类并换号冷却；不带机器码的裸 `402` 仍不分类。
 
 | 检查 | 结果与范围 |
 | --- | --- |
@@ -161,7 +162,7 @@ CPA 对 `402`／`403` 的冷却时长是写死的 30 分钟（`conductor_cooldow
 
 ### 错误规则专项验证
 
-- **匹配对象**：规则匹配插件生成的错误 Message，不是上游响应体。上游错误、协议错误、传输错误、插件不可用和响应过大分别带 `[open-design:<kind>]` 前缀；marker 只由封闭白名单拼出，上游文本无法伪造规则。测试含「未知 code 不回显」用例。
+- **匹配对象**：规则匹配插件生成的错误 Message，不是上游响应体。上游错误、协议错误、传输错误、插件不可用和响应过大分别带 `[upstream:<kind>]` 前缀；marker 只由封闭白名单拼出，上游文本无法伪造规则。测试含「未知 code 不回显」用例。
 - **分类**：`tier_limit_exceeded` 纳入受控已知码；上游写在消息里的 `[code=...]` 只在白名单内识别，其余一律归为 `upstream_error`。
 - **裸 402 的处置**：只有带白名单码（`insufficient_quota` 的 `code` 字段或 `[code=...]` 文本）的 402 才分类并触发换号冷却；不带机器码的 402 保持 `upstream_error`，不匹配任何默认规则，因此不换号、不冷却。生产 2026-11-01～04 共出现 6 次这样的 402（模型 `deepseek-v4.1-flash`，`err=[open-design:upstream_error] upstream request failed: payment required`），同一批账号的 200 请求占 496/500，未发现额度耗尽证据；把上游的自由文本映射成额度判定会误冷却健康账号，故不改默认策略。判定由 `TestErrorRulesBarePaymentRequiredStaysUnclassified` 与 `TestErrorRulesClassifyPaymentRequiredWithQuotaCode` 锁定。
 - **存储**：策略保存在 `<data_dir>/error-rules.json`，严格解析（拒绝未知字段、重复键、尾 JSON、超量条件、无效正则），原子写；文件损坏回退默认并上报 `load_error`，失败写不覆盖旧策略。

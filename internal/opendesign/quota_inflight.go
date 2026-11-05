@@ -88,7 +88,7 @@ func (s *Service) admitQuotaInFlight(source Credential, requestAuthID string) (*
 		hook.beforeAdmit()
 	}
 	if source.APIKey == "" {
-		return nil, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential is missing")
+		return nil, localFail(http.StatusUnauthorized, "credential_unavailable", "upstream credential is missing")
 	}
 	key := quotaInFlightKeyOf(source)
 	s.mu.Lock()
@@ -96,7 +96,7 @@ func (s *Service) admitQuotaInFlight(source Credential, requestAuthID string) (*
 	// Mirror selectedCredential's revocation check: the resolved record and the
 	// routed id are both identities, and either may have been revoked since.
 	if (source.ID != "" && s.revoked[source.ID]) || (requestAuthID != "" && s.revoked[requestAuthID]) {
-		return nil, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential is disabled or removed")
+		return nil, localFail(http.StatusUnauthorized, "credential_unavailable", "upstream credential is disabled or removed")
 	}
 	// The live record to verify against. selectedCredential prefers the resolved
 	// id and only falls back to the routed id when that id has no record, so the
@@ -115,13 +115,13 @@ func (s *Service) admitQuotaInFlight(source Credential, requestAuthID string) (*
 			// The key was replaced between selection and admission. Failing closed
 			// keeps a stale model-test snapshot from reaching a key this request
 			// never validated.
-			return nil, localFail(http.StatusConflict, "credential_changed", "OpenDesign credential changed before the request was admitted")
+			return nil, localFail(http.StatusConflict, "credential_changed", "upstream credential changed before the request was admitted")
 		}
 		if current.Disabled {
-			return nil, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential is disabled")
+			return nil, localFail(http.StatusUnauthorized, "credential_unavailable", "upstream credential is disabled")
 		}
 		if current.quotaBlocked() {
-			return nil, localFail(http.StatusTooManyRequests, "quota_blocked", quotaBlockMarker+" OpenDesign account quota is temporarily paused")
+			return nil, localFail(http.StatusTooManyRequests, "quota_blocked", quotaBlockMarker+" upstream account quota is temporarily paused")
 		}
 		// source.runtimeEpoch is 0 for a snapshot that came from StorageJSON or an
 		// id-less request: those never carried an epoch, so a record published
@@ -130,15 +130,15 @@ func (s *Service) admitQuotaInFlight(source Credential, requestAuthID string) (*
 		if source.runtimeEpoch != 0 && current.runtimeEpoch != source.runtimeEpoch {
 			// Same key, but the identity changed and changed back (for example a
 			// manual disable followed by an enable). The snapshot is stale.
-			return nil, localFail(http.StatusConflict, "credential_changed", "OpenDesign credential changed before the request was admitted")
+			return nil, localFail(http.StatusConflict, "credential_changed", "upstream credential changed before the request was admitted")
 		}
 		lease.admittedEpoch = current.runtimeEpoch
 	} else {
 		if source.Disabled {
-			return nil, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential is disabled")
+			return nil, localFail(http.StatusUnauthorized, "credential_unavailable", "upstream credential is disabled")
 		}
 		if source.quotaBlocked() {
-			return nil, localFail(http.StatusTooManyRequests, "quota_blocked", quotaBlockMarker+" OpenDesign account quota is temporarily paused")
+			return nil, localFail(http.StatusTooManyRequests, "quota_blocked", quotaBlockMarker+" upstream account quota is temporarily paused")
 		}
 	}
 	if s.quotaInflight == nil {

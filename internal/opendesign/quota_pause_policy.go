@@ -15,7 +15,7 @@ import (
 // quotaPauseMaxWindow is an absolute upper bound even for untrusted upstream
 // values and malformed local settings. It is not a host cooldown setting.
 const (
-	quotaBlockMarker        = "[open-design:quota_block]"
+	quotaBlockMarker        = "[upstream:quota_block]"
 	quotaPauseMinWindow     = time.Minute
 	quotaPauseDefaultWindow = 30 * time.Minute
 	quotaPauseDefaultMax    = 24 * time.Hour
@@ -200,11 +200,12 @@ type pauseSettings struct {
 	maxWindow     time.Duration
 }
 
-// pauseSettings resolves the persisted policy. Until CPA-native manual-disable
-// attribution is safe, older settings without an explicit choice must not start
-// quota pauses automatically. Zero MaxSeconds keeps the built-in cap.
+// pauseSettings resolves the persisted policy. New and older settings without
+// an explicit choice run the reviewed default: automatic quota pauses are on.
+// An operator can still persist enabled=false; the CPA-native manual-disable
+// attribution limitation remains documented. Zero MaxSeconds keeps the cap.
 func (c Config) pauseSettings() pauseSettings {
-	settings := pauseSettings{enabled: false, defaultWindow: quotaPauseDefaultWindow, maxWindow: quotaPauseDefaultMax}
+	settings := pauseSettings{enabled: true, defaultWindow: quotaPauseDefaultWindow, maxWindow: quotaPauseDefaultMax}
 	if c.Pause.Enabled != nil {
 		settings.enabled = *c.Pause.Enabled
 	}

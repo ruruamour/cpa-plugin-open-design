@@ -82,7 +82,7 @@ func (s *Service) cachedQuota(id string) (quotaResponse, error) {
 
 func (s *Service) quotaViewLocked(id string) (quotaResponse, error) {
 	if s.stopped {
-		return quotaResponse{}, fail(http.StatusServiceUnavailable, "OpenDesign plugin is shutting down")
+		return quotaResponse{}, fail(http.StatusServiceUnavailable, "plugin is shutting down")
 	}
 	entry, err := s.quotaEntryLocked(id)
 	if err != nil {

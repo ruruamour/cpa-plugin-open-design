@@ -2,15 +2,17 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.4`，但该版本的 GitHub Release 仍是 draft，公开 latest 为 `0.4.3`（安装边界见下文）。本开发分支的源码版本为 `0.4.6`，尚不可部署。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.4`，本开发分支的源码版本为 `0.4.7`（额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
-> `0.4.0` 在 `0.3.0` 之上增加可编辑的重试调度／错误规则，已于 2026-11-04 部署到 `nuoapi-net`；`0.4.1` 修复 Windows 上请求日志持久化与跨平台测试；`0.4.2` 把 settings.json 与错误规则文件也纳入同一条重试发布路径，并锁定裸 402 不并入额度分类；`0.4.3` 让「凭据 · 额度」标签页在打开时按账户顺序串行刷新额度；`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则。验收记录同样在该文档。
+> `0.4.0` 在 `0.3.0` 之上增加可编辑的重试调度／错误规则，已于 2026-11-04 部署到 `nuoapi-net`；`0.4.1` 修复 Windows 上请求日志持久化与跨平台测试；`0.4.2` 把 settings.json 与错误规则文件也纳入同一条重试发布路径，并锁定裸 402 不并入额度分类；`0.4.3` 让「凭据 · 额度」标签页在打开时按账户顺序串行刷新额度；`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则；`0.4.7` 新增额度耗尽自动暂停（默认开启）。验收记录同样在该文档。
 >
-> **开发分支警告：`0.4.6` 额度暂停仍不能部署。** 插件控制台的人工停用在部分隔离场景已测试，但文件回写及并发边界仍在复审；CPA 原生界面再次停用同一账户时，插件无法区分人工停用与自己的禁用投影，恢复可能重新启用该账户。`0.4.6` 发布工作流失败，未生成 Release；该 tag 默认开启额度暂停，不得使用。生产仍为 `0.4.4`。
+> **`0.4.6` tag 不得使用。** 该版本的暂停恢复路径会覆盖旧文件与人工停用状态，发布工作流失败且未生成 Release。`0.4.7` 已修复旧文件回放、解除修订和插件控制台人工停用保护，并通过独立复核与两套隔离宿主验收；生产升级前仍为 `0.4.4`。CPA 原生界面的停用仍无法可靠归因（已知限制）：暂停期间请在插件控制台启停账户。
 
 ## 功能
+
+`0.4.7` 新增额度耗尽自动暂停并默认开启：识别到结构化额度耗尽报文后临时停用该账户，到期或官方复查确认恢复后自动回到调度，并保护通过插件控制台作出的启停选择。详见[额度耗尽自动暂停](#额度耗尽自动暂停默认开启)。
 
 `0.4.4` 把 OpenDesign 真实的额度耗尽报文（`402` + `code=insufficient_balance`，带 `coding_plan_exhausted` 与 `reset_at`）纳入分类白名单，并新增一条默认规则：命中 `[open-design:insufficient_balance]` 时换号冷却。此前该报文被当成未分类的 `upstream_error`，只能靠宿主对裸 402 的固定 30 分钟冷却兜底。不带机器码的裸 `402 payment required` 仍然保持不分类。
 
@@ -22,7 +24,7 @@
 
 `0.4.0` 于 2026-11-04 从提交 `e66497e` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台、错误规则同步和原有效插件核验通过。
 
-GitHub Release 使用 `open-design-v0.4.4`，但该 Release 目前仍是 draft，公开 `/releases/latest` 仍指向 `open-design-v0.4.3`（`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release；`0.4.1`～`0.4.3` 已公开）。发布 0.4.4 还是把 registry 回指 0.4.3，尚未决定。
+GitHub Release 使用 `open-design-v0.4.4`，已从 draft 转为正式 Release；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release，`0.4.1`～`0.4.4` 均已公开。`0.4.7` 的发布状态见下文。
 
 `0.3.0` 于 2026-11-03 从提交 `2601888` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台和原有效插件核验通过。
 
@@ -31,7 +33,7 @@ GitHub Release 使用 `open-design-v0.4.4`，但该 Release 目前仍是 draft�
 `0.4.0` 在 `0.3.0` 之上新增**重试调度／错误规则**：
 
 - 每个 OpenDesign 账户可配置一组错误规则（HTTP 状态码 + 包含／正则条件 + `stop`／`stop-and-cooldown`／`continue`／`continue-and-cooldown` 四种动作），随凭据写入宿主 auth 文件的 `request_scoped_errors` 字段。
-- 规则匹配对象是**插件生成的错误 Message**，不是上游原始响应体；插件为上游错误、协议错误、传输错误、插件不可用和响应过大生成稳定的 `[open-design:<kind>]` 前缀，marker 只由封闭白名单拼出，上游文本无法伪造规则。
+- 规则匹配对象是**插件生成的错误 Message**，不是上游原始响应体；插件为上游错误、协议错误、传输错误、插件不可用和响应过大生成稳定的 `[upstream:<kind>]` 前缀，marker 只由封闭白名单拼出，上游文本无法伪造规则。
 - 管理路由 `GET`／`PUT /error-rules` 与 `POST /error-rules/sync`、`POST /error-rules/reset`；策略保存在 `<data_dir>/error-rules.json`，写入为原子替换。
 - 同步是**覆盖式逐账号推送**，只重写 `request_scoped_errors` 一个键，保留宿主或运维在 auth 文件中新增的未知字段；每个账号独立报告成功或失败，失败可重试恢复。
 - 不做并发限制、不做请求排队：插件只做错误分类与标记，是否换号、是否冷却由 CPA 宿主按规则决定。
@@ -75,24 +77,24 @@ GitHub Release 使用 `open-design-v0.4.4`，但该 Release 目前仍是 draft�
 | `continue` | 换到下一个可用账户，不冷却 |
 | `continue-and-cooldown` | 换到下一个可用账户并冷却该账户 |
 
-- 匹配对象是**插件生成的错误 Message**：上游错误、协议错误、传输错误、插件不可用和响应过大分别带稳定的 `[open-design:<kind>]` 前缀。marker 只由封闭白名单拼出，上游响应体无法伪造规则。
+- 匹配对象是**插件生成的错误 Message**：上游错误、协议错误、传输错误、插件不可用和响应过大分别带稳定的 `[upstream:<kind>]` 前缀。marker 只由封闭白名单拼出，上游响应体无法伪造规则。
 - 状态码为硬匹配（400 就是 400，不做状态码族）。条件支持子串与正则；正则无效或字段越界会在保存时被拒绝。
 - 插件只负责分类和标记；是否换号、是否冷却、冷却多久由 CPA 宿主按规则与自身配置决定。**插件不做并发限制，也不做请求排队。**
 - `PUT /error-rules` 保存策略并逐账号推送，`POST /error-rules/sync` 只重新推送，`POST /error-rules/reset` 恢复内置默认策略。空数组表示该账户不写插件自有规则（由 CPA 配置决定）。
 - 同步只重写 `request_scoped_errors` 一个键，保留宿主或运维写入的未知字段；每个账号独立报告结果，失败的账号会列在响应里，可再次同步。
 
-### 额度耗尽自动暂停（开发中，不可部署）
+### 额度耗尽自动暂停（默认开启）
 
-当前开发实现尝试识别上游额度耗尽并暂时阻断账户；插件控制台人工停用的保护尚未通过全部并发与文件回写场景复审，CPA 原生界面的重复停用也无法可靠归因，不应作为可用于生产的功能。
+`0.4.7` 识别上游额度耗尽并临时阻断账户：控制台显示「额度耗尽 · 自动暂停 / 约 X 小时后恢复」，截止时间到达后由后台官方复查确认恢复，再自动回到调度。
 
 - 信号很窄：仅 `error.code=insufficient_balance` 且状态为 `402`，或者同一机器码出现在 `2xx` 响应体/SSE 事件中且 `coding_plan_exhausted=true`。裸 `402`、文本 `payment required`、普通 `429`、普通 `insufficient_quota` 都不触发账户级暂停。
-- 暂停把 `quota_block`／`quota_revision` 写入凭据 auth 文件，并把有效停用状态返回给宿主。CPA 可能将该状态写回 `disabled`：暂停期间应在本插件控制台做启停，但文件回写及并发边界仍在复审；CPA 原生界面再次停用与插件投影不可区分，**恢复可能重新启用这样停用的账户**。
+- 暂停把 `quota_block`／`quota_revision` 写入凭据 auth 文件，并把有效停用状态返回给宿主。暂停期间请在**本插件控制台**启停账户：插件会把控制台的人工停用与自己的暂停投影分开保存，恢复时不会重新启用通过控制台停用的账户。CPA 原生界面的停用与插件投影写在同一个 `disabled` 字段里，无法可靠区分来源，因此不要用 CPA 原生界面操作暂停中的账户。
 - 截止时间只取结构化 `reset_at`／`Retry-After`，缺省 30 分钟，钳制 1 分钟～7 天，并受 `pause.max_seconds` 约束；没有新 reset 提示的迟到重复错误只更新观察时间，带新提示的会重算但不超过 `BlockedAt + pause.max_seconds` 上限。
-- 到期本身不解除暂停。开启 `pause.enabled` 后，后台按账号、逐模型串行请求官方 funding-check，只有全部已知耗尽模型都在最新观察之后取得新鲜的 `available`、Workspace 成员一致、同一推理密钥无在途请求、凭据／修订未变时才解除；失败、未授权、缓存或不完整模型集合继续暂停。复查总时长受预算限制，提交时会在进程内互斥锁 `authFileMu` 下重新核对磁盘身份与证据新鲜度（没有跨进程 CAS）。
+- 到期本身不解除暂停。后台按账号、逐模型串行请求官方 funding-check，只有全部已知耗尽模型都在最新观察之后取得新鲜的 `available`、Workspace 成员一致、同一推理密钥无在途请求、凭据／修订未变时才解除；失败、未授权、缓存或不完整模型集合继续暂停。复查总时长受预算限制，提交时会在进程内互斥锁 `authFileMu` 下重新核对磁盘身份与证据新鲜度（没有跨进程 CAS）。
 - 必须由管理员保证 `control_key` 与推理 key 属于同一账号，插件无法自动验证；`resume` 是操作员显式解除，不验证余额。
-- 开发分支配置项：`pause.enabled`（未明确配置时默认关闭）、`pause.max_seconds`（60–604800，默认 86400）。已推送的 `0.4.6` tag 仍默认开启且不安全，不要使用。
+- 配置项：`pause.enabled`（未明确配置时**默认开启**）、`pause.max_seconds`（60–604800，默认 86400）。
 
-**宿主边界**：上游 `402/403` 的冷却由 CPA 控制，现有宿主为 30 分钟；本插件不主动清除宿主冷却，也不承诺暂停／恢复对该冷却无副作用。隔离真实宿主的特定场景验证过失败复查保持暂停、新鲜 `available` 才解除及插件控制台人工停用保留；这不覆盖所有文件回写、并发和 CPA 原生停用，也没有生产额度耗尽事件验收。
+**宿主边界**：上游 `402/403` 的冷却由 CPA 控制，现有宿主为 30 分钟；本插件不主动清除宿主冷却，也不承诺暂停／恢复对该冷却无副作用。已知限制：暂停标记的修订内存标记不跨进程，若宿主在插件运行中用旧暂停 body 覆盖已清除的文件并立即重启进程，新实例只能信任磁盘；单进程写入是受支持的使用方式。
 
 ### 请求日志与统计
 
@@ -229,11 +231,11 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 产物是 `dist/open-design.so`（Linux amd64，C shared ABI v1）。
 
-发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。开发分支的 registry 暂指 `0.4.4`，但该 Release 仍是 draft，`github-release` 安装会失败；与未发布的源码版本也有意不同。发布新版本或把 registry 回指 `0.4.3` 前必须重新同步源码、registry 和新 tag。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动“取最新”不适用于本 fork。
+发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。源码 `Version`、`marketplace/registry.json` 与 `open-design-v0.4.7` tag 保持同步。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动"取最新"不适用于本 fork。
 
 ## 当前验证边界
 
-- 开发分支新增额度耗尽自动暂停：信号判定、钳制、多模型串行新鲜复查、在途与身份栅栏、插件控制台启停、解除修订／旧文件回放由 Go／Node 测试、独立复核及两套隔离宿主的 snapshot／live 场景覆盖；CPA 原生界面的重复停用仍无法可靠归因，是已知限制。**新版本的生产暂停、恢复和换号均未验收**，也没有部署该版本。
+- `0.4.7` 新增额度耗尽自动暂停（默认开启）：信号判定、钳制、多模型串行新鲜复查、在途与身份栅栏、插件控制台启停、解除修订／旧文件回放由 Go／Node 测试、独立复核及两套隔离宿主的 snapshot／live 场景覆盖；CPA 原生界面的重复停用仍无法可靠归因，是已知限制。**新版本的生产额度耗尽事件尚未实测**，上线后需观察。
 - `0.4.5` 的思考强度映射尚未发布：隔离测试发现，一个本地 CPA `8.0.51-gemini-usage-hotfix.test` 构建可能在插件执行前剥除 `reasoning_effort`。开发分支已通过公开模型元数据修复该测试场景，普通和流式请求均已复测；控制台多标签页并发处理仍在复核。`0.4.5` 的 Release 因 macOS runner 被取消未产出资产。
 - `0.4.4` 只改上游额度耗尽报文的分类：`402` 且带 `insufficient_balance` 机器码（`code` 字段或 `[code=...]` 文本）时归类并换号冷却；不带机器码的裸 402 仍不分类；`0.4.3` 只改控制台额度刷新触发方式（打开标签页串行自动查询）；`0.4.2`／`0.4.1` 只做跨平台持久化修复与分类边界锁定；`0.4.0` 在 `0.3.0` 之上新增重试调度／错误规则，并已用双账号真实宿主验证：假上游按凭据返回生产 400 `tier_limit_exceeded` 后，宿主按规则换到另一账号并返回 200，冷却后下一次请求不再使用失败账号，`stop` 规则下不换号且响应保留 marker。全仓 Go／race／vet、Node 项、离线与原版 CPA 隔离流程见[验证记录](docs/verification.md)。
 - `0.3.0` 在 `0.2.0` 之上新增日志、统计、官方模型覆盖、显式模型测试、配置与 runtime。全仓 Go／race／vet、Node 139 项、Edge 540 项、Debian 12 构建和原版 CPA 隔离流程已通过，具体产物与上线状态见[验证记录](docs/verification.md)。

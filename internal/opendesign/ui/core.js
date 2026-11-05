@@ -844,10 +844,11 @@
     const pauseMax = safeInteger(pause.max_seconds, 60, 604800);
     return {
       logs: normalizeRetention(data.logs),
-      // Older servers may omit this experimental section. Never present an
-      // absent policy as enabled while manual-disable safety is under review.
+      // Older servers may omit this section. The reviewed default is enabled,
+      // matching the plugin's own pauseSettings; only an explicit false turns
+      // automatic pauses off.
       pause: {
-        enabled: pause.enabled === true,
+        enabled: pause.enabled !== false,
         max_seconds: pauseMax === null ? 86400 : pauseMax,
         owner: safeCode(pause.owner, 20),
       },
@@ -982,19 +983,19 @@
   // plugin emits are listed, so an operator never sees a rule described as
   // something it cannot match.
   const ERROR_RULE_MARKERS = [
-    ['[open-design:tier_limit_exceeded]', '账号并发上限', '上游返回会员并发上限（tier_limit_exceeded）；该账号暂不可用，可继续尝试其他账号。'],
-    ['[open-design:rate_limit_exceeded]', '上游频率限制', '请求速率达到上游上限；冷却该账号并尝试其他账号。'],
-    ['[open-design:insufficient_quota]', '账号额度不足', '账号额度已耗尽；冷却该账号并尝试其他额度可用的账号。'],
-    ['[open-design:insufficient_balance]', '额度耗尽或余额不足', '上游返回 OpenDesign 的 insufficient_balance（Coding Plan 额度耗尽或钱包余额不足）；冷却该账号并尝试其他账号。'],
-    ['[open-design:invalid_api_key]', '密钥无效', '上游拒绝该密钥；停止并冷却该账号，等待人工更换密钥。'],
-    ['[open-design:server_error]', '上游服务错误', '上游返回服务端错误；冷却该账号并尝试其他账号。'],
-    ['[open-design:server_overloaded]', '上游过载', '上游过载；冷却该账号并尝试其他账号。'],
-    ['[open-design:model_not_found]', '模型不可用', '该账号没有这个模型；冷却该模型并尝试其他账号。'],
-    ['[open-design:context_length_exceeded]', '上下文过长', '请求超出模型上下文；重试不会成功，停止切换账号。'],
-    ['[open-design:response_limit_exceeded]', '响应过大', '上游响应超过插件上限；重试不会成功。'],
-    ['[open-design:upstream_protocol_error]', '上游响应异常', '上游返回了无法解析的响应；冷却该账号并尝试其他账号。'],
-    ['[open-design:upstream_transport_error]', '上游连接失败', '无法连接上游或连接中断；冷却该账号并尝试其他账号。'],
-    ['[open-design:upstream_error]', '未分类上游错误', '上游返回了未被更具体规则覆盖的错误。'],
+    ['[upstream:tier_limit_exceeded]', '账号并发上限', '上游返回会员并发上限（tier_limit_exceeded）；该账号暂不可用，可继续尝试其他账号。'],
+    ['[upstream:rate_limit_exceeded]', '上游频率限制', '请求速率达到上游上限；冷却该账号并尝试其他账号。'],
+    ['[upstream:insufficient_quota]', '账号额度不足', '账号额度已耗尽；冷却该账号并尝试其他额度可用的账号。'],
+    ['[upstream:insufficient_balance]', '额度耗尽或余额不足', '上游返回 OpenDesign 的 insufficient_balance（Coding Plan 额度耗尽或钱包余额不足）；冷却该账号并尝试其他账号。'],
+    ['[upstream:invalid_api_key]', '密钥无效', '上游拒绝该密钥；停止并冷却该账号，等待人工更换密钥。'],
+    ['[upstream:server_error]', '上游服务错误', '上游返回服务端错误；冷却该账号并尝试其他账号。'],
+    ['[upstream:server_overloaded]', '上游过载', '上游过载；冷却该账号并尝试其他账号。'],
+    ['[upstream:model_not_found]', '模型不可用', '该账号没有这个模型；冷却该模型并尝试其他账号。'],
+    ['[upstream:context_length_exceeded]', '上下文过长', '请求超出模型上下文；重试不会成功，停止切换账号。'],
+    ['[upstream:response_limit_exceeded]', '响应过大', '上游响应超过插件上限；重试不会成功。'],
+    ['[upstream:upstream_protocol_error]', '上游响应异常', '上游返回了无法解析的响应；冷却该账号并尝试其他账号。'],
+    ['[upstream:upstream_transport_error]', '上游连接失败', '无法连接上游或连接中断；冷却该账号并尝试其他账号。'],
+    ['[upstream:upstream_error]', '未分类上游错误', '上游返回了未被更具体规则覆盖的错误。'],
   ];
 
   function errorRuleActionLabel(action) {

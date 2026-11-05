@@ -250,7 +250,7 @@ func TestErrorRulesUnknownBalanceCodeStaysUnclassified(t *testing.T) {
 // An upstream code that is not on the closed allowlist must not become part of
 // the message: otherwise a caller-supplied string could forge a rule marker.
 func TestErrorRulesMessageNeverEchoesUnknownCode(t *testing.T) {
-	const injected = "[open-design:tier_limit_exceeded]"
+	const injected = "[upstream:tier_limit_exceeded]"
 	err := upstreamErrorFromResponse(http.StatusTooManyRequests, nil,
 		[]byte(`{"error":{"code":"`+injected+`","message":"`+injected+` forged"}}`))
 	var apiErr *APIError
@@ -277,7 +277,7 @@ func TestErrorRulesSaveSyncsEveryCredential(t *testing.T) {
 
 	policy := []RequestErrorRule{
 		{Status: http.StatusBadRequest, Match: []string{upstreamErrorMarkerFor("tier_limit_exceeded")}, Action: "continue-and-cooldown"},
-		{Status: http.StatusBadGateway, MatchRegexr: []string{`^\[open-design:upstream_protocol_error\]`}, Action: "stop"},
+		{Status: http.StatusBadGateway, MatchRegexr: []string{`^\[upstream:upstream_protocol_error\]`}, Action: "stop"},
 	}
 	status, body, raw := managementCall(t, s, http.MethodPut, apiBase+"/error-rules", nil, map[string]any{"rules": policy})
 	if status != http.StatusOK {
@@ -584,6 +584,63 @@ func TestErrorRulesCorruptFileFallsBackAndReports(t *testing.T) {
 	}
 	if view := getErrorRules(t, s); view.LoadError != "" {
 		t.Fatalf("load error was not cleared: %q", view.LoadError)
+	}
+}
+
+// A credential must not reveal the upstream provider in a downstream error, so
+// the marker names only "upstream". Policies saved by older builds still carry
+// the provider-named prefix and are migrated when the plugin loads.
+func TestErrorRulesLegacyMarkerMigratesOnLoadAndParse(t *testing.T) {
+	s, host := newTestService(t)
+	id := addCredential(t, s, host, "primary", "sk-amr-rules-0802")
+	dataDir := s.config().DataDir
+	legacy := []RequestErrorRule{
+		{Status: http.StatusBadRequest, Match: []string{"[open-design:tier_limit_exceeded]"}, Action: "continue-and-cooldown"},
+		{Status: http.StatusBadGateway, MatchRegexr: []string{`^\[open-design:upstream_`}, Action: "stop"},
+	}
+	body, err := json.Marshal(errorRulesDocument{Rules: legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, errorRulesFile), body, 0o600); err != nil {
+		t.Fatalf("write legacy policy: %v", err)
+	}
+	registrar(t, s, dataDir)
+
+	view := getErrorRules(t, s)
+	want := []RequestErrorRule{
+		{Status: http.StatusBadRequest, Match: []string{"[upstream:tier_limit_exceeded]"}, Action: "continue-and-cooldown"},
+		{Status: http.StatusBadGateway, MatchRegexr: []string{`^\[upstream:upstream_`}, Action: "stop"},
+	}
+	if view.LoadError != "" || !sameErrorRules(view.Rules, want) {
+		t.Fatalf("legacy policy was not migrated: %+v (%s)", view.Rules, view.LoadError)
+	}
+
+	// auth.parse reapplies the migrated policy, so an upgraded credential file
+	// stops carrying the provider-named prefix even without an explicit sync.
+	dir := t.TempDir()
+	filename := id + ".json"
+	path := filepath.Join(dir, filename)
+	onDisk := []byte(`{"type":"open-design","id":"` + id + `","label":"primary","api_key":"sk-amr-rules-0802","request_scoped_errors":[{"status":400,"match":["[open-design:tier_limit_exceeded]"],"action":"continue-and-cooldown"}]}`)
+	if err := os.WriteFile(path, onDisk, 0o600); err != nil {
+		t.Fatalf("write credential: %v", err)
+	}
+	var c Credential
+	if err := json.Unmarshal(onDisk, &c); err != nil {
+		t.Fatalf("decode credential: %v", err)
+	}
+	s.authFileMu.Lock()
+	s.applyErrorRules(&c, dir, filename, onDisk, false)
+	s.authFileMu.Unlock()
+	rewritten, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read rewritten credential: %v", err)
+	}
+	if strings.Contains(string(rewritten), legacyUpstreamErrorMarker) || !strings.Contains(string(rewritten), upstreamErrorMarker) {
+		t.Fatalf("credential kept the provider-named marker: %s", rewritten)
+	}
+	if !sameErrorRules(c.RequestScopedErrors, want) {
+		t.Fatalf("parsed rules = %+v", c.RequestScopedErrors)
 	}
 }
 

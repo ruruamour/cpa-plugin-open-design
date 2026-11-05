@@ -369,7 +369,7 @@
     const originalUpstream = String(row.original_upstream_id || '').trim();
     const alias = String(row.id || '').trim();
     const upstream = String(row.upstream_id || '').trim();
-    const legacyNote = !modelsSaveRevision()
+    const legacyNote = !pendingSaveRevision()
       ? '当前后端没有整表版本校验，之后保存会直接整表覆盖。'
       : '仅此行会改用服务器身份，整表版本和保存所依据的旧版本不会被自动替换；之后保存仍需按冲突流程确认覆盖。';
     const policyNote = server.reasoning_mapping ? '该服务器行已有思考强度映射，将按服务器当前策略。' : '该服务器行当前没有已保存的思考强度映射。';
@@ -561,6 +561,20 @@
 
   function modelsSaveRevision() {
     return state.modelsDraftActive ? state.modelsDraftRevision : state.modelsRevision;
+  }
+
+  // The revision the next confirmed save will actually send. A legacy draft
+  // that was begun before the server advertised a whole-list token has an empty
+  // draft revision, but once the operator arms the overwrite confirmation the
+  // save re-pins to the current server revision. Save-time gates must judge the
+  // revision that will be sent, not the empty draft revision, or they produce a
+  // false "policy will be lost" warning (and hide the per-row adopt control).
+  function pendingSaveRevision() {
+    if (state.modelsConflict === true && state.modelsRevision &&
+      state.modelsConflictSeenRevision === state.modelsRevision) {
+      return state.modelsRevision;
+    }
+    return modelsSaveRevision();
   }
 
   // Called after every mapping edit. Reverting the rows to the saved baseline
@@ -1872,7 +1886,7 @@
       // (and its policy)" without touching the other draft rows or the
       // whole-list token.
       if ((!mappingOriginalResolves(model) ||
-        unpinnedAliasConflict(model, options.ambiguityRevision ?? modelsSaveRevision())) &&
+        unpinnedAliasConflict(model, options.ambiguityRevision ?? pendingSaveRevision())) &&
         serverRowForMapping(model)) {
         actions.push(button('采用服务器此行', 'adopt-server-mapping', {
           className: 'button compact',
@@ -3461,14 +3475,17 @@
       message('modelState', '保存已取消：服务器现在提供整表版本校验，但当前草稿是在此之前开始编辑的。草稿已保留；再次点击「保存模型映射」可按当前服务器版本确认覆盖。', 'error');
       return;
     }
-    if (blockAmbiguousMappingIdentities()) return;
+    // Both gates below judge the revision this save will actually send after a
+    // confirmed overwrite, not a legacy draft's empty token.
+    const gateRevision = pendingSaveRevision();
+    if (blockAmbiguousMappingIdentities(gateRevision)) return;
     // Changing the upstream clears the stored policy by default on the backend.
     // Never carry it silently and never claim it was kept: the operator has to
     // see which rows drop their thinking-strength rules first. Rows that only
     // had their alias renamed keep them and are therefore not listed. This runs
     // before the overwrite confirmation re-pins the rows, so a row whose original
     // identity is about to fall away is still reported.
-    const losingReasoning = mappingsLosingReasoning();
+    const losingReasoning = mappingsLosingReasoning(state.mappings, gateRevision);
     if (losingReasoning.length && typeof confirm === 'function'
       && !confirm(`保存后以下模型不会沿用原来的思考强度映射，需要重新配置：${losingReasoning.join('；')}。确定继续保存？`)) {
       message('modelState', '已取消保存，草稿仍然保留。保存后这些模型不会沿用原来的思考强度映射。', '');

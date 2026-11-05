@@ -1,6 +1,6 @@
 # 套餐用量
 
-> **上游参考文档**：本文件保留自 ClinePassBridge 上游，描述的是 Cline 套餐／CPAMP 场景，**不是**本 fork 的 OpenDesign 插件当前行为。本 fork 的额度暂停在未配置 `pause.enabled` 时默认关闭，且 CPA 原生界面的停用无法可靠归因；请以根目录 [README](../README.md) 与 [open-design.md](open-design.md) 为准。
+> **上游参考文档**：本文件保留自 ClinePassBridge 上游，描述的是 Cline 套餐／CPAMP 场景，**不是**本 fork 的 OpenDesign 插件当前行为。本 fork 的额度暂停在未配置 `pause.enabled` 时默认开启，但 CPA 原生界面的停用无法可靠归因；请以根目录 [README](../README.md) 与 [open-design.md](open-design.md) 为准。
 
 在「配置概览 → 凭据与套餐用量」查看 Cline 账号的套餐名称、当前订阅周期，以及 5 小时、每周、每月的已用百分比和重置时间。时间按浏览器本地时区显示，百分比使用 Cline 返回值；缺失值显示 `—`，不当作零用量。
 

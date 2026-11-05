@@ -176,7 +176,7 @@ func (s *Service) saveReasoningMapping(raw json.RawMessage) (any, error) {
 func (s *Service) resolveModel(model string) (string, error) {
 	snapshot, ok := s.modelSnapshotFor(model)
 	if !ok {
-		return "", &APIError{Status: http.StatusBadRequest, Kind: "model_not_enabled", Message: "model is not enabled in the OpenDesign plugin"}
+		return "", &APIError{Status: http.StatusBadRequest, Kind: "model_not_enabled", Message: "model is not enabled"}
 	}
 	return snapshot.upstream, nil
 }

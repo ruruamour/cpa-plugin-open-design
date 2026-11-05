@@ -216,7 +216,7 @@ func resumeFailureReason(err error) string {
 }
 
 func quotaRecheckUnavailable() error {
-	return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
+	return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "plugin is shutting down")
 }
 
 // manualChoice decides the operator's disable state while a block exists. The
@@ -226,11 +226,17 @@ func quotaRecheckUnavailable() error {
 // operator disabled in the plugin console, and trusting the file would silently
 // re-enable it. Erring the other way only keeps a paused account paused, which
 // the operator can always undo in the console. A brand-new block (manualFromDisk)
-// takes the file's value, since an operator may have disabled the account there
-// before the pause was created.
+// normally takes the file's value, since an operator may have disabled the
+// account there before the pause was created; it still unions the live choice so
+// a host rewrite of an older pre-pause body cannot drop a plugin-console disable
+// that the watcher has not reported yet.
 func manualChoice(block *QuotaBlock, disk Credential, manualFromDisk bool) bool {
 	if manualFromDisk {
-		return disk.Disabled
+		manual := disk.Disabled
+		if block != nil && block.ManualDisabled != nil {
+			manual = manual || *block.ManualDisabled
+		}
+		return manual
 	}
 	manual := true
 	if block != nil && block.ManualDisabled != nil {

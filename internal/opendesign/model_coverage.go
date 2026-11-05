@@ -223,7 +223,7 @@ func (s *Service) joinedModelCoverage(key modelCoverageKey, entry *modelCoverage
 
 func (s *Service) modelCoverageViewLocked(key modelCoverageKey) (modelCoverageResponse, error) {
 	if s.stopped {
-		return modelCoverageResponse{}, fail(http.StatusServiceUnavailable, "OpenDesign plugin is shutting down")
+		return modelCoverageResponse{}, fail(http.StatusServiceUnavailable, "plugin is shutting down")
 	}
 	if entry := s.modelCoverage[key]; entry != nil && entry.epoch == s.billingEpoch[key.CredentialID] {
 		entry.lastAccess = s.modelCoverageNow()

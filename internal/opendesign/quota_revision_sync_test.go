@@ -487,6 +487,44 @@ func TestQuotaRevisionNewPauseOnStaleDiskKeepsManualDisable(t *testing.T) {
 	}
 }
 
+// A host rewrite of a pre-pause body can project disabled=false onto disk
+// without the watcher having marked it stale yet. A new pause must still keep
+// the live plugin-console disable instead of trusting that projection.
+func TestQuotaRevisionNewPauseKeepsLiveDisableOverUnmarkedDisk(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	quotaFixtureAuthFile(t, s, host, id, nil)
+	if status, _, body := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil,
+		map[string]any{"id": id, "disabled": true}); status != http.StatusOK {
+		t.Fatalf("disable: %d %s", status, body)
+	}
+	s.mu.RLock()
+	filename := s.authFiles[id]
+	s.mu.RUnlock()
+	c, _ := liveCredential(s, id)
+	projected := c
+	projected.Disabled = false
+	projected.QuotaBlock = nil
+	projected.QuotaRevision = ""
+	if err := os.WriteFile(filepath.Join(host.authDir, filename), jsonBytes(projected), 0600); err != nil {
+		t.Fatal(err)
+	}
+	source, _ := liveCredential(s, id)
+	s.observeQuotaBlock(source, "model-a", &APIError{Status: http.StatusPaymentRequired, quotaExhausted: true})
+	live, _ := liveCredential(s, id)
+	if !live.quotaBlocked() || !live.Disabled || live.QuotaBlock.ManualDisabled == nil || !*live.QuotaBlock.ManualDisabled {
+		t.Fatal("a new pause trusted an unmarked projected file and undid the manual disable")
+	}
+	if status, _, body := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil,
+		map[string]any{"credential_id": id}); status != http.StatusOK {
+		t.Fatalf("resume: %d %s", status, body)
+	}
+	live, _ = liveCredential(s, id)
+	if live.quotaBlocked() || !live.Disabled {
+		t.Fatal("resuming the new pause lost the manual disable")
+	}
+}
+
 func TestQuotaRevisionNewPauseFailedWriteRetries(t *testing.T) {
 	s, host, id, path, _, paused, _ := quotaRevisionPauseResume(t)
 	quotaRevisionDeliver(t, s, host, id, path, paused)

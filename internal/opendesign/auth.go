@@ -60,7 +60,7 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 		return map[string]any{"Handled": false}, nil
 	}
 	if c.APIKey == "" {
-		return nil, fail(http.StatusUnauthorized, "OpenDesign credential has no api_key")
+		return nil, fail(http.StatusUnauthorized, "credential has no api_key")
 	}
 	c.ID = strings.TrimSpace(c.ID)
 	if c.ID == "" {
@@ -262,7 +262,7 @@ func (s *Service) refreshAuth(raw json.RawMessage) (any, error) {
 	revoked := s.revoked[c.ID]
 	s.mu.RUnlock()
 	if revoked {
-		return nil, fail(http.StatusUnauthorized, "OpenDesign credential was removed")
+		return nil, fail(http.StatusUnauthorized, "upstream credential was removed")
 	}
 	if !known {
 		// Never synthesize an auth record from a stale StorageJSON snapshot: the
@@ -325,10 +325,10 @@ func (s *Service) selectedCredential(request ExecutorRequest) (Credential, error
 		}
 		s.mu.RUnlock()
 		if !ok || revoked {
-			return c, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential was replaced or removed")
+			return c, localFail(http.StatusUnauthorized, "credential_unavailable", "upstream credential was replaced or removed")
 		}
 		if epoch != c.runtimeEpoch || current.APIKey != c.APIKey || current.ControlKey != c.ControlKey || current.WorkspaceID != c.WorkspaceID || current.Disabled != c.Disabled || current.QuotaRevision != c.QuotaRevision || currentBaseURL != snapshotBaseURL {
-			return c, localFail(http.StatusConflict, "credential_changed", "OpenDesign credential changed while the model test was starting")
+			return c, localFail(http.StatusConflict, "credential_changed", "upstream credential changed while the model test was starting")
 		}
 		c.BaseURL = snapshotBaseURL
 	} else {
@@ -347,13 +347,13 @@ func (s *Service) selectedCredential(request ExecutorRequest) (Credential, error
 	revoked := s.revoked[c.ID] || s.revoked[request.AuthID]
 	s.mu.RUnlock()
 	if c.APIKey == "" {
-		return c, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential is missing")
+		return c, localFail(http.StatusUnauthorized, "credential_unavailable", "upstream credential is missing")
 	}
 	if c.Disabled || revoked {
-		return c, localFail(http.StatusUnauthorized, "credential_unavailable", "OpenDesign credential is disabled or removed")
+		return c, localFail(http.StatusUnauthorized, "credential_unavailable", "upstream credential is disabled or removed")
 	}
 	if c.quotaBlocked() {
-		return c, localFail(http.StatusTooManyRequests, "quota_blocked", quotaBlockMarker+" OpenDesign account quota is temporarily paused")
+		return c, localFail(http.StatusTooManyRequests, "quota_blocked", quotaBlockMarker+" upstream account quota is temporarily paused")
 	}
 	if c.BaseURL == "" {
 		c.BaseURL = s.config().BaseURL
