@@ -24,7 +24,7 @@
 | 全仓 Go | `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 通过 |
 | ABI | `scripts/smoke-abi.py`（CGO `c-shared` 构建）PASS |
 
-**真实上游样例与验收边界**：2026-11-05 已在生产环境的两个账号观察到周额度耗尽，上游返回结构化 `402`、`insufficient_balance`、`coding_plan_exhausted=true` 和约三天后的 `reset_at`；已将脱敏报文形态加入 `TestQuotaPauseSignalMatchesObservedCodingPlanExhaustion`。默认 `pause.max_seconds` 为一天，因此插件默认先在一天后复查，而不是保证等待到上游的三天重置时间。这只验证了真实错误形态，**新版本的生产暂停、自动恢复及换号行为仍未验收**；相关真实宿主测试均使用隔离 fixture。
+**真实上游样例与验收边界**：用户报告两个账号周额度耗尽；2026-11-05 从生产相关会话和上游请求获得了结构化 `402` 样例，其中包含 `insufficient_balance`、`coding_plan_exhausted=true` 和约三天后的 `reset_at`。脱敏报文形态已加入 `TestQuotaPauseSignalMatchesObservedCodingPlanExhaustion`。默认 `pause.max_seconds` 为一天，会将首次到期提示钳制在一天；届时还须启用策略并满足复查条件才会查询，不保证等待到上游的三天重置时间。这只验证了真实错误形态，**新版本的生产暂停、自动恢复及换号行为仍未验收**；相关真实宿主测试均使用隔离 fixture。
 
 人工停用保护仍未通过全部入口的真实宿主复核：当前实现返回有效 `Disabled` 给宿主，宿主可能写回文件，不能区分部分原生人工停用；隔离真实宿主已验证插件控制台的人工停用能在自动恢复后保留，但不包括 CPA 原生入口。上游 `402/403` 的冷却由宿主控制，现有宿主为 30 分钟；本插件不主动清除宿主冷却，暂停／恢复对该冷却的副作用仍需宿主实测。`0.4.6` 的 Release 运行 `41906585863` 因 macOS arm64 作业取消而失败，未生成 Release，未部署。
 
