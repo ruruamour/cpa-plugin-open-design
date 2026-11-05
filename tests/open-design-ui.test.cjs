@@ -3623,6 +3623,308 @@ test('a status refresh landing during a model-list save cannot replace the rows'
   assert.equal(api.state.modelsDraftActive, false);
 });
 
+test('a 401 during a model save leaves the auth form usable for re-verification', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let statusCalls = 0;
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        await gate;
+        return respond(401, { error: 'management key expired' });
+      }
+      if (!url.includes('/status')) return respond(404, { error: 'not found' });
+      statusCalls += 1;
+      // Re-verification with a good key succeeds.
+      return respond(200, statusBody({ models_revision: `rev-${statusCalls}` }));
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
+  const pending = api.handlers.saveModels();
+  assert.equal(api.state.busy, true);
+
+  // Release the save first: its 401 calls showAuth, which resets the old
+  // session and must release the busy lock it was holding.
+  release();
+  await pending;
+  assert.equal(api.state.verified, null, 'the 401 ends the old session');
+  assert.equal(api.state.busy, false, 'showAuth releases the model-save busy lock');
+  assert.equal(view.document.getElementById('authSubmit').disabled, false, 'the auth button is re-enabled');
+
+  view.document.getElementById('managementKey').value = 'replacement-key';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  assert.equal(api.state.verified && api.state.verified.source, 'manual', 're-verification succeeds');
+  assert.match(view.document.getElementById('authState').textContent, /验证成功/);
+});
+
+test('re-authentication works while a model POST from the old session is still pending', async () => {
+  let releaseSave;
+  const saveGate = new Promise(resolve => { releaseSave = resolve; });
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        await saveGate;
+        return respond(200, { models: [{ id: 'od-flash', upstream_id: 'open-design/flash' }], models_revision: 'saved-rev' });
+      }
+      if (url.includes('/status')) return respond(200, statusBody({ models_revision: 'fresh-rev' }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
+  const pending = api.handlers.saveModels();
+  assert.equal(api.state.busy, true);
+
+  // A different request returns 401 and calls showAuth while the model POST is
+  // still in flight. The auth form must be usable immediately.
+  api.render.showAuth('401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。');
+  assert.equal(api.state.busy, false);
+  assert.equal(view.document.getElementById('authSubmit').disabled, false);
+  view.document.getElementById('managementKey').value = 'replacement-key';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  assert.equal(api.state.verified && api.state.verified.source, 'manual', 'the new key is accepted');
+  assert.equal(api.state.modelsRevision, 'fresh-rev');
+
+  // The stale POST answer must not apply its old model list or release the new
+  // session's state.
+  releaseSave();
+  await pending;
+  assert.equal(api.state.modelsRevision, 'fresh-rev');
+  assert.equal(api.state.busy, false);
+  assert.equal(api.state.verified && api.state.verified.source, 'manual');
+});
+
+test('a synthetic account result keeps the models_revision won by a model save', async () => {
+  const posts = [];
+  let statusCalls = 0;
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/credentials') && init.method === 'POST') return respond(200, { id: 'cred-1', label: '主账户', disabled: false });
+      if (url.endsWith('/models') && init.method === 'POST') {
+        posts.push(JSON.parse(init.body));
+        return respond(200, { models: [{ id: 'od-flash', upstream_id: 'open-design/flash' }], models_revision: 'list-rev-8' });
+      }
+      if (url.includes('/status')) {
+        statusCalls += 1;
+        // After the account save the follow-up status read fails, so the
+        // synthetic acknowledgement must carry its own (fresh) token.
+        if (statusCalls === 1) return respond(200, statusBody({ models_revision: 'list-rev-7' }));
+        return respond(500, { error: 'status unavailable' });
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
+  await api.handlers.saveModels();
+  assert.equal(api.state.modelsRevision, 'list-rev-8');
+
+  // An acknowledged account edit builds a synthetic status from state.status.
+  // It must not roll the token back to the older status snapshot.
+  view.document.getElementById('accountLabel').value = '主账户';
+  view.document.getElementById('accountKey').value = key;
+  await api.handlers.addAccount({ preventDefault() {} });
+  assert.equal(api.state.modelsRevision, 'list-rev-8', 'the synthetic status keeps the fresh token');
+
+  // The next save must still be CAS-protected rather than fall back to no lock.
+  await api.handlers.saveModels();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].expected_models_revision, 'list-rev-8');
+});
+
+test('editing model rows back to the saved values releases the old-backend draft', () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/status') ? respond(200, statusBody({ models_revision: '' })) : respond(404, { error: 'not found' })),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  api.render.applyStatus(statusBody({ models: [{ id: 'od-flash', upstream_id: 'open-design/flash' }], models_revision: '' }));
+  const alias = view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'renamed';
+  alias.emit('input');
+  assert.equal(api.state.modelsDraftActive, true);
+  assert.equal(api.mappingsDirty(), true);
+
+  // Typing the old value back on an old backend releases the draft, so a later
+  // refresh may adopt the new server list instead of preserving a stale draft.
+  alias.value = 'od-flash';
+  alias.emit('input');
+  assert.equal(api.state.modelsDraftActive, false);
+  assert.equal(api.mappingsDirty(), false);
+
+  api.render.applyStatus(statusBody({ models: [{ id: 'server-new', upstream_id: 'open-design/server-new' }], models_revision: '' }));
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), ['server-new']);
+});
+
+test('re-validating the same management key keeps unsaved drafts', async () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/status')
+      ? respond(200, statusBody({
+        credentials: [{ id: 'cred-1', label: '主账户', disabled: false }],
+        models: [{ id: 'od-flash', upstream_id: 'open-design/flash' }],
+        models_revision: 'list-rev-1',
+      }))
+      : respond(404, { error: 'not found' })),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'session' };
+  await api.render.loadStatus();
+  api.handlers.addMapping();
+  assert.equal(api.state.modelsDraftActive, true);
+  const draftIds = plain(api.state.mappings.map(row => row.id));
+
+  view.document.getElementById('managementKey').value = managementKey;
+  await api.handlers.submitAuth({ preventDefault() {} });
+  assert.equal(api.state.modelsDraftActive, true, 'the same key is the same session');
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), draftIds, 'the draft survives re-validation');
+  assert.equal(api.state.modelsDraftRevision, 'list-rev-1');
+
+  // A different key is a new identity and clears it.
+  view.document.getElementById('managementKey').value = 'another-management-key';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  assert.equal(api.state.modelsDraftActive, false, 'a different key clears the draft');
+});
+
+test('switching the management key clears unsubmitted api_key and control_key fields', async () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/status')
+      ? respond(200, statusBody({ credentials: [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: true, workspace_id: 'ws-1' }] }))
+      : respond(404, { error: 'not found' })),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const row = accountRows(view)[0];
+  api.handlers.editAccount(api.state.status.credentials[0]);
+  assert.ok(row);
+  view.document.getElementById('accountKey').value = 'unsubmitted-api-key';
+  view.document.getElementById('accountControlKey').value = 'unsubmitted-control-key';
+  view.document.getElementById('accountWorkspaceID').value = 'ws-1';
+
+  view.document.getElementById('managementKey').value = 'different-management-key';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  assert.equal(view.document.getElementById('accountKey').value, '', 'the api_key input is cleared');
+  assert.equal(view.document.getElementById('accountControlKey').value, '', 'the control_key input is cleared');
+  assert.equal(view.document.getElementById('accountWorkspaceID').value, '');
+  assert.ok(!JSON.stringify(api.state).includes('unsubmitted-api-key'));
+  assert.ok(!JSON.stringify(api.state).includes('unsubmitted-control-key'));
+});
+
+test('switching the management key invalidates in-flight quota requests and their 401s', async () => {
+  const pendingQuota = deferred();
+  let statusCalls = 0;
+  const view = fakePage({
+    fetchImpl: async url => {
+      if (url.includes('/quota')) return pendingQuota.promise;
+      if (!url.includes('/status')) return respond(404, { error: 'not found' });
+      statusCalls += 1;
+      return respond(200, statusBody({
+        credentials: [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: true, workspace_id: 'ws-1' }],
+        models_revision: `rev-${statusCalls}`,
+      }));
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const flight = api.handlers.refreshQuota({ id: 'cred-1', label: '主账户', billing_configured: true, workspace_id: 'ws-1' });
+  await new Promise(setImmediate);
+  assert.equal(api.state.quotaBusy['cred-1'], true);
+
+  view.document.getElementById('managementKey').value = 'different-management-key';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  assert.notEqual(api.state.verified, null, 'the new key is verified');
+  pendingQuota.resolve(respond(401, { error: 'old key expired' }));
+  await flight;
+  assert.notEqual(api.state.verified, null, 'the old quota 401 does not log the new session out');
+  assert.equal(api.state.quotaBusy['cred-1'], undefined, 'the old busy marker is gone with its session');
+  assert.equal(view.document.getElementById('accountsPanel').hidden, false);
+});
+
+test('a reasoning success adopts a new models_revision for later model-list CAS', async () => {
+  const modelPosts = [];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+        return respond(200, {
+          models: [{ id: 'od-flash', upstream_id: 'open-design/flash', reasoning_revision: 'r-2', reasoning_mapping: { enabled: true, rules: [] } }],
+          models_revision: 'list-rev-5',
+        });
+      }
+      if (url.endsWith('/models') && init.method === 'POST') {
+        modelPosts.push(JSON.parse(init.body));
+        return respond(200, { models: [{ id: 'od-flash', upstream_id: 'open-design/flash' }], models_revision: 'list-rev-6' });
+      }
+      if (url.includes('/status')) return respond(200, statusBody({ models_revision: 'list-rev-4' }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.addReasoningRule();
+  await api.handlers.saveReasoning();
+  assert.equal(api.state.modelsRevision, 'list-rev-5', 'the reasoning response token is kept');
+
+  api.handlers.addMapping();
+  await api.handlers.saveModels();
+  assert.equal(modelPosts.length, 1);
+  assert.equal(modelPosts[0].expected_models_revision, 'list-rev-5');
+});
+
+test('a 409 retry waits for a freshly read token and then asks to confirm', async () => {
+  const posts = [];
+  let confirmations = 0;
+  let allowOverwrite = false;
+  let statusRevision = 'list-rev-1';
+  const models = () => [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
+  const view = fakePage({
+    confirmImpl: () => { confirmations += 1; return allowOverwrite; },
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        posts.push(body);
+        if (body.expected_models_revision === 'list-rev-1') return respond(409, { error: 'models_revision_conflict' });
+        return respond(200, { models: models(), models_revision: 'list-rev-9' });
+      }
+      if (url.includes('/status')) return respond(200, statusBody({ models: models(), models_revision: statusRevision }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.saveModels();
+  assert.equal(posts.length, 1, 'the first save uses the status token');
+  assert.match(view.document.getElementById('modelState').textContent, /提交内容已保留/);
+
+  // Clicking save again without reading a new token must not spin on the same
+  // stale revision or overwrite blindly.
+  await api.handlers.saveModels();
+  assert.equal(posts.length, 1, 'no retry before a new token is read');
+  assert.equal(confirmations, 0);
+  assert.match(view.document.getElementById('modelState').textContent, /请先刷新状态/);
+
+  // Reading the new token arms the next explicit confirmation.
+  statusRevision = 'list-rev-2';
+  await api.render.loadStatus();
+  await api.handlers.saveModels();
+  assert.equal(confirmations, 1, 'the retry asks for confirmation after the new token');
+  assert.equal(posts.length, 1, 'a declined confirmation sends nothing');
+
+  allowOverwrite = true;
+  await api.handlers.saveModels();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].expected_models_revision, 'list-rev-2');
+});
+
 test('switching the management key clears drafts and blocks the old status answer', async () => {
   const pendingStatus = deferred();
   let statusCalls = 0;

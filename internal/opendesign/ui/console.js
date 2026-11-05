@@ -31,6 +31,7 @@
     status: { version: '', base_url: DEFAULT_BASE_URL, credentials: [], models: [] },
     verified: null,
     candidate: null,
+    authSubmitting: false,
     selectedCredential: '',
     upstream: [],
     upstreamFor: '',
@@ -44,6 +45,11 @@
     modelsDraftRevision: '',
     modelsDraftActive: false,
     modelsConflict: false,
+    // The token the server had when the conflict was raised, and the token a
+    // later status read supplied. A retry is only allowed once seen === live
+    // revision, so a 409 can never spin on the same stale token.
+    modelsConflictRevision: '',
+    modelsConflictSeenRevision: '',
     // True while a POST /models write is in flight. A status answer landing in
     // that window must not replace the rows the response is about to confirm.
     modelsSaving: false,
@@ -194,16 +200,44 @@
     state.modelsDraftActive = true;
     state.modelsDraftRevision = state.modelsRevision;
     state.modelsConflict = false;
+    state.modelsConflictRevision = '';
+    state.modelsConflictSeenRevision = '';
   }
 
   function resetMappingsDraft(revision = state.modelsRevision) {
     state.modelsDraftActive = false;
     state.modelsDraftRevision = revision || '';
     state.modelsConflict = false;
+    state.modelsConflictRevision = '';
+    state.modelsConflictSeenRevision = '';
   }
 
   function modelsSaveRevision() {
     return state.modelsDraftActive ? state.modelsDraftRevision : state.modelsRevision;
+  }
+
+  // Called after every mapping edit. Reverting the rows to the saved baseline
+  // releases the draft (an old backend then accepts a fresh status list again),
+  // but a pending conflict stays armed: content equality must never skip the
+  // explicit overwrite confirmation.
+  function noteMappingsEdited() {
+    if (!state.modelsDraftActive) beginMappingsDraft();
+    if (!state.modelsConflict && !mappingsDirty()) resetMappingsDraft();
+  }
+
+  // Compare management identities by the key they carry, never by writing the
+  // key anywhere. Re-validating the same key keeps the current session and its
+  // unsaved drafts; only a different key starts a fresh session.
+  function authKeyOf(headers) {
+    if (!headers || typeof headers !== 'object') return '';
+    if (headers.Authorization) return String(headers.Authorization).replace(/^Bearer\s+/i, '').trim();
+    if (headers['X-Management-Key']) return String(headers['X-Management-Key']).trim();
+    return '';
+  }
+
+  function sameAuthIdentity(left, right) {
+    const previous = authKeyOf(left);
+    return previous !== '' && previous === authKeyOf(right);
   }
 
   // True while the editor holds rows that differ from what the server reports.
@@ -257,10 +291,13 @@
 
   function setBusy(value) {
     state.busy = Boolean(value);
-    for (const id of ['authSubmit', 'accountSubmit', 'accountCancel', 'fetchModels', 'saveModels', 'addMapping', 'revertMappings', 'modelCredential', 'selectVisible', 'clearVisible']) {
+    // The auth form is deliberately not disabled by the shared busy flag: a
+    // 401 from a model write or a logout must always let the operator re-verify.
+    for (const id of ['accountSubmit', 'accountCancel', 'fetchModels', 'saveModels', 'addMapping', 'revertMappings', 'modelCredential', 'selectVisible', 'clearVisible']) {
       const node = $(id);
       if (node) node.disabled = state.busy;
     }
+    setDisabled('authSubmit', state.authSubmitting);
     for (const id of ['accountList']) {
       setRowButtonsDisabled($(id), state.busy);
     }
@@ -533,9 +570,14 @@
 
   function resetManagementData() {
     state.optionalGeneration += 1;
-    // A new management identity owns no previous drafts or CAS tokens.
+    // A new management identity owns no previous drafts or CAS tokens, and every
+    // request captured under the old identity (including quota walks and their
+    // 401s) must be invalidated instead of logging the new session out.
     state.sessionGeneration += 1;
-    state.busy = false;
+    invalidateQuota();
+    // An upstream-model fetch from the replaced session must not keep a slot or
+    // a selection in the new one.
+    invalidateModelRequest();
     state.optionalBusy = {};
     syncOptionalBusyControls();
     state.status = { version: '', base_url: DEFAULT_BASE_URL, credentials: [], models: [] };
@@ -549,6 +591,8 @@
     state.modelsDraftRevision = '';
     state.modelsDraftActive = false;
     state.modelsConflict = false;
+    state.modelsConflictRevision = '';
+    state.modelsConflictSeenRevision = '';
     state.modelsSaving = false;
     state.serverModels = [];
     state.reasoningModelKey = '';
@@ -587,6 +631,9 @@
     renderRuntime();
     renderErrorRules();
     renderModelTest();
+    // Release the busy lock owned by the replaced session and re-enable every
+    // control (notably the auth form) without waiting for a stale async finally.
+    setBusy(false);
     message('logsState', '');
     message('configState', '');
     message('modelTestState', '');
@@ -775,10 +822,17 @@
     state.serverModels = Array.isArray(fullModels) ? fullModels : [];
     state.serverModelsGeneration += 1;
     state.modelsRevision = incoming.models_revision || '';
-    if (!state.modelsDraftActive) {
+    if (state.modelsConflict && state.modelsRevision && state.modelsRevision !== state.modelsConflictRevision) {
+      // A real status read supplied a token different from the one that lost the
+      // CAS. Only now may the next save ask to confirm the overwrite.
+      state.modelsConflictSeenRevision = state.modelsRevision;
+    }
+    // A draft whose rows are back on the saved baseline is not a pending edit:
+    // release it so a later refresh can adopt the new server list. A conflict
+    // stays armed even when the content happens to match.
+    if (!state.modelsDraftActive || (!mappingsDirty() && !state.modelsConflict)) {
       state.mappings = cloneMappings(serverModels);
-      state.modelsDraftRevision = state.modelsRevision;
-      state.modelsConflict = false;
+      resetMappingsDraft(state.modelsRevision);
     }
     reconcileReasoningDrafts();
     reportOrphanedReasoningDrafts(previousServerModels);
@@ -1365,10 +1419,10 @@
     const rows = visible.map(item => {
       const box = el('input', { type: 'checkbox', checked: Core.hasUpstream(state.mappings, item.id), disabled: state.modelsSaving });
       box.addEventListener('change', () => {
-        beginMappingsDraft();
         state.mappings = box.checked
           ? Core.addUpstream(state.mappings, item.id)
           : Core.removeUpstream(state.mappings, item.id);
+        noteMappingsEdited();
         renderMappings();
       });
       const details = [el('span', { className: 'mono', text: item.id })];
@@ -1411,8 +1465,8 @@
         attrs: { 'aria-label': `第 ${index + 1} 行对外模型名`, autocomplete: 'off' },
       });
       alias.addEventListener('input', () => {
-        beginMappingsDraft();
         state.mappings[index].id = alias.value;
+        noteMappingsEdited();
         updateDirtyBadge();
       });
       const upstream = el('input', {
@@ -1422,15 +1476,15 @@
         attrs: { 'aria-label': `第 ${index + 1} 行上游模型 ID`, autocomplete: 'off' },
       });
       upstream.addEventListener('input', () => {
-        beginMappingsDraft();
         state.mappings[index].upstream_id = upstream.value;
+        noteMappingsEdited();
         updateDirtyBadge();
       });
       const remove = button('删除', 'remove-mapping', {
         className: 'button compact danger',
         on: () => {
-          beginMappingsDraft();
           state.mappings.splice(index, 1);
+          noteMappingsEdited();
           renderModels();
         },
       });
@@ -1468,10 +1522,10 @@
       message('modelState', '当前没有可操作的上游模型。', 'error');
       return;
     }
-    beginMappingsDraft();
     state.mappings = selected
       ? Core.addUpstreams(state.mappings, ids)
       : Core.removeUpstreams(state.mappings, ids);
+    noteMappingsEdited();
     renderMappings();
     message('modelState', selected
       ? `已勾选当前可见的 ${ids.length} 个上游模型，仍在编辑中，需保存。`
@@ -1595,7 +1649,14 @@
     // state.status.models is the editor-shaped clone (no policy/revision), so
     // keep the full server list here instead of letting the acknowledged
     // account edit silently drop every model's reasoning revision.
-    applyStatus({ ...state.status, credentials, models: state.serverModels });
+    applyStatus({
+      ...state.status,
+      credentials,
+      models: state.serverModels,
+      // A synthetic status must not roll the whole-list token back to the last
+      // status snapshot: a later save would silently lose its CAS lock.
+      models_revision: state.modelsRevision,
+    });
   }
 
   async function addAccount(event) {
@@ -1619,6 +1680,7 @@
       message('accountState', '已勾选「清除额度授权」，不会再保存新的 controlKey。取消勾选后再保存。', 'error');
       return;
     }
+    const sessionGeneration = state.sessionGeneration;
     setBusy(true);
     // Values are captured for this request only; every send outcome clears the
     // DOM, including a lost response or a server error after persistence.
@@ -1639,6 +1701,7 @@
           if (billing.workspaceID) body.workspace_id = billing.workspaceID;
         }
         const result = await api().updateCredential(editing.id, body);
+        if (sessionGeneration !== state.sessionGeneration) return;
         saved = true;
         applyAccountResult(result, { ...state.status.credentials.find(item => item.id === editing.id), id: editing.id, label });
         const wasEditing = editing.label;
@@ -1654,6 +1717,7 @@
         if (billing.controlKey) extra.control_key = billing.controlKey;
         if (billing.workspaceID) extra.workspace_id = billing.workspaceID;
         const result = await api().addCredential(label, key, extra);
+        if (sessionGeneration !== state.sessionGeneration) return;
         saved = true;
         applyAccountResult(result, { label });
         if (labelInput) labelInput.value = '';
@@ -1663,8 +1727,10 @@
           : '账户已保存，API key 已从页面清空。额度查询配置可随后通过「编辑」添加。');
       }
       await refreshStatus();
+      if (sessionGeneration !== state.sessionGeneration) return;
       renderAccounts();
     } catch (error) {
+      if (sessionGeneration !== state.sessionGeneration) return;
       if (isManagementAuthError(error)) {
         clearRejectedManagementAuth();
         const prefix = saved ? '账户已保存，但读取最新状态时认证失效。' : '';
@@ -1675,18 +1741,22 @@
           : `${editing ? '保存修改' : '保存'}请求失败，服务器结果尚未确认：${formatError(error)}。密钥输入已清空，请先刷新状态确认后再试。`, 'error');
       }
     } finally {
-      setBusy(false);
+      // A stale response from a replaced session must not release a lock the new
+      // session now owns.
+      if (sessionGeneration === state.sessionGeneration) setBusy(false);
     }
   }
 
   async function deleteAccount(item) {
     if (state.busy) return;
     if (typeof confirm === 'function' && !confirm(`删除账户「${item.label}」？此操作会删除 CPA 中保存的 OpenDesign key。`)) return;
+    const sessionGeneration = state.sessionGeneration;
     setBusy(true);
     message('accountState', '正在删除账户…');
     let deleted = false;
     try {
       await api().deleteCredential(item.id);
+      if (sessionGeneration !== state.sessionGeneration) return;
       deleted = true;
       applyAccountResult(null, item, true);
       invalidateQuota(item.id);
@@ -1702,6 +1772,7 @@
       }
       await refreshStatus();
     } catch (error) {
+      if (sessionGeneration !== state.sessionGeneration) return;
       if (isManagementAuthError(error)) {
         clearRejectedManagementAuth();
         showAuth(`${deleted ? '账户已删除，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`);
@@ -1718,17 +1789,19 @@
         message('accountState', `删除失败：${formatError(error)}`, 'error');
       }
     } finally {
-      setBusy(false);
+      if (sessionGeneration === state.sessionGeneration) setBusy(false);
     }
   }
 
   async function toggleAccount(item) {
     if (state.busy) return;
+    const sessionGeneration = state.sessionGeneration;
     setBusy(true);
     message('accountState', item.disabled ? '正在启用账户…' : '正在停用账户…');
     let updated = false;
     try {
       const result = await api().updateCredential(item.id, { disabled: !item.disabled });
+      if (sessionGeneration !== state.sessionGeneration) return;
       updated = true;
       applyAccountResult(result, { ...item, disabled: !item.disabled });
       if (!item.disabled && state.selectedCredential === item.id) {
@@ -1738,6 +1811,7 @@
       message('accountState', item.disabled ? '账户已启用。' : '账户已停用。');
       await refreshStatus();
     } catch (error) {
+      if (sessionGeneration !== state.sessionGeneration) return;
       if (isManagementAuthError(error)) {
         clearRejectedManagementAuth();
         showAuth(`${updated ? '账户状态已更新，但读取最新状态时认证失效。' : ''}401/403：${formatError(error)}`);
@@ -1745,7 +1819,7 @@
         ? `账户已${item.disabled ? '启用' : '停用'}，但读取最新状态失败：${formatError(error)}。请刷新状态确认。`
         : `更新失败：${formatError(error)}`, 'error');
     } finally {
-      setBusy(false);
+      if (sessionGeneration === state.sessionGeneration) setBusy(false);
     }
   }
 
@@ -1755,16 +1829,20 @@
   async function resumeQuotaPause(item) {
     if (state.busy) return;
     if (typeof confirm === 'function' && !confirm(`解除账户「${item.label}」的额度暂停？这不会证明额度已恢复，也不会改变通过本插件设置的人工启用状态。`)) return;
+    const sessionGeneration = state.sessionGeneration;
     setBusy(true);
     message('accountState', '正在解除额度暂停…');
     try {
       await api().resumeQuotaPause(item.id);
+      if (sessionGeneration !== state.sessionGeneration) return;
       await refreshStatus();
+      if (sessionGeneration !== state.sessionGeneration) return;
       message('accountState', '已解除插件额度暂停；这不会查询或证明额度已恢复，账户是否调度仍由 CPA 与启用状态决定。');
     } catch (error) {
+      if (sessionGeneration !== state.sessionGeneration) return;
       message('accountState', `解除失败：${formatError(error)}`, 'error');
     } finally {
-      setBusy(false);
+      if (sessionGeneration === state.sessionGeneration) setBusy(false);
     }
   }
 
@@ -1773,16 +1851,20 @@
   async function recheckQuotaPause(item) {
     if (state.busy) return;
     if (typeof confirm === 'function' && !confirm(`用官方额度预检查重新确认账户「${item.label}」的额度？只有所有已知耗尽模型均有新鲜可用证据时才会解除暂停。`)) return;
+    const sessionGeneration = state.sessionGeneration;
     setBusy(true);
     message('accountState', '正在重查额度…');
     try {
       await api().recheckQuotaPause(item.id);
+      if (sessionGeneration !== state.sessionGeneration) return;
       await refreshStatus();
-      message('accountState', '本次官方复查通过，已解除插件本地额度暂停；账户是否调度仍由 CPA 与启用状态决定。');
+      if (sessionGeneration !== state.sessionGeneration) return;
+      message('accountState', '本次官方复查通过，已解除插件额度暂停；账户是否调度仍由 CPA 与启用状态决定。');
     } catch (error) {
+      if (sessionGeneration !== state.sessionGeneration) return;
       message('accountState', `重查未通过：${formatError(error)}`, 'error');
     } finally {
-      setBusy(false);
+      if (sessionGeneration === state.sessionGeneration) setBusy(false);
     }
   }
 
@@ -1813,7 +1895,10 @@
       return;
     }
     const requestToken = ++modelRequestSeq;
-    const stillCurrent = () => requestToken === modelRequestSeq && state.selectedCredential === credentialID;
+    const sessionGeneration = state.sessionGeneration;
+    const stillCurrent = () => requestToken === modelRequestSeq &&
+      sessionGeneration === state.sessionGeneration &&
+      state.selectedCredential === credentialID;
     state.selectedCredential = credentialID;
     activeModelRequest = requestToken;
     setBusy(true);
@@ -1857,7 +1942,7 @@
     } finally {
       // Only the request that owns the busy slot may release it; an invalidated
       // request has already handed the slot to a newer fetch.
-      if (activeModelRequest === requestToken) {
+      if (activeModelRequest === requestToken && sessionGeneration === state.sessionGeneration) {
         activeModelRequest = 0;
         setBusy(false);
       }
@@ -1903,8 +1988,11 @@
       }
       renderAccounts();
     } catch (error) {
+      // A logout/key switch bumps both generations; the old answer (including a
+      // 401) must neither repaint nor log the new session out.
       if (!stillCurrent()) return;
       if (isManagementAuthError(error)) {
+        clearRejectedManagementAuth();
         showAuth(error.status === 401
           ? '401：管理密钥无效或已过期，请重新验证后再查询额度。'
           : '403：管理请求被拒绝，请确认管理密钥和来源 IP。');
@@ -2124,9 +2212,10 @@
     }
     state.logQuery = { ...query };
     const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('logs', true);
     message('logsState', '正在读取请求日志…');
-    const stillCurrent = () => generation === state.optionalGeneration;
+    const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
       const raw = await api().requestLogs(query);
       if (!stillCurrent()) return;
@@ -2186,9 +2275,10 @@
   async function loadRequestStats() {
     if (optionalLogBusy()) return;
     const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('stats', true);
     message('logsState', '正在读取请求统计…');
-    const stillCurrent = () => generation === state.optionalGeneration;
+    const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
       const raw = await api().requestStats();
       if (!stillCurrent()) return;
@@ -2213,9 +2303,10 @@
     if (optionalLogBusy()) return;
     if (typeof confirm === 'function' && !confirm('清空全部请求日志？此操作不可撤销，但不会影响账户、模型映射或推理。')) return;
     const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('logsClear', true);
     message('logsState', '正在清空请求日志…');
-    const stillCurrent = () => generation === state.optionalGeneration;
+    const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
       await api().clearRequestLogs();
       if (!stillCurrent()) return;
@@ -2296,9 +2387,10 @@
       return;
     }
     const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('config', true);
     message('configState', '正在保存额度暂停设置…');
-    const stillCurrent = () => generation === state.optionalGeneration;
+    const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
       const raw = await api().updatePauseConfig({ enabled: Boolean(enabled && enabled.checked), max_seconds: seconds });
       if (!stillCurrent()) return;
@@ -2317,9 +2409,10 @@
   async function loadConfig() {
     if (optionalBusy('config')) return;
     const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('config', true);
     message('configState', '正在读取配置…');
-    const stillCurrent = () => generation === state.optionalGeneration;
+    const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
       const raw = await api().config();
       if (!stillCurrent()) return;
@@ -2357,9 +2450,10 @@
     logs.retention_days = retention;
     logs.max_entries = entries;
     const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('config', true);
     message('configState', '正在保存日志设置…');
-    const stillCurrent = () => generation === state.optionalGeneration;
+    const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
       const raw = await api().updateConfig(logs);
       if (!stillCurrent()) return;
@@ -2439,9 +2533,10 @@
   async function loadRuntime() {
     if (optionalBusy('runtime')) return;
     const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('runtime', true);
     message('configState', '正在读取运行时状态…');
-    const stillCurrent = () => generation === state.optionalGeneration;
+    const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
       const raw = await api().runtime();
       if (!stillCurrent()) return;
@@ -2664,11 +2759,12 @@
     if (dialog && typeof dialog.showModal === 'function' && !dialog.open) dialog.showModal();
     errorRulesView.generation += 1;
     const generation = errorRulesView.generation;
+    const sessionGeneration = state.sessionGeneration;
     errorRulesView.loaded = false;
     renderErrorRules();
     setOptionalBusy('errorRules', true);
     message('errorRulesState', '正在读取错误规则…');
-    const stillCurrent = () => generation === errorRulesView.generation;
+    const stillCurrent = () => generation === errorRulesView.generation && sessionGeneration === state.sessionGeneration;
     try {
       const raw = await api().errorRules();
       if (!stillCurrent()) return;
@@ -2718,57 +2814,60 @@
       return;
     }
     const generation = errorRulesView.generation;
+    const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('errorRules', true);
     message('errorRulesState', '正在保存并同步到所有账号…');
     try {
       const raw = await api().saveErrorRules(errorRulesPayload());
-      if (generation !== errorRulesView.generation) return;
+      if (generation !== errorRulesView.generation || sessionGeneration !== state.sessionGeneration) return;
       const view = applyErrorRulesResponse(raw);
       message('errorRulesState', errorRulesSyncText(view), view.sync.failed.length ? 'error' : 'ok');
     } catch (error) {
-      if (generation !== errorRulesView.generation) return;
+      if (generation !== errorRulesView.generation || sessionGeneration !== state.sessionGeneration) return;
       if (optionalAuthFailure(error)) return;
       message('errorRulesState', optionalErrorText(error), 'error');
     } finally {
-      if (generation === errorRulesView.generation) setOptionalBusy('errorRules', false);
+      if (generation === errorRulesView.generation && sessionGeneration === state.sessionGeneration) setOptionalBusy('errorRules', false);
     }
   }
 
   async function retryErrorRules() {
     if (errorRulesView.busy || !errorRulesView.loaded || errorRulesView.dirty) return;
     const generation = errorRulesView.generation;
+    const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('errorRules', true);
     message('errorRulesState', '正在重新同步到所有账号…');
     try {
       const raw = await api().syncErrorRules();
-      if (generation !== errorRulesView.generation) return;
+      if (generation !== errorRulesView.generation || sessionGeneration !== state.sessionGeneration) return;
       const view = applyErrorRulesResponse(raw);
       message('errorRulesState', errorRulesSyncText(view), view.sync.failed.length ? 'error' : 'ok');
     } catch (error) {
-      if (generation !== errorRulesView.generation) return;
+      if (generation !== errorRulesView.generation || sessionGeneration !== state.sessionGeneration) return;
       if (optionalAuthFailure(error)) return;
       message('errorRulesState', optionalErrorText(error), 'error');
     } finally {
-      if (generation === errorRulesView.generation) setOptionalBusy('errorRules', false);
+      if (generation === errorRulesView.generation && sessionGeneration === state.sessionGeneration) setOptionalBusy('errorRules', false);
     }
   }
 
   async function resetErrorRules() {
     if (errorRulesView.busy || !errorRulesView.loaded) return;
     const generation = errorRulesView.generation;
+    const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('errorRules', true);
     message('errorRulesState', '正在恢复默认规则…');
     try {
       const raw = await api().resetErrorRules();
-      if (generation !== errorRulesView.generation) return;
+      if (generation !== errorRulesView.generation || sessionGeneration !== state.sessionGeneration) return;
       const view = applyErrorRulesResponse(raw);
       message('errorRulesState', errorRulesSyncText(view), view.sync.failed.length ? 'error' : 'ok');
     } catch (error) {
-      if (generation !== errorRulesView.generation) return;
+      if (generation !== errorRulesView.generation || sessionGeneration !== state.sessionGeneration) return;
       if (optionalAuthFailure(error)) return;
       message('errorRulesState', optionalErrorText(error), 'error');
     } finally {
-      if (generation === errorRulesView.generation) setOptionalBusy('errorRules', false);
+      if (generation === errorRulesView.generation && sessionGeneration === state.sessionGeneration) setOptionalBusy('errorRules', false);
     }
   }
 
@@ -2841,12 +2940,13 @@
       : '';
     if (typeof confirm === 'function' && !confirm(`向账户「${credentialLabel(credentialID)}」发送一次真实模型测试请求（模型 ${modelID}${reasoningNote}）？这会产生一次真实推理用量。`)) return;
     const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     const modelTestGeneration = state.modelTestGeneration;
     setOptionalBusy('modelTest', true);
     state.modelTest = null;
     renderModelTest();
     message('modelTestState', '正在发送模型测试（只发送一次，不自动重试）…');
-    const stillCurrent = () => generation === state.optionalGeneration;
+    const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     // A mapping save, a status refresh or a selection change advances the model
     // test generation; a late answer for that older test is dropped silently so
     // it can neither repaint the panel nor overwrite a newer explanation.
@@ -2921,6 +3021,8 @@
     // once and require an explicit overwrite confirmation.
     if (state.modelsDraftActive && !sentDraftRevision && serverRevision && state.modelsConflict !== true) {
       state.modelsConflict = true;
+      state.modelsConflictRevision = serverRevision;
+      state.modelsConflictSeenRevision = serverRevision;
       renderMappings();
       message('modelState', '保存已取消：服务器现在提供整表版本校验，但当前草稿是在此之前开始编辑的。草稿已保留；再次点击「保存模型映射」可按当前服务器版本确认覆盖。', 'error');
       return;
@@ -2928,7 +3030,14 @@
     // A 409 (or a server revision that moved under the draft) must be confirmed
     // again by an explicit click. This is tied to the conflict flag, never to the
     // rows' content: typing the old values back does not skip the confirmation.
-    if (state.modelsConflict === true && serverRevision) {
+    if (state.modelsConflict === true) {
+      if (!serverRevision || state.modelsConflictSeenRevision !== serverRevision) {
+        // After a 409 the same stale token would just be rejected again. Require
+        // a fresh status read first, then an explicit confirmation.
+        renderMappings();
+        message('modelState', '保存已取消：模型列表已在其他页面更新。请先刷新状态读取最新整表版本，核对后再点击保存确认覆盖；草稿已保留。', 'error');
+        return;
+      }
       if (typeof confirm === 'function'
         && !confirm('模型列表已在其他页面更新。继续保存会用当前草稿覆盖服务器上的版本。确定继续？')) {
         message('modelState', '已取消保存，草稿仍然保留。', '');
@@ -3019,17 +3128,32 @@
           state.modelsDraftActive = true;
           state.modelsDraftRevision = sentRevision;
           state.modelsConflict = true;
+          state.modelsConflictRevision = state.modelsRevision;
+          state.modelsConflictSeenRevision = '';
         }
         renderMappings();
         message('modelState', `模型映射已保存，但宿主刷新模型目录失败：${formatError(error)}。可先刷新状态确认，再重试保存或启用账户触发刷新。`, 'error');
+      } else if (error.status === 409 && !sentRevision && !state.modelsRevision) {
+        // An older backend has no whole-list token, so a 409 is not a CAS
+        // conflict here. Keep the previous wording instead of arming a retry
+        // gate that no status read could ever satisfy.
+        message('modelState', '保存失败：模型或规则已变更，请检查提交内容后重试。', 'error');
       } else if (error.status === 409) {
         // Keep the submitted rows exactly as they are. The conflict must be
         // resolved by an explicit second confirmation, never by reverting.
         state.modelsDraftActive = true;
         state.modelsDraftRevision = sentRevision || state.modelsRevision;
         state.modelsConflict = true;
+        state.modelsConflictRevision = sentRevision || state.modelsRevision;
+        // A status refresh may already have supplied a token different from the
+        // one just rejected; that counts as reading the new revision. Otherwise
+        // the next click waits for a fresh status read instead of spinning on
+        // the same stale token.
+        state.modelsConflictSeenRevision = (serverRevision && serverRevision !== sentRevision)
+          ? serverRevision
+          : '';
         renderMappings();
-        message('modelState', '保存失败：模型列表已在其他页面更新。提交内容已保留；再次点击「保存模型映射」并确认后才会覆盖服务器版本。', 'error');
+        message('modelState', '保存失败：模型列表已在其他页面更新。提交内容已保留；请先刷新状态读取最新整表版本，再次点击「保存模型映射」并确认后才会覆盖服务器版本。', 'error');
       } else {
         message('modelState', `保存失败：${formatError(error)}`, 'error');
       }
@@ -3055,8 +3179,8 @@
   }
 
   function addMapping() {
-    beginMappingsDraft();
     state.mappings.push({ id: '', upstream_id: '' });
+    noteMappingsEdited();
     renderMappings();
     message('modelState', '已手动添加一行映射，填写对外别名和上游模型 ID 后保存。', '');
   }
@@ -3376,6 +3500,11 @@
       const raw = await api().saveReasoningMapping(payload);
       if (generation !== state.reasoningGeneration || sessionGeneration !== state.sessionGeneration) return;
       applyServerModels(raw && Array.isArray(raw.models) ? raw.models : null);
+      if (raw && typeof raw.models_revision === 'string' && raw.models_revision.trim()) {
+        // A reasoning save can move the whole-list token too. Keeping it makes
+        // the next model-list save CAS-checked instead of tokenless.
+        state.modelsRevision = raw.models_revision.trim();
+      }
       state.reasoningDrafts.delete(key);
       // The policy is request-shaping state: a result produced under the old
       // rules no longer describes what the plugin will now send.
@@ -3536,7 +3665,9 @@
 
   async function submitAuth(event) {
     if (event) event.preventDefault();
-    if (state.busy) return;
+    // A stale busy flag from the previous session (for example a model POST that
+    // returned 401) must never lock the operator out of re-authenticating.
+    if (state.authSubmitting) return;
     const keyInput = $('managementKey');
     const typeSelect = $('authType');
     const rememberInput = $('rememberAuth');
@@ -3549,8 +3680,15 @@
     }
     const generation = state.optionalGeneration;
     const sessionGeneration = state.sessionGeneration;
-    state.candidate = { headers: Auth.candidateHeaders(key, type) };
-    setBusy(true);
+    const candidate = { headers: Auth.candidateHeaders(key, type) };
+    // Re-validating the same key keeps the current session: its drafts and CAS
+    // tokens are still valid. A different key starts a fresh session.
+    const sameIdentity = sameAuthIdentity(state.verified && state.verified.headers, candidate.headers);
+    state.candidate = candidate;
+    state.authSubmitting = true;
+    // Authentication owns its own flag instead of the shared busy lock, so a
+    // stale model write can never keep the operator from re-verifying.
+    setDisabled('authSubmit', true);
     message('authState', '正在验证管理密钥…');
     try {
       const status = await api().status();
@@ -3558,16 +3696,21 @@
       const hadDrafts = mappingsDirty() || state.modelsDraftActive || state.reasoningDrafts.size > 0;
       // Persist only after CPA accepted the key.
       Auth.saveAuth(key, type, remember);
-      state.verified = { headers: state.candidate.headers, source: 'manual' };
+      state.verified = { headers: candidate.headers, source: 'manual' };
       state.candidate = null;
       if (keyInput) keyInput.value = '';
-      // A management-key switch owns a fresh session: old drafts and CAS tokens
-      // must never leak into it.
-      resetManagementData();
+      if (!sameIdentity) {
+        // A management-key switch owns a fresh session: old drafts, CAS tokens
+        // and any unsubmitted account secret in the form must go with it.
+        resetManagementData();
+        resetAccountForm();
+      }
       applyStatus(status);
       setAuthCollapsed(true);
       markConnected('manual');
-      message('modelState', hadDrafts ? '管理密钥已切换，未保存的模型映射/思考强度草稿已清除。' : '');
+      message('modelState', !sameIdentity && hadDrafts
+        ? '管理密钥已切换，未保存的模型映射/思考强度草稿已清除。'
+        : '');
       message('accountState', '');
       message('authState', '管理密钥验证成功，已开始读取账户和模型。', 'ok');
     } catch (error) {
@@ -3578,7 +3721,8 @@
           : '403：管理请求被拒绝，请确认管理密钥和来源 IP。')
         : `验证失败：${formatError(error)}`);
     } finally {
-      setBusy(false);
+      state.authSubmitting = false;
+      setDisabled('authSubmit', false);
     }
   }
 
@@ -3586,6 +3730,7 @@
     try { Auth.clearAuth(); } catch { /* Ignore blocked storage. */ }
     state.verified = null;
     state.candidate = null;
+    state.authSubmitting = false;
     state.selectedCredential = '';
     invalidateQuota();
     resetAccountForm();
