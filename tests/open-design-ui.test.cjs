@@ -2889,8 +2889,66 @@ test('the reasoning table follows a server refresh and keeps one draft per model
   api.render.applyStatus(reasoningStatus(...models));
   assert.equal(api.state.reasoningModelKey.includes('od-b'), true, 'the picker falls back to a live model');
   assert.equal(api.state.reasoningDrafts.size, 1, 'a removed model keeps its draft instead of losing it');
-  assert.match(view.document.getElementById('reasoningState').textContent, /草稿已保留/);
-  assert.match(view.document.getElementById('reasoningState').textContent, /od-a/);
+  assert.match(view.document.getElementById('reasoningOrphans').textContent, /草稿已保留/);
+  assert.match(view.document.getElementById('reasoningOrphans').textContent, /od-a/);
+});
+
+test('orphan reasoning drafts remain separately visible through saves, editing and refreshes', async () => {
+  const x = { id: 'od-x', upstream_id: 'vela/gpt-6-luna', reasoning_revision: 'rev-x' };
+  const r = { id: 'od-r', upstream_id: 'vela/gpt-6-saturn', reasoning_revision: 'rev-r' };
+  const posts = [];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+        posts.push(JSON.parse(init.body));
+        return respond(200, { models: [{ ...r, reasoning_revision: 'rev-r-2', reasoning_mapping: posts.at(-1).reasoning_mapping }] });
+      }
+      if (url.includes('/status')) return respond(200, reasoningStatus(x, r));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const orphanKey = 'od-x\u0000vela/gpt-6-luna';
+  const savedKey = 'od-r\u0000vela/gpt-6-saturn';
+  api.handlers.selectReasoningModel(orphanKey);
+  await api.handlers.addReasoningRule();
+  await api.handlers.changeReasoningRule(0, 'from', 'medium');
+  await api.handlers.changeReasoningRule(0, 'to', 'max');
+  api.handlers.selectReasoningModel(savedKey);
+  await api.handlers.addReasoningRule();
+  api.render.applyStatus(reasoningStatus(r)); // another tab removed X
+
+  await api.handlers.saveReasoning();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].model, 'od-r');
+  assert.match(view.document.getElementById('reasoningState').textContent, /已保存 od-r/);
+  const warning = view.document.getElementById('reasoningOrphans');
+  const checkWarning = () => {
+    assert.equal(warning.hidden, false);
+    assert.match(warning.textContent, /草稿已保留/);
+    assert.match(warning.textContent, /od-x → vela\/gpt-6-luna/);
+    assert.match(warning.textContent, /medium→max/);
+    assert.ok(!warning.textContent.includes(managementKey));
+  };
+  checkWarning();
+  assert.equal(api.state.reasoningDrafts.has(orphanKey), true);
+  assert.equal(api.state.reasoningDrafts.has(savedKey), false);
+  assert.deepEqual(plain(api.state.reasoningDrafts.get(orphanKey).rules), [{ from: 'medium', to: 'max' }]);
+  await api.handlers.addReasoningRule(); // routine edits must not erase the warning
+  checkWarning();
+  api.render.applyStatus(reasoningStatus(r)); // repeated refresh, X was already absent
+  checkWarning();
+  api.render.applyStatus(reasoningStatus(x, r)); // re-adding X makes its draft selectable
+  assert.equal(warning.hidden, true);
+  assert.equal(api.state.reasoningDrafts.has(orphanKey), true);
+  api.handlers.selectReasoningModel(orphanKey);
+  assert.deepEqual(plain(api.render.currentReasoningMapping(api.state.serverModels[0]).rules), [{ from: 'medium', to: 'max' }]);
+  api.render.applyStatus(reasoningStatus(r));
+  checkWarning();
+  api.handlers.clearAuth();
+  assert.equal(warning.hidden, true, 'logout clears notices belonging to the old session');
 });
 
 test('the model test sends a chosen strength and displays the applied conversion', async () => {
@@ -4039,7 +4097,7 @@ test('an upstream change keeps the old reasoning draft and surfaces it as copyab
   models = [{ id: 'od-a', upstream_id: 'vela/gpt-6-saturn', reasoning_revision: 'rev-0' }];
   api.render.applyStatus(reasoningStatus(...models));
   assert.equal(api.state.reasoningDrafts.has(draftKey), true, 'the upstream-changed draft is kept');
-  const text = view.document.getElementById('reasoningState').textContent;
+  const text = view.document.getElementById('reasoningOrphans').textContent;
   assert.match(text, /草稿已保留/);
   assert.match(text, /od-a → vela\/gpt-6-luna/, 'the copyable text names the old mapping');
   assert.match(text, /→/, 'the rule table is included for copying');

@@ -950,7 +950,6 @@
       renderOverview();
       return;
     }
-    const previousServerModels = state.serverModels;
     const serverModels = editorRowsFromServer(incoming.models);
     // A status refresh (account add/update, background reload) must not silently
     // discard mapping edits the operator has not saved yet. The saved baseline is
@@ -981,7 +980,7 @@
       resetMappingsDraft(state.modelsRevision);
     }
     reconcileReasoningDrafts();
-    reportOrphanedReasoningDrafts(previousServerModels);
+    reportOrphanedReasoningDrafts();
     renderMeta();
     renderAccounts();
     renderModels();
@@ -3458,20 +3457,21 @@
       : '（空表）';
   }
 
-  // Models that were present before a refresh but are gone (or now point at a
-  // different upstream) keep any draft they had. Show the rules as plain text so
-  // the operator can copy them instead of losing the edit silently.
-  function reportOrphanedReasoningDrafts(previousModels) {
-    const previous = new Set((Array.isArray(previousModels) ? previousModels : []).map(reasoningModelKey));
+  // An orphan remains important even after another refresh, a successful save
+  // or ordinary edits. Give these copyable drafts their own status element so
+  // transient operation messages cannot erase the warning. Derive it from the
+  // full current draft set; clearing or re-adding a model retracts it naturally.
+  function reportOrphanedReasoningDrafts() {
     const live = new Set(state.serverModels.map(reasoningModelKey));
     const lines = [];
     for (const [key, draft] of state.reasoningDrafts) {
-      if (!previous.has(key) || live.has(key)) continue;
+      if (live.has(key)) continue;
       const [id, upstream] = String(key).split('\u0000');
-      lines.push(`${id || '（无别名）'} → ${upstream || '（无上游）'}：${reasoningDraftText(draft)}`);
+      lines.push(`${id || '（无别名）'} → ${upstream || '（无上游）'}（${draft.enabled ? '启用' : '关闭'}）：${reasoningDraftText(draft)}`);
     }
-    if (!lines.length) return;
-    message('reasoningState', `模型映射已变化，以下未保存的思考强度草稿已保留，可复制后重新添加模型：${lines.join('；')}。`, 'error');
+    message('reasoningOrphans', lines.length
+      ? `模型映射已变化，以下未保存的思考强度草稿已保留，可复制后重新添加模型：${lines.join('；')}。`
+      : '', 'error');
   }
 
   // The revision a draft is pinned to. It is captured on the first edit and
@@ -3630,6 +3630,7 @@
     renderReasoningRows(currentReasoningMapping(model).rules, model, state.busy || state.reasoningSaving);
     syncReasoningControls();
     if (!model) message('reasoningState', '');
+    reportOrphanedReasoningDrafts();
   }
 
   function selectReasoningModel(key) {
@@ -3660,13 +3661,12 @@
   }
 
   function applyServerModels(models, options = {}) {
-    const previousServerModels = state.serverModels;
     state.serverModels = options.merged === true
       ? mergeServerModels(state.serverModels, models)
       : (Array.isArray(models) ? models : []);
     state.serverModelsGeneration += 1;
     reconcileReasoningDrafts();
-    reportOrphanedReasoningDrafts(previousServerModels);
+    reportOrphanedReasoningDrafts();
   }
 
   // A response that carries the complete stored list (a reasoning save, for
