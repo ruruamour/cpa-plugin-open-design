@@ -234,28 +234,35 @@
     return rows;
   }
 
-  // A pinned identity is only meaningful against the snapshot named by the
-  // whole-list token that is about to be sent. When an explicit overwrite moves
-  // the draft onto a newer snapshot, re-resolve every pin there: keep it when
-  // that exact row still exists (so a rename still keeps its policy) and drop
-  // it when the row is gone, instead of posting an identity the backend would
-  // reject on every retry.
-  function rebaseMappingOriginals(models) {
+  // A missing pin cannot safely be discarded: without it the backend matches a
+  // row by alias and can inherit a different model's policy. The same ambiguity
+  // exists for a genuinely new row when another tab creates its alias before a
+  // confirmed overwrite. Fail closed and keep the draft rather than inventing a
+  // new binding. Legacy servers have no whole-list CAS or pin semantics.
+  function blockAmbiguousMappingIdentities(revision = modelsSaveRevision()) {
+    if (!revision) return false;
     const snapshot = Array.isArray(state.serverModels) ? state.serverModels : [];
-    return (Array.isArray(models) ? models : []).map(model => {
-      const row = { id: model.id, upstream_id: model.upstream_id };
-      const originalID = String(model && model.original_id || '').trim();
-      const originalUpstreamID = String(model && model.original_upstream_id || '').trim();
-      if (!originalID || !originalUpstreamID) return row;
-      const stillPresent = snapshot.some(item =>
-        String(item && item.id || '').trim() === originalID &&
-        String(item && item.upstream_id || '').trim() === originalUpstreamID);
-      if (stillPresent) {
-        row.original_id = originalID;
-        row.original_upstream_id = originalUpstreamID;
+    const rows = Array.isArray(state.mappings) ? state.mappings : [];
+    const claimedIDs = new Set(rows.map(row => String(row && row.original_id || '').trim()).filter(Boolean));
+    const issues = [];
+    for (const row of rows) {
+      const alias = String(row && row.id || '').trim();
+      const upstream = String(row && row.upstream_id || '').trim();
+      const originalID = String(row && row.original_id || '').trim();
+      const originalUpstream = String(row && row.original_upstream_id || '').trim();
+      if (originalID || originalUpstream) {
+        const found = originalID && originalUpstream && snapshot.some(item =>
+          String(item && item.id || '').trim() === originalID &&
+          String(item && item.upstream_id || '').trim() === originalUpstream);
+        if (!found) issues.push(`${alias} → ${upstream}（原行 ${originalID} → ${originalUpstream} 已不存在或无法确认）`);
+      } else if (alias && !claimedIDs.has(alias) && snapshot.some(item => String(item && item.id || '').trim() === alias)) {
+        issues.push(`${alias} → ${upstream}（新行与服务器的同名别名冲突）`);
       }
-      return row;
-    });
+    }
+    if (!issues.length) return false;
+    renderMappings();
+    message('modelState', `保存已取消，未向服务器发送请求：${issues.join('；')}。去掉原行身份或直接覆盖可能沿用当前同名行的思考强度策略，草稿已保留。请先核对并复制需要的草稿；如以服务器当前行为准，请点击「还原为已保存」，再按需编辑模型和思考强度映射。`, 'error');
+    return true;
   }
 
   // Rows whose stored thinking-strength policy is about to be dropped. An
@@ -264,9 +271,8 @@
   // A real upstream change always drops it: the backend clears the old mapping
   // by default and this console never opts in silently. On an old backend there
   // is no original identity to send, so even a rename cannot be linked to its
-  // stored row and the policy is lost as well. A row whose original identity is
-  // no longer in the snapshot also loses it, because the backend refuses to
-  // resolve an identity it cannot see.
+  // stored row and the policy is lost as well. An unresolvable original identity
+  // is blocked before this warning on a backend with a whole-list token.
   function mappingsLosingReasoning(models = state.mappings, revision = modelsSaveRevision()) {
     const snapshot = Array.isArray(state.serverModels) ? state.serverModels : [];
     const lost = [];
@@ -3200,6 +3206,7 @@
       message('modelState', '保存已取消：服务器现在提供整表版本校验，但当前草稿是在此之前开始编辑的。草稿已保留；再次点击「保存模型映射」可按当前服务器版本确认覆盖。', 'error');
       return;
     }
+    if (blockAmbiguousMappingIdentities()) return;
     // Changing the upstream clears the stored policy by default on the backend.
     // Never carry it silently and never claim it was kept: the operator has to
     // see which rows drop their thinking-strength rules first. Rows that only
@@ -3228,12 +3235,12 @@
         message('modelState', '已取消保存，草稿仍然保留。', '');
         return;
       }
+      // A modal confirmation must never authorize a changed/ambiguous identity;
+      // check again before moving the draft to the newer snapshot.
+      if (blockAmbiguousMappingIdentities(serverRevision)) return;
       state.modelsDraftActive = true;
       state.modelsDraftRevision = serverRevision;
       state.modelsConflict = false;
-      // The confirmation re-bases the draft onto the token just read, so every
-      // original identity must describe that snapshot before it is sent.
-      state.mappings = rebaseMappingOriginals(state.mappings);
     }
     // A whole-table save carries the rows' original identities, and the backend
     // rejects a list where two rows claim the same original row or an alias

@@ -3485,7 +3485,8 @@ test('the model-list token is pinned at draft start and status refreshes do not 
   api.handlers.addMapping();
   assert.equal(api.state.modelsDraftActive, true);
   assert.equal(api.state.modelsDraftRevision, 'list-rev-1');
-  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }, { id: 'od-pro', upstream_id: 'open-design/pro' }];
+  api.state.mappings[1].id = 'od-pro';
+  api.state.mappings[1].upstream_id = 'open-design/pro';
 
   // A status refresh moves the server forward but must not move the draft base.
   currentRevision = 'list-rev-2';
@@ -3528,7 +3529,8 @@ test('a draft begun before the backend advertised models_revision needs an expli
   await api.render.loadStatus();
   assert.equal(api.state.modelsRevision, '', 'the old backend sends no token');
   api.handlers.addMapping();
-  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }, { id: 'od-pro', upstream_id: 'open-design/pro' }];
+  api.state.mappings[1].id = 'od-pro';
+  api.state.mappings[1].upstream_id = 'open-design/pro';
 
   // The backend starts providing a token after the draft was begun.
   revision = 'list-rev-9';
@@ -3665,7 +3667,8 @@ test('a status refresh landing during a model-list save cannot replace the rows'
   api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
   await api.render.loadStatus();
   api.handlers.addMapping();
-  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }, { id: 'od-pro', upstream_id: 'open-design/pro' }];
+  api.state.mappings[1].id = 'od-pro';
+  api.state.mappings[1].upstream_id = 'open-design/pro';
 
   const pending = api.handlers.saveModels();
   assert.equal(api.state.modelsSaving, true);
@@ -3702,7 +3705,6 @@ test('a 401 during a model save leaves the auth form usable for re-verification'
   const api = view.context.OpenDesignConsole;
   api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
   await api.render.loadStatus();
-  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
   const pending = api.handlers.saveModels();
   assert.equal(api.state.busy, true);
 
@@ -3736,7 +3738,6 @@ test('re-authentication works while a model POST from the old session is still p
   const api = view.context.OpenDesignConsole;
   api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
   await api.render.loadStatus();
-  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
   const pending = api.handlers.saveModels();
   assert.equal(api.state.busy, true);
 
@@ -3782,7 +3783,6 @@ test('a synthetic account result keeps the models_revision won by a model save',
   const api = view.context.OpenDesignConsole;
   api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
   await api.render.loadStatus();
-  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
   await api.handlers.saveModels();
   assert.equal(api.state.modelsRevision, 'list-rev-8');
 
@@ -4720,7 +4720,7 @@ test('a rejected save keeps every original identity for the retry', async () => 
   assert.equal(page.posts[1].models[0].original_upstream_id, 'open-design/flash');
 });
 
-test('a conflict retry drops a pin whose original row vanished from the snapshot', async () => {
+test('a conflict retry blocks rather than dropping an unresolved original identity', async () => {
   const page = modelSavePage({
     onSave: (body, count) => {
       if (count === 1) return { status: 409, body: { error: 'models_revision_conflict' } };
@@ -4730,21 +4730,18 @@ test('a conflict retry drops a pin whose original row vanished from the snapshot
   await page.api.render.loadStatus();
   const alias = page.view.document.getElementById('mappingList').children[0].children[0].children[1];
   alias.value = 'od-flash-fast';
-  alias.emit('input');
+  await alias.emit('input');
   await page.api.handlers.saveModels();
   assert.equal(page.posts.length, 1);
 
-  // Another tab deleted that row, so the identity can no longer be resolved.
   page.setModels([{ id: 'od-pro', upstream_id: 'open-design/pro' }]);
   page.setRevision('list-rev-2');
   await page.api.render.loadStatus();
   await page.api.handlers.saveModels();
-  assert.equal(page.posts.length, 2);
-  const resent = page.posts[1].models.find(row => row.id === 'od-flash-fast');
-  assert.equal(resent.original_id, undefined, 'an identity the snapshot cannot resolve is not resent');
-  assert.equal(resent.original_upstream_id, undefined);
-  assert.ok(page.confirmations.some(text => /原行已不存在/.test(text)),
-    'the operator is told the old row is gone instead of silently losing the link');
+  assert.equal(page.posts.length, 1, 'an unresolvable original is never stripped and posted');
+  assert.equal(page.api.state.mappings[0].original_id, 'od-flash');
+  assert.equal(page.api.state.mappings[0].original_upstream_id, 'open-design/flash');
+  assert.match(page.view.document.getElementById('modelState').textContent, /原行.*不存在/);
 });
 
 test('deleting or reordering rows keeps every remaining row pinned to its own server row', async () => {
@@ -5042,6 +5039,94 @@ test('a model mapping draft survives a reasoning response and keeps its original
     'the rejected draft is kept for an explicit overwrite decision');
 });
 
+test('two tabs cannot rebase an old pin onto a replacement row and inherit its policy', async () => {
+  const original = { enabled: true, rules: [{ from: 'low', to: 'medium' }] };
+  const backend = sharedModelBackend({ models: [{ id: 'a', upstream_id: 'up/1', reasoning_revision: 'rev-a', reasoning_mapping: original }] });
+  const { a, b } = twoModelTabs(backend);
+  await a.api.render.loadStatus();
+  await b.api.render.loadStatus();
+  const upstream = a.view.document.getElementById('mappingList').children[0].children[2].children[1];
+  upstream.value = 'up/2';
+  await upstream.emit('input');
+  await b.view.document.getElementById('mappingList').children[0].children[3].emit('click');
+  await b.api.handlers.saveModels(); // delete the old row in a completed save
+  b.api.handlers.addMapping();
+  b.api.state.mappings[0].id = 'a';
+  b.api.state.mappings[0].upstream_id = 'up/2';
+  await b.api.handlers.saveModels();
+  b.api.handlers.selectReasoningModel('a\u0000up/2');
+  await b.api.handlers.setReasoningEnabled(true);
+  await b.api.handlers.addReasoningRule();
+  await b.api.handlers.saveReasoning();
+  const replacementPolicy = backend.models()[0].reasoning_mapping;
+  assert.ok(replacementPolicy && replacementPolicy.enabled);
+  assert.notDeepEqual(replacementPolicy, original);
+
+  await a.api.handlers.saveModels(); // A still submits its original list revision
+  assert.equal(a.api.state.modelsConflict, true);
+  await a.api.render.loadStatus();
+  const beforeRetry = backend.posts.length;
+  await a.api.handlers.saveModels();
+  assert.equal(backend.posts.length, beforeRetry, 'must not POST after dropping the old pin');
+  assert.equal(a.api.state.mappings[0].original_id, 'a');
+  assert.equal(a.api.state.mappings[0].original_upstream_id, 'up/1');
+  assert.deepEqual(backend.models()[0].reasoning_mapping, replacementPolicy);
+  assert.match(a.view.document.getElementById('modelState').textContent, /原行.*不存在/);
+  assert.equal(a.view.document.getElementById('revertMappings').hidden, false);
+  a.api.handlers.revertMappings();
+  assert.equal(a.api.state.mappings[0].original_upstream_id, 'up/2', 'only explicit revert adopts the replacement row');
+  assert.equal(a.api.mappingsDirty(), false);
+});
+
+test('two tabs cannot implicitly bind a new row to a concurrently created alias', async () => {
+  const backend = sharedModelBackend({ models: [] });
+  const { a, b } = twoModelTabs(backend);
+  await a.api.render.loadStatus();
+  await b.api.render.loadStatus();
+  for (const tab of [a, b]) {
+    tab.api.handlers.addMapping();
+    tab.api.state.mappings[0].id = 'a';
+    tab.api.state.mappings[0].upstream_id = 'up/2';
+  }
+  await b.api.handlers.saveModels();
+  b.api.handlers.selectReasoningModel('a\u0000up/2');
+  await b.api.handlers.setReasoningEnabled(true);
+  await b.api.handlers.addReasoningRule();
+  await b.api.handlers.saveReasoning();
+  const policy = backend.models()[0].reasoning_mapping;
+  await a.api.handlers.saveModels();
+  assert.equal(a.api.state.modelsConflict, true);
+  await a.api.render.loadStatus();
+  const beforeRetry = backend.posts.length;
+  await a.api.handlers.saveModels();
+  assert.equal(backend.posts.length, beforeRetry, 'un-pinned new row must not silently inherit the other tab’s policy');
+  assert.equal(a.api.state.mappings[0].original_id, undefined);
+  assert.deepEqual(backend.models()[0].reasoning_mapping, policy);
+  assert.match(a.view.document.getElementById('modelState').textContent, /同名|别名/);
+});
+
+test('a draft started before CAS was advertised cannot rebase a new colliding alias', async () => {
+  const backend = sharedModelBackend({ models: [], revision: '' });
+  const { a, b } = twoModelTabs(backend);
+  await a.api.render.loadStatus();
+  await b.api.render.loadStatus();
+  for (const tab of [a, b]) {
+    tab.api.handlers.addMapping();
+    tab.api.state.mappings[0].id = 'a';
+    tab.api.state.mappings[0].upstream_id = 'up/2';
+  }
+  await b.api.handlers.saveModels(); // the backend starts advertising a token
+  await a.api.render.loadStatus();
+  assert.equal(a.api.state.modelsDraftRevision, '');
+  const before = backend.posts.length;
+  await a.api.handlers.saveModels(); // require confirmation for a tokenless draft
+  assert.equal(a.api.state.modelsConflict, true);
+  await a.api.handlers.saveModels(); // even confirmation cannot bind the new alias silently
+  assert.equal(backend.posts.length, before);
+  assert.equal(a.api.state.modelsDraftRevision, '');
+  assert.match(a.view.document.getElementById('modelState').textContent, /同名|别名/);
+});
+
 test('a reasoning response preserves a same-looking rename draft and its original identity', async () => {
   const backend = sharedModelBackend({ models: [
     { id: 'r', upstream_id: 'up/r', reasoning_revision: 'rr' },
@@ -5075,10 +5160,9 @@ test('a reasoning response preserves a same-looking rename draft and its origina
   assert.equal(a.api.state.mappings[1].original_upstream_id, 'up/x');
   const beforeSave = backend.posts.length;
   await a.api.handlers.saveModels();
-  assert.equal(backend.posts.length, beforeSave + 1, 'A must submit the pinned draft');
-  assert.equal(backend.posts.at(-1).expected_models_revision, originalRevision);
-  assert.equal(a.api.state.modelsConflict, true, 'the old draft must reach CAS and be rejected');
-  assert.equal(a.api.state.mappings[1].original_id, 'x', 'a rejected draft is not rebound to Y');
+  assert.equal(backend.posts.length, beforeSave, 'an unresolved pin is blocked before POST');
+  assert.equal(a.api.state.modelsDraftRevision, originalRevision, 'the old CAS base is not replaced');
+  assert.equal(a.api.state.mappings[1].original_id, 'x', 'the draft is not rebound to Y');
 });
 
 test('a status refresh preserves same-looking rows whose original identities differ', async () => {
@@ -5105,9 +5189,9 @@ test('a status refresh preserves same-looking rows whose original identities dif
   assert.equal(a.api.state.mappings[1].original_id, 'x');
   const beforeSave = backend.posts.length;
   await a.api.handlers.saveModels();
-  assert.equal(backend.posts.length, beforeSave + 1, 'A must submit the pinned draft');
-  assert.equal(backend.posts.at(-1).expected_models_revision, originalRevision);
-  assert.equal(a.api.state.modelsConflict, true);
+  assert.equal(backend.posts.length, beforeSave, 'an unresolved pin is blocked before POST');
+  assert.equal(a.api.state.modelsDraftRevision, originalRevision);
+  assert.match(a.view.document.getElementById('modelState').textContent, /原行.*不存在/);
 });
 
 test('a reasoning response repaints mapping rows before an operator edits them', async () => {
