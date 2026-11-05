@@ -34,7 +34,15 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 	now := s.quotaPauseTime().UTC()
 	s.mu.Lock()
 	current, exists := s.creds[source.ID]
-	if !exists || s.revoked[source.ID] || current.APIKey != source.APIKey || current.runtimeEpoch != source.runtimeEpoch {
+	if !exists || s.revoked[source.ID] || current.APIKey != source.APIKey {
+		s.mu.Unlock()
+		return
+	}
+	if current.runtimeEpoch != source.runtimeEpoch && !current.quotaBlocked() {
+		// An explicit resume or key/account edit fences old requests from
+		// creating a *new* block. While an existing block is active, however,
+		// a late 402 from the same inference key may name another failed model;
+		// merge it even if the operator changed the manual switch meanwhile.
 		s.mu.Unlock()
 		return
 	}

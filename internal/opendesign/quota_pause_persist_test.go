@@ -265,6 +265,47 @@ func TestQuotaBlockSurvivesStaleWatcherAfterFailedWrite(t *testing.T) {
 	}
 }
 
+func TestLateQuotaSignalAddsModelAfterPluginManualToggle(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	quotaFixtureAuthFile(t, s, host, id, nil)
+	source, _ := liveCredential(s, id)
+	exhausted := &APIError{Status: 402, quotaExhausted: true}
+	s.observeQuotaBlock(source, "model-a", exhausted)
+	if status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil, map[string]any{"id": id, "disabled": true}); status != http.StatusOK {
+		t.Fatal("plugin manual disable failed")
+	}
+	// The fake host only records saves in memory; mirror its confirmed write.
+	mirrorAuthFile(t, s, host, id)
+	current, _ := liveCredential(s, id)
+	if current.runtimeEpoch == source.runtimeEpoch {
+		t.Fatal("fixture did not move the credential epoch")
+	}
+	s.observeQuotaBlock(source, "model-b", exhausted)
+	current, _ = liveCredential(s, id)
+	models, ok := quotaBlockModels(current.QuotaBlock)
+	if !ok || len(models) != 2 || models[0] != "model-a" || models[1] != "model-b" || !current.Disabled {
+		t.Fatalf("late same-key failure lost a model or changed the manual switch: %v", models)
+	}
+}
+
+func TestExplicitQuotaResumeFencesOldRequests(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	quotaFixtureAuthFile(t, s, host, id, nil)
+	source, _ := liveCredential(s, id)
+	exhausted := &APIError{Status: 402, quotaExhausted: true}
+	s.observeQuotaBlock(source, "model-a", exhausted)
+	if status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil, map[string]any{"credential_id": id}); status != http.StatusOK {
+		t.Fatal("explicit resume failed")
+	}
+	s.observeQuotaBlock(source, "model-b", exhausted)
+	current, _ := liveCredential(s, id)
+	if current.quotaBlocked() {
+		t.Fatal("an old in-flight request overrode an explicit resume")
+	}
+}
+
 // CPA may save a pre-pause StorageJSON after the plugin has already written a
 // block. The watcher must keep the in-memory guard AND schedule another write;
 // retaining only memory would silently lose the pause after process restart.
