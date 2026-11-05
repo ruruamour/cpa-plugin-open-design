@@ -3,6 +3,7 @@ package opendesign
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -167,13 +168,46 @@ func TestCloneQuotaBlockDoesNotShareManualDisabled(t *testing.T) {
 		t.Fatal("nil block should remain nil")
 	}
 	manual := true
-	original := &QuotaBlock{ManualDisabled: &manual, BlockedAt: time.Unix(42, 0), Reason: "quota_exhausted"}
+	original := &QuotaBlock{ManualDisabled: &manual, BlockedAt: time.Unix(42, 0), Reason: "quota_exhausted", ModelIDs: []string{"model-a"}}
 	cloned := cloneQuotaBlock(original)
 	if cloned == original || cloned.ManualDisabled == original.ManualDisabled || !*cloned.ManualDisabled {
 		t.Fatal("quota block or its manual-state pointer was not cloned")
 	}
 	*cloned.ManualDisabled = false
-	if !*original.ManualDisabled {
+	cloned.ModelIDs[0] = "model-b"
+	if !*original.ManualDisabled || original.ModelIDs[0] != "model-a" {
 		t.Fatal("editing a cloned snapshot changed the original")
+	}
+}
+
+func TestQuotaBlockModelSetKeepsAmbiguityAndIsBounded(t *testing.T) {
+	block := &QuotaBlock{}
+	addQuotaBlockModel(block, "model-b")
+	addQuotaBlockModel(block, "model-a")
+	addQuotaBlockModel(block, "model-b")
+	models, ok := quotaBlockModels(block)
+	if !ok || len(models) != 2 || models[0] != "model-a" || models[1] != "model-b" || !block.MultipleModels {
+		t.Fatalf("unexpected model set: %v, complete=%t", models, ok)
+	}
+	models[0] = "changed"
+	if block.ModelIDs[0] != "model-a" {
+		t.Fatal("returned model set shares the stored slice")
+	}
+	legacy := &QuotaBlock{ModelID: "model-a", MultipleModels: true}
+	addQuotaBlockModel(legacy, "model-b")
+	if _, ok := quotaBlockModels(legacy); ok || !legacy.ModelsAmbiguous {
+		t.Fatal("legacy multi-model block was treated as complete")
+	}
+	missing := &QuotaBlock{}
+	addQuotaBlockModel(missing, "")
+	if _, ok := quotaBlockModels(missing); ok || !missing.ModelsAmbiguous {
+		t.Fatal("missing model was treated as complete")
+	}
+	overflow := &QuotaBlock{}
+	for i := 0; i <= quotaPauseMaxModels; i++ {
+		addQuotaBlockModel(overflow, fmt.Sprintf("model-%02d", i))
+	}
+	if _, ok := quotaBlockModels(overflow); ok || !overflow.ModelsAmbiguous || len(overflow.ModelIDs) != quotaPauseMaxModels {
+		t.Fatal("oversized model set was not conservatively marked ambiguous")
 	}
 }

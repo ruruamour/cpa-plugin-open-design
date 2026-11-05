@@ -5,9 +5,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // quotaPauseMaxWindow is an absolute upper bound even for untrusted upstream
@@ -18,6 +20,7 @@ const (
 	quotaPauseDefaultWindow = 30 * time.Minute
 	quotaPauseDefaultMax    = 24 * time.Hour
 	quotaPauseMaxWindow     = 7 * 24 * time.Hour
+	quotaPauseMaxModels     = 32
 )
 
 // QuotaBlock mirrors the ClinePass separation between an operator's Disabled
@@ -33,11 +36,13 @@ type QuotaBlock struct {
 	BlockedAt      time.Time `json:"blocked_at"`
 	ObservedAt     time.Time `json:"observed_at"`
 	RetryAt        time.Time `json:"retry_at"`
-	// The failing upstream model supports conservative, model-specific early
-	// recovery. If different models reported exhaustion, a single preflight is
-	// insufficient to prove recovery of the whole credential.
-	ModelID        string `json:"model_id,omitempty"`
-	MultipleModels bool   `json:"multiple_models,omitempty"`
+	// ModelID/MultipleModels remain readable for existing auth files and UIs.
+	// ModelIDs is the complete bounded set of models that reported exhaustion;
+	// ModelsAmbiguous means it cannot safely be treated as a complete set.
+	ModelID         string   `json:"model_id,omitempty"`
+	MultipleModels  bool     `json:"multiple_models,omitempty"`
+	ModelIDs        []string `json:"model_ids,omitempty"`
+	ModelsAmbiguous bool     `json:"models_ambiguous,omitempty"`
 }
 
 func quotaPauseKeyHash(apiKey string) string {
@@ -69,6 +74,16 @@ func normalizeQuotaBlock(c Credential, now time.Time) (*QuotaBlock, bool) {
 	if block.ManualDisabled == nil {
 		manual := true
 		block.ManualDisabled = &manual
+		changed = true
+	}
+	// Older blocks recorded only the first model and a multiple-model flag.
+	// A multi-model legacy block cannot reconstruct its complete set, so keep
+	// it ambiguous instead of treating one model as sufficient proof.
+	if len(block.ModelIDs) == 0 && block.MultipleModels && !block.ModelsAmbiguous {
+		block.ModelsAmbiguous = true
+		changed = true
+	} else if len(block.ModelIDs) == 0 && !block.MultipleModels && validQuotaModelID(block.ModelID) {
+		block.ModelIDs = []string{block.ModelID}
 		changed = true
 	}
 	if block.BlockedAt.After(now) {
@@ -106,11 +121,77 @@ func cloneQuotaBlock(block *QuotaBlock) *QuotaBlock {
 		return nil
 	}
 	copy := *block
+	copy.ModelIDs = append([]string(nil), block.ModelIDs...)
 	if block.ManualDisabled != nil {
 		manual := *block.ManualDisabled
 		copy.ManualDisabled = &manual
 	}
 	return &copy
+}
+
+func validQuotaModelID(model string) bool {
+	return model != "" && len(model) <= 512 && strings.TrimSpace(model) == model && strings.IndexFunc(model, unicode.IsControl) < 0
+}
+
+// addQuotaBlockModel only removes ambiguity when every observed model can be
+// enumerated. A missing or oversized set must not become a single-model proof.
+func addQuotaBlockModel(block *QuotaBlock, model string) {
+	model = strings.TrimSpace(model)
+	if !validQuotaModelID(model) {
+		block.ModelsAmbiguous = true
+		return
+	}
+	if len(block.ModelIDs) == 0 && block.MultipleModels {
+		// Legacy metadata records that more than one model failed, but not all
+		// their IDs; adding one now cannot reconstruct the old missing set.
+		block.ModelsAmbiguous = true
+	}
+	if len(block.ModelIDs) == 0 && validQuotaModelID(block.ModelID) {
+		block.ModelIDs = append(block.ModelIDs, block.ModelID)
+	}
+	for _, existing := range block.ModelIDs {
+		if existing == model {
+			return
+		}
+	}
+	if len(block.ModelIDs) >= quotaPauseMaxModels {
+		block.ModelsAmbiguous = true
+		block.MultipleModels = true
+		return
+	}
+	block.ModelIDs = append(block.ModelIDs, model)
+	sort.Strings(block.ModelIDs)
+	if block.ModelID == "" {
+		block.ModelID = model
+	}
+	block.MultipleModels = block.MultipleModels || len(block.ModelIDs) > 1
+}
+
+// quotaBlockModels returns only a complete, internally consistent set. An old
+// block with a multiple-model flag but no list can be resumed manually only.
+func quotaBlockModels(block *QuotaBlock) ([]string, bool) {
+	if block == nil || block.ModelsAmbiguous || len(block.ModelIDs) > quotaPauseMaxModels {
+		return nil, false
+	}
+	models := append([]string(nil), block.ModelIDs...)
+	if len(models) == 0 && !block.MultipleModels && validQuotaModelID(block.ModelID) {
+		models = append(models, block.ModelID)
+	}
+	if len(models) == 0 || block.MultipleModels && len(models) < 2 {
+		return nil, false
+	}
+	seen := make(map[string]bool, len(models))
+	for _, model := range models {
+		if !validQuotaModelID(model) || seen[model] {
+			return nil, false
+		}
+		seen[model] = true
+	}
+	if block.ModelID != "" && !seen[block.ModelID] {
+		return nil, false
+	}
+	sort.Strings(models)
+	return models, true
 }
 
 type pauseSettings struct {

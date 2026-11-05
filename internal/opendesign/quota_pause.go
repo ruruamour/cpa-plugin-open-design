@@ -41,21 +41,35 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 	var block *QuotaBlock
 	if current.quotaBlocked() {
 		block = cloneQuotaBlock(current.QuotaBlock)
-		if block.ModelID != upstreamModel {
-			block.MultipleModels = true
+		seen := block.ModelID == upstreamModel
+		for _, model := range block.ModelIDs {
+			seen = seen || model == upstreamModel
 		}
+		addQuotaBlockModel(block, upstreamModel)
 		if now.After(block.ObservedAt) {
 			block.ObservedAt = now
 		}
-		// A delayed duplicate must not repeatedly extend a pause into the future.
+		// A distinct model or an explicit later upstream reset can postpone the
+		// first recheck, but only within the cap measured from the first block.
+		// Repeated errors without a reset hint must not extend it indefinitely.
+		if !seen || !apiErr.quotaResetAt.IsZero() {
+			retry := quotaPauseDeadline(now, apiErr.quotaResetAt, settings)
+			if latest := block.BlockedAt.Add(settings.maxWindow); retry.After(latest) {
+				retry = latest
+			}
+			if retry.After(block.RetryAt) {
+				block.RetryAt = retry
+			}
+		}
 	} else {
 		manual := current.Disabled
 		block = &QuotaBlock{
 			KeyHash: quotaPauseKeyHash(current.APIKey), ManualDisabled: &manual,
 			Source: "upstream", Reason: "quota_exhausted", BlockedAt: now,
 			ObservedAt: now, RetryAt: quotaPauseDeadline(now, apiErr.quotaResetAt, settings),
-			ModelID: upstreamModel,
+			ModelID: strings.TrimSpace(upstreamModel),
 		}
+		addQuotaBlockModel(block, upstreamModel)
 	}
 	current.QuotaBlock = block
 	current.QuotaRevision = newID()

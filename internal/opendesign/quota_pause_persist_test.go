@@ -85,14 +85,25 @@ func TestObserveQuotaBlockPersistsOnlyQuotaFields(t *testing.T) {
 		t.Fatal("successful quota write reported a synchronization error")
 	}
 
-	// A delayed error for another model may add ambiguity, but cannot push the
-	// first deadline forward indefinitely.
+	// A second model may have a later reset. Retain both identities and wait
+	// for the later hint, capped relative to the first observation.
 	now = now.Add(10 * time.Minute)
 	setNow(now)
 	s.observeQuotaBlock(source, "fixture-other-model", &APIError{Status: 402, quotaExhausted: true, quotaResetAt: now.Add(24 * time.Hour)})
 	current, _ = liveCredential(s, id)
-	if !current.QuotaBlock.MultipleModels || !current.QuotaBlock.RetryAt.Equal(time.Date(2026, 11, 4, 15, 0, 0, 0, time.UTC)) {
-		t.Fatal("duplicate error extended the deadline or lost model ambiguity")
+	if !current.QuotaBlock.MultipleModels || !current.QuotaBlock.RetryAt.Equal(time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)) {
+		t.Fatal("second model did not extend the check time within the original cap")
+	}
+	models, ok := quotaBlockModels(current.QuotaBlock)
+	if !ok || len(models) != 2 || models[0] != "fixture-model" || models[1] != "fixture-other-model" {
+		t.Fatalf("quota block lost a failing model: %v", models)
+	}
+	now = now.Add(time.Minute)
+	setNow(now)
+	s.observeQuotaBlock(source, "fixture-other-model", &APIError{Status: 402, quotaExhausted: true})
+	current, _ = liveCredential(s, id)
+	if !current.QuotaBlock.RetryAt.Equal(time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)) {
+		t.Fatal("duplicate without a reset hint extended the check time")
 	}
 }
 
