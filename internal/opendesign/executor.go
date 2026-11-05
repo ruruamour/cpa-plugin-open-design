@@ -205,9 +205,16 @@ func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel 
 	}
 	draft := &requestLogDraft{started: time.Now()}
 	var c Credential
+	var lease *quotaInFlightLease
+	// The safety net runs last (LIFO) so a panic in the metadata bookkeeping
+	// cannot leave an in-flight counter that would fence recovery forever.
+	defer func() { lease.release(s) }()
 	defer func() {
 		s.observeQuotaBlock(c, draft.upstreamModel, err)
 		s.recordRequestLog(draft, err)
+		// The counter drops only after the quota observation above completed, so
+		// an exhausted account is published before the fence disappears.
+		lease.release(s)
 	}()
 	r, err := decodeExecutorRequest(raw)
 	if err != nil {
@@ -231,6 +238,13 @@ func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel 
 	draft.secrets = []string{captured.APIKey, captured.ControlKey, captured.WorkspaceID}
 	c, err = s.selectedCredential(r)
 	draft.secrets = append(draft.secrets, c.APIKey, c.ControlKey, c.WorkspaceID)
+	if err != nil {
+		return nil, reasoningDecision{}, err
+	}
+	// Admission re-verifies the live credential and counts this inference under
+	// the same lock, so a pause, key replacement or removal between selection
+	// and here fails locally instead of reaching the upstream.
+	lease, err = s.admitQuotaInFlight(c)
 	if err != nil {
 		return nil, reasoningDecision{}, err
 	}
@@ -298,12 +312,21 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 	finished := false
 	draft := &requestLogDraft{started: time.Now(), stream: true}
 	var c Credential
+	var lease *quotaInFlightLease
 	// Every early return records its quota observation and metadata row. Once
 	// the goroutine takes over, it owns both observations and the release call.
+	// The safety net is declared first so it runs last: a panic cannot leave an
+	// in-flight counter behind (release is idempotent).
+	defer func() {
+		if !finished {
+			lease.release(s)
+		}
+	}()
 	defer func() {
 		if !finished {
 			s.observeQuotaBlock(c, draft.upstreamModel, err)
 			s.recordRequestLog(draft, err)
+			lease.release(s)
 			release()
 		}
 	}()
@@ -317,6 +340,12 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 	draft.secrets = []string{captured.APIKey, captured.ControlKey, captured.WorkspaceID}
 	c, err = s.selectedCredential(r)
 	draft.secrets = append(draft.secrets, c.APIKey, c.ControlKey, c.WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	// Same admission fence as the buffered path: it runs before any upstream
+	// byte is requested, so a pause that landed during selection is respected.
+	lease, err = s.admitQuotaInFlight(c)
 	if err != nil {
 		return nil, err
 	}
@@ -376,6 +405,9 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 		usage := &tokenUsage{}
 		var streamErr error
 		defer release()
+		// Declared before the metadata defer so it runs after it; the metadata
+		// defer drops the counter itself, this is only panic insurance.
+		defer lease.release(s)
 		defer func() {
 			if recovered := recover(); recovered != nil && streamErr == nil {
 				streamErr = upstreamProtocolError("upstream stream processing failed")
@@ -393,6 +425,9 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 				s.finishOutputStream(r.StreamID, streamErr, keys...)
 			}()
 			s.recordRequestLog(draft, streamErr)
+			// Only after the terminal error was observed, so a pause reported by
+			// the last SSE frame is published before the fence disappears.
+			lease.release(s)
 		}()
 		streamErr = s.pumpSSE(r.HostCallbackID, stream, r.Model, emitter, requestChoiceCount(j), usage, keys)
 	}()

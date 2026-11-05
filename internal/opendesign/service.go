@@ -66,6 +66,14 @@ type Service struct {
 	active               sync.WaitGroup
 	activeN              atomic.Int64
 	stopCh               chan struct{}
+
+	// quotaInflight counts admitted inferences per credential key. It is a
+	// recovery fence for the parent session's automatic resume, never a
+	// concurrency limit; guarded by mu.
+	quotaInflight map[quotaInFlightKey]int
+	// quotaInFlightTestHook is nil in production. It is per instance so a test
+	// can observe admission/release interleaving without any global state.
+	quotaInFlightTestHook atomic.Pointer[quotaInFlightTestHook]
 }
 
 // NewService returns an unconfigured plugin instance.
@@ -89,6 +97,7 @@ func NewService() *Service {
 		errorRuleSynced:     map[string]string{},
 		errorRuleSyncErrors: map[string]string{},
 		quotaPauseErrors:    map[string]string{},
+		quotaInflight:       map[quotaInFlightKey]int{},
 		quotaPauseWake:      make(chan struct{}, 1),
 		requestLogs:         requestLogs,
 		modelTests:          map[string]modelTestRecord{},
