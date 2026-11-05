@@ -37,6 +37,16 @@
     upstreamQuery: '',
     mappings: [],
     savedMappings: [],
+    // Whole-list CAS for the model editor. Newer backends advertise a
+    // models_revision token; the first edit pins it as modelsDraftRevision so a
+    // status refresh or another tab cannot move the base under the draft.
+    modelsRevision: '',
+    modelsDraftRevision: '',
+    modelsDraftActive: false,
+    modelsConflict: false,
+    // True while a POST /models write is in flight. A status answer landing in
+    // that window must not replace the rows the response is about to confirm.
+    modelsSaving: false,
     // Models exactly as the server describes them, including each saved
     // thinking-strength policy. Kept apart from the editor rows above, which
     // carry only id and upstream_id and drive the dirty badge.
@@ -56,6 +66,10 @@
     // status answer requested before a newer list was applied is stale for the
     // model side and must not roll its reasoning revisions back either.
     serverModelsGeneration: 0,
+    // Bumped whenever the management identity changes (logout, key switch,
+    // rejected auth). Responses captured under an older session are discarded
+    // so a delayed status/refresh cannot repaint the new session.
+    sessionGeneration: 0,
     accountEdit: null,
     authCollapsed: false,
     // Quota snapshots are keyed by credential id. They are only fetched when the
@@ -171,6 +185,27 @@
     return (Array.isArray(models) ? models : []).map(model => ({ id: model.id, upstream_id: model.upstream_id }));
   }
 
+  // The first edit pins the server's whole-list revision so a later status
+  // refresh cannot move it under the operator. A conflict stays armed until a
+  // save succeeds or the draft is explicitly reverted, even if the rows are
+  // edited back to their old values.
+  function beginMappingsDraft() {
+    if (state.modelsDraftActive) return;
+    state.modelsDraftActive = true;
+    state.modelsDraftRevision = state.modelsRevision;
+    state.modelsConflict = false;
+  }
+
+  function resetMappingsDraft(revision = state.modelsRevision) {
+    state.modelsDraftActive = false;
+    state.modelsDraftRevision = revision || '';
+    state.modelsConflict = false;
+  }
+
+  function modelsSaveRevision() {
+    return state.modelsDraftActive ? state.modelsDraftRevision : state.modelsRevision;
+  }
+
   // True while the editor holds rows that differ from what the server reports.
   function mappingsDirty() {
     return mappingKey(state.mappings) !== mappingKey(state.savedMappings);
@@ -226,8 +261,13 @@
       const node = $(id);
       if (node) node.disabled = state.busy;
     }
-    for (const id of ['accountList', 'upstreamList', 'mappingList']) {
+    for (const id of ['accountList']) {
       setRowButtonsDisabled($(id), state.busy);
+    }
+    // Only a model-list save owns these rows: other busy operations (fetch,
+    // account edits) must not freeze edits the operator is making in parallel.
+    for (const id of ['upstreamList', 'mappingList']) {
+      setRowControlsDisabled($(id), state.modelsSaving);
     }
     // Reasoning rows stay locked while a reasoning save is in flight: releasing
     // an unrelated busy flag must not re-enable their delete buttons and let an
@@ -241,14 +281,22 @@
     if (!state.busy) renderAccounts();
   }
 
-  // Row buttons are recreated on every render, so busy transitions also walk the
+  // Row controls are recreated on every render, so busy transitions also walk the
   // rendered rows instead of relying on a full re-render.
   function setRowButtonsDisabled(container, disabled) {
+    setRowControlsDisabled(container, disabled, ['BUTTON']);
+  }
+
+  // During a save the mapping inputs and upstream checkboxes must be locked too:
+  // letting the operator keep editing rows the response will replace would lose
+  // those edits when the POST succeeds.
+  function setRowControlsDisabled(container, disabled, tags = ['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA']) {
     if (!container) return;
+    const wanted = new Set(tags);
     const stack = [...(container.children || [])];
     while (stack.length) {
       const node = stack.pop();
-      if (node.tagName === 'BUTTON') node.disabled = Boolean(disabled);
+      if (wanted.has(node.tagName)) node.disabled = Boolean(disabled);
       if (node.children) stack.push(...node.children);
     }
   }
@@ -485,6 +533,9 @@
 
   function resetManagementData() {
     state.optionalGeneration += 1;
+    // A new management identity owns no previous drafts or CAS tokens.
+    state.sessionGeneration += 1;
+    state.busy = false;
     state.optionalBusy = {};
     syncOptionalBusyControls();
     state.status = { version: '', base_url: DEFAULT_BASE_URL, credentials: [], models: [] };
@@ -494,11 +545,17 @@
     state.upstreamQuery = '';
     state.mappings = [];
     state.savedMappings = [];
+    state.modelsRevision = '';
+    state.modelsDraftRevision = '';
+    state.modelsDraftActive = false;
+    state.modelsConflict = false;
+    state.modelsSaving = false;
     state.serverModels = [];
     state.reasoningModelKey = '';
     state.reasoningDrafts.clear();
     state.reasoningSaving = false;
     state.reasoningGeneration += 1;
+    state.serverModelsGeneration += 1;
     state.requestLogs = [];
     state.logQuery = { offset: 0, limit: 50, status: '', model: '', credentialID: '', attempted: '' };
     state.logPage = { loaded: false, total: 0, offset: 0, limit: 50, has_more: false, next_offset: null, retention: null };
@@ -607,10 +664,11 @@
 
   async function loadStatus(options = {}) {
     const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     const serverModelsGeneration = state.serverModelsGeneration;
     try {
       const raw = await api().status();
-      if (generation !== state.optionalGeneration) return false;
+      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return false;
       applyStatus(raw, { serverModelsGeneration });
       const source = options.source || (state.verified && state.verified.source) || '';
       if (state.verified) state.verified.source = source;
@@ -619,7 +677,7 @@
       message('authState', '');
       return true;
     } catch (error) {
-      if (generation !== state.optionalGeneration) return false;
+      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return false;
       // /status is a management-only route, so a 401/403 here always means the
       // management key, never an upstream account key.
       if (isAuthStatus(error.status)) {
@@ -660,20 +718,25 @@
     const incoming = Core.normalizeStatus(raw);
     // A status answer may have been requested before a newer model-list write
     // completed. Its credentials are still fresh enough to apply, but the older
-    // model snapshot must not replace the newer list, its reasoning revisions,
-    // or the draft pinned to them.
+    // model snapshot must not replace the newer list (or the rows a save is
+    // about to confirm), its reasoning revisions, or the draft pinned to them.
     const modelsAreCurrent = options.serverModelsGeneration === undefined ||
       options.serverModelsGeneration === state.serverModelsGeneration;
+    const modelsWritable = modelsAreCurrent && !state.modelsSaving;
     const modelTestWasBusy = optionalBusy('modelTest');
+    const reasoningWasSaving = state.reasoningSaving;
     state.modelTestGeneration += 1;
     state.modelTest = null;
     renderModelTest();
-    // A status refresh replaces the model list, so a reasoning save issued
-    // before it is stale: its response must not repopulate the panel.
+    // A status refresh makes an in-flight reasoning answer stale, but it must not
+    // release the save lock: the POST is still in flight and only its own
+    // completion may re-enable the rows.
     state.reasoningGeneration += 1;
-    state.reasoningSaving = false;
     if (modelTestWasBusy) {
       message('modelTestState', '账户状态已刷新，正在发送的模型测试结果已失效。', 'error');
+    }
+    if (reasoningWasSaving) {
+      message('reasoningState', '账户状态已刷新，正在发送的思考强度保存结果已失效；未保存草稿已保留。', 'error');
     }
     invalidateChangedQuotas(incoming.credentials);
     // Credentials are refreshed even when the model side is stale below, so the
@@ -686,7 +749,7 @@
       state.selectedCredential = '';
       invalidateModelRequest();
     }
-    if (!modelsAreCurrent) {
+    if (!modelsWritable) {
       state.status = { ...incoming, models: cloneMappings(state.serverModels) };
       renderMeta();
       renderAccounts();
@@ -694,10 +757,12 @@
       renderOverview();
       return;
     }
+    const previousServerModels = state.serverModels;
     const serverModels = cloneMappings(incoming.models);
     // A status refresh (account add/update, background reload) must not silently
     // discard mapping edits the operator has not saved yet. The saved baseline is
-    // always refreshed; the draft is replaced only when it is not dirty.
+    // always refreshed; an active draft is kept even when its rows happen to look
+    // unchanged again, because the conflict state must not be reset by content.
     const dirty = mappingsDirty();
     // state.status and incoming are the same object, so the server's model list
     // has to be captured before status.models is replaced with the editor-shaped
@@ -709,8 +774,14 @@
     state.savedMappings = cloneMappings(serverModels);
     state.serverModels = Array.isArray(fullModels) ? fullModels : [];
     state.serverModelsGeneration += 1;
-    if (!dirty) state.mappings = cloneMappings(serverModels);
+    state.modelsRevision = incoming.models_revision || '';
+    if (!state.modelsDraftActive) {
+      state.mappings = cloneMappings(serverModels);
+      state.modelsDraftRevision = state.modelsRevision;
+      state.modelsConflict = false;
+    }
     reconcileReasoningDrafts();
+    reportOrphanedReasoningDrafts(previousServerModels);
     renderMeta();
     renderAccounts();
     renderModels();
@@ -1246,8 +1317,9 @@
     }
     const credentialID = state.upstreamFor;
     const rows = visible.map(item => {
-      const box = el('input', { type: 'checkbox', checked: Core.hasUpstream(state.mappings, item.id) });
+      const box = el('input', { type: 'checkbox', checked: Core.hasUpstream(state.mappings, item.id), disabled: state.modelsSaving });
       box.addEventListener('change', () => {
+        beginMappingsDraft();
         state.mappings = box.checked
           ? Core.addUpstream(state.mappings, item.id)
           : Core.removeUpstream(state.mappings, item.id);
@@ -1272,6 +1344,7 @@
       ]);
     });
     list.replaceChildren(...rows);
+    if (state.modelsSaving) setRowControlsDisabled(list, true);
     updateUpstreamCount();
     syncModelTools();
   }
@@ -1292,6 +1365,7 @@
         attrs: { 'aria-label': `第 ${index + 1} 行对外模型名`, autocomplete: 'off' },
       });
       alias.addEventListener('input', () => {
+        beginMappingsDraft();
         state.mappings[index].id = alias.value;
         updateDirtyBadge();
       });
@@ -1302,12 +1376,14 @@
         attrs: { 'aria-label': `第 ${index + 1} 行上游模型 ID`, autocomplete: 'off' },
       });
       upstream.addEventListener('input', () => {
+        beginMappingsDraft();
         state.mappings[index].upstream_id = upstream.value;
         updateDirtyBadge();
       });
       const remove = button('删除', 'remove-mapping', {
         className: 'button compact danger',
         on: () => {
+          beginMappingsDraft();
           state.mappings.splice(index, 1);
           renderModels();
         },
@@ -1320,7 +1396,7 @@
       ]);
     });
     list.replaceChildren(...rows);
-    if (state.busy) setRowButtonsDisabled(list, true);
+    if (state.modelsSaving) setRowControlsDisabled(list, true);
     // Keep checkbox state in sync after edits/removals without re-rendering the
     // upstream list (which would drop the search field's focus).
     syncUpstreamChecks();
@@ -1346,6 +1422,7 @@
       message('modelState', '当前没有可操作的上游模型。', 'error');
       return;
     }
+    beginMappingsDraft();
     state.mappings = selected
       ? Core.addUpstreams(state.mappings, ids)
       : Core.removeUpstreams(state.mappings, ids);
@@ -1664,8 +1741,13 @@
   }
 
   async function refreshStatus() {
+    const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     const serverModelsGeneration = state.serverModelsGeneration;
     const raw = await api().status();
+    // A refresh started under an older management identity must not repaint the
+    // session that replaced it (logout or another key).
+    if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return null;
     applyStatus(raw, { serverModelsGeneration });
     markConnected((state.verified && state.verified.source) || '');
     return raw;
@@ -2784,11 +2866,47 @@
       return;
     }
     if (!models.length && typeof confirm === 'function' && !confirm('清空所有模型映射？保存后将从 CPA 撤回本插件的模型。')) return;
+    const sessionGeneration = state.sessionGeneration;
+    const submittedKey = mappingKey(state.mappings);
+    const sentDraftRevision = state.modelsDraftActive ? state.modelsDraftRevision : state.modelsRevision;
+    const serverRevision = state.modelsRevision;
+    // The backend started advertising a whole-list token after this draft was
+    // begun. Sending the tokenless body would be last-writer-wins, so refuse
+    // once and require an explicit overwrite confirmation.
+    if (state.modelsDraftActive && !sentDraftRevision && serverRevision && state.modelsConflict !== true) {
+      state.modelsConflict = true;
+      renderMappings();
+      message('modelState', '保存已取消：服务器现在提供整表版本校验，但当前草稿是在此之前开始编辑的。草稿已保留；再次点击「保存模型映射」可按当前服务器版本确认覆盖。', 'error');
+      return;
+    }
+    // A 409 (or a server revision that moved under the draft) must be confirmed
+    // again by an explicit click. This is tied to the conflict flag, never to the
+    // rows' content: typing the old values back does not skip the confirmation.
+    if (state.modelsConflict === true && serverRevision) {
+      if (typeof confirm === 'function'
+        && !confirm('模型列表已在其他页面更新。继续保存会用当前草稿覆盖服务器上的版本。确定继续？')) {
+        message('modelState', '已取消保存，草稿仍然保留。', '');
+        return;
+      }
+      state.modelsDraftActive = true;
+      state.modelsDraftRevision = serverRevision;
+      state.modelsConflict = false;
+    }
+    let body;
+    try {
+      body = Core.buildModelsSaveBody(state.mappings, modelsSaveRevision());
+    } catch (error) {
+      message('modelState', `无法保存：${error.message}`, 'error');
+      return;
+    }
+    const sentRevision = body.expected_models_revision || '';
     const serverModelsGeneration = state.serverModelsGeneration;
+    state.modelsSaving = true;
     setBusy(true);
     message('modelState', '正在保存模型映射…');
     try {
-      const raw = await api().saveModels(models);
+      const raw = await api().request('/models', { method: 'POST', body });
+      if (sessionGeneration !== state.sessionGeneration) return;
       // Saving changes the host model catalog, so any displayed/in-flight model
       // test no longer describes the current mapping. The generation increments
       // exactly once, so a late response can never repaint the cleared result.
@@ -2798,7 +2916,7 @@
         .filter(item => item.id && item.upstream_id);
       state.status.models = cloneMappings(normalized);
       state.savedMappings = cloneMappings(normalized);
-      state.mappings = cloneMappings(normalized);
+      const responseRevision = raw && typeof raw.models_revision === 'string' ? raw.models_revision.trim() : '';
       // The server echoes each model's full stored state: keep reasoning_mapping
       // *and* reasoning_revision, so a following reasoning save still carries a
       // CAS token instead of silently falling back to last-writer-wins.
@@ -2820,9 +2938,25 @@
       // to the old list and must not repaint the panel.
       state.reasoningGeneration += 1;
       state.reasoningSaving = false;
+      const rowsStillMatchSubmission = mappingKey(state.mappings) === submittedKey;
+      if (rowsStillMatchSubmission) {
+        state.mappings = cloneMappings(normalized);
+        state.modelsRevision = responseRevision || state.modelsRevision;
+        resetMappingsDraft(state.modelsRevision);
+      } else {
+        // The controls are locked during a save; this branch is a safety net for
+        // programmatic edits and keeps them instead of throwing them away.
+        state.modelsDraftActive = true;
+        state.modelsDraftRevision = sentRevision || state.modelsRevision;
+        state.modelsConflict = false;
+        if (responseRevision) state.modelsRevision = responseRevision;
+      }
       renderModels();
-      message('modelState', `已保存 ${normalized.length} 个模型映射。`);
+      message('modelState', rowsStillMatchSubmission
+        ? `已保存 ${normalized.length} 个模型映射。`
+        : '模型映射已保存；保存期间的新编辑已保留为草稿。');
     } catch (error) {
+      if (sessionGeneration !== state.sessionGeneration) return;
       if (isAuthStatus(error.status) && !isUpstreamSource(error)) {
         clearRejectedManagementAuth();
         showAuth(error.status === 401 ? '401：管理密钥无效或已过期，模型映射未保存。' : `403：${formatError(error)}`);
@@ -2833,13 +2967,33 @@
         // The saved baseline moves forward so the draft badge tells the truth.
         invalidateModelTestResult();
         state.savedMappings = cloneMappings(models);
+        // A token we sent is now stale: the next save must re-confirm instead of
+        // silently overwriting whatever revision the server has now.
+        if (sentRevision) {
+          state.modelsDraftActive = true;
+          state.modelsDraftRevision = sentRevision;
+          state.modelsConflict = true;
+        }
         renderMappings();
         message('modelState', `模型映射已保存，但宿主刷新模型目录失败：${formatError(error)}。可先刷新状态确认，再重试保存或启用账户触发刷新。`, 'error');
+      } else if (error.status === 409) {
+        // Keep the submitted rows exactly as they are. The conflict must be
+        // resolved by an explicit second confirmation, never by reverting.
+        state.modelsDraftActive = true;
+        state.modelsDraftRevision = sentRevision || state.modelsRevision;
+        state.modelsConflict = true;
+        renderMappings();
+        message('modelState', '保存失败：模型列表已在其他页面更新。提交内容已保留；再次点击「保存模型映射」并确认后才会覆盖服务器版本。', 'error');
       } else {
         message('modelState', `保存失败：${formatError(error)}`, 'error');
       }
     } finally {
-      setBusy(false);
+      // A response from a replaced session must not release the busy slot the
+      // new session may already own.
+      if (sessionGeneration === state.sessionGeneration) {
+        state.modelsSaving = false;
+        setBusy(false);
+      }
     }
   }
 
@@ -2855,6 +3009,7 @@
   }
 
   function addMapping() {
+    beginMappingsDraft();
     state.mappings.push({ id: '', upstream_id: '' });
     renderMappings();
     message('modelState', '已手动添加一行映射，填写对外别名和上游模型 ID 后保存。', '');
@@ -2864,6 +3019,7 @@
   function revertMappings() {
     if (state.busy || !mappingsDirty()) return;
     state.mappings = cloneMappings(state.savedMappings);
+    resetMappingsDraft();
     renderModels();
     message('modelState', '已还原为最近一次保存的模型映射。', '');
   }
@@ -2906,30 +3062,40 @@
     return Core.reasoningKey(currentReasoningMapping(model)) !== Core.reasoningKey(reasoningBaseline(model));
   }
 
-  // Drafts are only kept for models that still exist, so a removed model can
-  // never leave an orphaned policy behind.
-  function pruneReasoningDrafts() {
-    const live = new Set(state.serverModels.map(reasoningModelKey));
-    for (const key of [...state.reasoningDrafts.keys()]) {
-      if (!live.has(key)) state.reasoningDrafts.delete(key);
-    }
-  }
-
-  // A status refresh can move a model's baseline forward while a draft is open.
-  // The draft keeps its own (older) revision so a save stays CAS-checked. If the
-  // fresh baseline already equals the draft there is nothing unsaved, so the
-  // draft can be dropped without losing an edit.
+  // A draft is never silently deleted just because its model left the current
+  // list: an upstream change or a temporary removal must not destroy unsaved
+  // rules. Orphans stay in the map (so a re-added model gets its draft back) and
+  // are surfaced as copyable text by reportOrphanedReasoningDrafts.
   function reconcileReasoningDrafts() {
     for (const [key, draft] of [...state.reasoningDrafts]) {
       const model = state.serverModels.find(item => reasoningModelKey(item) === key);
-      if (!model) {
-        state.reasoningDrafts.delete(key);
-        continue;
-      }
+      if (!model) continue;
       if (Core.reasoningKey(draft) === Core.reasoningKey(reasoningBaseline(model))) {
         state.reasoningDrafts.delete(key);
       }
     }
+  }
+
+  function reasoningDraftText(draft) {
+    return draft.rules.length
+      ? draft.rules.map(rule => `${Core.reasoningLabel(rule.from)}→${Core.reasoningLabel(rule.to)}`).join('、')
+      : '（空表）';
+  }
+
+  // Models that were present before a refresh but are gone (or now point at a
+  // different upstream) keep any draft they had. Show the rules as plain text so
+  // the operator can copy them instead of losing the edit silently.
+  function reportOrphanedReasoningDrafts(previousModels) {
+    const previous = new Set((Array.isArray(previousModels) ? previousModels : []).map(reasoningModelKey));
+    const live = new Set(state.serverModels.map(reasoningModelKey));
+    const lines = [];
+    for (const [key, draft] of state.reasoningDrafts) {
+      if (!previous.has(key) || live.has(key)) continue;
+      const [id, upstream] = String(key).split('\u0000');
+      lines.push(`${id || '（无别名）'} → ${upstream || '（无上游）'}：${reasoningDraftText(draft)}`);
+    }
+    if (!lines.length) return;
+    message('reasoningState', `模型映射已变化，以下未保存的思考强度草稿已保留，可复制后重新添加模型：${lines.join('；')}。`, 'error');
   }
 
   // The revision a draft is pinned to. It is captured on the first edit and
@@ -3071,7 +3237,6 @@
   }
 
   function renderReasoning() {
-    pruneReasoningDrafts();
     const select = $('reasoningModel');
     if (select) {
       const options = state.serverModels.map(model => el('option', {
@@ -3119,11 +3284,13 @@
   }
 
   function applyServerModels(models, options = {}) {
+    const previousServerModels = state.serverModels;
     state.serverModels = options.merged === true
       ? mergeServerModels(state.serverModels, models)
       : (Array.isArray(models) ? models : []);
     state.serverModelsGeneration += 1;
     reconcileReasoningDrafts();
+    reportOrphanedReasoningDrafts(previousServerModels);
   }
 
   async function saveReasoning() {
@@ -3147,6 +3314,7 @@
       state.reasoningDrafts.set(key, draft);
     }
     const generation = state.reasoningGeneration;
+    const sessionGeneration = state.sessionGeneration;
     let payload;
     try {
       payload = Core.buildReasoningPayload(model, currentReasoningMapping(model), reasoningDraftRevision(model));
@@ -3160,7 +3328,7 @@
     message('reasoningState', '正在保存思考强度映射…');
     try {
       const raw = await api().saveReasoningMapping(payload);
-      if (generation !== state.reasoningGeneration) return;
+      if (generation !== state.reasoningGeneration || sessionGeneration !== state.sessionGeneration) return;
       applyServerModels(raw && Array.isArray(raw.models) ? raw.models : null);
       state.reasoningDrafts.delete(key);
       // The policy is request-shaping state: a result produced under the old
@@ -3169,7 +3337,7 @@
       renderReasoning();
       message('reasoningState', `已保存 ${model.id} 的思考强度映射${payload.reasoning_mapping.enabled ? '（已启用）' : '（当前关闭，不生效）'}。`);
     } catch (error) {
-      if (generation !== state.reasoningGeneration) return;
+      if (generation !== state.reasoningGeneration || sessionGeneration !== state.sessionGeneration) return;
       if (isAuthStatus(error.status) && !isUpstreamSource(error)) {
         clearRejectedManagementAuth();
         showAuth(error.status === 401 ? '401：管理密钥无效或已过期，映射未保存。' : `403：${formatError(error)}`);
@@ -3189,7 +3357,9 @@
         message('reasoningState', `保存失败：${formatError(error)}`, 'error');
       }
     } finally {
-      if (generation === state.reasoningGeneration) {
+      // The saver owns the lock even when a status refresh made the answer stale,
+      // but a session switch already cleared it and owns the new page state.
+      if (sessionGeneration === state.sessionGeneration) {
         state.reasoningSaving = false;
         renderReasoning();
       }
@@ -3332,25 +3502,30 @@
       return;
     }
     const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
     state.candidate = { headers: Auth.candidateHeaders(key, type) };
     setBusy(true);
     message('authState', '正在验证管理密钥…');
     try {
       const status = await api().status();
-      if (generation !== state.optionalGeneration) return;
+      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return;
+      const hadDrafts = mappingsDirty() || state.modelsDraftActive || state.reasoningDrafts.size > 0;
       // Persist only after CPA accepted the key.
       Auth.saveAuth(key, type, remember);
       state.verified = { headers: state.candidate.headers, source: 'manual' };
       state.candidate = null;
       if (keyInput) keyInput.value = '';
+      // A management-key switch owns a fresh session: old drafts and CAS tokens
+      // must never leak into it.
+      resetManagementData();
       applyStatus(status);
       setAuthCollapsed(true);
       markConnected('manual');
-      message('modelState', '');
+      message('modelState', hadDrafts ? '管理密钥已切换，未保存的模型映射/思考强度草稿已清除。' : '');
       message('accountState', '');
       message('authState', '管理密钥验证成功，已开始读取账户和模型。', 'ok');
     } catch (error) {
-      if (generation !== state.optionalGeneration) return;
+      if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return;
       showAuth(isManagementAuthError(error)
         ? (error.status === 401
           ? '401：管理密钥未通过验证，请检查后重试。'

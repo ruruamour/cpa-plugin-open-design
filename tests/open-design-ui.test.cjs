@@ -549,6 +549,19 @@ test('model mapping validates aliases, deduplicates, and derives a safe payload'
   );
   assert.throws(() => core.buildModelsPayload([{ id: 'alias', upstream_id: '' }]), /不能为空/);
   assert.throws(() => core.buildModelsPayload([{ id: 'a', upstream_id: 'x' }, { id: 'a', upstream_id: 'y' }]), /重复/);
+  // The save body keeps the old shape for an absent token and only adds the CAS
+  // field when the server advertised one.
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(core.buildModelsSaveBody([{ id: ' alias ', upstream_id: ' a ' }]))),
+    { models: [{ id: 'alias', upstream_id: 'a' }] },
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(core.buildModelsSaveBody([{ id: 'alias', upstream_id: 'a' }], 'rev-7'))),
+    { models: [{ id: 'alias', upstream_id: 'a' }], expected_models_revision: 'rev-7' },
+  );
+  assert.equal(core.normalizeStatus(statusBody({ models_revision: 'rev-7' })).models_revision, 'rev-7',
+    'the whole-list revision is preserved from status');
+  assert.equal(core.normalizeStatus(statusBody()).models_revision, '', 'a missing token stays empty');
   assert.equal(core.aliasForUpstream('m'), 'open-design-m');
   assert.deepEqual(JSON.parse(JSON.stringify(core.addUpstream([], 'm'))), [{ id: 'open-design-m', upstream_id: 'm' }]);
   assert.deepEqual(
@@ -2868,11 +2881,14 @@ test('the reasoning table follows a server refresh and keeps one draft per model
   // A status refresh must not silently accept an unsaved draft as saved.
   api.render.applyStatus(reasoningStatus(...models));
   assert.equal(api.render.reasoningDirty(), true, 'an unsaved draft survives a refresh as a draft');
-  // A model that disappears takes its draft with it.
+  // A model that disappears keeps its draft (or an upstream change would
+  // silently destroy unsaved rules) and the copyable message names it.
   models = [{ id: 'od-b', upstream_id: 'vela/gpt-6-luna' }];
   api.render.applyStatus(reasoningStatus(...models));
   assert.equal(api.state.reasoningModelKey.includes('od-b'), true, 'the picker falls back to a live model');
-  assert.equal(api.state.reasoningDrafts.size, 0, 'a removed model leaves no orphaned policy');
+  assert.equal(api.state.reasoningDrafts.size, 1, 'a removed model keeps its draft instead of losing it');
+  assert.match(view.document.getElementById('reasoningState').textContent, /草稿已保留/);
+  assert.match(view.document.getElementById('reasoningState').textContent, /od-a/);
 });
 
 test('the model test sends a chosen strength and displays the applied conversion', async () => {
@@ -3158,11 +3174,14 @@ test('a status refresh discards an in-flight reasoning save response', async () 
   await api.handlers.addReasoningRule();
   const pending = api.handlers.saveReasoning();
   assert.equal(api.state.reasoningSaving, true);
-  // A refresh (or logout) bumps the generation while the save is still in flight.
+  // A refresh bumps the generation while the save is still in flight, but the
+  // POST owns the lock: a status answer must not unlock the rows early.
   api.render.applyStatus(reasoningStatus({ id: 'od-flash', upstream_id: 'open-design/flash' }));
-  assert.equal(api.state.reasoningSaving, false, 'the refresh releases the saving lock');
+  assert.equal(api.state.reasoningSaving, true, 'the refresh does not release the saving lock');
+  assert.match(view.document.getElementById('reasoningState').textContent, /未保存草稿已保留/);
   release();
   await pending;
+  assert.equal(api.state.reasoningSaving, false, 'the in-flight save releases its own lock');
   assert.equal(api.render.reasoningDirty(), true, 'the unsaved draft survives; the stale answer did not adopt the server policy');
   const draftRules = plain(api.render.currentReasoningMapping(api.state.serverModels[0])).rules;
   assert.equal(draftRules.length, 1, 'the stale response never replaced the local draft');
@@ -3379,6 +3398,346 @@ test('an old status answer cannot roll a newer reasoning save back', async () =>
     'the saved policy stays visible instead of reverting to the stale snapshot');
   assert.match(view.document.getElementById('reasoningState').textContent, /已保存/,
     'the success message is not contradicted by a stale status answer');
+});
+
+test('the model-list token is pinned at draft start and status refreshes do not reset it', async () => {
+  const posts = [];
+  let currentRevision = 'list-rev-1';
+  const models = () => [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        posts.push(body);
+        if (body.expected_models_revision === 'list-rev-1') return respond(409, { error: 'models_revision_conflict' });
+        return respond(200, { models: models(), models_revision: 'list-rev-3' });
+      }
+      if (url.includes('/status')) return respond(200, statusBody({ models: models(), models_revision: currentRevision }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  assert.equal(api.state.modelsRevision, 'list-rev-1', 'the status token is kept');
+
+  // The first edit pins the token the draft was started against.
+  api.handlers.addMapping();
+  assert.equal(api.state.modelsDraftActive, true);
+  assert.equal(api.state.modelsDraftRevision, 'list-rev-1');
+  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }, { id: 'od-pro', upstream_id: 'open-design/pro' }];
+
+  // A status refresh moves the server forward but must not move the draft base.
+  currentRevision = 'list-rev-2';
+  api.render.applyStatus(statusBody({ models: models(), models_revision: 'list-rev-2' }));
+  assert.equal(api.state.modelsRevision, 'list-rev-2');
+  assert.equal(api.state.modelsDraftRevision, 'list-rev-1', 'the draft keeps its first-edit token');
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), ['od-flash', 'od-pro']);
+
+  // The first save posts the pinned token; the server rejects the competing tab.
+  await api.handlers.saveModels();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].expected_models_revision, 'list-rev-1');
+  assert.match(view.document.getElementById('modelState').textContent, /提交内容已保留/);
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), ['od-flash', 'od-pro'], 'the rejected content stays editable');
+
+  // The second explicit click is the overwrite decision and uses the refreshed token.
+  await api.handlers.saveModels();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].expected_models_revision, 'list-rev-2');
+  assert.equal(api.state.modelsRevision, 'list-rev-3', 'the response token becomes the new baseline');
+  assert.equal(api.state.modelsDraftActive, false);
+});
+
+test('a draft begun before the backend advertised models_revision needs an explicit overwrite', async () => {
+  const posts = [];
+  let revision = '';
+  const models = () => [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        posts.push(JSON.parse(init.body));
+        return respond(200, { models: models(), models_revision: 'list-rev-9' });
+      }
+      if (url.includes('/status')) return respond(200, statusBody({ models: models(), models_revision: revision }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  assert.equal(api.state.modelsRevision, '', 'the old backend sends no token');
+  api.handlers.addMapping();
+  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }, { id: 'od-pro', upstream_id: 'open-design/pro' }];
+
+  // The backend starts providing a token after the draft was begun.
+  revision = 'list-rev-9';
+  api.render.applyStatus(statusBody({ models: models(), models_revision: 'list-rev-9' }));
+  assert.equal(api.state.modelsDraftRevision, '', 'the draft stays tokenless until it is explicitly re-based');
+
+  await api.handlers.saveModels();
+  assert.equal(posts.length, 0, 'a tokenless draft is not silently posted once the backend provides a token');
+  assert.match(view.document.getElementById('modelState').textContent, /再次点击/);
+  assert.equal(api.state.modelsConflict, true);
+
+  await api.handlers.saveModels();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].expected_models_revision, 'list-rev-9', 'the confirmed save uses the current server token');
+});
+
+test('a rejected model-list save keeps its content and never skips confirmation by reverting rows', async () => {
+  const posts = [];
+  let confirmations = 0;
+  let allowOverwrite = false;
+  const models = () => [{ id: 'od-flash', upstream_id: 'open-design/flash' }];
+  let statusCalls = 0;
+  const view = fakePage({
+    confirmImpl: () => { confirmations += 1; return allowOverwrite; },
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        posts.push(body);
+        if (body.expected_models_revision === 'list-rev-1') return respond(409, { error: 'models_revision_conflict' });
+        return respond(200, { models: models(), models_revision: 'list-rev-3' });
+      }
+      if (url.includes('/status')) {
+        statusCalls += 1;
+        return respond(200, statusBody({ models: models(), models_revision: statusCalls === 1 ? 'list-rev-1' : 'list-rev-2' }));
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+
+  // A clean save (no draft) still carries the token and the server has moved on.
+  await api.handlers.saveModels();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].expected_models_revision, 'list-rev-1');
+  assert.match(view.document.getElementById('modelState').textContent, /提交内容已保留/);
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), ['od-flash']);
+
+  // A refresh shows the competing revision. The submitted content now equals the
+  // old baseline again, but the conflict flag must still demand confirmation.
+  api.render.applyStatus(statusBody({ models: models(), models_revision: 'list-rev-2' }));
+  assert.equal(api.mappingsDirty(), false, 'the rows match the old baseline by content');
+  await api.handlers.saveModels();
+  assert.equal(confirmations, 1, 'the confirmation is asked even though the content hash matches');
+  assert.equal(posts.length, 1, 'a declined confirmation sends nothing');
+  assert.equal(view.document.getElementById('modelState').textContent.includes('已取消保存'), true);
+
+  allowOverwrite = true;
+  await api.handlers.saveModels();
+  assert.equal(confirmations, 2);
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].expected_models_revision, 'list-rev-2');
+});
+
+test('model rows lock during a save and a racing edit survives the response', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        await gate;
+        return respond(200, { models: [{ id: 'saved', upstream_id: 'open-design/saved' }], models_revision: 'list-rev-2' });
+      }
+      if (url.includes('/upstream-models')) return respond(200, { data: [{ id: 'open-design/flash' }] });
+      if (url.includes('/status')) return respond(200, statusBody({ models: [{ id: 'od-flash', upstream_id: 'open-design/flash' }], models_revision: 'list-rev-1' }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  api.state.selectedCredential = 'cred-1';
+  view.document.getElementById('modelCredential').value = 'cred-1';
+  await api.handlers.fetchModels();
+  const upstreamCheckbox = Array.from(view.document.getElementById('upstreamList').children)
+    .flatMap(row => Array.from(row.children || []))
+    .find(node => node.tagName === 'INPUT');
+  assert.equal(upstreamCheckbox.disabled, false);
+
+  const pending = api.handlers.saveModels();
+  const aliasInput = view.document.getElementById('mappingList').children[0].children[0].children[1];
+  assert.equal(aliasInput.disabled, true, 'mapping inputs are locked while the save is in flight');
+  assert.equal(upstreamCheckbox.disabled, true, 'upstream checkboxes are locked while the save is in flight');
+
+  // The lock blocks user edits, but a racing programmatic edit must not be lost.
+  api.state.mappings[0].id = 'edited-during-save';
+  release();
+  await pending;
+  assert.equal(api.state.mappings[0].id, 'edited-during-save', 'the racing edit is kept as a draft');
+  assert.deepEqual(plain(api.state.savedMappings.map(row => row.id)), ['saved']);
+  assert.match(view.document.getElementById('modelState').textContent, /草稿/);
+  const freshAliasInput = view.document.getElementById('mappingList').children[0].children[0].children[1];
+  const freshUpstreamCheckbox = Array.from(view.document.getElementById('upstreamList').children)
+    .flatMap(row => Array.from(row.children || []))
+    .find(node => node.tagName === 'INPUT');
+  assert.equal(freshAliasInput.disabled, false, 'inputs unlock once the save is over');
+  assert.equal(freshUpstreamCheckbox.disabled, false, 'checkboxes unlock once the save is over');
+});
+
+test('a status refresh landing during a model-list save cannot replace the rows', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let statusCalls = 0;
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/models') && init.method === 'POST') {
+        await gate;
+        return respond(200, { models: [{ id: 'saved', upstream_id: 'open-design/saved' }], models_revision: 'list-rev-2' });
+      }
+      if (url.includes('/status')) {
+        statusCalls += 1;
+        return respond(200, statusBody({
+          models: statusCalls === 1
+            ? [{ id: 'od-flash', upstream_id: 'open-design/flash' }]
+            : [{ id: 'server-new', upstream_id: 'open-design/server-new' }],
+          models_revision: statusCalls === 1 ? 'list-rev-1' : 'list-rev-9',
+        }));
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  api.handlers.addMapping();
+  api.state.mappings = [{ id: 'od-flash', upstream_id: 'open-design/flash' }, { id: 'od-pro', upstream_id: 'open-design/pro' }];
+
+  const pending = api.handlers.saveModels();
+  assert.equal(api.state.modelsSaving, true);
+  // A refresh answer lands while the POST is still pending: its model side must
+  // not replace the rows the response is about to confirm.
+  api.render.applyStatus(statusBody({ models: [{ id: 'server-new', upstream_id: 'open-design/server-new' }], models_revision: 'list-rev-9' }));
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), ['od-flash', 'od-pro']);
+  assert.equal(api.state.modelsRevision, 'list-rev-1', 'the pending save owns the revision until it answers');
+
+  release();
+  await pending;
+  assert.equal(api.state.modelsSaving, false);
+  assert.deepEqual(plain(api.state.savedMappings.map(row => row.id)), ['saved'], 'the confirmed response is the new baseline');
+  assert.equal(api.state.modelsRevision, 'list-rev-2');
+  assert.equal(api.state.modelsDraftActive, false);
+});
+
+test('switching the management key clears drafts and blocks the old status answer', async () => {
+  const pendingStatus = deferred();
+  let statusCalls = 0;
+  const statusFor = (id, revision) => statusBody({ models: [{ id, upstream_id: id }], models_revision: revision });
+  const view = fakePage({
+    fetchImpl: async url => {
+      if (!url.includes('/status')) return respond(404, { error: 'not found' });
+      statusCalls += 1;
+      if (statusCalls === 1) return respond(200, statusFor('old-model', 'old-rev'));
+      if (statusCalls === 2) return pendingStatus.promise;
+      return respond(200, statusFor('new-model', 'new-rev'));
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  api.handlers.addMapping();
+  assert.equal(api.state.modelsDraftActive, true);
+
+  // An old-session status read is still pending when the key is switched.
+  const stale = api.render.loadStatus();
+  await new Promise(setImmediate);
+  view.document.getElementById('managementKey').value = 'new-management-key';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  assert.equal(api.state.modelsDraftActive, false, 'a key switch clears the old mapping draft');
+  assert.equal(api.state.reasoningDrafts.size, 0, 'a key switch clears the old reasoning drafts');
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), ['new-model']);
+
+  pendingStatus.resolve(respond(200, statusFor('old-model', 'old-rev')));
+  await stale;
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), ['new-model'], 'the old status cannot repaint the new session');
+  assert.equal(api.state.modelsRevision, 'new-rev');
+  assert.equal(api.state.serverModels[0].id, 'new-model');
+});
+
+test('a late 401 from the old session cannot log out the newly verified key', async () => {
+  const pendingStatus = deferred();
+  let statusCalls = 0;
+  const view = fakePage({
+    fetchImpl: async url => {
+      if (!url.includes('/status')) return respond(404, { error: 'not found' });
+      statusCalls += 1;
+      if (statusCalls === 1) return respond(200, statusBody({ models_revision: 'old-rev' }));
+      if (statusCalls === 2) return pendingStatus.promise;
+      return respond(200, statusBody({ models_revision: 'new-rev' }));
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const stale = api.render.loadStatus();
+  await new Promise(setImmediate);
+
+  view.document.getElementById('managementKey').value = 'brand-new-key';
+  await api.handlers.submitAuth({ preventDefault() {} });
+  assert.notEqual(api.state.verified, null);
+  pendingStatus.resolve(respond(401, { error: 'old key expired' }));
+  await stale;
+  assert.notEqual(api.state.verified, null, 'the old 401 must not log out the new session');
+  assert.equal(api.state.candidate, null);
+  assert.equal(api.state.modelsRevision, 'new-rev');
+});
+
+test('a delayed refreshStatus from the old session cannot repopulate after logout', async () => {
+  const pendingStatus = deferred();
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/credentials') && init.method === 'POST') return respond(200, { id: 'cred-9', label: '新账户', disabled: false });
+      if (url.includes('/status')) return pendingStatus.promise;
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  view.document.getElementById('accountLabel').value = '新账户';
+  view.document.getElementById('accountKey').value = key;
+  const saving = api.handlers.addAccount({ preventDefault() {} });
+  await new Promise(setImmediate);
+
+  api.handlers.clearAuth();
+  assert.equal(api.state.verified, null);
+  pendingStatus.resolve(respond(200, statusBody({
+    credentials: [{ id: 'cred-9', label: '新账户', disabled: false }],
+    models: [{ id: 'stale-model', upstream_id: 'stale-model' }],
+    models_revision: 'stale-rev',
+  })));
+  await saving;
+  assert.deepEqual(plain(api.state.status.credentials), [], 'the old refresh cannot repopulate credentials after logout');
+  assert.deepEqual(plain(api.state.serverModels), [], 'the old refresh cannot repopulate models after logout');
+  assert.equal(api.state.modelsRevision, '', 'the old token is not adopted after logout');
+  assert.equal(view.document.getElementById('accountsPanel').hidden, true);
+});
+
+test('an upstream change keeps the old reasoning draft and surfaces it as copyable text', async () => {
+  let models = [{ id: 'od-a', upstream_id: 'vela/gpt-6-luna', reasoning_revision: 'rev-0' }];
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/status') ? respond(200, reasoningStatus(...models)) : respond(404, { error: 'not found' })),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.setReasoningEnabled(true);
+  const draftKey = api.state.reasoningModelKey;
+  assert.equal(api.state.reasoningDrafts.has(draftKey), true);
+  assert.ok(draftKey.includes('vela/gpt-6-luna'));
+
+  // The same alias now points at a different upstream: the draft's key disappears
+  // from the live list but the rules must not vanish with it.
+  models = [{ id: 'od-a', upstream_id: 'vela/gpt-6-saturn', reasoning_revision: 'rev-0' }];
+  api.render.applyStatus(reasoningStatus(...models));
+  assert.equal(api.state.reasoningDrafts.has(draftKey), true, 'the upstream-changed draft is kept');
+  const text = view.document.getElementById('reasoningState').textContent;
+  assert.match(text, /草稿已保留/);
+  assert.match(text, /od-a → vela\/gpt-6-luna/, 'the copyable text names the old mapping');
+  assert.match(text, /→/, 'the rule table is included for copying');
 });
 
 // ---- 额度暂停 (plugin-owned quota pause) ------------------------------------

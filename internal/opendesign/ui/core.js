@@ -106,6 +106,10 @@
     return {
       version: text(data.version),
       base_url: text(data.base_url) || DEFAULT_BASE_URL,
+      // Optional whole-list optimistic-lock token. A backend that does not send
+      // it leaves the field empty; a backend that starts sending it lets the
+      // console reject a save written against an older model list.
+      models_revision: text(data.models_revision),
       credentials,
       models,
     };
@@ -138,6 +142,16 @@
       models.push({ id, upstream_id: upstreamID });
     }
     return models;
+  }
+
+  // The POST /models body. expected_models_revision is only attached when the
+  // server advertised a token; an older backend keeps receiving exactly the
+  // same body as before, so it is never asked to validate an unknown field.
+  function buildModelsSaveBody(rows, expectedRevision) {
+    const body = { models: buildModelsPayload(rows) };
+    const revision = text(expectedRevision);
+    if (revision) body.expected_models_revision = revision;
+    return body;
   }
 
   // --- thinking-strength mapping -------------------------------------------
@@ -1155,6 +1169,7 @@
     formatTime,
     forecastView,
     buildModelsPayload,
+    buildModelsSaveBody,
     hasUpstream,
     reasoningLabel,
     defaultReasoningRules,
