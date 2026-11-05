@@ -223,24 +223,39 @@ func TestLegacyBlockWithoutRevisionSurvivesStaleWrite(t *testing.T) {
 
 // The automatic recheck backoff must not overflow into an immediate retry.
 func TestQuotaRecheckBackoffSaturates(t *testing.T) {
-	s, host, id, _ := quotaRecoveryFixture(t, false, "model-a")
-	s.mu.RLock()
-	revision := s.creds[id].QuotaRevision
-	s.mu.RUnlock()
+	s, _, id, _ := quotaRecoveryFixture(t, false, "model-a")
+	now := time.Now().UTC()
+	s.mu.Lock()
+	// Prevent the worker from rechecking concurrently, and make the block due so
+	// the reset hint cannot mask a broken exponential delay with the 30m cap.
+	disabled := false
+	s.cfg.Pause.Enabled = &disabled
+	s.quotaNow = func() time.Time { return now }
+	current := s.creds[id]
+	current.QuotaBlock = cloneQuotaBlock(current.QuotaBlock)
+	current.QuotaBlock.RetryAt = now.Add(-time.Minute)
+	s.creds[id] = current
+	revision := current.QuotaRevision
+	s.mu.Unlock()
 	for i := 0; i < 64; i++ {
-		now := s.quotaPauseTime()
 		s.setQuotaRecheckStatus(id, revision,
 			localFail(http.StatusConflict, "quota_recheck_unproven", "unproven"))
 		s.mu.RLock()
 		retry, ok := s.quotaRecheckRetryAt[id]
-		s.quotaRecheckRetryAt[id] = time.Time{}
 		s.mu.RUnlock()
 		if !ok {
 			t.Fatalf("round %d recorded no retry delay", i+1)
 		}
-		if delay := retry.Sub(now); delay <= 0 || delay > quotaRecheckBackoffMax+time.Second {
-			t.Fatalf("round %d scheduled a %v retry delay", i+1, delay)
+		want := quotaRecheckBackoffMax
+		if i == 0 {
+			want = 5 * time.Minute
+		} else if i == 1 {
+			want = 10 * time.Minute
+		} else if i == 2 {
+			want = 20 * time.Minute
+		}
+		if delay := retry.Sub(now); delay != want {
+			t.Fatalf("round %d scheduled a %v retry delay, want %v", i+1, delay, want)
 		}
 	}
-	_ = host
 }
