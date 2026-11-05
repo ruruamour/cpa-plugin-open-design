@@ -94,7 +94,8 @@ python3 scripts/smoke-abi.py dist/open-design.so --cpa-live
 6. 跨源重定向（**在删除之前**跑，凭据必须仍然可用）：假上游对 `/models` 回 307 指向另一个测试 origin，观察宿主是否把 `Authorization` 带过去；
 7. 额度流程（`host_quota`，在删除之前跑）：旧凭据 `not_configured` 零联网 → 空 `label`/`api_key` 更新保留原值 → 写入 controlKey/workspaceId（只落 auth-dir，status/credentials/models/console/`/v1/models`/quota 及客户端响应都不回显）→ 首次 `refresh=1` 校验官网形状与真实数字/窗口并断言只发生 2 次、均带 control bearer 且经 CONNECT 与 TLS、不带 `modelId` → 普通 GET 与立即 refresh 走缓存且 `next_refresh_at` 保持 → `clear_billing` 后缓存清空、不再联网，推理 key 与别名仍可用（再次真实推理返回 200）→ 另外用独立临时凭据覆盖 401/403/畸形响应被分别归类为 `unauthorized`/`forbidden`/`malformed`，`data`/`fetched_at` 保持 null，不宽松接受；
 8. `DELETE /credentials?id=` 后不可调用、且不应再出现在模型列表，`GET /quota` 对已删除凭据返回 404；
-9. 上游 401 与 429 **各起一个独立 CPA 进程**（真实 401 会让 CPA 冷却凭据，同进程里第二个用例会被宿主以 `auth_unavailable` 挡下、证明不了插件行为），每个用例都断言请求确实到达假上游。
+9. 上游 401 与 429 **各起一个独立 CPA 进程**（真实 401 会让 CPA 冷却凭据，同进程里第二个用例会被宿主以 `auth_unavailable` 挡下、证明不了插件行为），每个用例都断言请求确实到达假上游；
+10. 并发额度暂停（`host_quota_concurrent`，独立进程）：同一推理 key 两个别名指向两个上游模型，假上游把慢请求（`glm-5.3-flash`）挂住、让快请求（`deepseek-v4.1-flash`）先回结构化 402 建立暂停。在途窗口内官方 `funding-check` 对两个模型都回 `available`，但 `POST /quota-pause/recheck` 必须 409（`在途`）且**零**次官方查询、暂停仍在；放行慢请求后，它的迟到 402 必须**合并**出 `model_ids=[deepseek-v4.1-flash, glm-5.3-flash]`、`multiple_models=true`。随后一模型 `available`／另一模型 `insufficient` 的混合答案仍必须 409 并保持暂停（且两个模型都被查过），只有两个模型都新鲜 `available` 才 200 解除并清空磁盘 block。证据等待 `quotaRecoveryProven` 的 5 秒证据边界，不放宽插件规则；
 
 实测结论（CPA v8.0.48）：跨源 307 **会被跟随**，但 `Authorization` **会被剥掉**（`host_http_redirect.verdict = "Authorization stripped across origin"`），即宿主不会把 bearer key 带到别的 origin；`registry.npmjs.org:443` 的 CONNECT 被代理拒绝，证明没有其它出站。
 

@@ -186,8 +186,16 @@ def funding_reply(billing, path):
     billing = stamp_funding_generated_at(billing)
     status, payload = billing_reply(billing, "funding")
     model_ids = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query).get("modelId", [])
+    # Optional per-model answer, used by the concurrent-pause case to prove that
+    # one model's `available` is not enough to clear a two-model pause. The
+    # default (no entry for the model) keeps the historic single shape.
+    by_model = billing.get("funding_check_by_model") or {}
     if status == 200 and model_ids and isinstance(payload, dict):
-        payload = dict(payload, modelId=model_ids[0], modelCovered=True)
+        model = model_ids[0]
+        payload = dict(payload, modelId=model, modelCovered=True)
+        check = by_model.get(model)
+        if check is not None:
+            payload = dict(payload, modelCovered=check == "available", fundingCheck=check)
     return status, payload
 
 
@@ -827,6 +835,12 @@ class TlsFakeOrigin:
         # predicate (given the bearer header), so a retry-scheduling leg can make
         # exactly one account fail and observe the host rotating to the other.
         self.retry_fail = None
+        # When set, a map of upstream model -> {"gate": Event, "arrived": Event,
+        # "status": int, "body": str}. A matching /chat/completions call parks
+        # its handler on `gate` (after recording the request) and then answers
+        # with the given status/body, so a test can hold one request open while
+        # another one on the same inference key completes.
+        self.hold_chat = None
 
     def start(self):
         outer = self
@@ -929,6 +943,19 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
                     "message": "[code=tier_limit_exceeded] membership concurrency "
                                "limit exceeded: 11/10 resets 2026-11-03T16:32:30Z",
                     "type": "invalid_request_error"}).encode())
+                return
+        hold = getattr(self.owner, "hold_chat", None)
+        if hold is not None and self.path.endswith("/chat/completions"):
+            try:
+                held_model = json.loads(raw or b"{}").get("model")
+            except json.JSONDecodeError:
+                held_model = None
+            entry = hold.get(held_model)
+            if entry is not None:
+                entry["arrived"].set()
+                # Bounded only so a broken case cannot hang the suite forever.
+                entry["gate"].wait(120)
+                self._send(entry["status"], entry["body"].encode())
                 return
         if self.owner.fail is not None and self.path.endswith("/chat/completions"):
             status, body = self.owner.fail
@@ -1357,6 +1384,10 @@ def run_cpa_live(artifact, binary, version):
         # A due pause is recovered only by a fresh official available check; a
         # failing check must keep the pause and the operator's manual disable.
         evidence["host_quota_recovery"] = _live_case(binary, artifact, version, quota_recovery=True)
+        # Two concurrent in-flight requests on one inference key, two different
+        # upstream models, the slow one landing a structured 402 last.
+        evidence["host_quota_concurrent"] = _live_case(
+            binary, artifact, version, quota_concurrent=True)
 
         # ---- 6. disable -> enable must resync the runtime ----
         # If the registration never came up there is nothing to withdraw, so these
@@ -1499,6 +1530,8 @@ def run_cpa_live(artifact, binary, version):
             blockers.append("host_quota_manual_disable")
         if evidence.get("host_quota_recovery", {}).get("status") != "PASS":
             blockers.append("host_quota_recovery")
+        if evidence.get("host_quota_concurrent", {}).get("status") != "PASS":
+            blockers.append("host_quota_concurrent")
         if not registration_live:
             blockers.append("ui_flow.registration")
         if stage_failures:
@@ -2028,7 +2061,8 @@ def _rewrite_fixture_block(path, *, due):
     return block
 
 
-def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, quota_recovery=False):
+def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, quota_recovery=False,
+               quota_concurrent=False):
     work = Path(tempfile.mkdtemp(prefix="opendesign-cpa-case-"))
     process = proxy = origin = log = None
     result = {"status": "FAIL"}
@@ -2121,8 +2155,12 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
                                  {"label": "fixture", "api_key": FIXTURE_KEY})
         require(status == 201, "case credential create %s" % status)
         credential_id = json.loads(raw)["id"]
-        status, raw, _ = request(API + "/models", {"models": [
-            {"id": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash"}]})
+        mappings = [{"id": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash"}]
+        if quota_concurrent:
+            # Two aliases on two upstream models so one inference key can have
+            # two different models in flight at the same time.
+            mappings.append({"id": "glm-flash", "upstream_id": "glm-5.3-flash"})
+        status, raw, _ = request(API + "/models", {"models": mappings})
         require(status == 200, "case models POST %s" % status)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -2132,19 +2170,21 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
                 break
             time.sleep(0.25)
 
-        if quota_manual or quota_recovery:
+        if quota_manual or quota_recovery or quota_concurrent:
             # The feature remains opt-in while its documented CPA-native
             # manual-disable limitation is under review; this is an isolated
             # fixture account and deliberately exercises the plugin UI path.
             status, _, _ = request(API + "/config", {"pause": {"enabled": True}})
             require(status == 200, "case could not enable experimental quota pause")
-        if quota_recovery:
+        if quota_recovery or quota_concurrent:
             # The official billing identity is a separate operator setting; the
             # fixture key/workspace pair is what the recovery preflight uses.
             status, raw, _ = request(API + "/credentials", {
                 "id": credential_id, "control_key": FIXTURE_CONTROL_KEY,
                 "workspace_id": FIXTURE_WORKSPACE_ID})
             require(status == 200, "case billing configure %s" % status)
+        if quota_concurrent:
+            return _live_quota_concurrent(boot, stop, request, origin, work, credential_id)
 
         before = len(origin.requests)
         # Some CPA versions expose the alias in /v1/models just before its
@@ -2245,6 +2285,204 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
             if server is not None:
                 server.stop()
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _live_quota_concurrent(boot, stop, request, origin, work, credential_id):
+    """Two in-flight requests, two upstream models, one late structured 402.
+
+    The fast request publishes the pause first; the slow one is still in flight
+    afterwards. While it is running, the official billing fixture answers
+    `available` for both models, but no official query may clear the pause:
+    the recovery recheck must be refused on the in-flight fence before it makes
+    any billing call. Only after the slow 402 lands may the pause be reviewed,
+    and then only a fresh, available answer for *both* recorded models clears it.
+
+    Every value is a fixture. No production key, host or endpoint is touched.
+    """
+    import threading
+
+    result = {"status": "FAIL"}
+    path = work / "auths" / (credential_id + ".json")
+    quota_body = json.dumps({"error": {"code": "insufficient_balance",
+                                       "details": {"coding_plan_exhausted": True}}})
+
+    def disk_state():
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def pause_row():
+        status, raw, _ = request(API + "/quota-pause", timeout=10)
+        require(status == 200, "GET /quota-pause returned %s" % status)
+        rows = json.loads(raw).get("pauses") or []
+        row = next((item for item in rows if item.get("credential_id") == credential_id), None)
+        return row
+
+    def wait_for(condition, timeout, label):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if condition():
+                    return True
+            except (OSError, ValueError, urllib.error.URLError):
+                pass
+            time.sleep(0.1)
+        return False
+
+    def chat(alias, out):
+        try:
+            out["status"], out["body"], _ = request("/v1/chat/completions", {
+                "model": alias,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False}, timeout=120)
+        except urllib.error.HTTPError as exc:
+            out["status"], out["body"] = exc.code, exc.read()
+        except Exception as exc:  # noqa: BLE001 - surfaced as evidence
+            out["status"], out["body"] = 0, str(exc).encode()
+
+    def model_ids_on_disk():
+        block = disk_state().get("quota_block") or {}
+        return sorted(block.get("model_ids") or [])
+
+    try:
+        # The official API is available for both models the whole time. This is
+        # the exact shape that must NOT be able to clear a pause while an
+        # inference on the same key is still running.
+        origin.billing = dict(official_billing_fixture(), stamp_funding_now=True,
+                              funding_check_by_model={"deepseek-v4.1-flash": "available",
+                                                      "glm-5.3-flash": "available"})
+        slow = {"gate": threading.Event(), "arrived": threading.Event(),
+                "status": 402, "body": quota_body}
+        fast = {"gate": threading.Event(), "arrived": threading.Event(),
+                "status": 402, "body": quota_body}
+        fast["gate"].set()  # answers immediately after recording the request
+        origin.hold_chat = {"glm-5.3-flash": slow, "deepseek-v4.1-flash": fast}
+
+        slow_out, fast_out = {}, {}
+        slow_thread = threading.Thread(target=chat, args=("glm-flash", slow_out), daemon=True)
+        slow_thread.start()
+        require(slow["arrived"].wait(60), "the slow glm request never reached the fake origin")
+        fast_thread = threading.Thread(target=chat, args=("deepseek-flash", fast_out), daemon=True)
+        fast_thread.start()
+        fast_thread.join(90)
+        require(fast_out.get("status") == 402,
+                "fast request surfaced %r" % (fast_out.get("status"),))
+        require(wait_for(lambda: pause_row() is not None, 30, "fast pause"),
+                "the fast request did not publish a quota pause")
+        fast_row = pause_row()
+        require(fast_row is not None, "no pause row after the fast 402")
+        require((fast_row.get("model_id") or "") == "deepseek-v4.1-flash",
+                "first pause model = %r" % (fast_row.get("model_id"),))
+        result["fast_request"] = {"upstream_model": "deepseek-v4.1-flash",
+                                  "surfaced_status": fast_out["status"],
+                                  "pause_published": True}
+
+        # ---- in-flight window: an available official query must not clear it ----
+        require(not slow["gate"].is_set() and slow_thread.is_alive(),
+                "the slow request finished before the in-flight check")
+        billing_before = len(billing_hits(origin))
+        try:
+            status, raw, _ = request(API + "/quota-pause/recheck",
+                                     {"credential_id": credential_id}, timeout=60)
+        except urllib.error.HTTPError as exc:
+            status, raw = exc.code, exc.read()
+        text = raw.decode(errors="replace")
+        require(status == 409,
+                "recheck while in flight returned %s: %s" % (status, text[:200]))
+        require("在途" in text, "the in-flight refusal lost its reason: %s" % text[:200])
+        require(len(billing_hits(origin)) == billing_before,
+                "the refused recheck still issued %d official query(ies)"
+                % (len(billing_hits(origin)) - billing_before))
+        still = pause_row()
+        require(still is not None, "the pause disappeared during the in-flight window")
+        result["inflight_window"] = {
+            "recheck_status": status,
+            "official_queries": 0,
+            "pause_kept": True,
+            "slow_request_still_running": True,
+        }
+
+        # ---- release the slow request: its late 402 must merge, not replace ----
+        slow["gate"].set()
+        slow_thread.join(120)
+        require(slow_out.get("status") == 402,
+                "slow request surfaced %r" % (slow_out.get("status"),))
+        require(wait_for(lambda: model_ids_on_disk() == ["deepseek-v4.1-flash",
+                                                          "glm-5.3-flash"],
+                         30, "merged model set"),
+                "the pause model set is %r, want both upstream models"
+                % (model_ids_on_disk(),))
+        merged = pause_row()
+        require(merged is not None and merged.get("multiple_models") is True,
+                "the merged pause lost its multiple-model marker: %r" % (merged,))
+        result["late_402"] = {
+            "surfaced_status": slow_out["status"],
+            "model_ids": model_ids_on_disk(),
+            "multiple_models": True,
+        }
+
+        # quotaRecoveryProven requires evidence generated more than 5s after the
+        # observation, so wait out that boundary instead of loosening it. The
+        # late 402 just refreshed observed_at, and a failed round never moves it
+        # again, so one wait covers both remaining steps.
+        observed = parse_rfc3339(disk_state()["quota_block"]["observed_at"])
+        while (dt.datetime.now(dt.timezone.utc) - observed).total_seconds() < 6:
+            time.sleep(0.5)
+
+        # ---- one model's `available` is not a recovery proof ----
+        origin.billing = dict(official_billing_fixture(), stamp_funding_now=True,
+                              funding_check_by_model={"deepseek-v4.1-flash": "available",
+                                                      "glm-5.3-flash": "insufficient"})
+        billing_before = len(billing_hits(origin))
+        try:
+            status, raw, _ = request(API + "/quota-pause/recheck",
+                                     {"credential_id": credential_id}, timeout=90)
+        except urllib.error.HTTPError as exc:
+            status, raw = exc.code, exc.read()
+        text = raw.decode(errors="replace")
+        queried = sorted({urllib.parse.parse_qs(urllib.parse.urlsplit(hit["path"]).query)["modelId"][0]
+                          for hit in billing_hits(origin)[billing_before:]
+                          if urllib.parse.parse_qs(urllib.parse.urlsplit(hit["path"]).query).get("modelId")})
+        require(status == 409,
+                "a mixed official answer returned %s: %s" % (status, text[:200]))
+        require(queried == ["deepseek-v4.1-flash", "glm-5.3-flash"],
+                "the recheck only queried %r" % (queried,))
+        require(pause_row() is not None, "a mixed official answer cleared the pause")
+        result["mixed_answer"] = {"recheck_status": status,
+                                  "queried_models": queried, "pause_kept": True}
+
+        # ---- both fresh available answers do clear it ----
+        origin.billing = dict(official_billing_fixture(), stamp_funding_now=True,
+                              funding_check_by_model={"deepseek-v4.1-flash": "available",
+                                                      "glm-5.3-flash": "available"})
+        billing_before = len(billing_hits(origin))
+        status, raw, _ = request(API + "/quota-pause/recheck",
+                                 {"credential_id": credential_id}, timeout=120)
+        queried = sorted({urllib.parse.parse_qs(urllib.parse.urlsplit(hit["path"]).query)["modelId"][0]
+                          for hit in billing_hits(origin)[billing_before:]
+                          if urllib.parse.parse_qs(urllib.parse.urlsplit(hit["path"]).query).get("modelId")})
+        require(status == 200, "a fresh two-model answer returned %s: %s"
+                % (status, raw.decode(errors="replace")[:200]))
+        require(queried == ["deepseek-v4.1-flash", "glm-5.3-flash"],
+                "the successful recheck only queried %r" % (queried,))
+        require(wait_for(lambda: pause_row() is None, 30, "pause cleared"),
+                "the pause survived a fresh two-model available answer")
+        require(wait_for(lambda: not disk_state().get("quota_block"), 30, "disk cleared"),
+                "the on-disk quota block survived the recovery")
+        result["recovered"] = {"recheck_status": 200,
+                               "queried_models": queried,
+                               "pause_cleared": True}
+        result["status"] = "PASS"
+        return result
+    except AssertionError as exc:
+        result["failure"] = str(exc)[:400]
+        return result
+    finally:
+        origin.hold_chat = None
+        for entry in (locals().get("slow"), locals().get("fast")):
+            if isinstance(entry, dict) and "gate" in entry:
+                entry["gate"].set()
 
 
 def _live_quota_recovery(boot, stop, request, origin, work, credential_id):
