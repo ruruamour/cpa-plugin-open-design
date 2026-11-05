@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -154,6 +155,43 @@ func TestQuotaPauseManagementRoutes(t *testing.T) {
 	c, _ := liveCredential(s, id)
 	if c.quotaBlocked() || c.Disabled {
 		t.Fatal("manual resume did not clear only the quota block")
+	}
+}
+
+func TestManualResumeFileFailureRequiresOperatorRetry(t *testing.T) {
+	s, _, id, path := quotaRecoveryFixture(t, false, "model-a")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil,
+		map[string]any{"credential_id": id})
+	if status != http.StatusBadGateway {
+		t.Fatalf("resume with a missing file returned %d, want 502", status)
+	}
+	message, _ := body["error"].(string)
+	if !strings.Contains(message, "重试") || strings.Contains(message, "自动重试") || strings.Contains(message, path) {
+		t.Fatalf("resume error should require an operator retry without exposing the path: %q", message)
+	}
+	// A local sweep repairs recorded persistence errors but does not re-run the
+	// operator's explicit resume. The block must remain until they try again.
+	s.sweepQuotaBlocks(make(chan struct{}))
+	if current, _ := liveCredential(s, id); !current.quotaBlocked() {
+		t.Fatal("a failed manual resume unexpectedly cleared the block")
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, _, response := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil,
+		map[string]any{"credential_id": id})
+	if status != http.StatusOK {
+		t.Fatalf("manual retry after restoring file: %d %s", status, response)
+	}
+	if current, _ := liveCredential(s, id); current.quotaBlocked() {
+		t.Fatal("successful manual retry left the quota block in place")
 	}
 }
 

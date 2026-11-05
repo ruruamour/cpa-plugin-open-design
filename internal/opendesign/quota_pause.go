@@ -174,9 +174,9 @@ func (s *Service) persistQuotaBlockLocked(id, revision string, manualFromDisk bo
 	return nil
 }
 
-// resumeFailureReason maps the internal resume/sweep error to a short, fixed
-// explanation. The console needs to tell "the file changed under us" apart from
-// "the file could not be written", because only the former is fixed by refreshing.
+// resumeFailureReason maps an explicit resume error to a fixed, redacted
+// explanation. A failed manual resume is not retried by the background worker;
+// the operator must try again after correcting the underlying problem.
 func resumeFailureReason(err error) string {
 	switch err.Error() {
 	case "quota state changed":
@@ -186,7 +186,7 @@ func resumeFailureReason(err error) string {
 	case "credential file unavailable":
 		return "凭据文件路径不可用"
 	default:
-		return "凭据文件写入失败，稍后会自动重试"
+		return "凭据文件访问或写入失败，请检查文件状态后重试"
 	}
 }
 
