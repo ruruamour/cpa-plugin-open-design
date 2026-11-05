@@ -290,10 +290,23 @@
   // on any backend: the console never strips it and lets an alias match decide.
   // Legacy servers have no whole-list CAS, so the collision check for a row that
   // never had a pin only runs after a known partial persistence.
+  // True when this draft row has no original identity and would silently bind
+  // to another row's same alias on save. Mirrors the save gate exactly so the
+  // per-row adopt control appears wherever that gate asks for it.
+  function unpinnedAliasConflict(row, revision = modelsSaveRevision()) {
+    const alias = String(row && row.id || '').trim();
+    if (!alias || String(row && row.original_id || '').trim() || String(row && row.original_upstream_id || '').trim()) return false;
+    if (!(revision || state.modelsPersistedPartial)) return false;
+    const snapshot = Array.isArray(state.serverModels) ? state.serverModels : [];
+    if (!snapshot.some(item => String(item && item.id || '').trim() === alias)) return false;
+    const claimed = (Array.isArray(state.mappings) ? state.mappings : [])
+      .some(other => String(other && other.original_id || '').trim() === alias);
+    return !claimed;
+  }
+
   function blockAmbiguousMappingIdentities(revision = modelsSaveRevision()) {
     const snapshot = Array.isArray(state.serverModels) ? state.serverModels : [];
     const rows = Array.isArray(state.mappings) ? state.mappings : [];
-    const claimedIDs = new Set(rows.map(row => String(row && row.original_id || '').trim()).filter(Boolean));
     const issues = [];
     for (const row of rows) {
       const alias = String(row && row.id || '').trim();
@@ -305,8 +318,7 @@
           String(item && item.id || '').trim() === originalID &&
           String(item && item.upstream_id || '').trim() === originalUpstream);
         if (!found) issues.push(`${alias} → ${upstream}（原行 ${originalID} → ${originalUpstream} 已不存在或无法确认）`);
-      } else if ((revision || state.modelsPersistedPartial) && alias && !claimedIDs.has(alias)
-        && snapshot.some(item => String(item && item.id || '').trim() === alias)) {
+      } else if (unpinnedAliasConflict(row, revision)) {
         issues.push(`${alias} → ${upstream}（新行与服务器的同名别名冲突）`);
       }
     }
@@ -357,7 +369,10 @@
       ? '当前后端没有整表版本校验，之后保存会直接整表覆盖。'
       : '仅此行会改用服务器身份，整表版本和保存所依据的旧版本不会被自动替换；之后保存仍需按冲突流程确认覆盖。';
     const policyNote = server.reasoning_mapping ? '该服务器行已有思考强度映射，将按服务器当前策略。' : '该服务器行当前没有已保存的思考强度映射。';
-    if (typeof confirm === 'function' && !confirm(`仅此行：将「${alias} → ${upstream}」的原草稿身份 ${originalID} → ${originalUpstream} 改为采用服务器当前行 ${String(server.id).trim()} → ${String(server.upstream_id).trim()}。${policyNote}其他草稿行不会被改动。${legacyNote}确定继续？`)) {
+    const subject = (originalID || originalUpstream)
+      ? `原草稿身份 ${originalID} → ${originalUpstream}`
+      : '未绑定身份的草稿行';
+    if (typeof confirm === 'function' && !confirm(`仅此行：将「${alias} → ${upstream}」的${subject}改为采用服务器当前行 ${String(server.id).trim()} → ${String(server.upstream_id).trim()}。${policyNote}其他草稿行不会被改动。${legacyNote}确定继续？`)) {
       message('modelState', '已取消逐行采用，草稿和原行身份均保留。', '');
       return;
     }
@@ -1847,12 +1862,12 @@
         },
       });
       const actions = [remove];
-      // A pin that the current snapshot cannot resolve is never dropped or
-      // rebound automatically. This single-row control is the only explicit way
-      // to say "use the server's current row (and its policy)" without touching
-      // the other draft rows or the whole-list token.
-      const pinned = String(model && model.original_id || '').trim() || String(model && model.original_upstream_id || '').trim();
-      if (pinned && !mappingOriginalResolves(model) && serverRowForMapping(model)) {
+      // An unresolved pin and an unpinned row that collides with a server alias
+      // are both never dropped or rebound automatically. This single-row
+      // control is the only explicit way to say "use the server's current row
+      // (and its policy)" without touching the other draft rows or the
+      // whole-list token.
+      if ((!mappingOriginalResolves(model) || unpinnedAliasConflict(model)) && serverRowForMapping(model)) {
         actions.push(button('采用服务器此行', 'adopt-server-mapping', {
           className: 'button compact',
           disabled: state.modelsSaving,

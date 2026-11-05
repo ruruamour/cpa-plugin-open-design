@@ -6351,3 +6351,34 @@ test('api.saveModels keeps the legacy body and only adds a revision when explici
   assert.deepEqual(JSON.parse(calls[2].init.body), { models },
     'an empty revision does not fabricate a whole-list check');
 });
+
+test('an unpinned new row colliding with a same-alias same-upstream row offers a per-row adopt control', async () => {
+  const page = modelSavePage();
+  await page.api.render.loadStatus();
+  page.api.handlers.addMapping();
+  const draft = page.api.state.mappings[page.api.state.mappings.length - 1];
+  draft.id = 'od-ghost';
+  draft.upstream_id = 'open-design/ghost';
+  page.api.render.renderMappings();
+
+  // Another tab writes the exact same alias+upstream before this page refreshes.
+  page.setModels([...pinnedModels(), { id: 'od-ghost', upstream_id: 'open-design/ghost' }]);
+  page.setRevision('list-rev-2');
+  await page.api.render.loadStatus();
+  assert.equal(page.api.state.mappings.at(-1).id, 'od-ghost', 'the dirty draft survives the refresh');
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 0, 'the same-alias collision blocks the save');
+  assert.match(page.view.document.getElementById('modelState').textContent, /同名别名冲突/);
+
+  const rows = page.view.document.getElementById('mappingList').children;
+  const conflictRow = rows[rows.length - 1];
+  const adopt = Array.from(conflictRow.children)
+    .find(node => node.getAttribute('data-action') === 'adopt-server-mapping');
+  assert.ok(adopt, 'the unpinned conflict row exposes the promised adopt control');
+  await adopt.emit('click');
+  assert.match(page.confirmations.at(-1), /未绑定身份/);
+  assert.equal(page.api.state.mappings.at(-1).original_id, 'od-ghost');
+  assert.equal(page.api.state.mappings.at(-1).original_upstream_id, 'open-design/ghost');
+  await page.api.handlers.saveModels();
+  assert.equal(page.posts.length, 1, 'the adopted row can be saved');
+});
