@@ -2005,7 +2005,17 @@
       if (sessionGeneration !== state.sessionGeneration) return;
       await refreshStatus();
       if (sessionGeneration !== state.sessionGeneration) return;
-      message('accountState', '本次官方复查通过，已解除插件额度暂停；账户是否调度仍由 CPA 与启用状态决定。');
+      // A successful response can mean the pause was already gone before this
+      // request; it does not necessarily prove that this call queried upstream.
+      // The account may also have been paused again before the status refresh.
+      const current = state.status.credentials.find(credential => credential.id === item.id);
+      if (!current) {
+        message('accountState', '复查请求已完成，但账户状态已变化，请查看最新列表。');
+      } else if (current.quota_paused) {
+        message('accountState', '复查请求已完成，账户仍处于额度暂停；请查看最新暂停详情。');
+      } else {
+        message('accountState', '复查请求已完成，当前没有插件额度暂停；账户是否调度仍由 CPA 与启用状态决定。');
+      }
     } catch (error) {
       if (sessionGeneration !== state.sessionGeneration) return;
       message('accountState', `重查未通过：${formatError(error)}`, 'error');

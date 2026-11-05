@@ -4239,6 +4239,10 @@ test('仅完整模型集合与有效额度配置显示重查按钮，多个模�
   const sent = calls.filter(call => call.url.endsWith('/quota-pause/recheck'));
   assert.equal(sent.length, 1);
   assert.deepEqual(JSON.parse(sent[0].init.body), { credential_id: 'cred-1' });
+  // A block may be recreated before the status refresh completes. Do not say
+  // that the account has been resumed while the latest list still says paused.
+  assert.match(view.document.getElementById('accountState').textContent, /仍处于额度暂停/);
+  assert.doesNotMatch(view.document.getElementById('accountState').textContent, /已解除插件额度暂停/);
 
   // A legacy multi-model result without the completeness flag is ambiguous and
   // must not invite a preflight that cannot prove recovery.
