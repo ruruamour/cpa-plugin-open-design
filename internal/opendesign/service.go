@@ -31,25 +31,31 @@ type Service struct {
 	pendingMu    sync.Mutex
 	pendingSaves map[string]pendingSave
 
-	cfg                  Config
-	creds                map[string]Credential
-	billingEpoch         map[string]uint64 // guarded by mu; changes on either key/workspace replacement or clear/delete
-	quota                map[string]*quotaEntry
-	quotaSlots           chan struct{}
-	quotaNow             func() time.Time
-	quotaBudget          time.Duration
-	modelCoverage        map[modelCoverageKey]*modelCoverageEntry
-	modelCoverageSlots   chan struct{}
-	modelCoverageNow     func() time.Time
-	modelCoverageBudget  time.Duration
-	authFiles            map[string]string
-	revoked              map[string]bool
-	errorRules           []RequestErrorRule
-	errorRulesLoadError  string
-	errorRuleSynced      map[string]string
-	errorRuleSyncErrors  map[string]string
-	quotaPauseErrors     map[string]string // fixed, redacted persistence failures; guarded by mu
-	quotaRecheckStatus   map[string]string // fixed recovery error codes only; guarded by mu
+	cfg                 Config
+	creds               map[string]Credential
+	billingEpoch        map[string]uint64 // guarded by mu; changes on either key/workspace replacement or clear/delete
+	quota               map[string]*quotaEntry
+	quotaSlots          chan struct{}
+	quotaNow            func() time.Time
+	quotaBudget         time.Duration
+	modelCoverage       map[modelCoverageKey]*modelCoverageEntry
+	modelCoverageSlots  chan struct{}
+	modelCoverageNow    func() time.Time
+	modelCoverageBudget time.Duration
+	authFiles           map[string]string
+	revoked             map[string]bool
+	errorRules          []RequestErrorRule
+	errorRulesLoadError string
+	errorRuleSynced     map[string]string
+	errorRuleSyncErrors map[string]string
+	quotaPauseErrors    map[string]string // fixed, redacted persistence failures; guarded by mu
+	quotaRecheckStatus  map[string]string // fixed recovery error codes only; guarded by mu
+	// quotaRecheckRetryAt delays the next automatic recheck after a failed round.
+	// quotaRecheckFailures escalates that delay, so a multi-day coding-plan
+	// exhaustion settles into slow polling instead of hitting the official API
+	// every ticker. Guarded by mu; a manual recheck ignores both.
+	quotaRecheckRetryAt  map[string]time.Time
+	quotaRecheckFailures map[string]int
 	quotaPauseWake       chan struct{}
 	quotaPauseStarted    bool
 	quotaPauseWorker     sync.WaitGroup
@@ -93,37 +99,39 @@ type Service struct {
 func NewService() *Service {
 	requestLogs := newRequestLogStore()
 	s := &Service{
-		cfg:                 defaultConfig(),
-		creds:               map[string]Credential{},
-		billingEpoch:        map[string]uint64{},
-		quota:               map[string]*quotaEntry{},
-		quotaSlots:          make(chan struct{}, 3),
-		quotaNow:            time.Now,
-		quotaBudget:         quotaRefreshBudget,
-		modelCoverage:       map[modelCoverageKey]*modelCoverageEntry{},
-		modelCoverageSlots:  make(chan struct{}, 3),
-		modelCoverageNow:    time.Now,
-		modelCoverageBudget: modelCoverageBudget,
-		authFiles:           map[string]string{},
-		revoked:             map[string]bool{},
-		errorRules:          defaultErrorRules(),
-		errorRuleSynced:     map[string]string{},
-		errorRuleSyncErrors: map[string]string{},
-		quotaPauseErrors:    map[string]string{},
-		quotaRecheckStatus:  map[string]string{},
-		quotaInflight:       map[quotaInFlightKey]int{},
-		quotaRecoveryGate:   make(chan struct{}, 1),
-		quotaCommitGate:     make(chan struct{}, 1),
-		quotaRecoveryBudget: quotaRecoveryBudget,
-		quotaPauseWake:      make(chan struct{}, 1),
-		requestLogs:         requestLogs,
-		modelTests:          map[string]modelTestRecord{},
-		modelTestRunning:    map[string]int{},
-		credentialEpoch:     map[string]uint64{},
-		streams:             map[string]struct{}{},
-		pendingSaves:        map[string]pendingSave{},
-		ops:                 newOperationTracker(),
-		stopCh:              make(chan struct{}),
+		cfg:                  defaultConfig(),
+		creds:                map[string]Credential{},
+		billingEpoch:         map[string]uint64{},
+		quota:                map[string]*quotaEntry{},
+		quotaSlots:           make(chan struct{}, 3),
+		quotaNow:             time.Now,
+		quotaBudget:          quotaRefreshBudget,
+		modelCoverage:        map[modelCoverageKey]*modelCoverageEntry{},
+		modelCoverageSlots:   make(chan struct{}, 3),
+		modelCoverageNow:     time.Now,
+		modelCoverageBudget:  modelCoverageBudget,
+		authFiles:            map[string]string{},
+		revoked:              map[string]bool{},
+		errorRules:           defaultErrorRules(),
+		errorRuleSynced:      map[string]string{},
+		errorRuleSyncErrors:  map[string]string{},
+		quotaPauseErrors:     map[string]string{},
+		quotaRecheckStatus:   map[string]string{},
+		quotaRecheckRetryAt:  map[string]time.Time{},
+		quotaRecheckFailures: map[string]int{},
+		quotaInflight:        map[quotaInFlightKey]int{},
+		quotaRecoveryGate:    make(chan struct{}, 1),
+		quotaCommitGate:      make(chan struct{}, 1),
+		quotaRecoveryBudget:  quotaRecoveryBudget,
+		quotaPauseWake:       make(chan struct{}, 1),
+		requestLogs:          requestLogs,
+		modelTests:           map[string]modelTestRecord{},
+		modelTestRunning:     map[string]int{},
+		credentialEpoch:      map[string]uint64{},
+		streams:              map[string]struct{}{},
+		pendingSaves:         map[string]pendingSave{},
+		ops:                  newOperationTracker(),
+		stopCh:               make(chan struct{}),
 	}
 	requestLogs.keys = s.metadataSecrets
 	return s

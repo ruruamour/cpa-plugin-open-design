@@ -77,3 +77,27 @@ func TestQuotaPauseSignalPrefersStructuredResetToRetryAfter(t *testing.T) {
 		t.Fatalf("header fallback = %s, allowed = %t", reset, ok)
 	}
 }
+
+// The exact body OpenDesign returned in production on 2026-11-05 for a
+// coding-plan week limit (fixture key removed; only the shape and values that
+// matter for classification are kept). The weekly window resets three days
+// later, which is longer than the default pause cap.
+func TestQuotaPauseSignalMatchesObservedCodingPlanExhaustion(t *testing.T) {
+	now := time.Date(2026, time.November, 5, 11, 42, 34, 0, time.UTC)
+	const body = `{"error":{"code":"insufficient_balance","details":{"coding_plan_exhausted":true,"reset_at":"2026-11-08T14:41:17Z"},"message":"[code=insufficient_balance] Coding Plan quota is exhausted and wallet balance is insufficient. Please top up your wallet to continue now. Coding Plan quota resets at 2026-11-08T14:41:17Z; this does not replenish your wallet.","type":"insufficient_balance"}}`
+	reset, blocked := quotaPauseSignal(http.StatusPaymentRequired, nil, []byte(body), now)
+	if !blocked {
+		t.Fatal("the observed production body was not classified as quota exhaustion")
+	}
+	want := time.Date(2026, time.November, 8, 14, 41, 17, 0, time.UTC)
+	if !reset.Equal(want) {
+		t.Fatalf("reset = %s, want %s", reset, want)
+	}
+	// The default cap is shorter than the real weekly window; the pause must be
+	// bounded rather than trusting the upstream value outright.
+	settings := Config{}.pauseSettings()
+	deadline := quotaPauseDeadline(now, reset, settings)
+	if !deadline.Equal(now.Add(quotaPauseDefaultMax)) {
+		t.Fatalf("deadline = %s, want the configured cap %s", deadline, now.Add(quotaPauseDefaultMax))
+	}
+}

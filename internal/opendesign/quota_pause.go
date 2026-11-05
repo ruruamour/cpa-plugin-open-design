@@ -78,6 +78,8 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 		current.QuotaBlock = block
 		current.QuotaRevision = newID()
 		delete(s.quotaRecheckStatus, id)
+		delete(s.quotaRecheckRetryAt, id)
+		delete(s.quotaRecheckFailures, id)
 		// Publish every in-memory guard before writing any of the files.
 		s.creds[id] = current
 		s.clearModelTestsLocked(id)
@@ -248,6 +250,8 @@ func (s *Service) publishQuotaResumeLocked(expected quotaCommitSnapshot, path st
 		s.creds[expected.id] = live
 		delete(s.quotaPauseErrors, expected.id)
 		delete(s.quotaRecheckStatus, expected.id)
+		delete(s.quotaRecheckRetryAt, expected.id)
+		delete(s.quotaRecheckFailures, expected.id)
 	}
 	s.mu.Unlock()
 	return nil
@@ -590,6 +594,16 @@ func (s *Service) commitQuotaRecovery(current Credential, block *QuotaBlock, pro
 
 // setQuotaRecheckStatus stores only allowlisted, non-sensitive reason codes and
 // never associates an old result with a newer block revision.
+// quotaRecheckBackoff bounds how often the automatic worker retries a round that
+// could not prove recovery. A coding-plan window can be days away, so polling the
+// official API every ticker would be wasteful; a manual recheck is never delayed.
+const (
+	quotaRecheckBackoffMin = 5 * time.Minute
+	quotaRecheckBackoffMax = 30 * time.Minute
+)
+
+// setQuotaRecheckStatus records the fixed reason code of the last automatic or
+// manual round and schedules the next automatic attempt.
 func (s *Service) setQuotaRecheckStatus(id, revision string, err error) {
 	code := ""
 	if err != nil {
@@ -626,9 +640,30 @@ func (s *Service) setQuotaRecheckStatus(id, revision string, err error) {
 	}
 	if code == "" {
 		delete(s.quotaRecheckStatus, id)
-	} else {
-		s.quotaRecheckStatus[id] = code
+		delete(s.quotaRecheckRetryAt, id)
+		delete(s.quotaRecheckFailures, id)
+		return
 	}
+	s.quotaRecheckStatus[id] = code
+	// Escalate the retry delay with consecutive failures so a long exhaustion is
+	// polled slowly. Nothing else limits this: the block itself still gates
+	// scheduling, and the recorded deadline is only a review hint.
+	s.quotaRecheckFailures[id]++
+	delay := quotaRecheckBackoffMin << (s.quotaRecheckFailures[id] - 1)
+	if delay > quotaRecheckBackoffMax {
+		delay = quotaRecheckBackoffMax
+	}
+	// mu is already held, so read the injected clock directly instead of calling
+	// quotaPauseTime, which takes the same lock.
+	now := s.quotaNow()
+	if remaining := c.QuotaBlock.RetryAt.Sub(now); remaining > delay {
+		// A later upstream reset hint is the better estimate; cap it anyway.
+		delay = remaining
+		if delay > quotaRecheckBackoffMax {
+			delay = quotaRecheckBackoffMax
+		}
+	}
+	s.quotaRecheckRetryAt[id] = now.Add(delay)
 }
 
 func (s *Service) wakeQuotaPauseWorker() {
@@ -732,7 +767,8 @@ func (s *Service) recheckDueQuotaBlocks(stop <-chan struct{}) {
 	type candidate struct{ id, revision string }
 	var candidates []candidate
 	for id, c := range s.creds {
-		if !s.revoked[id] && c.quotaBlocked() && !c.QuotaBlock.RetryAt.After(now) && s.quotaPauseErrors[id] == "" {
+		if !s.revoked[id] && c.quotaBlocked() && !c.QuotaBlock.RetryAt.After(now) && s.quotaPauseErrors[id] == "" &&
+			!s.quotaRecheckRetryAt[id].After(now) {
 			candidates = append(candidates, candidate{id: id, revision: c.QuotaRevision})
 		}
 	}

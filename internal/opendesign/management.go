@@ -526,6 +526,8 @@ func (s *Service) deleteCredential(credentialID string) (any, error) {
 	delete(s.authFiles, credentialID)
 	delete(s.quotaPauseErrors, credentialID)
 	delete(s.quotaRecheckStatus, credentialID)
+	delete(s.quotaRecheckRetryAt, credentialID)
+	delete(s.quotaRecheckFailures, credentialID)
 	// The id stays revoked so a watcher callback queued before the unlink cannot
 	// recreate the credential.
 	s.revoked[credentialID] = true

@@ -288,3 +288,53 @@ func TestQuotaRecoveryFencesControlKeyChangeDuringCheck(t *testing.T) {
 	}
 	requireQuotaStillBlocked(t, s, id, path)
 }
+
+func TestQuotaRecoveryWorkerBacksOffAfterRepeatedFailures(t *testing.T) {
+	s, host, id, path := quotaRecoveryFixture(t, false, "model-a")
+	// A coding-plan window can be days away, so consecutive failures must
+	// lengthen the automatic retry delay instead of polling every ticker.
+	revision, _ := liveCredential(s, id)
+	failure := &APIError{Status: http.StatusConflict, Kind: "quota_recheck_unproven", Message: "unproven"}
+	var previous time.Duration
+	for round := 1; round <= 4; round++ {
+		s.setQuotaRecheckStatus(id, revision.QuotaRevision, failure)
+		s.mu.RLock()
+		failures := s.quotaRecheckFailures[id]
+		delay := time.Until(s.quotaRecheckRetryAt[id])
+		s.mu.RUnlock()
+		if failures != round {
+			t.Fatalf("round %d: failures = %d", round, failures)
+		}
+		if delay < quotaRecheckBackoffMin {
+			t.Fatalf("round %d: retry delay %s is below the minimum backoff", round, delay)
+		}
+		if delay > quotaRecheckBackoffMax+time.Second {
+			t.Fatalf("round %d: retry delay %s exceeds the cap", round, delay)
+		}
+		if round > 1 && delay+2*time.Second < previous {
+			t.Fatalf("round %d: retry delay %s did not grow from %s", round, delay, previous)
+		}
+		previous = delay
+	}
+	// While the backoff is armed the automatic sweep must not contact the API.
+	makeQuotaPauseDue(t, s, id)
+	before := host.countMethod("host.http.do")
+	s.recheckDueQuotaBlocks(s.stopCh)
+	if host.countMethod("host.http.do") != before {
+		t.Fatal("automatic recheck ignored the failure backoff")
+	}
+	requireQuotaStillBlocked(t, s, id, path)
+
+	// Success clears the status, the counter and the backoff, so a later pause
+	// starts its automatic schedule from scratch.
+	current, _ := liveCredential(s, id)
+	s.setQuotaRecheckStatus(id, current.QuotaRevision, nil)
+	s.mu.RLock()
+	_, armed := s.quotaRecheckRetryAt[id]
+	_, failures := s.quotaRecheckFailures[id]
+	_, status := s.quotaRecheckStatus[id]
+	s.mu.RUnlock()
+	if armed || failures || status {
+		t.Fatal("a cleared recovery left stale backoff state")
+	}
+}
