@@ -30,7 +30,10 @@
   const state = {
     status: { version: '', base_url: DEFAULT_BASE_URL, credentials: [], models: [] },
     verified: null,
-    candidate: null,
+    // There is deliberately no `candidate` field: a typed management key is
+    // passed to its own verification request and never stored on the page, so an
+    // unverified key can neither authenticate an ordinary request nor outlive
+    // the verification that produced it.
     authSubmitting: false,
     selectedCredential: '',
     upstream: [],
@@ -170,7 +173,12 @@
     if (!client) {
       client = API.createClient({
         base: managementBase(),
-        resolveAuth: () => state.candidate || state.verified || { headers: {} },
+        // Ordinary requests are bound to the last *verified* management
+        // identity only. A key that is merely being validated must never
+        // authenticate them: a rejected candidate would then take the verified
+        // session (and its drafts) down with it. Verification passes its own
+        // one-shot credential through request settings instead.
+        resolveAuth: () => state.verified || { headers: {} },
       });
     }
     return client;
@@ -781,7 +789,6 @@
 
   function showAuth(text, kind = 'error') {
     state.verified = null;
-    state.candidate = null;
     invalidateModelRequest();
     invalidateQuota();
     resetManagementData();
@@ -853,7 +860,6 @@
       applyStatus(raw, { serverModelsGeneration });
       const source = options.source || (state.verified && state.verified.source) || '';
       if (state.verified) state.verified.source = source;
-      state.candidate = null;
       markConnected(source);
       message('authState', '');
       return true;
@@ -3657,6 +3663,41 @@
     reportOrphanedReasoningDrafts(previousServerModels);
   }
 
+  // A response that carries the complete stored list (a reasoning save, for
+  // example) is the authoritative snapshot for *both* the reasoning panel and
+  // the model editor's saved baseline. Keeping those apart was a cross-tab data
+  // loss bug: the reasoning panel adopted the new rows and whole-list token while
+  // the editor kept its old rows, so the next model-list save posted the stale
+  // rows under the fresh token and silently deleted a row another tab added.
+  //
+  // So this one helper moves the saved baseline and the token together:
+  // - a clean editor adopts the new rows and revision atomically;
+  // - an unsaved draft keeps its own rows *and* the revision it was first edited
+  //   against, so the next save still reaches the server as a stale CAS and gets
+  //   a 409 instead of overwriting the newer snapshot. A response never drops a
+  //   draft, and never silently moves its base.
+  function adoptWholeModelList(models, revision) {
+    const rows = editorRowsFromServer(models);
+    applyServerModels(models);
+    state.savedMappings = cloneMappings(rows);
+    state.status.models = cloneMappings(rows);
+    const nextRevision = typeof revision === 'string' ? revision.trim() : '';
+    if (nextRevision) state.modelsRevision = nextRevision;
+    if (state.modelsConflict && state.modelsRevision && state.modelsRevision !== state.modelsConflictRevision) {
+      // The response itself supplied a token different from the one that lost the
+      // CAS, so the next click may ask for the explicit overwrite.
+      state.modelsConflictSeenRevision = state.modelsRevision;
+    }
+    // Rows that no longer differ from the new baseline are not a pending edit; a
+    // conflict still stays armed because content equality must never skip the
+    // overwrite confirmation.
+    if (!state.modelsDraftActive || (!mappingsDirty() && !state.modelsConflict)) {
+      state.mappings = cloneMappings(rows);
+      resetMappingsDraft(state.modelsRevision);
+    }
+    return rows;
+  }
+
   async function saveReasoning() {
     const model = selectedReasoningModel();
     if (!model || state.reasoningSaving || state.busy) return;
@@ -3693,11 +3734,14 @@
     try {
       const raw = await api().saveReasoningMapping(payload);
       if (generation !== state.reasoningGeneration || sessionGeneration !== state.sessionGeneration) return;
-      applyServerModels(raw && Array.isArray(raw.models) ? raw.models : null);
-      if (raw && typeof raw.models_revision === 'string' && raw.models_revision.trim()) {
-        // A reasoning save can move the whole-list token too. Keeping it makes
-        // the next model-list save CAS-checked instead of tokenless.
-        state.modelsRevision = raw.models_revision.trim();
+      if (raw && Array.isArray(raw.models)) {
+        // The echoed list also moves the editor baseline and the whole-list token
+        // (kept together, see adoptWholeModelList): a reasoning save can move the
+        // token too, and the next model-list save must stay CAS-checked.
+        adoptWholeModelList(raw.models, raw && raw.models_revision);
+      } else {
+        // An older backend returns no list; keep the previous behaviour.
+        applyServerModels(null);
       }
       state.reasoningDrafts.delete(key);
       // The policy is request-shaping state: a result produced under the old
@@ -3874,32 +3918,44 @@
     }
     const generation = state.optionalGeneration;
     const sessionGeneration = state.sessionGeneration;
+    const serverModelsGeneration = state.serverModelsGeneration;
     const candidate = { headers: Auth.candidateHeaders(key, type) };
     // Re-validating the same key keeps the current session: its drafts and CAS
     // tokens are still valid. A different key starts a fresh session.
     const sameIdentity = sameAuthIdentity(state.verified && state.verified.headers, candidate.headers);
-    state.candidate = candidate;
     state.authSubmitting = true;
     // Authentication owns its own flag instead of the shared busy lock, so a
     // stale model write can never keep the operator from re-verifying.
     setDisabled('authSubmit', true);
     message('authState', '正在验证管理密钥…');
     try {
-      const status = await api().status();
+      // The candidate is scoped to this one request. It is never stored as the
+      // page's auth, so a concurrent ordinary request keeps using the verified
+      // identity and a rejected candidate cannot end that session.
+      const status = await api().status({ resolveAuth: () => candidate });
       if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return;
       const hadDrafts = mappingsDirty() || state.modelsDraftActive || state.reasoningDrafts.size > 0;
       // Persist only after CPA accepted the key.
       Auth.saveAuth(key, type, remember);
       state.verified = { headers: candidate.headers, source: 'manual' };
-      state.candidate = null;
       if (keyInput) keyInput.value = '';
+      // The answer was requested with the key that just became the verified one,
+      // so for a same-key re-validation it must not roll a newer model write back
+      // (that is the generation fence below). A different key starts a new
+      // session whose model side *is* this answer, so the fence is re-based onto
+      // the session reset instead of comparing across two identities.
+      let modelsGeneration = serverModelsGeneration;
       if (!sameIdentity) {
         // A management-key switch owns a fresh session: old drafts, CAS tokens
         // and any unsubmitted account secret in the form must go with it.
         resetManagementData();
         resetAccountForm();
+        modelsGeneration = state.serverModelsGeneration;
       }
-      applyStatus(status);
+      // A same-key re-validation may answer after a newer model write (or a
+      // reasoning save) landed. Its model side must then not roll the list,
+      // its tokens or a draft pinned to them back.
+      applyStatus(status, { serverModelsGeneration: modelsGeneration });
       setAuthCollapsed(true);
       markConnected('manual');
       message('modelState', !sameIdentity && hadDrafts
@@ -3909,11 +3965,22 @@
       message('authState', '管理密钥验证成功，已开始读取账户和模型。', 'ok');
     } catch (error) {
       if (generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return;
-      showAuth(isManagementAuthError(error)
-        ? (error.status === 401
-          ? '401：管理密钥未通过验证，请检查后重试。'
-          : '403：管理请求被拒绝，请确认管理密钥和来源 IP。')
-        : `验证失败：${formatError(error)}`);
+      // A rejected candidate proves nothing about the already verified identity:
+      // keep that session, its models, its drafts and its CAS tokens intact.
+      // Only a fresh page with no verified key falls back to the auth screen.
+      if (state.verified) {
+        message('authState', isManagementAuthError(error)
+          ? (error.status === 401
+            ? '401：该管理密钥未通过验证。当前已验证会话与未保存草稿均已保留。'
+            : '403：该管理密钥被拒绝。当前已验证会话与未保存草稿均已保留。')
+          : `验证失败：${formatError(error)}。当前已验证会话与未保存草稿均已保留。`, 'error');
+      } else {
+        showAuth(isManagementAuthError(error)
+          ? (error.status === 401
+            ? '401：管理密钥未通过验证，请检查后重试。'
+            : '403：管理请求被拒绝，请确认管理密钥和来源 IP。')
+          : `验证失败：${formatError(error)}`);
+      }
     } finally {
       state.authSubmitting = false;
       setDisabled('authSubmit', false);
@@ -3923,7 +3990,6 @@
   function clearAuth() {
     try { Auth.clearAuth(); } catch { /* Ignore blocked storage. */ }
     state.verified = null;
-    state.candidate = null;
     state.authSubmitting = false;
     state.selectedCredential = '';
     invalidateQuota();

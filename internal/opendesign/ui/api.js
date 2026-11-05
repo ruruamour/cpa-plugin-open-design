@@ -66,7 +66,12 @@
 
     async function request(path, settings = {}) {
       const method = String(settings.method || 'GET').toUpperCase();
-      const auth = await resolveAuth();
+      // A caller may override the auth for exactly one request. The console uses
+      // that to validate a newly typed management key without ever letting the
+      // unverified candidate become the identity of ordinary requests.
+      const auth = typeof settings.resolveAuth === 'function'
+        ? await settings.resolveAuth()
+        : await resolveAuth();
       const headers = { Accept: 'application/json', ...(auth && auth.headers ? auth.headers : {}), ...(settings.headers || {}) };
       const init = { method, headers, credentials: 'same-origin', cache: 'no-store' };
       if (settings.body !== undefined) {
@@ -86,7 +91,7 @@
 
     return {
       request,
-      status: () => request('/status'),
+      status: (options = {}) => request('/status', options),
       // extra carries the optional billing fields (control_key / workspace_id) on
       // create; older callers pass only a label and key.
       addCredential: (label, apiKey, extra = {}) => request('/credentials', {
@@ -109,7 +114,20 @@
       modelCoverage: (credentialID, modelID, options = {}) => request('/model-coverage', {
         query: { credential_id: credentialID, model_id: modelID, refresh: options.refresh ? 1 : '' },
       }),
-      saveModels: models => request('/models', { method: 'POST', body: { models } }),
+      // Whole-list save. `expectedRevision` is optional and purely additive:
+      // callers that pass only the list keep sending exactly `{ models }` with
+      // no CAS, so nothing here can pretend an old caller is concurrency-safe.
+      // An empty/absent revision is omitted rather than sent as an empty string,
+      // because an empty token is not a valid comparison value.
+      // The console itself builds the full body directly (it additionally needs
+      // per-row original identities and local validation), so this helper stays
+      // the simple entry point for other callers.
+      saveModels: (models, expectedRevision) => {
+        const body = { models };
+        const revision = typeof expectedRevision === 'string' ? expectedRevision.trim() : '';
+        if (revision) body.expected_models_revision = revision;
+        return request('/models', { method: 'POST', body });
+      },
       // Quota pause is plugin-owned: it never changes the operator's `disabled`
       // choice. Resume and recheck are explicit single-credential actions.
       quotaPauses: () => request('/quota-pause'),

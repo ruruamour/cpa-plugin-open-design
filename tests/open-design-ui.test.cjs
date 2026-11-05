@@ -506,7 +506,9 @@ test('the console validates management keys before storing and handles 401 feedb
   assert.equal(view.document.getElementById('accountsPanel').hidden, true);
 
   view.fetch = async (url) => ({ ok: url.endsWith('/status'), status: 200, text: async () => JSON.stringify(statusBody()) });
-  consoleApi.state.candidate = null;
+  // No candidate credential is ever stored on the page: a typed key is scoped to
+  // its own verification request, so nothing has to be dropped here.
+  assert.equal(consoleApi.state.candidate, undefined);
   const login = fakePage({ fetchImpl: async (url) => respond(200, url.endsWith('/status') ? statusBody() : {}) });
   const loginApi = login.context.OpenDesignConsole;
   login.document.getElementById('managementKey').value = managementKey;
@@ -3984,7 +3986,8 @@ test('a late 401 from the old session cannot log out the newly verified key', as
   pendingStatus.resolve(respond(401, { error: 'old key expired' }));
   await stale;
   assert.notEqual(api.state.verified, null, 'the old 401 must not log out the new session');
-  assert.equal(api.state.candidate, null);
+  assert.equal(api.state.candidate, undefined,
+    'a typed key is never stored as page auth, so no candidate can outlive its verification request');
   assert.equal(api.state.modelsRevision, 'new-rev');
 });
 
@@ -4806,4 +4809,329 @@ test('the save body carries original identity only with a whole-list token', () 
     JSON.parse(JSON.stringify(core.buildModelsPayload(rows))),
     [{ id: 'renamed', upstream_id: 'open-design/flash' }],
   );
+});
+
+// --- cross-tab model/reasoning consistency and auth-candidate isolation ------
+
+// Two console pages share one in-memory backend. `applyImportLikeBackend` mirrors
+// the whole-table write, while a reasoning save returns the complete current list
+// (including rows another tab added) with a new whole-list revision.
+function sharedModelBackend({ models, revision = 'list-rev-1' }) {
+  let rows = models.map(model => ({ ...model }));
+  let currentRevision = revision;
+  let counter = 0;
+  let reasoningGate = null;
+  const posts = [];
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+      const body = JSON.parse(init.body);
+      if (reasoningGate) await reasoningGate;
+      const row = rows.find(item => item.id === body.model && item.upstream_id === body.upstream_id);
+      if (!row) return respond(404, { error: 'model not found' });
+      if (body.expected_revision && body.expected_revision !== (row.reasoning_revision || '')) {
+        return respond(409, { error: 'reasoning_revision_conflict' });
+      }
+      row.reasoning_mapping = body.reasoning_mapping;
+      row.reasoning_revision = `reasoning-${++counter}`;
+      currentRevision = `list-rev-${++counter}`;
+      return respond(200, {
+        models: rows.map(item => ({ ...item })),
+        models_revision: currentRevision,
+      });
+    }
+    if (url.endsWith('/models') && init.method === 'POST') {
+      const body = JSON.parse(init.body);
+      posts.push(body);
+      if ('expected_models_revision' in body && body.expected_models_revision !== currentRevision) {
+        return respond(409, { error: 'models_revision_conflict' });
+      }
+      rows = applyImportLikeBackend(rows, body);
+      currentRevision = `list-rev-${++counter}`;
+      return respond(200, {
+        models: rows.map(item => ({ ...item })),
+        models_revision: currentRevision,
+      });
+    }
+    if (url.includes('/status')) {
+      return respond(200, statusBody({
+        models: rows.map(item => ({ ...item })),
+        models_revision: currentRevision,
+      }));
+    }
+    return respond(404, { error: 'not found' });
+  };
+  return {
+    fetchImpl,
+    posts,
+    models: () => rows,
+    revision: () => currentRevision,
+    delayReasoning() {
+      let release;
+      reasoningGate = new Promise(resolve => { release = resolve; });
+      return () => {
+        const done = reasoningGate;
+        reasoningGate = null;
+        release();
+        return done;
+      };
+    },
+  };
+}
+
+function twoModelTabs(backend) {
+  const open = () => {
+    const view = fakePage({ fetchImpl: backend.fetchImpl });
+    const api = view.context.OpenDesignConsole;
+    api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+    return { view, api };
+  };
+  return { a: open(), b: open() };
+}
+
+test('a reasoning save adopts the returned whole list so the next model save cannot delete another tab row', async () => {
+  const backend = sharedModelBackend({
+    models: [{
+      id: 'od-x',
+      upstream_id: 'upstream/x',
+      reasoning_revision: 'reasoning-x',
+      reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }] },
+    }],
+  });
+  const tabs = twoModelTabs(backend);
+  await tabs.a.api.render.loadStatus();
+  await tabs.b.api.render.loadStatus();
+
+  await tabs.a.api.handlers.addReasoningRule();
+  const releaseReasoning = backend.delayReasoning();
+  const savingReasoning = tabs.a.api.handlers.saveReasoning();
+  await new Promise(setImmediate);
+
+  // Tab B adds a row while A's reasoning POST is still in flight. A's answer is
+  // therefore the first time A learns about the new row and its revision.
+  tabs.b.api.handlers.addMapping();
+  tabs.b.api.state.mappings[1].id = 'od-y';
+  tabs.b.api.state.mappings[1].upstream_id = 'upstream/y';
+  await tabs.b.api.handlers.saveModels();
+  assert.deepEqual(plain(backend.models().map(model => model.id)), ['od-x', 'od-y']);
+
+  releaseReasoning();
+  await savingReasoning;
+  const adoptedRevision = backend.revision();
+  assert.deepEqual(plain(tabs.a.api.state.serverModels.map(model => model.id)), ['od-x', 'od-y']);
+  assert.deepEqual(plain(tabs.a.api.state.mappings.map(row => row.id)), ['od-x', 'od-y'],
+    'a clean editor adopts the new whole list together with its token');
+  assert.deepEqual(plain(tabs.a.api.state.savedMappings.map(row => row.id)), ['od-x', 'od-y']);
+  assert.equal(tabs.a.api.state.modelsRevision, adoptedRevision);
+  assert.equal(tabs.a.api.state.modelsDraftActive, false);
+
+  await tabs.a.api.handlers.saveModels();
+  const sent = backend.posts[backend.posts.length - 1];
+  assert.deepEqual(sent.models.map(row => row.id), ['od-x', 'od-y'],
+    'A must not post its pre-reasoning list under the newer revision token');
+  assert.equal(sent.expected_models_revision, adoptedRevision);
+  assert.deepEqual(plain(backend.models().map(model => model.id)), ['od-x', 'od-y'],
+    'the row added by B is still saved');
+});
+
+test('a model mapping draft survives a reasoning response and keeps its original CAS revision', async () => {
+  const backend = sharedModelBackend({
+    models: [{
+      id: 'od-x',
+      upstream_id: 'upstream/x',
+      reasoning_revision: 'reasoning-x',
+      reasoning_mapping: { enabled: true, rules: [{ from: 'medium', to: 'high' }] },
+    }],
+  });
+  const tabs = twoModelTabs(backend);
+  await tabs.a.api.render.loadStatus();
+  await tabs.b.api.render.loadStatus();
+  const baseRevision = tabs.a.api.state.modelsRevision;
+
+  const alias = tabs.a.view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'od-x-renamed';
+  alias.emit('input');
+  assert.equal(tabs.a.api.state.modelsDraftActive, true);
+  await tabs.a.api.handlers.addReasoningRule();
+  const releaseReasoning = backend.delayReasoning();
+  const savingReasoning = tabs.a.api.handlers.saveReasoning();
+  await new Promise(setImmediate);
+
+  tabs.b.api.handlers.addMapping();
+  tabs.b.api.state.mappings[1].id = 'od-y';
+  tabs.b.api.state.mappings[1].upstream_id = 'upstream/y';
+  await tabs.b.api.handlers.saveModels();
+  releaseReasoning();
+  await savingReasoning;
+
+  assert.deepEqual(plain(tabs.a.api.state.mappings.map(row => row.id)), ['od-x-renamed'],
+    'the unsaved mapping draft is not replaced by the response list');
+  assert.deepEqual(plain(tabs.a.api.state.savedMappings.map(row => row.id)), ['od-x', 'od-y'],
+    'the saved baseline follows the response');
+  assert.equal(tabs.a.api.state.modelsDraftRevision, baseRevision,
+    'the draft keeps the revision it was edited against');
+  assert.equal(tabs.a.api.state.modelsDraftActive, true);
+
+  await tabs.a.api.handlers.saveModels();
+  const sent = backend.posts[backend.posts.length - 1];
+  assert.equal(sent.expected_models_revision, baseRevision,
+    'the stale draft revision reaches the server so it can return 409');
+  assert.equal(tabs.a.api.state.modelsConflict, true, 'the competing change is surfaced as a conflict');
+  assert.deepEqual(plain(tabs.a.api.state.mappings.map(row => row.id)), ['od-x-renamed'],
+    'the rejected draft is kept for an explicit overwrite decision');
+});
+
+test('a candidate key is only used to verify itself and a failed re-validation keeps the verified session', async () => {
+  const pendingVerifications = [];
+  const upstreamAuth = [];
+  let statusCalls = 0;
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/status')) {
+        statusCalls += 1;
+        if (statusCalls === 1) return respond(200, statusBody({ models_revision: 'list-rev-1' }));
+        const request = deferred();
+        pendingVerifications.push(request);
+        return request.promise;
+      }
+      if (url.includes('/upstream-models')) {
+        upstreamAuth.push(init.headers.Authorization || init.headers['X-Management-Key']);
+        return respond(200, { data: [{ id: 'open-design/flash' }] });
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.addReasoningRule();
+  const alias = view.document.getElementById('mappingList').children[0].children[0].children[1];
+  alias.value = 'od-flash-draft';
+  alias.emit('input');
+  const draftIds = plain(api.state.mappings.map(row => row.id));
+
+  view.document.getElementById('managementKey').value = 'candidate-management-key';
+  const verifyingCandidate = api.handlers.submitAuth({ preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(pendingVerifications.length, 1);
+
+  // A regular request made while the candidate is being verified must keep using
+  // the already verified identity, not the unverified candidate key.
+  api.state.selectedCredential = 'cred-1';
+  view.document.getElementById('modelCredential').value = 'cred-1';
+  await api.handlers.fetchModels();
+  assert.deepEqual(upstreamAuth, [`Bearer ${managementKey}`],
+    'the candidate key never authenticates an ordinary management request');
+
+  pendingVerifications[0].resolve(respond(401, { error: 'invalid candidate key' }));
+  await verifyingCandidate;
+  assert.equal(api.state.verified && api.state.verified.headers.Authorization, `Bearer ${managementKey}`,
+    'a rejected candidate does not log out the verified session');
+  assert.equal(api.state.modelsRevision, 'list-rev-1');
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), draftIds, 'the mapping draft survives');
+  assert.equal(api.state.reasoningDrafts.size, 1, 'the reasoning draft survives');
+  assert.equal(api.state.candidate, undefined,
+    'the candidate key is never stored as page auth');
+  assert.match(view.document.getElementById('authState').textContent, /当前已验证会话/,
+    'the operator is told the verified session was kept, not logged out');
+  assert.equal(view.document.getElementById('accountsPanel').hidden, false);
+
+  // A failed same-key re-validation is also non-destructive.
+  view.document.getElementById('managementKey').value = managementKey;
+  const verifyingSameKey = api.handlers.submitAuth({ preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(pendingVerifications.length, 2);
+  pendingVerifications[1].resolve(respond(401, { error: 'key now rejected' }));
+  await verifyingSameKey;
+  assert.equal(api.state.verified && api.state.verified.headers.Authorization, `Bearer ${managementKey}`);
+  assert.deepEqual(plain(api.state.mappings.map(row => row.id)), draftIds);
+  assert.equal(api.state.reasoningDrafts.size, 1);
+});
+
+test('a late /status from a same-key re-validation cannot roll back a newer reasoning save', async () => {
+  const pendingVerification = deferred();
+  let statusCalls = 0;
+  const model = (revision, rules) => ({
+    id: 'od-x', upstream_id: 'upstream/x', reasoning_revision: revision,
+    reasoning_mapping: { enabled: true, rules },
+  });
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/status')) {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return respond(200, statusBody({
+            models: [model('reasoning-0', [{ from: 'medium', to: 'high' }])],
+            models_revision: 'list-rev-1',
+          }));
+        }
+        return pendingVerification.promise;
+      }
+      if (url.endsWith('/models/reasoning') && init.method === 'POST') {
+        return respond(200, {
+          models: [
+            model('reasoning-1', [{ from: 'low', to: 'low' }, { from: 'medium', to: 'high' }]),
+            { id: 'od-y', upstream_id: 'upstream/y', reasoning_revision: 'reasoning-y' },
+          ],
+          models_revision: 'list-rev-2',
+        });
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.addReasoningRule();
+
+  // The same-key re-validation starts before the reasoning save, so its /status
+  // answer describes the older list even though the save is newer.
+  view.document.getElementById('managementKey').value = managementKey;
+  const verifying = api.handlers.submitAuth({ preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(statusCalls, 2);
+
+  await api.handlers.saveReasoning();
+  assert.equal(api.state.modelsRevision, 'list-rev-2');
+  assert.deepEqual(plain(api.state.serverModels.map(item => item.id)), ['od-x', 'od-y']);
+  // A new draft is made after the save; the stale status must not hide its model
+  // or roll its baseline back.
+  api.handlers.selectReasoningModel('od-y\u0000upstream/y');
+  assert.match(api.state.reasoningModelKey, /^od-y/, 'the model added by the save is selectable');
+  await api.handlers.addReasoningRule();
+  assert.equal(api.state.reasoningDrafts.size, 1);
+
+  pendingVerification.resolve(respond(200, statusBody({
+    models: [model('reasoning-0', [{ from: 'medium', to: 'high' }])],
+    models_revision: 'list-rev-1',
+  })));
+  await verifying;
+  assert.equal(api.state.modelsRevision, 'list-rev-2', 'the late answer does not move the whole-list token back');
+  assert.deepEqual(plain(api.state.serverModels.map(item => item.id)), ['od-x', 'od-y']);
+  assert.equal(api.state.serverModels[0].reasoning_revision, 'reasoning-1');
+  assert.equal(api.state.reasoningDrafts.size, 1, 'the newer reasoning draft is kept');
+  assert.equal(api.render.reasoningDirty(), true);
+});
+
+test('api.saveModels keeps the legacy body and only adds a revision when explicitly given one', async () => {
+  const calls = [];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, init });
+      return respond(200, { models: [] });
+    },
+  });
+  const client = view.context.OpenDesignAPI.createClient({
+    base: '/v0/management/open-design',
+    resolveAuth: () => ({ headers: { Authorization: `Bearer ${managementKey}` } }),
+    fetchImpl: view.fetch,
+  });
+  const models = [{ id: 'od-x', upstream_id: 'upstream/x' }];
+  await client.saveModels(models);
+  assert.deepEqual(JSON.parse(calls[0].init.body), { models },
+    'an old call that only passes the list keeps the exact legacy body and gets no CAS');
+  await client.saveModels(models, 'list-rev-7');
+  assert.deepEqual(JSON.parse(calls[1].init.body), { models, expected_models_revision: 'list-rev-7' });
+  await client.saveModels(models, '');
+  assert.deepEqual(JSON.parse(calls[2].init.body), { models },
+    'an empty revision does not fabricate a whole-list check');
 });
