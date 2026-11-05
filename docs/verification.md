@@ -13,15 +13,16 @@
 | 人工停用保护 | 插件管理接口的启停路径有模拟测试；但 CPA 原生界面停用与插件投影的禁用无法可靠区分，到期恢复可能覆盖人工停用，**未通过**。`ManualDisabled=nil` 的保守回退另有本地修复，不能解决上述归因问题 |
 | 持久化 | 读—比对—原子替换，只改 `quota_block`／`quota_revision`／`disabled`，保留未知字段；写失败时先发布内存拦截再记 `quotaPauseSyncError`，后台任务重试 |
 | 执行路径 | `executor.execute`／`execute_stream`（含 SSE 事件）都调用 `observeQuotaBlock`；已暂停账户在 `selectedCredential` 本地返回 `429 [open-design:quota_block]`，配套 `continue` 规则允许换号，不产生新的宿主冷却归因 |
-| 恢复 | 开发分支已移除仅凭到期自动启用；后台目前只重试失败写入，可信的新鲜额度复查与自动恢复仍在实现，不能用于生产 |
+| 恢复 | 开发分支的到期不再直接启用：后台按账号与模型串行请求官方预检，只有全部已知耗尽模型在最新观察之后取得新鲜 `available`、Workspace 成员一致、同一推理密钥无在途、凭据／修订未变时才解除；失败、未授权、缓存或模型集合不完整均保留暂停。复查总时长受预算限制，提交在 `authFileMu` 下复核磁盘身份与证据新鲜度 |
 | 管理接口 | `GET /quota-pause`、`POST /quota-pause/resume`、`POST /quota-pause/recheck`；`GET /status`、`/credentials` 返回 `quota_paused`／`effective_disabled`／`quota_pause`（不含任何 Key 指纹） |
 | 配置 | `0.4.6` tag 的 `pause.enabled` 默认开启，不安全；后续开发分支改为缺省关闭，但显式开启仍不安全。`pause.max_seconds` 为 60–604800 秒，默认 86400 |
 | Go 用例 | `quota_pause_deadline_test.go`、`quota_pause_signal_test.go`、`quota_pause_identity_test.go`、`quota_pause_manual_test.go`、`quota_pause_persist_test.go`、`quota_pause_executor_test.go`；覆盖到期不构成恢复证明及插件内人工启停后显式恢复等行为 |
 | Node 用例 | 额度徽标与人工开关分离、解除按钮不发 `/credentials`、重查未通过提示、暂停配置默认值与越界拒绝 |
+| 真实宿主恢复 | `scripts/smoke-abi.py --cpa-live` 新增隔离场景：结构化 402 建立暂停、重启后仍保留、官方预检失败保持暂停、官方新鲜 `available` 后清除插件暂停且插件控制台人工停用保持。原版 v8.0.29 隔离构建与本地 `8.0.51` 测试构建均 PASS；原版构建 `--version` 自述 `dev`，不能从二进制自证版本 |
 | 全仓 Go | `go test ./...`、`go test -race ./internal/opendesign/`、`go vet ./...` 通过 |
 | ABI | `scripts/smoke-abi.py`（CGO `c-shared` 构建）PASS |
 
-**未验收**：尚未在生产环境观测到真实额度耗尽事件（当时 6 个账户均有余额）。人工停用保护也未通过真实宿主复核：当前实现返回有效 `Disabled` 给宿主，宿主可能写回文件，不能区分部分原生人工停用。上游 `402/403` 的冷却由宿主控制，现有宿主为 30 分钟；本插件不主动清除宿主冷却，暂停／恢复对该冷却的副作用仍需宿主实测。`0.4.6` 的 Release 运行 `41906585863` 因 macOS arm64 作业取消而失败，未生成 Release，未部署。
+**未验收**：尚未在生产环境观测到真实额度耗尽事件（当时 6 个账户均有余额）。人工停用保护仍未通过真实宿主复核：当前实现返回有效 `Disabled` 给宿主，宿主可能写回文件，不能区分部分原生人工停用；隔离真实宿主已验证插件控制台的人工停用能在自动恢复后保留，但不包括 CPA 原生入口。上游 `402/403` 的冷却由宿主控制，现有宿主为 30 分钟；本插件不主动清除宿主冷却，暂停／恢复对该冷却的副作用仍需宿主实测。`0.4.6` 的 Release 运行 `41906585863` 因 macOS arm64 作业取消而失败，未生成 Release，未部署。
 
 **人工停用缺陷复现**：在隔离临时目录中构建并启动未修改的原版 CPA `v8.0.29`（源码提交 `5fc580b1d72d87a7bcfe5cfb6f479c1aea5625b3`），使用仅包含测试 Key 的临时配置、loopback 代理和假上游返回结构化 402。插件进入额度暂停后，通过 CPA 原生 `PATCH /v0/management/auth-files/status` 设置 `disabled=true`；接着调用插件的 `/quota-pause/resume`，观察到文件 `disabled` 从 `true` 变回 `false`，插件状态也为启用。该复现证明当前实现不能保护这种人工停用操作；它没有访问生产服务或真实密钥，也不涉及宿主补丁。
 
