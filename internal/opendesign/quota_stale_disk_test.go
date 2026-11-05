@@ -109,6 +109,21 @@ func TestStalePausedWriteAfterResumeDoesNotResurrect(t *testing.T) {
 		t.Fatal("a stale paused body re-blocked the live credential")
 	}
 	s.sweepQuotaBlocks(make(chan struct{}))
+	s.mu.RLock()
+	pendingRepair := s.quotaDiskStale[id]
+	s.mu.RUnlock()
+	if pendingRepair {
+		t.Fatal("successful repair left a stale marker and would be retried forever")
+	}
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.sweepQuotaBlocks(make(chan struct{}))
+	second, err := os.Stat(path)
+	if err != nil || !os.SameFile(first, second) {
+		t.Fatalf("a subsequent sweep rewrote the already repaired file: %v", err)
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -131,6 +146,56 @@ func TestStalePausedWriteAfterResumeDoesNotResurrect(t *testing.T) {
 	}
 	if c, ok := liveCredential(reloaded, id); ok && c.quotaBlocked() {
 		t.Fatal("restart resurrected the cleared pause")
+	}
+}
+
+// A newer host write may already have repaired the stale body before the worker
+// reaches it. A matching cleared file must retire the marker without a rewrite.
+func TestAlreadyRepairedDiskRetiresStaleMarker(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	path := quotaFixtureAuthFile(t, s, host, id, nil)
+	source, _ := liveCredential(s, id)
+	s.observeQuotaBlock(source, "model-a", &APIError{Status: http.StatusPaymentRequired, quotaExhausted: true})
+	paused, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/quota-pause/resume", nil,
+		map[string]any{"credential_id": id}); status != http.StatusOK {
+		t.Fatal("explicit resume failed")
+	}
+	cleared, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.credentialMu.Lock()
+	if err := os.WriteFile(path, paused, 0600); err != nil {
+		s.credentialMu.Unlock()
+		t.Fatal(err)
+	}
+	_, err = s.parseAuth(jsonBytes(map[string]any{
+		"FileName": id + ".json", "RawJSON": paused,
+		"Host": map[string]any{"AuthDir": host.authDir},
+	}))
+	if err == nil {
+		err = os.WriteFile(path, cleared, 0600)
+	}
+	s.credentialMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.sweepQuotaBlocks(make(chan struct{}))
+	s.mu.RLock()
+	pending := s.quotaDiskStale[id]
+	s.mu.RUnlock()
+	after, err := os.Stat(path)
+	if err != nil || pending || !os.SameFile(before, after) {
+		t.Fatalf("already repaired file left stale marker=%v or was rewritten: %v", pending, err)
 	}
 }
 
@@ -218,6 +283,180 @@ func TestLegacyBlockWithoutRevisionSurvivesStaleWrite(t *testing.T) {
 	s.mu.RUnlock()
 	if pending == "" {
 		t.Fatal("a legacy block dropped from disk was not scheduled for repair")
+	}
+}
+
+// A watcher callback for the exact body just written by the plugin must not
+// invent a sync failure and repeatedly rewrite the file it is watching.
+func TestIdenticalPausedAuthReloadDoesNotTriggerRepair(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	path := quotaFixtureAuthFile(t, s, host, id, nil)
+	source, _ := liveCredential(s, id)
+	s.observeQuotaBlock(source, "model-a", &APIError{Status: http.StatusPaymentRequired, quotaExhausted: true})
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Block the background worker so the error, if introduced by parseAuth,
+	// cannot be hidden by a successful repair before the assertion.
+	s.credentialMu.Lock()
+	for i := 0; i < 3; i++ {
+		_, err = s.parseAuth(jsonBytes(map[string]any{
+			"FileName": id + ".json", "RawJSON": body,
+			"Host": map[string]any{"AuthDir": host.authDir},
+		}))
+		if err != nil {
+			s.credentialMu.Unlock()
+			t.Fatal(err)
+		}
+		s.mu.RLock()
+		pending := s.quotaPauseErrors[id]
+		s.mu.RUnlock()
+		if pending != "" {
+			s.credentialMu.Unlock()
+			t.Fatalf("identical watcher body falsely marked pending: %q", pending)
+		}
+	}
+	s.credentialMu.Unlock()
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.sweepQuotaBlocks(make(chan struct{}))
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("identical body caused the file to be rewritten: %v", err)
+	}
+}
+
+// Matching a revision is not sufficient if a file editor changed the actual
+// block under the same ID: restore the live model set and report divergence.
+func TestChangedBlockWithSameRevisionTriggersRepair(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	path := quotaFixtureAuthFile(t, s, host, id, nil)
+	source, _ := liveCredential(s, id)
+	s.observeQuotaBlock(source, "model-a", &APIError{Status: http.StatusPaymentRequired, quotaExhausted: true})
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var disk Credential
+	if err := json.Unmarshal(raw, &disk); err != nil {
+		t.Fatal(err)
+	}
+	disk.QuotaBlock.ModelID = "model-b"
+	disk.QuotaBlock.ModelIDs = []string{"model-b"}
+	s.credentialMu.Lock()
+	if err := os.WriteFile(path, jsonBytes(disk), 0600); err != nil {
+		s.credentialMu.Unlock()
+		t.Fatal(err)
+	}
+	_, err = s.parseAuth(jsonBytes(map[string]any{
+		"FileName": id + ".json", "RawJSON": jsonBytes(disk),
+		"Host": map[string]any{"AuthDir": host.authDir},
+	}))
+	s.mu.RLock()
+	pending := s.quotaPauseErrors[id]
+	live := s.creds[id]
+	s.mu.RUnlock()
+	s.credentialMu.Unlock()
+	if err != nil || pending == "" || live.QuotaBlock == nil || live.QuotaBlock.ModelID != "model-a" {
+		t.Fatalf("changed block was not flagged and retained: err=%v pending=%q", err, pending)
+	}
+	s.sweepQuotaBlocks(make(chan struct{}))
+	raw, err = os.ReadFile(path)
+	if err != nil || json.Unmarshal(raw, &disk) != nil || disk.QuotaBlock == nil || disk.QuotaBlock.ModelID != "model-a" {
+		t.Fatal("repair failed to restore the live block")
+	}
+}
+
+// Without a cleared-state revision, an incoming valid block may be a legitimate
+// persisted pause rather than an old snapshot. It is unsafe to erase it merely
+// because the in-memory credential came from an older file without revisions.
+func TestUnknownClearedRevisionDoesNotEraseIncomingPause(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	path := quotaFixtureAuthFile(t, s, host, id, nil)
+	current, _ := liveCredential(s, id)
+	if current.QuotaRevision != "" || current.quotaBlocked() {
+		t.Fatal("fixture must start with an unversioned, unblocked credential")
+	}
+	now := time.Now().UTC()
+	manual := false
+	paused := current
+	paused.QuotaRevision = "incoming-revision"
+	paused.QuotaBlock = &QuotaBlock{
+		KeyHash: quotaPauseKeyHash(current.APIKey), ManualDisabled: &manual,
+		Source: "upstream", Reason: "quota_exhausted", ModelID: "model-a",
+		BlockedAt: now, ObservedAt: now, RetryAt: now.Add(time.Hour),
+	}
+	if err := os.WriteFile(path, jsonBytes(paused), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.parseAuth(jsonBytes(map[string]any{
+		"FileName": id + ".json", "RawJSON": jsonBytes(paused),
+		"Host": map[string]any{"AuthDir": host.authDir},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := liveCredential(s, id); !c.quotaBlocked() {
+		t.Fatal("valid incoming block was discarded without evidence of an explicit resume")
+	}
+	s.sweepQuotaBlocks(make(chan struct{}))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored Credential
+	if err := json.Unmarshal(raw, &stored); err != nil || !stored.quotaBlocked() {
+		t.Fatal("an unversioned live state must not erase a valid persisted pause")
+	}
+}
+
+func TestUnversionedManualDisableSurvivesIncomingPause(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	path := quotaFixtureAuthFile(t, s, host, id, nil)
+	if status, _, _ := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil,
+		map[string]any{"id": id, "disabled": true}); status != http.StatusOK {
+		t.Fatal("plugin manual disable failed")
+	}
+	current, _ := liveCredential(s, id)
+	if !current.Disabled || current.QuotaRevision != "" {
+		t.Fatal("fixture must have a manual disable but no quota revision")
+	}
+	now := time.Now().UTC()
+	manual := false
+	paused := current
+	paused.Disabled = false // a stale body unaware of the plugin-console disable
+	paused.QuotaRevision = "incoming-revision"
+	paused.QuotaBlock = &QuotaBlock{
+		KeyHash: quotaPauseKeyHash(current.APIKey), ManualDisabled: &manual,
+		Source: "upstream", Reason: "quota_exhausted", ModelID: "model-a",
+		ModelIDs: []string{"model-a"}, BlockedAt: now, ObservedAt: now, RetryAt: now.Add(time.Hour),
+	}
+	s.credentialMu.Lock()
+	if err := os.WriteFile(path, jsonBytes(paused), 0600); err != nil {
+		s.credentialMu.Unlock()
+		t.Fatal(err)
+	}
+	_, err := s.parseAuth(jsonBytes(map[string]any{
+		"FileName": id + ".json", "RawJSON": jsonBytes(paused),
+		"Host": map[string]any{"AuthDir": host.authDir},
+	}))
+	live, _ := liveCredential(s, id)
+	s.credentialMu.Unlock()
+	if err != nil || !live.quotaBlocked() || !live.Disabled || live.QuotaBlock.ManualDisabled == nil || !*live.QuotaBlock.ManualDisabled {
+		t.Fatal("adopting an unversioned pause lost the manual disable")
+	}
+	s.sweepQuotaBlocks(make(chan struct{}))
+	raw, err := os.ReadFile(path)
+	var stored Credential
+	if err != nil || json.Unmarshal(raw, &stored) != nil || !stored.Disabled || !stored.quotaBlocked() ||
+		stored.QuotaBlock.ManualDisabled == nil || !*stored.QuotaBlock.ManualDisabled {
+		t.Fatal("manual disable and incoming pause were not repaired together")
 	}
 }
 

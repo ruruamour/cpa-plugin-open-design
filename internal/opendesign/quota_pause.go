@@ -227,8 +227,7 @@ type quotaCommitSnapshot struct {
 }
 
 // quotaCommitSnapshotLocked snapshots the identity fields a quota write must
-// re-verify. Callers must hold mu: this reads s.creds, and a caller that only
-// holds credentialMu/authFileMu would be relying on an undocumented invariant.
+// re-verify. It acquires mu itself; callers must not already hold its write lock.
 func (s *Service) quotaCommitSnapshotLocked(id string) (quotaCommitSnapshot, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -249,8 +248,6 @@ func credentialFilePath(dir, filename string) (string, error) {
 	return filepath.Join(dir, filename), nil
 }
 
-// readQuotaAuthFile reads one auth file together with its preserved fields. The
-// caller owns authFileMu, so no plugin writer can swap the file in between.
 // readQuotaAuthFile reads one auth file together with its preserved fields. The
 // caller owns authFileMu, so no plugin writer can swap the file in between.
 func readQuotaAuthFile(path, id string) ([]byte, map[string]json.RawMessage, Credential, error) {
@@ -346,8 +343,25 @@ func (s *Service) persistQuotaResumeLocked(id string) error {
 	if err != nil {
 		return err
 	}
-	if disk.APIKey != current.APIKey || disk.QuotaBlock == nil {
-		// Nothing stale to repair, or the file already describes another key.
+	if disk.APIKey != current.APIKey {
+		return errors.New("credential file changed")
+	}
+	if disk.QuotaBlock == nil {
+		// Another writer may already have restored the exact cleared state.
+		// Retire the marker without rewriting, but never treat a different manual
+		// choice or revision as proof that this is the same published state.
+		if disk.QuotaRevision != current.QuotaRevision || disk.Disabled != current.Disabled {
+			return errors.New("credential file changed")
+		}
+		s.mu.Lock()
+		if live, ok := s.creds[id]; ok && live.APIKey == current.APIKey && live.QuotaBlock == nil &&
+			live.QuotaRevision == current.QuotaRevision && live.Disabled == current.Disabled {
+			delete(s.quotaDiskStale, id)
+		}
+		s.mu.Unlock()
+		return nil
+	}
+	if !quotaBlockBelongsToKey(disk.QuotaBlock, disk.APIKey) {
 		return errors.New("credential file changed")
 	}
 	revision := newID()
@@ -369,6 +383,9 @@ func (s *Service) persistQuotaResumeLocked(id string) error {
 		live.QuotaRevision == current.QuotaRevision {
 		live.QuotaRevision = revision
 		s.creds[id] = live
+		// Clear the marker in the same critical section as the revision advance.
+		// A later attempt to clear it using the old revision is correctly fenced.
+		delete(s.quotaDiskStale, id)
 	}
 	s.mu.Unlock()
 	return nil
@@ -896,7 +913,7 @@ func (s *Service) sweepQuotaBlocks(stop <-chan struct{}) {
 			continue
 		}
 		blocked := c.quotaBlocked()
-		if blocked && s.quotaPauseErrors[id] != "" || s.quotaDiskStale[id] {
+		if (blocked && s.quotaPauseErrors[id] != "") || s.quotaDiskStale[id] {
 			candidates = append(candidates, candidate{id: id, revision: c.QuotaRevision, blocked: blocked})
 		}
 	}
