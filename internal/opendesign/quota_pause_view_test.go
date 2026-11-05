@@ -209,7 +209,7 @@ func TestQuotaPauseViewReportsRemainingSecondsOnlyBeforeDeadline(t *testing.T) {
 	now = now.Add(70 * time.Minute)
 	setNow(now)
 	current, _ := liveCredential(s, id)
-	view := credentialView(current, now, "")
+	view := credentialView(current, now, "", "")
 	pause = pauseOf(t, view)
 	if _, ok := pause["remaining_seconds"]; ok {
 		t.Fatalf("overdue pause still advertised a countdown: %#v", pause)

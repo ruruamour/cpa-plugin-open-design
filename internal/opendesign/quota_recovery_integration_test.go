@@ -218,9 +218,23 @@ func TestQuotaRecoveryWorkerKeepsBlockWhenOfficialCheckFails(t *testing.T) {
 	// Synchronize with the serial recheck so the assertion runs after it returns.
 	s.quotaRecoveryGate <- struct{}{}
 	<-s.quotaRecoveryGate
+	waitForRecoveryCondition(t, func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return s.quotaRecheckStatus[id] == "unauthorized"
+	})
 	requireQuotaStillBlocked(t, s, id, path)
 	if host.countMethod("host.http.do") != 1 {
 		t.Fatal("failed checks bypassed the per-model retry interval")
+	}
+	status, _, raw := managementCall(t, s, http.MethodGet, apiBase+"/status", nil, nil)
+	if status != http.StatusOK || !strings.Contains(raw, `"recheck_status":"unauthorized"`) {
+		t.Fatalf("safe authorization failure was not shown in status: %d %s", status, raw)
+	}
+	for _, secret := range []string{"quota-control-secret", "sk-quota-inference-secret", "private-member-do-not-expose"} {
+		if strings.Contains(raw, secret) {
+			t.Fatal("status exposed an internal recovery credential or member identity")
+		}
 	}
 }
 

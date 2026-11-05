@@ -81,6 +81,7 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 	}
 	current.QuotaBlock = block
 	current.QuotaRevision = newID()
+	delete(s.quotaRecheckStatus, current.ID)
 	// Publish the local guard first. If writing fails, no new request will reach
 	// the exhausted upstream even if the host watcher still has an old snapshot.
 	s.creds[current.ID] = current
@@ -216,6 +217,7 @@ func (s *Service) resumeQuotaBlockLocked(id, expectedRevision string, dueOnly bo
 		s.clearModelTestsLocked(id)
 		s.creds[id] = live
 		delete(s.quotaPauseErrors, id)
+		delete(s.quotaRecheckStatus, id)
 	}
 	s.mu.Unlock()
 	return nil
@@ -244,7 +246,7 @@ func (s *Service) quotaPauseResponse() map[string]any {
 		if s.revoked[id] || !c.quotaBlocked() {
 			continue
 		}
-		pause := quotaPauseView(c, now, s.quotaPauseErrors[id])
+		pause := quotaPauseView(c, now, s.quotaPauseErrors[id], s.quotaRecheckStatus[id])
 		pause["credential_id"] = c.ID
 		pause["label"] = c.Label
 		pause["effective_disabled"] = c.effectiveDisabled()
@@ -296,7 +298,12 @@ func (s *Service) quotaPauseAction(r ManagementRequest) (any, error) {
 		}
 		return managementJSON(http.StatusOK, s.quotaPauseResponse())
 	}
-	if err := s.recheckQuotaBlock(r.HostCallbackID, id); err != nil {
+	s.mu.RLock()
+	revision := s.creds[id].QuotaRevision
+	s.mu.RUnlock()
+	err := s.recheckQuotaBlock(r.HostCallbackID, id)
+	s.setQuotaRecheckStatus(id, revision, err)
+	if err != nil {
 		return managementError(statusOf(err), err.Error())
 	}
 	return managementJSON(http.StatusOK, s.quotaPauseResponse())
@@ -377,6 +384,14 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 		}
 		one := cloneQuotaBlock(block)
 		one.ModelID, one.MultipleModels = model, false
+		if view.Error != nil {
+			switch view.Error.Kind {
+			case "unauthorized":
+				return localFail(http.StatusConflict, "quota_recheck_unauthorized", "官方拒绝额度授权，请检查 controlKey")
+			case "forbidden":
+				return localFail(http.StatusConflict, "quota_recheck_forbidden", "官方拒绝访问该 Workspace，请检查额度授权")
+			}
+		}
 		if !quotaRecoveryProven(view, one, id, current.WorkspaceID, started, clock()) {
 			return localFail(http.StatusConflict, "quota_recheck_unproven", "本次官方复查未能证明额度已恢复")
 		}
@@ -422,6 +437,49 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 		return localFail(http.StatusBadGateway, "host_contract_error", "额度复查通过，但凭据文件未能更新")
 	}
 	return nil
+}
+
+// setQuotaRecheckStatus stores only allowlisted, non-sensitive reason codes and
+// never associates an old result with a newer block revision.
+func (s *Service) setQuotaRecheckStatus(id, revision string, err error) {
+	code := ""
+	if err != nil {
+		code = "error"
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr != nil {
+			switch apiErr.Kind {
+			case "quota_recheck_inflight":
+				code = "inflight"
+			case "quota_sync_pending":
+				code = "sync_pending"
+			case "quota_recheck_unconfigured":
+				code = "unconfigured"
+			case "quota_recheck_ambiguous":
+				code = "ambiguous"
+			case "quota_recheck_unauthorized":
+				code = "unauthorized"
+			case "quota_recheck_forbidden":
+				code = "forbidden"
+			case "quota_recheck_identity":
+				code = "identity"
+			case "quota_recheck_unproven":
+				code = "unproven"
+			case "quota_state_changed", "quota_recheck_not_due", "plugin_unavailable":
+				code = ""
+			}
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, exists := s.creds[id]
+	if !exists || !c.quotaBlocked() || c.QuotaRevision != revision {
+		return
+	}
+	if code == "" {
+		delete(s.quotaRecheckStatus, id)
+	} else {
+		s.quotaRecheckStatus[id] = code
+	}
 }
 
 func (s *Service) wakeQuotaPauseWorker() {
@@ -522,20 +580,22 @@ func (s *Service) recheckDueQuotaBlocks(stop <-chan struct{}) {
 		s.mu.RUnlock()
 		return
 	}
-	var ids []string
+	type candidate struct{ id, revision string }
+	var candidates []candidate
 	for id, c := range s.creds {
 		if !s.revoked[id] && c.quotaBlocked() && !c.QuotaBlock.RetryAt.After(now) && s.quotaPauseErrors[id] == "" {
-			ids = append(ids, id)
+			candidates = append(candidates, candidate{id: id, revision: c.QuotaRevision})
 		}
 	}
 	s.mu.RUnlock()
-	sort.Strings(ids)
-	for _, id := range ids {
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].id < candidates[j].id })
+	for _, item := range candidates {
 		select {
 		case <-stop:
 			return
 		default:
 		}
-		_ = s.recheckQuotaBlockMode("", id, true)
+		err := s.recheckQuotaBlockMode("", item.id, true)
+		s.setQuotaRecheckStatus(item.id, item.revision, err)
 	}
 }

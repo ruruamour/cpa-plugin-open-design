@@ -846,23 +846,33 @@
     }
   }
 
-  // Human-readable pause footer. The recorded deadline only means "due for
-  // review": it neither proves the quota came back nor re-enables the account,
-  // and the plugin does not yet run an automatic official quota check at that
-  // point. Recovery needs a passing official recheck, and the CPA native console
-  // writes the same auth files, so a disable there cannot be attributed
-  // reliably. Nothing here may promise a background check that does not exist.
+  // The deadline starts an official recheck, not an unconditional recovery.
+  // CPA's native console shares the auth file, so disable provenance there is
+  // not reliable. The two separately configured keys cannot be linked by API.
   function quotaPauseNote(item, pause) {
     const parts = [
-      '到点只表示等待复查，不代表额度已恢复；复查安全校验仍在完善，请勿用于生产。',
+      '到点只表示应复查，不代表额度已恢复；开启自动暂停时，插件会逐账号串行复查，只有新鲜官方结果确认可用才解除，失败继续暂停。',
     ];
     if (item.billing_configured && item.workspace_id) {
-      parts.push('到点自动复查仍在开发中，插件当前不会在到点自动查询官方额度；可点「重查额度」手动发起一次官方复查。');
+      parts.push('可点「重查额度」提前发起复查。请确认 controlKey 和推理 key 属于同一账号；插件无法自动验证归属。');
     } else {
       parts.push('未配置官方 controlKey 或 Workspace ID，无法复查额度，仍须人工处理。');
     }
     parts.push('暂停期间请在本页启用/停用；CPA 原生入口和并发文件改写无法可靠归因，请勿在那里改动同一账户。');
-    if (pause.multiple_models) parts.push('多个模型报告过额度耗尽，单次复查不足以证明恢复，只能人工解除。');
+    if (pause.models_ambiguous) parts.push('耗尽模型集合不完整，无法自动确认恢复，只能人工解除。');
+    else if (pause.multiple_models) parts.push('多个模型报告过额度耗尽，须逐一复查并确认属于同一 Workspace 成员。');
+    const recheckMessages = {
+      inflight: '仍有同一推理密钥的请求在途，结束后再复查。',
+      sync_pending: '暂停状态尚未同步，成功写回前不会自动恢复。',
+      unconfigured: '额度授权或 Workspace ID 缺失，无法复查。',
+      ambiguous: '耗尽模型记录不完整，无法自动确认恢复。',
+      unauthorized: '官方拒绝额度授权，请检查 controlKey。',
+      forbidden: '官方拒绝访问 Workspace，请检查额度授权与 Workspace ID。',
+      identity: '不同模型的官方复查身份不一致，继续暂停。',
+      unproven: '上次复查未取得新鲜可用证据，继续暂停并稍后重试。',
+      error: '上次复查失败，继续暂停并稍后重试。',
+    };
+    if (recheckMessages[pause.recheck_status]) parts.push(recheckMessages[pause.recheck_status]);
     if (pause.error) parts.push('暂停状态尚未写回凭据文件，插件会按固定间隔重试；期间本地仍会拦截该账户。');
     return parts.join('');
   }
@@ -1758,13 +1768,11 @@
     }
   }
 
-  // Recheck runs one fresh official model preflight. Only a proven available
-  // result clears the pause; a cache hit or a failure changes nothing.
-  // The deadline sweep does not do this on its own yet: auto-recheck is still
-  // under development, so the operator has to trigger it here.
+  // Recheck all known exhausted models. Cached or failed results cannot clear
+  // the pause; the background worker also tries when the deadline is due.
   async function recheckQuotaPause(item) {
     if (state.busy) return;
-    if (typeof confirm === 'function' && !confirm(`用官方额度预检查重新确认账户「${item.label}」的额度？复查安全校验仍在完善，请勿用于生产。`)) return;
+    if (typeof confirm === 'function' && !confirm(`用官方额度预检查重新确认账户「${item.label}」的额度？只有所有已知耗尽模型均有新鲜可用证据时才会解除暂停。`)) return;
     setBusy(true);
     message('accountState', '正在重查额度…');
     try {

@@ -3914,10 +3914,10 @@ test('暂停期间的说明明确人工启停边界、复查要求与无授权�
   const note = view.document.getElementById('accountList').children[0].textContent;
   assert.match(note, /请在本页启用\/停用/, '暂停期间必须要求通过插件控制台人工启停');
   assert.match(note, /CPA 原生入口和并发文件改写无法可靠归因/, '必须提示宿主入口无法可靠归因');
-  assert.match(note, /复查安全校验仍在完善/);
-  assert.match(note, /到点只表示等待复查，不代表额度已恢复/);
-  assert.match(note, /到点自动复查仍在开发中/, '不能声称已实现自动复查');
-  assert.match(note, /插件当前不会在到点自动查询官方额度/, '不能虚构后台网络行为');
+  assert.match(note, /到点只表示应复查，不代表额度已恢复/);
+  assert.match(note, /开启自动暂停时，插件会逐账号串行复查/);
+  assert.match(note, /只有新鲜官方结果确认可用才解除，失败继续暂停/);
+  assert.match(note, /controlKey 和推理 key 属于同一账号；插件无法自动验证归属/);
 
   // No control key: the note must say recovery cannot be checked automatically.
   api.render.applyStatus(statusBody({
@@ -3934,7 +3934,7 @@ test('暂停期间的说明明确人工启停边界、复查要求与无授权�
   const bare = view.document.getElementById('accountList').children[0].textContent;
   assert.match(bare, /未配置官方 controlKey 或 Workspace ID，无法复查额度/);
   assert.match(bare, /仍须人工处理/);
-  assert.ok(!bare.includes('到点自动复查仍在开发中'), 'an unconfigured account has no recheck path at all');
+  assert.ok(!bare.includes('可点「重查额度」'), 'an unconfigured account has no recheck path at all');
 
   // A control key alone is insufficient without the workspace identifier.
   const missingWorkspace = pauseStatus();
@@ -3943,6 +3943,13 @@ test('暂停期间的说明明确人工启停边界、复查要求与无授权�
   const missing = view.document.getElementById('accountList').children[0].textContent;
   assert.match(missing, /未配置官方 controlKey 或 Workspace ID，无法复查额度/);
   assert.ok(!missing.includes('可点「重查额度」'), 'a missing workspace cannot be rechecked');
+
+  api.render.applyStatus(pauseStatus({ recheck_status: 'unauthorized' }));
+  assert.match(view.document.getElementById('accountList').children[0].textContent, /官方拒绝额度授权，请检查 controlKey/);
+  api.render.applyStatus(pauseStatus({ multiple_models: true, models_ambiguous: false }));
+  assert.match(view.document.getElementById('accountList').children[0].textContent, /须逐一复查并确认属于同一 Workspace 成员/);
+  api.render.applyStatus(pauseStatus({ multiple_models: true }));
+  assert.match(view.document.getElementById('accountList').children[0].textContent, /耗尽模型集合不完整，无法自动确认恢复/);
 });
 
 test('人工停用与额度暂停是两个独立徽标，解除暂停不会发送 disabled', async () => {

@@ -49,6 +49,7 @@ type Service struct {
 	errorRuleSynced      map[string]string
 	errorRuleSyncErrors  map[string]string
 	quotaPauseErrors     map[string]string // fixed, redacted persistence failures; guarded by mu
+	quotaRecheckStatus   map[string]string // fixed recovery error codes only; guarded by mu
 	quotaPauseWake       chan struct{}
 	quotaPauseStarted    bool
 	quotaPauseWorker     sync.WaitGroup
@@ -99,6 +100,7 @@ func NewService() *Service {
 		errorRuleSynced:     map[string]string{},
 		errorRuleSyncErrors: map[string]string{},
 		quotaPauseErrors:    map[string]string{},
+		quotaRecheckStatus:  map[string]string{},
 		quotaInflight:       map[quotaInFlightKey]int{},
 		quotaRecoveryGate:   make(chan struct{}, 1),
 		quotaPauseWake:      make(chan struct{}, 1),

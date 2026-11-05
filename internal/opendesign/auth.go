@@ -320,6 +320,7 @@ func (s *Service) storeCredentialLocked(c Credential) {
 	identityChanged := !exists || previous.APIKey != c.APIKey || previous.ControlKey != c.ControlKey ||
 		previous.WorkspaceID != c.WorkspaceID || previous.Disabled != c.Disabled || previous.BaseURL != c.BaseURL
 	if identityChanged {
+		delete(s.quotaRecheckStatus, c.ID)
 		s.credentialEpoch[c.ID]++
 		s.invalidateBillingLocked(c.ID)
 		s.clearModelTestsLocked(c.ID)
