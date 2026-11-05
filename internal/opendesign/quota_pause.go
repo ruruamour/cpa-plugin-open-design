@@ -28,7 +28,10 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
 
-	type changedBlock struct{ id, revision string }
+	type changedBlock struct {
+		id, revision string
+		existing     bool
+	}
 	var changed []changedBlock
 	now := s.quotaPauseTime().UTC()
 	s.mu.Lock()
@@ -83,13 +86,15 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 		// Publish every in-memory guard before writing any of the files.
 		s.creds[id] = current
 		s.clearModelTestsLocked(id)
-		changed = append(changed, changedBlock{id: id, revision: current.QuotaRevision})
+		changed = append(changed, changedBlock{id: id, revision: current.QuotaRevision, existing: active})
 	}
 	s.mu.Unlock()
 
 	sort.Slice(changed, func(i, j int) bool { return changed[i].id < changed[j].id })
 	for _, item := range changed {
-		err := s.persistQuotaBlockLocked(item.id, item.revision)
+		// A brand-new block inherits the file's disable choice; an existing block
+		// keeps its recorded choice even if the file was rewritten meanwhile.
+		err := s.persistQuotaBlockLocked(item.id, item.revision, !item.existing)
 		s.setQuotaPauseSyncError(item.id, item.revision, err != nil)
 	}
 	if len(changed) != 0 {
@@ -98,10 +103,22 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 }
 
 // persistQuotaBlockLocked merges plugin-owned quota fields into the latest auth
-// file, preserving host/operator extensions and the latest visible manual state.
-// It follows ClinePass's atomic file + CPA watcher approach; it never calls the
-// host while holding authFileMu. Caller holds credentialMu.
-func (s *Service) persistQuotaBlockLocked(id, revision string) error {
+// file, preserving host/operator extensions.
+//
+// manualFromDisk decides where the operator's disable choice comes from. A newly
+// created block takes it from the file, because an operator may have disabled the
+// account there before the pause existed (and the plugin console is not the only
+// editor). A block that already exists takes it from the block snapshot: at that
+// point the file may be a host rewrite of a pre-pause body whose `disabled` is
+// only CPA's projection, so trusting it would silently drop a plugin-console
+// choice that the snapshot still records.
+//
+// Caller holds credentialMu; never calls the host while holding authFileMu.
+func (s *Service) persistQuotaBlockLocked(id, revision string, manualFromDisk bool) error {
+	// Follow the global order credentialMu -> quotaCommitGate -> authFileMu so a
+	// pause write cannot interleave with a recovery/resume commit.
+	s.quotaCommitGate <- struct{}{}
+	defer func() { <-s.quotaCommitGate }()
 	s.authFileMu.Lock()
 	defer s.authFileMu.Unlock()
 	s.mu.RLock()
@@ -131,10 +148,10 @@ func (s *Service) persistQuotaBlockLocked(id, revision string) error {
 	if disk.Type != Provider || disk.ID != id || disk.APIKey != current.APIKey {
 		return errors.New("credential file changed")
 	}
-	// A file edit that reached disk first wins for the operator-owned disabled
-	// field. With a valid quota block, UnmarshalJSON already recovered the manual
-	// flag from its snapshot rather than CPA's projected effective flag.
-	manual := disk.Disabled
+	// The live block owns the operator's choice. Disk `disabled` is only a
+	// projection that CPA may have rewritten (including from a pre-pause
+	// snapshot), so trusting it here would silently drop a plugin-console disable.
+	manual := manualChoice(current.QuotaBlock, disk, manualFromDisk)
 	block := cloneQuotaBlock(current.QuotaBlock)
 	block.ManualDisabled = &manual
 	fields["disabled"] = jsonBytes(manual)
@@ -161,6 +178,26 @@ func quotaRecheckUnavailable() error {
 	return localFail(http.StatusServiceUnavailable, "plugin_unavailable", "OpenDesign plugin is shutting down")
 }
 
+// manualChoice decides the operator's disable state while a block exists. The
+// result is the restrictive union of the live snapshot and the file, because the
+// two can disagree in either direction and only one of those directions is safe:
+// a stale host body can carry a projected `disabled=false` for an account the
+// operator disabled in the plugin console, and trusting the file would silently
+// re-enable it. Erring the other way only keeps a paused account paused, which
+// the operator can always undo in the console. A brand-new block (manualFromDisk)
+// takes the file's value, since an operator may have disabled the account there
+// before the pause was created.
+func manualChoice(block *QuotaBlock, disk Credential, manualFromDisk bool) bool {
+	if manualFromDisk {
+		return disk.Disabled
+	}
+	manual := true
+	if block != nil && block.ManualDisabled != nil {
+		manual = *block.ManualDisabled
+	}
+	return manual || disk.Disabled
+}
+
 // quotaCommitSnapshot is everything a quota-file write must re-check after it
 // acquired authFileMu. A watcher may publish a new identity while a recheck waits
 // for that lock, and an operator may edit the file directly without the watcher
@@ -173,7 +210,12 @@ type quotaCommitSnapshot struct {
 	now                                                time.Time
 }
 
+// quotaCommitSnapshotLocked snapshots the identity fields a quota write must
+// re-verify. Callers must hold mu: this reads s.creds, and a caller that only
+// holds credentialMu/authFileMu would be relying on an undocumented invariant.
 func (s *Service) quotaCommitSnapshotLocked(id string) (quotaCommitSnapshot, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	c, exists := s.creds[id]
 	if !exists {
 		return quotaCommitSnapshot{}, false
@@ -249,9 +291,68 @@ func (s *Service) publishQuotaResumeLocked(expected quotaCommitSnapshot, path st
 		s.clearModelTestsLocked(expected.id)
 		s.creds[expected.id] = live
 		delete(s.quotaPauseErrors, expected.id)
+		delete(s.quotaDiskStale, expected.id)
 		delete(s.quotaRecheckStatus, expected.id)
 		delete(s.quotaRecheckRetryAt, expected.id)
 		delete(s.quotaRecheckFailures, expected.id)
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// persistQuotaResumeLocked republishes the already-published cleared state of a
+// credential whose auth file still carries an older body (for example a stale
+// paused snapshot delivered by the host after an explicit resume). It never
+// clears a live block and never needs recovery evidence: it only refuses when the
+// live state is not the cleared one it is meant to mirror. Caller holds
+// credentialMu.
+func (s *Service) persistQuotaResumeLocked(id string) error {
+	s.quotaCommitGate <- struct{}{}
+	defer func() { <-s.quotaCommitGate }()
+	s.authFileMu.Lock()
+	defer s.authFileMu.Unlock()
+	s.mu.RLock()
+	current, exists := s.creds[id]
+	dir, filename := s.authDir, s.authFiles[id]
+	revoked, stopped := s.revoked[id], s.stopped
+	s.mu.RUnlock()
+	if stopped {
+		return errors.New("quota state changed")
+	}
+	if !exists || revoked || current.QuotaBlock != nil || current.QuotaRevision == "" {
+		return errors.New("quota state changed")
+	}
+	path, err := credentialFilePath(dir, filename)
+	if err != nil {
+		return err
+	}
+	original, fields, disk, err := readQuotaAuthFile(path, id)
+	if err != nil {
+		return err
+	}
+	if disk.APIKey != current.APIKey || disk.QuotaBlock == nil {
+		// Nothing stale to repair, or the file already describes another key.
+		return errors.New("credential file changed")
+	}
+	revision := newID()
+	delete(fields, "quota_block")
+	fields["quota_revision"] = jsonBytes(revision)
+	fields["disabled"] = jsonBytes(current.Disabled)
+	latest, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(original, latest) {
+		return errors.New("credential file changed")
+	}
+	if err := writeJSONAtomic(path, fields); err != nil {
+		return err
+	}
+	// The effective state did not change, so the runtime epochs stay untouched:
+	// this is a file repair, not a resume. Only the revision advances so a later
+	// stale body is recognised as out of date again.
+	s.mu.Lock()
+	if live, ok := s.creds[id]; ok && live.APIKey == current.APIKey && live.QuotaBlock == nil &&
+		live.QuotaRevision == current.QuotaRevision {
+		live.QuotaRevision = revision
+		s.creds[id] = live
 	}
 	s.mu.Unlock()
 	return nil
@@ -297,17 +398,23 @@ func (s *Service) resumeQuotaBlockLocked(id, expectedRevision string, dueOnly bo
 		return err
 	}
 	// The file may have been edited (or rewritten by the host) after the last
-	// in-memory publish. Refuse to clear a block that the disk does not still
-	// describe with this exact identity. Optional fields are only rejected when
-	// the file actually carries a conflicting value, so an older file that
-	// predates them keeps working.
-	if disk.APIKey != current.APIKey || disk.QuotaBlock == nil ||
+	// in-memory publish. Refuse to clear a block the disk describes with another
+	// identity, but do not require the block itself: when persistence failed, or
+	// the host rewrote an older body that never carried the block, the live block
+	// is still the authoritative plugin state and only the operator can clear it.
+	// Optional fields are only rejected when the file carries a conflicting value,
+	// so an older file that predates them keeps working.
+	if disk.APIKey != current.APIKey ||
 		conflictingQuotaField(disk.WorkspaceID, current.WorkspaceID) ||
 		conflictingQuotaField(disk.QuotaRevision, current.QuotaRevision) {
 		return errors.New("credential file changed")
 	}
+	// Keep the operator's plugin-console choice, which lives in the block. A file
+	// that still has an intact block is the better source when the live one was
+	// recorded elsewhere, but the live snapshot always wins when present.
+	manual := manualChoice(current.QuotaBlock, disk, false)
 	expected, _ := s.quotaCommitSnapshotLocked(id)
-	return s.publishQuotaResumeLocked(expected, path, original, fields, disk.Disabled)
+	return s.publishQuotaResumeLocked(expected, path, original, fields, manual)
 }
 
 // quotaPauseTime obtains the clock pointer under mu. Quota tests replace that
@@ -325,7 +432,10 @@ func (s *Service) quotaPauseTime() time.Time {
 func (s *Service) quotaPauseResponse() map[string]any {
 	// sweepQuotaBlocks takes credentialMu per candidate itself; taking it here
 	// as well would deadlock on the first due block.
-	s.sweepQuotaBlocks(s.stopCh)
+	s.mu.RLock()
+	stop := s.stopCh
+	s.mu.RUnlock()
+	s.sweepQuotaBlocks(stop)
 	now := s.quotaPauseTime()
 	s.mu.RLock()
 	pauses := make([]map[string]any, 0, len(s.creds))
@@ -545,6 +655,12 @@ func (s *Service) commitQuotaRecovery(current Credential, block *QuotaBlock, pro
 	stopped := s.stopped
 	inflight := s.quotaHasInFlightLocked(live)
 	syncPending := s.quotaPauseErrors[current.ID] != ""
+	// Capture the policy under the same RLock that reads the live credential. The
+	// config writer publishes s.cfg/s.pauseGeneration under mu, so re-reading
+	// them after the unlock would race and could accept a round the operator
+	// cancelled.
+	enabled := s.cfg.pauseSettings().enabled
+	liveGeneration := s.pauseGeneration
 	clock := s.modelCoverageNow
 	s.mu.RUnlock()
 	if stopped {
@@ -556,7 +672,7 @@ func (s *Service) commitQuotaRecovery(current Credential, block *QuotaBlock, pro
 		inflight || syncPending {
 		return localFail(http.StatusConflict, "quota_state_changed", "额度暂停状态或凭据已变化，请刷新后重试")
 	}
-	if dueOnly && (!s.cfg.pauseSettings().enabled || live.QuotaBlock.RetryAt.After(now) || s.pauseGeneration != generation) {
+	if dueOnly && (!enabled || live.QuotaBlock.RetryAt.After(now) || liveGeneration != generation) {
 		return localFail(http.StatusConflict, "quota_recheck_not_due", "额度暂停策略已变化，已放弃本轮复查")
 	}
 	path, err := credentialFilePath(dir, filename)
@@ -649,11 +765,17 @@ func (s *Service) setQuotaRecheckStatus(id, revision string, err error) {
 	s.quotaRecheckStatus[id] = code
 	// Escalate the retry delay with consecutive failures so a long exhaustion is
 	// polled slowly. Nothing else limits this: the block itself still gates
-	// scheduling, and the recorded deadline is only a review hint.
-	s.quotaRecheckFailures[id]++
-	delay := quotaRecheckBackoffMin << (s.quotaRecheckFailures[id] - 1)
-	if delay > quotaRecheckBackoffMax {
-		delay = quotaRecheckBackoffMax
+	// scheduling, and the recorded deadline is only a review hint. The shift is
+	// capped before it can overflow int64 (26 doublings of 5m already exceed it),
+	// which would otherwise produce a negative delay and retry every tick.
+	if s.quotaRecheckFailures[id] < 32 {
+		s.quotaRecheckFailures[id]++
+	}
+	delay := quotaRecheckBackoffMax
+	if failures := s.quotaRecheckFailures[id]; failures > 0 && failures <= 8 {
+		if grown := quotaRecheckBackoffMin << (failures - 1); grown > 0 && grown < delay {
+			delay = grown
+		}
 	}
 	// mu is already held, so read the injected clock directly instead of calling
 	// quotaPauseTime, which takes the same lock.
@@ -675,6 +797,8 @@ func (s *Service) wakeQuotaPauseWorker() {
 	}
 }
 
+// setQuotaPauseSyncError records a persistence failure for a paused credential.
+// It never clears the state of a newer block revision.
 func (s *Service) setQuotaPauseSyncError(id, revision string, failed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -686,6 +810,23 @@ func (s *Service) setQuotaPauseSyncError(id, revision string, failed bool) {
 		s.quotaPauseErrors[id] = quotaPauseSyncError
 	} else {
 		delete(s.quotaPauseErrors, id)
+	}
+}
+
+// setQuotaDiskStale tracks whether the auth file still matches the published
+// cleared state. A later resume or a new block invalidates the marker through
+// the revision comparison.
+func (s *Service) setQuotaDiskStale(id, revision string, stale bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, exists := s.creds[id]
+	if !exists || current.QuotaRevision != revision {
+		return
+	}
+	if stale {
+		s.quotaDiskStale[id] = true
+	} else {
+		delete(s.quotaDiskStale, id)
 	}
 }
 
@@ -724,20 +865,23 @@ func (s *Service) startQuotaPauseWorker() {
 	s.wakeQuotaPauseWorker()
 }
 
-// sweepQuotaBlocks retries failed persistence without treating a deadline as
-// proof of restored quota. It performs no network requests.
+// sweepQuotaBlocks repairs auth files that no longer describe the published
+// state, in both directions, without treating a deadline as proof of restored
+// quota. It performs no network requests.
 func (s *Service) sweepQuotaBlocks(stop <-chan struct{}) {
 	type candidate struct {
 		id, revision string
+		blocked      bool
 	}
 	s.mu.RLock()
 	var candidates []candidate
 	for id, c := range s.creds {
-		if s.revoked[id] || !c.quotaBlocked() {
+		if s.revoked[id] {
 			continue
 		}
-		if s.quotaPauseErrors[id] != "" {
-			candidates = append(candidates, candidate{id: id, revision: c.QuotaRevision})
+		blocked := c.quotaBlocked()
+		if blocked && s.quotaPauseErrors[id] != "" || s.quotaDiskStale[id] {
+			candidates = append(candidates, candidate{id: id, revision: c.QuotaRevision, blocked: blocked})
 		}
 	}
 	s.mu.RUnlock()
@@ -749,9 +893,22 @@ func (s *Service) sweepQuotaBlocks(stop <-chan struct{}) {
 		default:
 		}
 		s.credentialMu.Lock()
-		err := s.persistQuotaBlockLocked(item.id, item.revision)
+		var err error
+		if item.blocked {
+			err = s.persistQuotaBlockLocked(item.id, item.revision, false)
+		} else {
+			// The live state is "no block", so the file may only be repaired by
+			// republishing that same cleared state. This is not a resume: it never
+			// removes a live block and never needs recovery evidence, it only
+			// prevents a stale paused body from resurrecting after a restart.
+			err = s.persistQuotaResumeLocked(item.id)
+		}
 		s.credentialMu.Unlock()
-		s.setQuotaPauseSyncError(item.id, item.revision, err != nil)
+		if item.blocked {
+			s.setQuotaPauseSyncError(item.id, item.revision, err != nil)
+		} else {
+			s.setQuotaDiskStale(item.id, item.revision, err != nil)
+		}
 	}
 }
 

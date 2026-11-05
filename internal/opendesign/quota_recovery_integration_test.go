@@ -36,7 +36,7 @@ func quotaRecoveryFixture(t *testing.T, manual bool, models ...string) (*Service
 	s.creds[id] = c
 	s.mu.Unlock()
 	s.credentialMu.Lock()
-	err := s.persistQuotaBlockLocked(id, c.QuotaRevision)
+	err := s.persistQuotaBlockLocked(id, c.QuotaRevision, false)
 	s.credentialMu.Unlock()
 	if err != nil {
 		t.Fatalf("write fixture block: %v", err)
@@ -216,7 +216,7 @@ func makeQuotaPauseDue(t *testing.T, s *Service, id string) {
 	c.QuotaRevision = newID()
 	s.creds[id] = c
 	s.mu.Unlock()
-	if err := s.persistQuotaBlockLocked(id, c.QuotaRevision); err != nil {
+	if err := s.persistQuotaBlockLocked(id, c.QuotaRevision, false); err != nil {
 		t.Fatalf("make block due: %v", err)
 	}
 }

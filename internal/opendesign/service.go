@@ -49,7 +49,12 @@ type Service struct {
 	errorRuleSynced     map[string]string
 	errorRuleSyncErrors map[string]string
 	quotaPauseErrors    map[string]string // fixed, redacted persistence failures; guarded by mu
-	quotaRecheckStatus  map[string]string // fixed recovery error codes only; guarded by mu
+	// quotaDiskStale marks credentials whose auth file no longer describes the
+	// published state, in either direction: a stale host body can drop a live
+	// block, and a stale *paused* body can resurrect a block after an explicit
+	// resume. The worker rewrites such a file from live state. Guarded by mu.
+	quotaDiskStale     map[string]bool
+	quotaRecheckStatus map[string]string // fixed recovery error codes only; guarded by mu
 	// quotaRecheckRetryAt delays the next automatic recheck after a failed round.
 	// quotaRecheckFailures escalates that delay, so a multi-day coding-plan
 	// exhaustion settles into slow polling instead of hitting the official API
@@ -116,6 +121,7 @@ func NewService() *Service {
 		errorRuleSynced:      map[string]string{},
 		errorRuleSyncErrors:  map[string]string{},
 		quotaPauseErrors:     map[string]string{},
+		quotaDiskStale:       map[string]bool{},
 		quotaRecheckStatus:   map[string]string{},
 		quotaRecheckRetryAt:  map[string]time.Time{},
 		quotaRecheckFailures: map[string]int{},

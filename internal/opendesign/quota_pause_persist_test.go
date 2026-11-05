@@ -169,7 +169,7 @@ func TestObserveQuotaBlockFailureKeepsLocalGuard(t *testing.T) {
 	}
 	quotaFixtureAuthFile(t, s, host, id, nil)
 	s.credentialMu.Lock()
-	err := s.persistQuotaBlockLocked(id, current.QuotaRevision)
+	err := s.persistQuotaBlockLocked(id, current.QuotaRevision, false)
 	s.credentialMu.Unlock()
 	if err != nil {
 		t.Fatalf("retry of quota persistence failed: %v", err)

@@ -37,7 +37,7 @@ func quotaCommitFixture(t *testing.T, models ...string) (*Service, *fakeHost, st
 	s.creds[id] = c
 	s.mu.Unlock()
 	s.credentialMu.Lock()
-	err := s.persistQuotaBlockLocked(id, c.QuotaRevision)
+	err := s.persistQuotaBlockLocked(id, c.QuotaRevision, false)
 	s.credentialMu.Unlock()
 	if err != nil {
 		t.Fatalf("write fixture block: %v", err)
@@ -174,7 +174,7 @@ func TestQuotaRecoveryAutomaticRoundAbortsWhenPolicyGenerationChanges(t *testing
 	s.creds[id] = c
 	s.mu.Unlock()
 	s.credentialMu.Lock()
-	err := s.persistQuotaBlockLocked(id, revision)
+	err := s.persistQuotaBlockLocked(id, revision, false)
 	s.credentialMu.Unlock()
 	if err != nil {
 		t.Fatal(err)

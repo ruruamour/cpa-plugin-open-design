@@ -114,18 +114,41 @@ func (s *Service) parseAuth(raw json.RawMessage) (any, error) {
 		delete(s.revoked, c.ID)
 	}
 	if current, exists := s.creds[c.ID]; exists {
-		if current.APIKey == c.APIKey && current.QuotaRevision != "" && current.QuotaRevision != c.QuotaRevision {
-			// CPA can persist an old StorageJSON after the quota write, not only
-			// deliver a stale watcher callback. Retain the live block and make a
-			// missing on-disk revision visible to the retry worker, so it repairs
-			// the file instead of losing the block at the next restart.
-			if current.quotaBlocked() {
-				s.quotaPauseErrors[c.ID] = quotaPauseSyncError
-			}
+		// A live block is authoritative for both the block itself and the
+		// operator's disable choice, because CPA persists a projected `disabled`
+		// that may come from a snapshot older than the operator's last change.
+		switch {
+		case current.APIKey != c.APIKey:
+			// The key was replaced, so the old block no longer applies.
+			delete(s.quotaPauseErrors, c.ID)
+			delete(s.quotaDiskStale, c.ID)
+		case current.APIKey == c.APIKey && current.quotaBlocked():
+			// Same key and a live block: the incoming body is either a stale host
+			// snapshot or a legacy file with no revision. Either way, keep the live
+			// block and the live manual flag, and make the divergence visible so the
+			// worker rewrites the file instead of losing the pause or the operator's
+			// choice at the next restart. The block is bound to the key, not to a
+			// revision string, so a missing revision must not drop it.
+			delete(s.quotaDiskStale, c.ID)
+			s.quotaPauseErrors[c.ID] = quotaPauseSyncError
 			c.QuotaBlock = cloneQuotaBlock(current.QuotaBlock)
 			c.QuotaRevision = current.QuotaRevision
-		} else if current.APIKey != c.APIKey {
-			delete(s.quotaPauseErrors, c.ID)
+			// The block snapshot is the operator's choice as the plugin console
+			// recorded it; this stale body only carries CPA's projection.
+			if snapshot := current.QuotaBlock.ManualDisabled; snapshot != nil {
+				c.Disabled = *snapshot
+			} else {
+				c.Disabled = true
+			}
+		case current.APIKey == c.APIKey && c.quotaBlocked() && current.QuotaRevision != c.QuotaRevision:
+			// The opposite direction: the live state is resumed/cleared, but the
+			// incoming body still carries the paused snapshot (a host rewrite of
+			// the pre-resume file). Keep the live cleared state and schedule a
+			// repair, otherwise the stale block would come back after a restart.
+			s.quotaDiskStale[c.ID] = true
+			c.QuotaBlock = nil
+			c.QuotaRevision = current.QuotaRevision
+			c.Disabled = current.Disabled
 		}
 	}
 	if block, changed := normalizeQuotaBlock(c, now); changed {
