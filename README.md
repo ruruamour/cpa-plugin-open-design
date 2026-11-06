@@ -2,19 +2,19 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.4`，本开发分支的源码版本为 `0.4.7`（额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本与源码版本均为 `0.4.7`（额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
 > `0.4.0` 在 `0.3.0` 之上增加可编辑的重试调度／错误规则，已于 2026-11-04 部署到 `nuoapi-net`；`0.4.1` 修复 Windows 上请求日志持久化与跨平台测试；`0.4.2` 把 settings.json 与错误规则文件也纳入同一条重试发布路径，并锁定裸 402 不并入额度分类；`0.4.3` 让「凭据 · 额度」标签页在打开时按账户顺序串行刷新额度；`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则；`0.4.7` 新增额度耗尽自动暂停（默认开启）。验收记录同样在该文档。
 >
-> **`0.4.6` tag 不得使用。** 该版本的暂停恢复路径会覆盖旧文件与人工停用状态，发布工作流失败且未生成 Release。`0.4.7` 已修复旧文件回放、解除修订和插件控制台人工停用保护，并通过独立复核与两套隔离宿主验收；生产升级前仍为 `0.4.4`。CPA 原生界面的停用仍无法可靠归因（已知限制）：暂停期间请在插件控制台启停账户。
+> **`0.4.6` tag 不得使用。** 该版本的暂停恢复路径会覆盖旧文件与人工停用状态，发布工作流失败且未生成 Release。`0.4.7` 已修复旧文件回放、解除修订、插件控制台人工停用保护与 Windows 粗时钟复查误判，通过独立复核、两套隔离宿主验收和五平台 Release 构建，并已于 2026-11-06 完成生产升级。CPA 原生界面的停用仍无法可靠归因（已知限制）：暂停期间请在插件控制台启停账户。
 
 ## 功能
 
 `0.4.7` 新增额度耗尽自动暂停并默认开启：识别到结构化额度耗尽报文后临时停用该账户，到期或官方复查确认恢复后自动回到调度，并保护通过插件控制台作出的启停选择。详见[额度耗尽自动暂停](#额度耗尽自动暂停默认开启)。
 
-`0.4.4` 把 OpenDesign 真实的额度耗尽报文（`402` + `code=insufficient_balance`，带 `coding_plan_exhausted` 与 `reset_at`）纳入分类白名单，并新增一条默认规则：命中 `[open-design:insufficient_balance]` 时换号冷却。此前该报文被当成未分类的 `upstream_error`，只能靠宿主对裸 402 的固定 30 分钟冷却兜底。不带机器码的裸 `402 payment required` 仍然保持不分类。
+`0.4.4` 把 OpenDesign 真实的额度耗尽报文（`402` + `code=insufficient_balance`，带 `coding_plan_exhausted` 与 `reset_at`）纳入分类白名单，并新增一条默认规则：命中 `[upstream:insufficient_balance]` 时换号冷却（`0.4.4` 时 marker 为 `[open-design:insufficient_balance]`，`0.4.7` 已迁移为不暴露上游身份的写法）。此前该报文被当成未分类的 `upstream_error`，只能靠宿主对裸 402 的固定 30 分钟冷却兜底。不带机器码的裸 `402 payment required` 仍然保持不分类。
 
 `0.4.3` 让控制台的「凭据 · 额度」标签页在打开时自动按账户顺序逐个查询一次额度：一个账号一个账号地查，不并发；离开标签页即停止；60 秒节流窗口内的账号会被跳过；未配置 control Key 或已停用的账号不查询。失败账号会在状态行单独提示，成功账号不再逐个弹出消息。
 
@@ -24,7 +24,7 @@
 
 `0.4.0` 于 2026-11-04 从提交 `e66497e` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台、错误规则同步和原有效插件核验通过。
 
-GitHub Release 使用 `open-design-v0.4.4`，已从 draft 转为正式 Release；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release，`0.4.1`～`0.4.4` 均已公开。`0.4.7` 的发布状态见下文。
+GitHub 最新 Release 为 `open-design-v0.4.7`，已发布并标记 Latest，五平台资产与 `checksums.txt` 齐全；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release，`0.4.1`～`0.4.4` 均已公开。`0.4.5`／`0.4.6` 的发布运行未产出可用资产，`0.4.6` 禁止使用。
 
 `0.3.0` 于 2026-11-03 从提交 `2601888` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台和原有效插件核验通过。
 
@@ -235,8 +235,8 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 ## 当前验证边界
 
-- `0.4.7` 新增额度耗尽自动暂停（默认开启）：信号判定、钳制、多模型串行新鲜复查、在途与身份栅栏、插件控制台启停、解除修订／旧文件回放由 Go／Node 测试、独立复核及两套隔离宿主的 snapshot／live 场景覆盖；CPA 原生界面的重复停用仍无法可靠归因，是已知限制。**新版本的生产额度耗尽事件尚未实测**，上线后需观察。
-- `0.4.5` 的思考强度映射尚未发布：隔离测试发现，一个本地 CPA `8.0.51-gemini-usage-hotfix.test` 构建可能在插件执行前剥除 `reasoning_effort`。开发分支已通过公开模型元数据修复该测试场景，普通和流式请求均已复测；控制台多标签页并发处理仍在复核。`0.4.5` 的 Release 因 macOS runner 被取消未产出资产。
+- `0.4.7` 新增额度耗尽自动暂停（默认开启）：信号判定、钳制、多模型串行新鲜复查、在途与身份栅栏、插件控制台启停、解除修订／旧文件回放由 Go／Node 测试、独立复核及两套隔离宿主的 snapshot／live 场景覆盖；CPA 原生界面的重复停用仍无法可靠归因，是已知限制。2026-11-06 生产上线后已观察到真实结构化额度耗尽事件：43 个凭据中 16 个由上游信号自动暂停，均为 `source=upstream`、`reason=quota_exhausted`、`manual_disabled=false`，未出现人工停用冲突；下游错误 marker 已在生产日志中显示为 `[upstream:<kind>]`。首批暂停的到期时间在约 24 小时后，**自动复查恢复流程尚未在生产到期窗口中实测**，继续观察。
+- `0.4.5` 的 tag 未产出 Release（macOS runner 被取消），其思考强度映射与后续修复已包含在 `0.4.7` Release 中：隔离测试发现，一个本地 CPA `8.0.51-gemini-usage-hotfix.test` 构建可能在插件执行前剥除 `reasoning_effort`。开发分支已通过公开模型元数据修复该测试场景，普通和流式请求均已复测；控制台多标签页并发处理由 `0.4.7` 的保存闸门修复覆盖。
 - `0.4.4` 只改上游额度耗尽报文的分类：`402` 且带 `insufficient_balance` 机器码（`code` 字段或 `[code=...]` 文本）时归类并换号冷却；不带机器码的裸 402 仍不分类；`0.4.3` 只改控制台额度刷新触发方式（打开标签页串行自动查询）；`0.4.2`／`0.4.1` 只做跨平台持久化修复与分类边界锁定；`0.4.0` 在 `0.3.0` 之上新增重试调度／错误规则，并已用双账号真实宿主验证：假上游按凭据返回生产 400 `tier_limit_exceeded` 后，宿主按规则换到另一账号并返回 200，冷却后下一次请求不再使用失败账号，`stop` 规则下不换号且响应保留 marker。全仓 Go／race／vet、Node 项、离线与原版 CPA 隔离流程见[验证记录](docs/verification.md)。
 - `0.3.0` 在 `0.2.0` 之上新增日志、统计、官方模型覆盖、显式模型测试、配置与 runtime。全仓 Go／race／vet、Node 139 项、Edge 540 项、Debian 12 构建和原版 CPA 隔离流程已通过，具体产物与上线状态见[验证记录](docs/verification.md)。
 - 以下为 `0.2.0` 已发生的生产事实，保留为历史，不属于 `0.3.0` 的验收证据：2026-11-02 发现 13 个模型；官方直连与生产 CPA 插件各完成一次最小 JSON 推理并得到 `OK`。生产插件测试使用 `open-design-minimax-m3.1-flash`，usage 为 219 输入／3 输出／222 总 token。13 个模型只验证发现、持久化与注册，没有逐个付费推理。
