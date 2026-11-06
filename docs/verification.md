@@ -15,6 +15,9 @@
 | Node 用例 | `tests/open-design-ui.test.cjs` 新增搜索参数、结果筛选映射、自动读取一次、展开状态在重绘后保留、格式化辅助（秒级时间、耗时人类可读、token 千分位）用例；全量 `node --test tests/*.test.cjs` 333/333 通过。 |
 | 静态检查 | `go vet ./...`、`go test ./...`、`go test -race ./...` 通过；`node --check` 通过，控制台脚本不含字面控制字符。 |
 | 视觉核对 | 用离线 fixture（无网络、假 `fetch`）在 headless Chrome 渲染桌面 1360px 与移动 430px 两种宽度，确认结果列不换行、失败行红色、统计卡片与折叠模型分布显示正常。 |
+| 发布 | tag `open-design-v0.4.9`（提交 `77c7d706c6aa542767777f0412096ac2313779e2`）。Release 首次运行因 GitHub 未分配 `macos-15` arm64 runner 被取消两次（各排队约 15 分钟，作业无 runner 直接 `cancelled`）；第三次重跑取得 runner 后，五平台构建与 `release` 作业全绿，CI 运行 [42206324119](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42206324119)、Release 运行 [42206328455](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42206328455)。下载全部资产 `sha256sum -c checksums.txt` 通过，draft 已转为正式 Release 并标记 Latest。 |
+| 生产升级 | 2026-11-06 由 ops 部署脚本升级 `nuoapi-net`：下载的 Linux amd64 产物 SHA256 `4ad1b5d8d92cd58c8e97b2a8eb6fdaa8c626f192cf0aea95772c9f89c7481480`，与 Release `linux_amd64` 资产内 `.so` 一致；本地 ABI 冒烟通过；备份 `/srv/cliproxy/_backups/open-design-20261106T114118Z`。部署后 `plugin_registered=true`、`effective_enabled=true`、`version=0.4.9`，服务 `active`、`NRestarts=0`。 |
+| 生产只读观察 | 43 个凭据中 19 个额度暂停（`source=upstream`、`manual_disabled=false`），0 个人工停用冲突，24 个凭据可用；`request-logs?q=deepseek` 返回 200 且只含元数据字段，`q=%01` 返回 `400 invalid q filter`；`/console` 返回新版日志页结构。重启瞬间记录到一批 `upstream_transport_error`（重启打断在途请求），随后日志恢复为 `success`。这仍是展示与只读筛选改版，**不改变暂停／复查／错误分类行为**；0.4.7 的额度自动复查恢复仍待生产到期窗口验证。 |
 
 ## 0.4.8 控制台账户列表改版
 
