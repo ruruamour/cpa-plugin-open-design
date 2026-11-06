@@ -86,7 +86,9 @@ func TestQuotaRecoveryProofStrictConditions(t *testing.T) {
 		{"request before recheck", func(p *recoveryProofInput) {
 			p.view.evidence.requestStartedAt = p.recheckStartedAt.Add(-time.Nanosecond)
 		}, false},
-		{"request at recheck", func(p *recoveryProofInput) { p.view.evidence.requestStartedAt = p.recheckStartedAt }, false},
+		// A proof read forces a new request; a coarse Windows clock can stamp
+		// the recheck start and that request's start within the same tick.
+		{"request at recheck tick", func(p *recoveryProofInput) { p.view.evidence.requestStartedAt = p.recheckStartedAt }, true},
 		{"request after now", func(p *recoveryProofInput) { p.view.evidence.requestStartedAt = p.now.Add(time.Nanosecond) }, false},
 		{"missing generatedAt", func(p *recoveryProofInput) { p.view.evidence.generatedAt = time.Time{} }, false},
 		{"generated before observation", func(p *recoveryProofInput) { p.view.evidence.generatedAt = p.block.ObservedAt.Add(-time.Nanosecond) }, false},

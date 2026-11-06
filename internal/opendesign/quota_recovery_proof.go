@@ -8,8 +8,11 @@ import (
 // quotaRecoveryProven checks one validated model preflight, not a balance or a
 // timer. Capture recheckStartedAt with modelCoverageNow immediately before the
 // recheck's readModelCoverage call, and pass modelCoverageNow() again as now.
-// Only the result of this read's refresh (including a joined in-flight refresh)
-// can prove recovery; a cache hit or a request started before this recheck cannot.
+// Only the result of this read's refresh can prove recovery; a cache hit or a
+// request started before this recheck cannot. requestStartedAt may equal
+// recheckStartedAt: proof reads force a brand-new request and never join an
+// older attempt, but coarse clocks (Windows ~15ms) can stamp both within the
+// same tick. Earlier stamps are still rejected.
 //
 // For multiple model proofs, the caller must also compare each successful
 // view.evidence.workspaceMemberID exactly; do not serialize or log it. The
@@ -29,7 +32,7 @@ func quotaRecoveryProven(view modelCoverageResponse, block *QuotaBlock, credenti
 	if evidence == nil || evidence.credentialID != credentialID || evidence.workspaceID != workspaceID || evidence.modelID != block.ModelID ||
 		strings.TrimSpace(evidence.workspaceMemberID) == "" || evidence.fundingCheck != "available" ||
 		evidence.requestStartedAt.IsZero() || evidence.generatedAt.IsZero() ||
-		!evidence.requestStartedAt.After(block.ObservedAt) || !evidence.requestStartedAt.After(recheckStartedAt) ||
+		!evidence.requestStartedAt.After(block.ObservedAt) || evidence.requestStartedAt.Before(recheckStartedAt) ||
 		evidence.requestStartedAt.After(now) || !evidence.generatedAt.After(block.ObservedAt.Add(5*time.Second)) {
 		return false
 	}
