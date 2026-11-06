@@ -2,7 +2,7 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.7`，本开发分支源码版本为 `0.4.9`（请求日志页改版：搜索、筛选、统计卡片、可展开行与分页；额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.9`，本开发分支源码版本为 `0.4.10`（账户列表按暂停恢复时间排序、活动账户额度汇总；请求日志页改版：搜索、筛选、统计卡片、可展开行与分页；额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
@@ -11,6 +11,8 @@
 > **`0.4.6` tag 不得使用。** 该版本的暂停恢复路径会覆盖旧文件与人工停用状态，发布工作流失败且未生成 Release。`0.4.7` 已修复旧文件回放、解除修订、插件控制台人工停用保护与 Windows 粗时钟复查误判，通过独立复核、两套隔离宿主验收和五平台 Release 构建，并已于 2026-11-06 完成生产升级。CPA 原生界面的停用仍无法可靠归因（已知限制）：暂停期间请在插件控制台启停账户。
 
 ## 功能
+
+`0.4.10` 调整控制台账户列表：额度暂停账户在活跃账户之后按 `/status` 记录的恢复时间升序排列，最早恢复的排在最前，无可用恢复时间的排最后；账户列表上方新增「当前可用总额度」汇总，只统计启用且未暂停的账户，按窗口时长汇总剩余 credits 并单独汇总钱包美元余额，未查询账户显示为待查询。
 
 `0.4.9` 改版控制台「请求日志」页：顶部工具栏支持按模型／上游模型／错误类型／请求 ID 的自由文本搜索，结果筛选（全部／成功／失败／本地拒绝）、按账户筛选与每页条数；汇总统计改为四张卡片（总请求、成功率、Token 总量、上游已尝试），模型分布折叠展示；日志行按时间、模型／上游、思考强度、结果、账户、耗时、用量排列，点击展开请求 ID、起止时间、HTTP 状态与 token 明细，失败行红色标记；底部分页显示「第 X / Y 页」。打开日志页只读取一次日志与统计，之后仅在点「刷新」或切换筛选时请求；后端 `request-logs` 新增 `q` 自由文本筛选，仍只匹配元数据字段，列表依旧不返回正文、headers、query 或任何密钥。
 
