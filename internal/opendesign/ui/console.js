@@ -35,6 +35,12 @@
     // unverified key can neither authenticate an ordinary request nor outlive
     // the verification that produced it.
     authSubmitting: false,
+    // Credential cards are rendered one page at a time; paused accounts are
+    // sorted last, and expanded detail sections keep their state across the
+    // minute-by-minute countdown re-render.
+    accountPage: 1,
+    accountSearch: '',
+    accountExpanded: {},
     selectedCredential: '',
     upstream: [],
     upstreamFor: '',
@@ -944,6 +950,11 @@
     state.optionalBusy = {};
     syncOptionalBusyControls();
     state.status = { version: '', base_url: DEFAULT_BASE_URL, credentials: [], models: [] };
+    state.accountPage = 1;
+    state.accountSearch = '';
+    state.accountExpanded = {};
+    const accountSearch = $('accountSearch');
+    if (accountSearch) accountSearch.value = '';
     state.selectedCredential = '';
     state.upstream = [];
     state.upstreamFor = '';
@@ -1327,68 +1338,153 @@
     return parts.join('');
   }
 
+  const ACCOUNT_PAGE_SIZE = 10;
+
+  // Paused accounts are a plugin-owned scheduling state, already present in the
+  // /status payload. Sorting them last needs no quota request, and keeps the
+  // operator's normal accounts at the top of the page.
+  function accountDisplayItems() {
+    const query = state.accountSearch.trim().toLowerCase();
+    const entries = state.status.credentials
+      .map((item, index) => ({ item, index }))
+      .filter(({ item }) => !query ||
+        String(item.label || '').toLowerCase().includes(query) ||
+        String(item.id || '').toLowerCase().includes(query));
+    entries.sort((left, right) => {
+      const paused = (left.item.quota_paused ? 1 : 0) - (right.item.quota_paused ? 1 : 0);
+      return paused || left.index - right.index;
+    });
+    return entries.map(entry => entry.item);
+  }
+
+  function accountPageCount(items) {
+    return Math.max(1, Math.ceil(items.length / ACCOUNT_PAGE_SIZE));
+  }
+
+  function nextAccountsPage() {
+    const items = accountDisplayItems();
+    if (state.accountPage >= accountPageCount(items)) return;
+    state.accountPage += 1;
+    renderAccounts();
+  }
+
+  function previousAccountsPage() {
+    if (state.accountPage <= 1) return;
+    state.accountPage -= 1;
+    renderAccounts();
+  }
+
+  function filterAccounts(value) {
+    state.accountSearch = String(value || '');
+    state.accountPage = 1;
+    renderAccounts();
+  }
+
+  // A paused badge at the top must be actionable: the operator should not have
+  // to page through the active accounts to find the red rows.
+  function showPausedAccounts() {
+    const index = accountDisplayItems().findIndex(item => item.quota_paused);
+    if (index < 0) return;
+    state.accountPage = Math.floor(index / ACCOUNT_PAGE_SIZE) + 1;
+    renderAccounts();
+  }
+
+  function renderAccountRow(item) {
+    const editing = Boolean(state.accountEdit && state.accountEdit.id === item.id);
+    const pause = item.quota_pause;
+    const detail = el('div', { className: 'row-main' }, [
+      el('span', { className: 'name', text: item.label }),
+      // A paused account is still enabled in the operator's switch, but showing
+      // both badges together reads as a contradiction. The red pause badge is
+      // the scheduling state; only an actual manual disable needs its own badge.
+      item.disabled ? el('span', { className: 'badge off', text: '已停用' })
+        : (pause ? null : el('span', { className: 'badge on', text: '已启用' })),
+      // A quota pause is separate from the operator's own switch: it never
+      // changes `disabled`, so it gets its own badges and its own controls.
+      pause ? el('span', { className: 'badge danger', text: Core.quotaPauseTitle(pause) }) : null,
+      pause ? el('span', { className: 'badge danger-soft', text: Core.quotaPauseCountdown(pause) }) : null,
+      pause && pause.multiple_models ? el('span', { className: 'badge', text: '多个模型' }) : null,
+      pause && pause.error ? el('span', { className: 'badge off', text: '同步待重试' }) : null,
+      editing ? el('span', { className: 'badge', text: '正在编辑' }) : null,
+    ]);
+    const actions = el('div', { className: 'row-actions' }, [
+      button('获取模型', 'fetch-account', {
+        className: 'button compact',
+        disabled: item.disabled,
+        on: () => selectAccount(item),
+      }),
+      button('编辑', 'edit-account', {
+        className: 'button compact',
+        on: () => editAccount(item),
+      }),
+      button(item.disabled ? '启用' : '停用', 'toggle-account', {
+        className: 'button compact',
+        on: () => toggleAccount(item),
+      }),
+      pause ? button('解除额度暂停', 'resume-quota-pause', {
+        className: 'button compact',
+        on: () => resumeQuotaPause(item),
+      }) : null,
+      canRecheckQuotaPause(item, pause) ? button('重查额度', 'recheck-quota-pause', {
+        className: 'button compact',
+        on: () => recheckQuotaPause(item),
+      }) : null,
+      button('删除', 'delete-account', {
+        className: 'button compact danger',
+        on: () => deleteAccount(item),
+      }),
+    ]);
+    return el('div', {
+      className: `row account-row${pause ? ' paused' : ''}`,
+      attrs: { 'data-credential-id': item.id, 'data-account-paused': pause ? 'true' : 'false' },
+    }, [
+      detail,
+      actions,
+      renderQuota(item),
+    ]);
+  }
+
   function renderAccounts() {
     scheduleQuotaView();
     const list = $('accountList');
     if (!list) return;
     const items = state.status.credentials;
+    const pausedCount = items.filter(item => item.quota_paused).length;
     const count = $('accountCount');
     if (count) count.textContent = `${items.length} 个账户`;
+    const pausedBadge = $('accountPausedCount');
+    if (pausedBadge) {
+      pausedBadge.textContent = `${pausedCount} 个额度暂停`;
+      pausedBadge.hidden = pausedCount === 0;
+    }
+    // The add/edit form stays collapsed until the operator opens it or clicks
+    // an account's 编辑 action; a countdown re-render must not reopen it.
+    const ordered = accountDisplayItems();
+    const pageCount = accountPageCount(ordered);
+    if (state.accountPage > pageCount) state.accountPage = pageCount;
+    if (state.accountPage < 1) state.accountPage = 1;
+    const start = (state.accountPage - 1) * ACCOUNT_PAGE_SIZE;
+    const visible = ordered.slice(start, start + ACCOUNT_PAGE_SIZE);
+    const filterInfo = $('accountFilterInfo');
+    if (filterInfo) {
+      filterInfo.textContent = state.accountSearch.trim() ? `匹配 ${ordered.length} 个账户` : '';
+    }
+    const pager = $('accountPager');
+    if (pager) pager.hidden = !items.length || !ordered.length;
+    const pageInfo = $('accountPageInfo');
+    if (pageInfo) {
+      pageInfo.textContent = ordered.length
+        ? `第 ${state.accountPage} / ${pageCount} 页 · 显示 ${start + 1}–${start + visible.length} / ${ordered.length} 个`
+        : '没有匹配的账户。';
+    }
+    setDisabled('accountsPrev', state.accountPage <= 1);
+    setDisabled('accountsNext', state.accountPage >= pageCount);
     if (!items.length) {
       list.replaceChildren(el('p', { className: 'empty', text: '还没有账户。填写标签和 API key 后添加。' }));
+    } else if (!ordered.length) {
+      list.replaceChildren(el('p', { className: 'empty', text: '没有匹配的账户。' }));
     } else {
-      const rows = items.map(item => {
-        const editing = Boolean(state.accountEdit && state.accountEdit.id === item.id);
-        const pause = item.quota_pause;
-        const detail = el('div', { className: 'row-main' }, [
-          el('span', { className: 'name', text: item.label }),
-          el('span', {
-            className: `badge ${item.disabled ? 'off' : 'on'}`,
-            text: item.disabled ? '已停用' : '已启用',
-          }),
-          // A quota pause is separate from the operator's own switch: it never
-          // changes `disabled`, so it gets its own badge and its own controls.
-          pause ? el('span', { className: 'badge warn', text: Core.quotaPauseText(pause) }) : null,
-          pause && pause.multiple_models ? el('span', { className: 'badge', text: '多个模型' }) : null,
-          pause && pause.error ? el('span', { className: 'badge off', text: '同步待重试' }) : null,
-          item.billing_configured ? el('span', { className: 'badge', text: '额度已配置' }) : null,
-          editing ? el('span', { className: 'badge', text: '正在编辑' }) : null,
-        ]);
-        const actions = el('div', { className: 'row-actions' }, [
-          button('获取模型', 'fetch-account', {
-            className: 'button compact',
-            disabled: item.disabled,
-            on: () => selectAccount(item),
-          }),
-          button('编辑', 'edit-account', {
-            className: 'button compact',
-            on: () => editAccount(item),
-          }),
-          button(item.disabled ? '启用' : '停用', 'toggle-account', {
-            className: 'button compact',
-            on: () => toggleAccount(item),
-          }),
-          pause ? button('解除额度暂停', 'resume-quota-pause', {
-            className: 'button compact',
-            on: () => resumeQuotaPause(item),
-          }) : null,
-          canRecheckQuotaPause(item, pause) ? button('重查额度', 'recheck-quota-pause', {
-            className: 'button compact',
-            on: () => recheckQuotaPause(item),
-          }) : null,
-          button('删除', 'delete-account', {
-            className: 'button compact danger',
-            on: () => deleteAccount(item),
-          }),
-        ]);
-        return el('div', { className: 'row', attrs: { 'data-credential-id': item.id } }, [
-          detail,
-          actions,
-          pause ? el('p', { className: 'row-detail hint', attrs: { 'data-quota-pause-note': item.id }, text: quotaPauseNote(item, pause) }) : null,
-          renderQuota(item),
-        ]);
-      });
-      list.replaceChildren(...rows);
+      list.replaceChildren(...visible.map(renderAccountRow));
     }
     if (state.busy) setRowButtonsDisabled(list, true);
     // The clear-billing checkbox only makes sense while editing an account that
@@ -1590,7 +1686,10 @@
     try {
       for (const item of state.status.credentials.slice()) {
         if (generation !== state.quotaAutoGeneration) return;
-        if (!item || !item.billing_configured || item.disabled) continue;
+        // Paused accounts are already identified by /status; the automatic
+        // walk does not spend an upstream query on them. The details panel
+        // still offers a manual refresh.
+        if (!item || !item.billing_configured || item.disabled || item.quota_paused) continue;
         if (state.quotaBusy[item.id]) continue;
         // A snapshot still inside the 60s window would only come back throttled,
         // so the walk skips it instead of spending a request to learn nothing.
@@ -1612,11 +1711,84 @@
     return `两次上游查询至少间隔 60 秒，约 ${seconds} 秒后可再次刷新。`;
   }
 
+  function quotaSummaryText(label, value, sub) {
+    return el('span', { className: 'usage' }, [
+      el('span', { className: 'usage-head' }, [el('span', { className: 'usage-label', text: label })]),
+      el('span', { className: 'usage-value', text: value }),
+      sub ? el('span', { className: 'usage-sub', text: sub }) : null,
+    ]);
+  }
+
+  function quotaSummaryWallet(quota) {
+    const wallet = quota.wallet || {};
+    if ((wallet.state === 'available' || wallet.state === 'stale') && wallet.data && wallet.data.balanceUsd) {
+      return quotaSummaryText(
+        '钱包余额',
+        Core.formatUSD(wallet.data.balanceUsd),
+        [wallet.state === 'stale' ? '上次数据' : '已更新', wallet.fetched_at ? `查询 ${Core.formatTime(wallet.fetched_at)}` : '']
+          .filter(Boolean).join(' · '),
+      );
+    }
+    if (wallet.state === 'error') return quotaSummaryText('钱包余额', '查询失败', '展开查看原因');
+    return null;
+  }
+
+  function quotaSummaryWindow(window) {
+    const title = window.durationSeconds ? `窗口 ${Core.formatDuration(window.durationSeconds)}` : '额度窗口';
+    const percent = Core.creditsPercent(window.usedCredits, window.limitCredits);
+    const sub = [];
+    if (window.remainingCredits) sub.push(`剩余 ${Core.formatCredits(window.remainingCredits)}`);
+    if (window.resetsAt) sub.push(`重置于 ${Core.formatTime(window.resetsAt)}`);
+    const parts = [
+      el('span', { className: 'usage-head' }, [
+        el('span', { className: 'usage-label', text: title }),
+        el('span', { className: 'usage-percent', text: percent ? percent.text : '—' }),
+      ]),
+    ];
+    if (percent) {
+      parts.push(el('span', { className: `meter${percent.basisPoints >= 8000 ? ' warn' : ''}` }, [
+        el('span', { attrs: { style: `width:${percent.text}` }, text: '' }),
+      ]));
+    }
+    parts.push(el('span', { className: 'usage-sub', text: sub.join(' · ') || '等待官方数据' }));
+    return el('span', { className: 'usage' }, parts);
+  }
+
+  function quotaSummary(item, quota) {
+    if (!item.billing_configured) return [quotaSummaryText('额度', '未配置额度查询', '可在「编辑」中填写 controlKey')];
+    if (!quota && item.quota_paused) return [quotaSummaryText('额度', '暂停期间未自动查询', '展开详情可手动刷新')];
+    if (!quota) return [quotaSummaryText('额度', '尚未查询', '打开本页会按顺序查询一次')];
+    const parts = [];
+    const wallet = quotaSummaryWallet(quota);
+    if (wallet) parts.push(wallet);
+    const windows = quota.funding && quota.funding.data && quota.funding.data.codingPlan
+      ? quota.funding.data.codingPlan.windows : [];
+    for (const window of windows.slice(0, 4)) parts.push(quotaSummaryWindow(window));
+    if (!parts.length) {
+      const funding = quota.funding || {};
+      if (funding.state === 'error') parts.push(quotaSummaryText('额度', '查询失败', '展开查看原因'));
+      else if (funding.state === 'not_requested' || !quota.workspace_id) parts.push(quotaSummaryText('额度', '未填写 Workspace ID', '钱包查询不影响推理'));
+      else parts.push(quotaSummaryText('额度', '暂无数据', '展开查看说明'));
+    }
+    return parts;
+  }
+
   function renderQuota(item) {
     const quota = state.quotas[item.id];
     const busy = Boolean(state.quotaBusy[item.id]);
+    const details = el('details', {
+      className: 'quota account-details',
+      attrs: { 'data-quota-id': item.id },
+    });
+    details.open = state.accountExpanded[item.id] === true;
+    details.addEventListener('toggle', () => {
+      state.accountExpanded[item.id] = details.open === true;
+    });
+    const summary = el('summary', { className: 'account-summary', attrs: { title: '展开额度详情与刷新' } });
+    summary.append(...quotaSummary(item, quota));
+    details.append(summary);
     const head = el('div', { className: 'quota-head' }, [
-      el('span', { className: 'quota-window-title', text: '额度' }),
+      el('span', { className: 'quota-window-title', text: '额度详情' }),
       quota ? quotaStateBadge(quota.state) : el('span', { className: 'badge', text: item.billing_configured ? '未查询' : '未配置' }),
       el('span', { className: 'hint', text: quota ? quotaRefreshHint(quota) : (item.billing_configured ? '打开本页会自动按顺序查询。' : '额度查询可选，未配置时不查询。') }),
     ]);
@@ -1626,9 +1798,9 @@
       on: () => refreshQuota(item),
     });
     head.append(refresh);
-    const section = el('div', { className: 'quota', attrs: { 'data-quota-id': item.id } }, [head]);
+    details.append(head);
     if (quota && quota.state === 'stale') {
-      section.append(el('p', { className: 'quota-note', text: '当前显示的是上次成功查询的数据；上游暂时不可用时不显示旧预测。' }));
+      details.append(el('p', { className: 'quota-note', text: '当前显示的是上次成功查询的数据；上游暂时不可用时不显示旧预测。' }));
     }
     const cards = el('div', { className: 'quota-grid' });
     if (!item.billing_configured) {
@@ -1645,9 +1817,16 @@
       cards.append(quotaWalletCard(item, quota));
       cards.append(quotaFundingCard(item, quota));
     }
-    section.append(cards);
-    if (quota && quota.error_note) section.append(el('p', { className: 'quota-note', text: quota.error_note }));
-    return section;
+    details.append(cards);
+    if (quota && quota.error_note) details.append(el('p', { className: 'quota-note', text: quota.error_note }));
+    if (item.quota_pause) {
+      details.append(el('p', {
+        className: 'quota-note',
+        attrs: { 'data-quota-pause-note': item.id },
+        text: quotaPauseNote(item, item.quota_pause),
+      }));
+    }
+    return details;
   }
 
   function renderCredentialOptions() {
@@ -1995,6 +2174,10 @@
 
   function resetAccountForm() {
     state.accountEdit = null;
+    const editor = $('accountEditor');
+    if (editor) editor.open = false;
+    const editorSummary = $('accountEditorSummary');
+    if (editorSummary) editorSummary.textContent = '添加账户';
     const nodes = accountFormNodes();
     const clearRow = $('accountClearBillingRow');
     if (clearRow) clearRow.hidden = true;
@@ -2014,6 +2197,10 @@
   function editAccount(item) {
     if (state.busy) return;
     state.accountEdit = { id: item.id, label: item.label, billing_configured: item.billing_configured === true };
+    const editor = $('accountEditor');
+    if (editor) editor.open = true;
+    const editorSummary = $('accountEditorSummary');
+    if (editorSummary) editorSummary.textContent = `编辑账户「${item.label}」`;
     const nodes = accountFormNodes();
     if (nodes.title) nodes.title.textContent = `编辑账户「${item.label}」`;
     if (nodes.hint) nodes.hint.textContent = 'API key 不能回显；留空表示保留原 Key，保存后输入框会清空。';
@@ -4112,6 +4299,14 @@
     if (accountForm) accountForm.addEventListener('submit', addAccount);
     const cancel = $('accountCancel');
     if (cancel) cancel.addEventListener('click', cancelAccountEdit);
+    const accountsPrev = $('accountsPrev');
+    if (accountsPrev) accountsPrev.addEventListener('click', previousAccountsPage);
+    const accountsNext = $('accountsNext');
+    if (accountsNext) accountsNext.addEventListener('click', nextAccountsPage);
+    const accountSearch = $('accountSearch');
+    if (accountSearch) accountSearch.addEventListener('input', () => filterAccounts(accountSearch.value));
+    const accountPausedCount = $('accountPausedCount');
+    if (accountPausedCount) accountPausedCount.addEventListener('click', showPausedAccounts);
     const fetchButton = $('fetchModels');
     if (fetchButton) fetchButton.addEventListener('click', fetchModels);
     const saveButton = $('saveModels');
@@ -4347,6 +4542,10 @@
       editAccount,
       deleteAccount,
       toggleAccount,
+      nextAccountsPage,
+      previousAccountsPage,
+      filterAccounts,
+      showPausedAccounts,
       resumeQuotaPause,
       recheckQuotaPause,
       selectAccount,

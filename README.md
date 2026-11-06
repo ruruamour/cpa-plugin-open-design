@@ -2,7 +2,7 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本与源码版本均为 `0.4.7`（额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.7`，本开发分支源码版本为 `0.4.8`（控制台账户列表暂停置底、额度摘要、分页与搜索；额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
@@ -11,6 +11,8 @@
 > **`0.4.6` tag 不得使用。** 该版本的暂停恢复路径会覆盖旧文件与人工停用状态，发布工作流失败且未生成 Release。`0.4.7` 已修复旧文件回放、解除修订、插件控制台人工停用保护与 Windows 粗时钟复查误判，通过独立复核、两套隔离宿主验收和五平台 Release 构建，并已于 2026-11-06 完成生产升级。CPA 原生界面的停用仍无法可靠归因（已知限制）：暂停期间请在插件控制台启停账户。
 
 ## 功能
+
+`0.4.8` 重新整理控制台账户列表：额度暂停账户自动排到列表末尾，显示红色卡片、`额度耗尽 · 自动暂停` 徽标与本机恢复倒计时，不需要先查询额度；每页默认 10 个账户并支持翻页、按名称或 ID 搜索、点击暂停徽标跳到暂停账户；额度详情默认折叠，列表行直接显示钱包余额与各窗口使用率/重置时间摘要，减少页面长度并提高信息密度。
 
 `0.4.7` 新增额度耗尽自动暂停并默认开启：识别到结构化额度耗尽报文后临时停用该账户，到期或官方复查确认恢复后自动回到调度，并保护通过插件控制台作出的启停选择。详见[额度耗尽自动暂停](#额度耗尽自动暂停默认开启)。
 

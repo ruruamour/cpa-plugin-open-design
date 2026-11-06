@@ -76,7 +76,9 @@
     .version { color: var(--muted); font-size: 12px; }
     .badge { display: inline-flex; align-items: center; min-height: 22px; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 12px; white-space: nowrap; }
     .badge.good, .badge.on { background: color-mix(in srgb, var(--good) 16%, var(--surface)); color: var(--good); }
-    .badge.off { background: color-mix(in srgb, var(--danger) 14%, var(--surface)); color: var(--danger); }
+    .badge.off, .badge.danger { background: color-mix(in srgb, var(--danger) 14%, var(--surface)); color: var(--danger); }
+    .badge.danger { border: 1px solid color-mix(in srgb, var(--danger) 32%, transparent); font-weight: 600; }
+    .badge.danger-soft { background: transparent; color: var(--danger); padding-left: 2px; }
     .lead { color: var(--muted); margin: 0 0 20px; max-width: 760px; }
     .lead code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
     .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 18px; }
@@ -114,6 +116,24 @@
     .row-main .name { font-weight: 600; overflow-wrap: anywhere; }
     .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
     .row-detail { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; }
+    .account-editor { border: 1px solid var(--line); border-radius: 9px; padding: 9px 12px; background: var(--surface); }
+    .account-editor > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+    .account-editor[open] > summary { margin-bottom: 10px; }
+    .account-row { align-items: flex-start; }
+    .account-row.paused { border-color: color-mix(in srgb, var(--danger) 42%, var(--line)); background: color-mix(in srgb, var(--danger) 6%, var(--surface)); }
+    .account-group-head { margin-top: 4px; padding: 2px 2px 0; color: var(--danger); font-size: 12.5px; font-weight: 700; }
+    .account-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; }
+    .account-tools .search { flex: 1 1 240px; width: auto; }
+    .account-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 8px 16px; width: 100%; cursor: pointer; list-style: none; }
+    .account-summary::-webkit-details-marker { display: none; }
+    .usage { display: grid; gap: 3px; min-width: 0; align-content: start; }
+    .usage-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 12px; }
+    .usage-label { color: var(--muted); overflow-wrap: anywhere; }
+    .usage-percent { font-weight: 700; color: var(--ink); }
+    .usage-value { font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }
+    .usage-sub { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+    .pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; }
+    .pager-actions { display: flex; gap: 6px; }
     .toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
     .toolbar .field { flex: 1 1 180px; }
     .search { flex: 1 1 220px; width: auto; }
@@ -152,7 +172,10 @@
     .quota-window + .quota-window { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
     .quota-window-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 10px; }
     .quota-window-title { font-weight: 600; font-size: 12.5px; }
-    .meter { width: 100%; height: 6px; border-radius: 999px; background: color-mix(in srgb, var(--ink) 12%, var(--surface)); overflow: hidden; }
+    .meter { display: block; width: 100%; height: 6px; border-radius: 999px; background: color-mix(in srgb, var(--ink) 12%, var(--surface)); overflow: hidden; }
+    .account-details > summary { cursor: pointer; color: var(--muted); }
+    .account-details[open] > summary { margin-bottom: 8px; }
+    .account-details > summary:hover { color: var(--ink); }
     .meter > span { display: block; height: 100%; background: var(--accent); }
     .meter.warn > span { background: #b54708; }
     .quota-forecast { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
@@ -299,8 +322,14 @@
           <h2 id="accountsTitle">账户</h2>
           <p class="hint">账户列表只显示标签、启用状态和操作；API key 不会回显，编辑时也不能读取原 key。打开本标签页会按账户顺序逐个查询一次额度（不并发），离开即停止。</p>
         </div>
-        <span class="badge" id="accountCount">0 个账户</span>
+        <div class="panel-actions">
+          <button class="button compact" id="openErrorRules" type="button" title="配置 CPA 的重试调度：命中规则后是停止还是继续换号，以及是否冷却失败的账号">错误规则</button>
+          <span class="badge" id="accountCount">0 个账户</span>
+          <button class="badge danger" id="accountPausedCount" type="button" title="跳到额度暂停账户" hidden>0 个额度暂停</button>
+        </div>
       </div>
+      <details class="account-editor" id="accountEditor">
+        <summary id="accountEditorSummary">添加账户</summary>
       <form class="stack" id="accountForm" autocomplete="off">
         <div class="form-head">
           <h3 id="accountFormTitle">添加账户</h3>
@@ -341,12 +370,20 @@
           <p class="hint">编辑时留空表示保留原值；勾选后保存可清除额度授权，推理 Key 保留。</p>
         </details>
         <p class="state" id="accountState" role="status" aria-live="polite" hidden></p>
-        <div class="panel-actions" style="margin-top: 12px;">
-          <button class="button compact" id="openErrorRules" type="button">错误规则</button>
-          <span class="hint">配置 CPA 的重试调度：命中规则的失败是停止还是继续换号，以及是否冷却失败的账号。保存后会同步到每个账号的凭据。</span>
-        </div>
       </form>
-      <div class="rows" id="accountList" style="margin-top: 14px;" aria-live="polite"></div>
+      </details>
+      <div class="account-tools">
+        <input class="control search" id="accountSearch" type="search" autocomplete="off" spellcheck="false" placeholder="搜索账户名称或 ID">
+        <span class="hint" id="accountFilterInfo"></span>
+      </div>
+      <div class="rows" id="accountList" aria-live="polite"></div>
+      <div class="pager" id="accountPager" hidden>
+        <span class="hint" id="accountPageInfo"></span>
+        <div class="pager-actions">
+          <button class="button compact" id="accountsPrev" type="button" disabled>上一页</button>
+          <button class="button compact" id="accountsNext" type="button" disabled>下一页</button>
+        </div>
+      </div>
     </section>
     </section>
 

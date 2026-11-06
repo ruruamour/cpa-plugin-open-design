@@ -1127,7 +1127,8 @@ function quotaPage(fetchImpl, credentials) {
 
 const quotaRow = view => view.document.getElementById('accountList').children[0];
 const quotaText = view => quotaRow(view).children[2].textContent;
-const quotaButtons = view => Array.from(quotaRow(view).children[2].children).flatMap(node => Array.from(node.children || []))
+const flattenNodes = node => [node, ...Array.from(node.children || []).flatMap(flattenNodes)];
+const quotaButtons = view => flattenNodes(quotaRow(view).children[2])
   .filter(node => node.tagName === 'BUTTON');
 
 test('loading status never requests quota; only the explicit refresh button does', async () => {
@@ -4153,7 +4154,8 @@ test('a paused account offers 解除额度暂停 and never flips the disabled sw
   api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
   await api.render.loadStatus();
   const row = view.document.getElementById('accountList').children[0];
-  assert.match(row.textContent, /额度暂停/);
+  assert.match(row.textContent, /额度耗尽 · 自动暂停/);
+  assert.match(row.textContent, /约 .*后恢复/);
   // The row exposes an explicit resume control, but nothing runs on render.
   const actionsRow = row.children[1];
   const actionTexts = [...actionsRow.children].map(node => node.textContent);
@@ -4425,7 +4427,7 @@ test('人工停用与额度暂停是两个独立徽标，解除暂停不会发�
   await api.render.loadStatus();
   const row = view.document.getElementById('accountList').children[0];
   assert.match(row.textContent, /已停用/, '人工停用状态单独显示');
-  assert.match(row.textContent, /额度暂停/, '额度暂停状态单独显示');
+  assert.match(row.textContent, /额度耗尽 · 自动暂停/, '额度暂停状态单独显示');
   assert.match(row.textContent, /已停用/);
   const actionTexts = [...row.children[1].children].map(node => node.textContent);
   assert.ok(actionTexts.includes('启用'), 'the operator switch reflects the manual disable');
@@ -4464,7 +4466,8 @@ test('暂停倒计时在页面内本地变化，且不发出任何网络请求',
   // words "不代表额度已恢复", so the badge itself must stay free of any
   // recovered/expiring wording.
   const readBadge = () => view.document.getElementById('accountList').children[0].children[0].textContent;
-  assert.match(readBadge(), /额度暂停（剩余/);
+  assert.match(readBadge(), /额度耗尽 · 自动暂停/);
+  assert.match(readBadge(), /约 .*后恢复/);
   const requestsAfterLoad = calls.length;
 
   // The scheduled tick is local: it re-renders through the same renderer with no
@@ -6438,4 +6441,134 @@ test('a legacy draft confirmed against a new revision judges the revision it wil
     'a rename the backend can preserve must not warn that the policy is lost');
   assert.ok(page.confirmations.some(text => /覆盖服务器/.test(text)));
   assert.match(page.view.document.getElementById('modelState').textContent, /已保存 2 个模型映射/);
+});
+
+// ---- account list density: pause sorting, pagination and search -----------
+
+function activeCredential(id, label = id) {
+  return { id, label, disabled: false, billing_configured: true, workspace_id: `ws-${id}` };
+}
+
+function pausedCredential(id, label = id, resumeInMs = 3600_000) {
+  return {
+    id, label, disabled: false, billing_configured: true, workspace_id: `ws-${id}`,
+    quota_paused: true, effective_disabled: true,
+    quota_pause: {
+      reason: 'quota_exhausted', source: 'upstream',
+      resume_at: new Date(Date.now() + resumeInMs).toISOString(),
+      manual_disabled: false, model_id: 'open-design/flash',
+    },
+  };
+}
+
+test('额度暂停账户自动排到列表末尾并以红色卡片显示，自动查询跳过暂停账户', async () => {
+  const credentials = [
+    activeCredential('active-1', '正常一'),
+    pausedCredential('paused-1', '暂停一'),
+    activeCredential('active-2', '正常二'),
+    pausedCredential('paused-2', '暂停二'),
+  ];
+  const { view, consoleApi, calls } = quotaPage(async url => {
+    if (url.includes('/quota')) {
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      return respond(200, quotaContract({ credential_id: id }));
+    }
+    return respond(404, { error: 'not found' });
+  }, credentials);
+  const rows = [...view.document.getElementById('accountList').children];
+  assert.deepEqual(rows.map(row => row.getAttribute('data-credential-id')),
+    ['active-1', 'active-2', 'paused-1', 'paused-2'],
+    '暂停账户必须自动移到列表末尾，无需额度查询');
+  assert.ok(rows[2].className.includes('paused'), '暂停行使用红色卡片样式');
+  assert.equal(rows[2].getAttribute('data-account-paused'), 'true');
+  assert.match(rows[2].textContent, /额度耗尽 · 自动暂停/);
+  assert.match(rows[2].textContent, /约 .*后恢复/);
+  assert.equal(view.document.getElementById('accountPausedCount').textContent, '2 个额度暂停');
+  assert.equal(view.document.getElementById('accountPausedCount').hidden, false);
+  assert.equal(calls.filter(call => call.url.includes('/quota')).length, 0,
+    '渲染暂停排序本身不得触发额度查询');
+
+  consoleApi.handlers.activateTab('credentials');
+  await new Promise(resolve => setTimeout(resolve, 30));
+  const queried = calls.filter(call => call.url.includes('/quota'))
+    .map(call => new URL(call.url, 'https://cpa.example').searchParams.get('credential_id'));
+  assert.deepEqual(queried, ['active-1', 'active-2'], '自动额度查询必须跳过已暂停账户');
+});
+
+test('账户列表按每页 10 个翻页，暂停账户保持在各页末尾', () => {
+  const credentials = [pausedCredential('paused-1', '暂停一')];
+  for (let i = 0; i < 11; i += 1) credentials.push(activeCredential(`active-${i}`, `正常 ${i}`));
+  credentials.push(pausedCredential('paused-2', '暂停二'));
+  const { view, consoleApi } = quotaPage(async () => respond(404, { error: 'not found' }), credentials);
+
+  const list = () => view.document.getElementById('accountList');
+  const ids = () => [...list().children].map(row => row.getAttribute('data-credential-id'));
+  assert.equal(list().children.length, 10, '第一页只显示 10 个账户');
+  assert.deepEqual(ids(), credentials.filter(item => !item.quota_paused).slice(0, 10).map(item => item.id));
+  assert.match(view.document.getElementById('accountPageInfo').textContent, /第 1 \/ 2 页/);
+  assert.equal(view.document.getElementById('accountsPrev').disabled, true);
+  assert.equal(view.document.getElementById('accountsNext').disabled, false);
+
+  consoleApi.handlers.nextAccountsPage();
+  assert.deepEqual(ids(), ['active-10', 'paused-1', 'paused-2']);
+  assert.match(view.document.getElementById('accountPageInfo').textContent, /第 2 \/ 2 页/);
+  assert.match(view.document.getElementById('accountPageInfo').textContent, /11–13 \/ 13 个/);
+  assert.ok(list().children[1].className.includes('paused'));
+  assert.ok(list().children[2].className.includes('paused'));
+  assert.equal(view.document.getElementById('accountsPrev').disabled, false);
+  assert.equal(view.document.getElementById('accountsNext').disabled, true);
+
+  consoleApi.handlers.previousAccountsPage();
+  assert.equal(list().children.length, 10);
+  assert.equal(view.document.getElementById('accountPageInfo').textContent.includes('第 1 / 2 页'), true);
+
+  // The pause badge jumps straight to the first page containing a paused row.
+  consoleApi.handlers.showPausedAccounts();
+  assert.equal(view.document.getElementById('accountPageInfo').textContent.includes('第 2 / 2 页'), true);
+  assert.ok(list().children[1].className.includes('paused'));
+});
+
+test('账户搜索按名称或 ID 过滤并把分页重置到第一页', () => {
+  const credentials = [pausedCredential('paused-1', '额度耗尽账户')];
+  for (let i = 0; i < 11; i += 1) credentials.push(activeCredential(`active-${i}`, `正常 ${i}`));
+  const { view, consoleApi } = quotaPage(async () => respond(404, { error: 'not found' }), credentials);
+  consoleApi.handlers.nextAccountsPage();
+  assert.equal(view.document.getElementById('accountPageInfo').textContent.includes('第 2 / 2 页'), true);
+
+  consoleApi.handlers.filterAccounts('额度耗尽');
+  const rows = [...view.document.getElementById('accountList').children];
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].getAttribute('data-credential-id'), 'paused-1');
+  assert.match(view.document.getElementById('accountFilterInfo').textContent, /匹配 1 个账户/);
+  assert.match(view.document.getElementById('accountPageInfo').textContent, /第 1 \/ 1 页/);
+
+  consoleApi.handlers.filterAccounts('active-3');
+  assert.deepEqual([...view.document.getElementById('accountList').children].map(row => row.getAttribute('data-credential-id')), ['active-3']);
+
+  consoleApi.handlers.filterAccounts('');
+  assert.equal(view.document.getElementById('accountList').children.length, 10);
+  assert.equal(view.document.getElementById('accountFilterInfo').textContent, '');
+});
+
+test('额度详情默认折叠为紧凑摘要，展开状态在倒计时重绘后保留', async () => {
+  const { view, consoleApi } = quotaPage(async url => {
+    if (url.includes('/quota')) return respond(200, quotaContract());
+    return respond(404, { error: 'not found' });
+  });
+  await consoleApi.handlers.refreshQuota({ id: 'cred-1', label: '主账户', billing_configured: true, workspace_id: 'ws-1' });
+  const details = () => view.document.getElementById('accountList').children[0].children[2];
+  assert.equal(details().tagName, 'DETAILS');
+  assert.equal(details().open, false, '详情默认折叠');
+  const summary = details().children[0];
+  assert.equal(summary.tagName, 'SUMMARY');
+  assert.match(summary.textContent, /\$12\.345/, '摘要保留钱包余额');
+  assert.match(summary.textContent, /20\.00%/, '摘要保留窗口使用率');
+  assert.match(summary.textContent, /剩余 800/, '摘要保留剩余额度');
+  assert.match(summary.textContent, /重置于/, '摘要保留重置时间');
+  assert.doesNotMatch(summary.textContent, /本次预检未指定模型/, '长说明应在展开的详情里');
+
+  details().open = true;
+  await details().emit('toggle');
+  consoleApi.render.renderAccounts();
+  assert.equal(details().open, true, '本地倒计时重绘不得收起用户展开的详情');
 });

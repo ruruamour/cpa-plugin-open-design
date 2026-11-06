@@ -68,6 +68,29 @@
     return `额度暂停（剩余 ${formatDuration(remaining)}）`;
   }
 
+  // Compact copy for the account card. Paused accounts are moved to the bottom
+  // of the list, so the badge must explain both why and for how long without
+  // opening the quota details or querying the upstream again.
+  function quotaPauseTitle(pause) {
+    if (!pause) return '';
+    return pause.reason === 'quota_exhausted' ? '额度耗尽 · 自动暂停' : '额度暂停';
+  }
+
+  function quotaPauseCountdown(pause, now = Date.now()) {
+    if (!pause) return '';
+    if (pause.awaiting_recheck === true) return '等待复查';
+    const remaining = quotaPauseRemaining(pause, now);
+    if (remaining === null) return '';
+    return remaining > 0 ? `约 ${formatDuration(remaining)}后恢复` : '等待复查';
+  }
+
+  function quotaPauseSummary(pause, now = Date.now()) {
+    const title = quotaPauseTitle(pause);
+    if (!title) return '';
+    const countdown = quotaPauseCountdown(pause, now);
+    return countdown ? `${title} · ${countdown}` : title;
+  }
+
   function normalizeStatus(value) {
     const data = value && typeof value === 'object' ? value : {};
     const credentials = [];
@@ -1181,6 +1204,9 @@
     normalizeQuotaPause,
     quotaPauseRemaining,
     quotaPauseText,
+    quotaPauseTitle,
+    quotaPauseCountdown,
+    quotaPauseSummary,
     normalizeUpstreamModels,
     normalizeQuota,
     normalizeModelCoverage,
