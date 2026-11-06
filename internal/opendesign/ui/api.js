@@ -156,6 +156,7 @@
           model: options.model,
           credential_id: options.credentialID,
           attempted: options.attempted,
+          q: options.search,
         },
       }),
       requestStats: () => request('/request-stats'),

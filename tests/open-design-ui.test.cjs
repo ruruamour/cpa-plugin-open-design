@@ -2178,9 +2178,9 @@ test('request stats render per-model rows and the retention scope from input/out
   assert.equal(consoleApi.state.requestStats.tokens.input, 11, 'input tokens are read from tokens.input');
   assert.equal(consoleApi.state.requestStats.tokens.output, 7, 'output tokens are read from tokens.output');
   const facts = view.document.getElementById('requestStats').textContent;
-  assert.match(facts, /输入 Token11/);
-  assert.match(facts, /输出 Token7/);
-  assert.match(facts, /本地拒绝1/);
+  assert.match(facts, /输入 Token 11/);
+  assert.match(facts, /输出 Token 7/);
+  assert.match(facts, /本地拒绝 1/);
   assert.match(facts, /保留 7 天，最多 500 条/);
   assert.match(facts, /当前 3 条/);
   const models = view.document.getElementById('requestStatsModels');
@@ -2296,16 +2296,16 @@ test('a quota window whose reset time has passed or precedes exhaustion stops sh
   assert.equal(core.quotaForecastExpired({ resetsAt: '2026-11-03T01:00:00Z', forecast: { exhausts_at: '2026-11-03T00:00:00Z' } }, Date.parse('2026-11-03T00:30:00Z')), true);
 });
 
-test('logout and re-login restore the log model and credential filters', async () => {
+test('logout and re-login restore the log search and credential filters', async () => {
   const view = fakePage({
     fetchImpl: async () => respond(404, { error: 'not found' }),
   });
   const consoleApi = view.context.OpenDesignConsole;
-  view.document.getElementById('logsFilterModel').value = 'stale-model';
+  view.document.getElementById('logsFilterSearch').value = 'stale-model';
   view.document.getElementById('logsFilterCredential').value = 'cred-1';
   view.document.getElementById('logsFilterStatus').value = 'failed';
   consoleApi.handlers.clearAuth();
-  assert.equal(view.document.getElementById('logsFilterModel').value, '');
+  assert.equal(view.document.getElementById('logsFilterSearch').value, '');
   assert.equal(view.document.getElementById('logsFilterCredential').value, '');
   assert.equal(view.document.getElementById('logsFilterStatus').value, '');
 });
@@ -3047,6 +3047,132 @@ test('a request-log row shows a mapped strength and stays quiet for a passthroug
   assert.match(rows[1].textContent, /思考强度 none/, 'a passthrough with an explicit strength is still reported');
   assert.ok(!/思考强度/.test(rows[2].textContent), 'a request with no strength shows no row');
   assert.ok(!rows[3].textContent.includes('injected'), 'an injected value outside the closed sets is dropped');
+});
+
+test('request-log rows keep a dense summary and move identities into an expandable detail', async () => {
+  const logs = {
+    logs: [
+      {
+        id: 'log-1', started_at: '2026-11-05T01:00:00Z', finished_at: '2026-11-05T01:00:01.234Z',
+        status: 'error', http_status: 402, model: 'od-flash', upstream_model: 'deepseek-v4.1-flash',
+        credential_id: 'cred-1', duration_ms: 1234, input_tokens: 1000, output_tokens: 234,
+        total_tokens: 1234, request_id: 'req-abc', error_kind: 'insufficient_balance',
+        stream: true, upstream_attempted: true,
+      },
+      {
+        id: 'log-2', started_at: '2026-11-05T01:01:00Z', status: 'error', model: 'od-flash',
+        credential_id: 'cred-1', error_kind: 'model_not_enabled', upstream_attempted: false,
+      },
+    ],
+    total: 2,
+  };
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/status') ? respond(200, statusBody()) : respond(200, logs)),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  await api.handlers.loadRequestLogs({ reset: true });
+  const list = view.document.getElementById('requestLogList');
+  const rows = list.children;
+  assert.equal(rows[0].tagName, 'DETAILS', 'each row is expandable');
+  assert.match(rows[0].className, /failed/, 'a failed request row is toned red');
+  const summary = rows[0].children[0];
+  assert.match(summary.textContent, /额度耗尽/, 'a known error kind becomes the result label');
+  assert.match(summary.textContent, /HTTP 402/);
+  assert.match(summary.textContent, /deepseek-v4\.1-flash/);
+  assert.match(summary.textContent, /主账户/);
+  assert.match(summary.textContent, /1\.23 s/);
+  assert.match(summary.textContent, /1,234/);
+  assert.ok(!summary.textContent.includes('req-abc'), 'the request id lives in the detail, not the dense summary');
+  const detail = rows[0].children[1];
+  assert.match(detail.textContent, /req-abc/);
+  assert.match(detail.textContent, /输入 Token 1,000/);
+  assert.match(detail.textContent, /输出 Token 234/);
+  assert.match(rows[1].children[0].textContent, /本地拒绝/);
+
+  rows[0].open = true;
+  await rows[0].emit('toggle');
+  api.render.renderRequestLogs();
+  assert.equal(list.children[0].open, true, 'the expansion survives a countdown-style repaint');
+});
+
+test('request-log filters send free-text search and fold local rejection into attempted=no', async () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/request-logs')
+      ? respond(200, { logs: [], total: 0, limit: 25, offset: 0, has_more: false })
+      : respond(200, statusBody())),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  view.document.getElementById('logsFilterSearch').value = '  DeepSeek  ';
+  view.document.getElementById('logsFilterStatus').value = 'local';
+  view.document.getElementById('logsFilterLimit').value = '25';
+  await api.handlers.loadRequestLogs({ reset: true });
+  const request = view.calls.find(call => call.url.includes('/request-logs')).url;
+  assert.match(request, /q=DeepSeek/);
+  assert.match(request, /attempted=no/);
+  assert.match(request, /limit=25/);
+  assert.ok(!/[?&]status=/.test(request), 'a local-rejection filter does not also constrain status');
+  assert.equal(api.state.logQuery.search, 'DeepSeek');
+  assert.equal(api.state.logQuery.attempted, 'no');
+});
+
+test('opening the logs tab reads one page and the summary once per session', async () => {
+  let logCalls = 0;
+  let statsCalls = 0;
+  const view = fakePage({
+    fetchImpl: async url => {
+      if (url.includes('/request-stats')) {
+        statsCalls += 1;
+        return respond(200, {
+          total: 1, success: 1, failed: 0, streams: 0, success_rate: 1,
+          tokens: { input: 2, output: 3, total: 5, requests_with_usage: 1, requests_without_usage: 0 },
+          models: [{ model: 'od-flash', total: 1, success: 1, failed: 0 }],
+          retention: { enabled: true, retention_days: 7, max_entries: 500, entries: 1 },
+        });
+      }
+      if (url.includes('/request-logs')) {
+        logCalls += 1;
+        return respond(200, { logs: [], total: 0, limit: 50, offset: 0, has_more: false });
+      }
+      return respond(200, statusBody());
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+  api.handlers.activateTab('logs');
+  await settle();
+  assert.equal(logCalls, 1, 'opening the logs tab loads the first page');
+  assert.equal(statsCalls, 1, 'opening the logs tab loads the summary cards');
+  api.handlers.activateTab('overview');
+  api.handlers.activateTab('logs');
+  await settle();
+  assert.equal(logCalls, 1, 'switching back does not re-read a loaded page');
+  assert.equal(statsCalls, 1, 'the summary is not re-read either');
+  await api.handlers.refreshRequestLogs();
+  assert.equal(logCalls, 2, 'the refresh button always reads again');
+  assert.equal(statsCalls, 2);
+  assert.match(view.document.getElementById('requestStatsModelsSummary').textContent, /按模型分布（1）/);
+});
+
+test('log formatting keeps seconds, humanises latency, and groups token counts', () => {
+  const core = fakePage().context.OpenDesignCore;
+  const now = new Date(2026, 10, 6, 12, 0, 0).getTime();
+  assert.equal(core.formatLogTime(new Date(2026, 10, 6, 9, 5, 7).toISOString(), now), '09:05:07');
+  assert.equal(core.formatLogTime(new Date(2026, 10, 5, 23, 59, 59).toISOString(), now), '11-05 23:59:59');
+  assert.equal(core.formatLogTime(new Date(2025, 11, 31, 0, 0, 0).toISOString(), now), '2025-12-31 00:00:00');
+  assert.equal(core.formatLogTime('not-a-time', now), '');
+  assert.equal(core.formatLogDuration(999), '999 ms');
+  assert.equal(core.formatLogDuration(1234), '1.23 s');
+  assert.equal(core.formatLogDuration(12500), '12.5 s');
+  assert.equal(core.formatLogDuration(65000), '1 分 5 秒');
+  assert.equal(core.formatLogDuration(null), '');
+  assert.equal(core.formatCount(1234567), '1,234,567');
+  assert.equal(core.formatCount(null), '');
 });
 
 test('reset uses the model-derived default table and new rules pick a legal target', async () => {

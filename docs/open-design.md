@@ -1,6 +1,6 @@
 # OpenDesign 插件说明
 
-本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`；生产版本为 `0.4.7`，本开发分支为 `0.4.8`（控制台账户列表暂停置底、额度摘要、分页与搜索；额度耗尽自动暂停默认开启），`0.4.6` tag 不得使用。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射，并修复其快照一致性与控制台草稿问题；`0.4.7` 新增额度耗尽自动暂停。详见[验证记录](verification.md)。
+本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`；生产版本为 `0.4.7`，本开发分支为 `0.4.9`（请求日志页搜索／筛选／统计／展开行／分页改版；额度耗尽自动暂停默认开启），`0.4.6` tag 不得使用。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射，并修复其快照一致性与控制台草稿问题；`0.4.7` 新增额度耗尽自动暂停。详见[验证记录](verification.md)。
 
 ## 范围
 
@@ -9,7 +9,7 @@
 - 使用 CPA 公开的 host HTTP、translation 和 public RPC；不修改、不打包、不发布 CPA 宿主。
 - 额度查询按 OpenDesign 官方 control API 实现，可选配置独立 control Key；不使用 Cline 的额度、价格或周期规则。详见[额度说明](quota.md)。
 - 模型级覆盖查询同样使用官方 `funding-check` 的 `modelId`，与共享额度缓存分开。
-- 请求日志只保存元数据 allowlist；模型测试与日志、统计、覆盖、配置、runtime 都由人工在控制台触发。
+- 请求日志只保存元数据 allowlist；打开日志标签页读取一次日志与统计，之后只在刷新或切换筛选时请求；模型测试、覆盖检查、配置与 runtime 由人工在控制台触发。
 - 管理页的账号选择用于模型发现，映射为插件共享；实际请求的账号选择与冷却遵循 CPA 公开接口。
 
 ## 协议
@@ -59,7 +59,7 @@ OpenDesign 生产接口：
 | `POST /quota-pause/recheck` | 对全部已知耗尽模型串行发起官方预检；全部通过才提前解除暂停 |
 | `GET /quota?credential_id=<id>` | 共享钱包／套餐窗口缓存；`refresh=1` 手动查询 |
 | `GET /model-coverage?credential_id=<id>&model_id=<id>` | 模型级官方覆盖缓存；`refresh=1` 手动查询 |
-| `GET /request-logs` | 分页读取元数据日志 |
+| `GET /request-logs` | 分页读取元数据日志；支持 `limit`／`offset`／`status`／`model`／`q`／`credential_id`／`attempted`／`since`／`until` |
 | `GET /request-stats` | 汇总统计（含本地拒绝数） |
 | `DELETE /request-logs` | 持久化清空日志 |
 | `GET` / `PUT /error-rules` | 读取或保存错误规则策略并逐账号同步 |
@@ -130,6 +130,7 @@ OpenDesign 生产接口：
 - 清空是持久化事务：先写入 clear tombstone（同时记录保留策略），再更新内存；崩溃恢复不会让旧日志复活。
 - usage 可以是 `null`：响应没有对应 usage 时保持未知，不写成 0。
 - 统计包含总数、成功／失败、流式、成功率、token 汇总、带／不带 usage、上游已尝试与本地拒绝，并按模型聚合。`attempted=yes|no` 可筛选已尝试上游与本地拒绝。
+- `q` 是大小写不敏感的自由文本筛选，只匹配客户端模型、上游模型、凭据 ID、请求 ID 与错误类型；超过 128 字节或含控制字符返回 400。控制台以 `q` 承载搜索框，并把它与结果／账户筛选组合成同一请求。
 
 `POST /config` 接受插件自有的 `logs` 与开发中的 `pause` 设置；上游地址、代理、路由与宿主冷却不能被插件修改。
 
@@ -239,10 +240,11 @@ plugins:
 2. 在「凭据 · 额度」添加 OpenDesign 推理 API key；如需共享额度，再填同一账号的 control Key 与 Workspace ID。打开该标签页会按账户顺序自动查询一次额度。
 3. 在「模型映射 · 覆盖」拉取上游模型、勾选并保存映射。
 4.（可选）在同一页对单个模型「检查覆盖」，或确认后「发送测试」。
-5.（可选）在「请求日志」手动刷新日志与统计，在「代理池 · 配置」调整日志保留策略或读取 runtime。
+5.（可选）打开「请求日志」会读取一次日志与统计，之后用搜索／结果／账户筛选、翻页或「刷新」重查；在「代理池 · 配置」调整日志保留策略或读取 runtime。
 
 ## 当前验证边界
 
+- `0.4.9` 改版控制台「请求日志」页：新增自由文本搜索（后端 `q`，只匹配安全元数据字段）、结果／账户筛选、每页条数、四张统计卡片、可展开日志行与分页；失败行红色标记，详情展示请求 ID、起止时间、HTTP 状态与 token 明细。打开标签页只读取一次日志与统计。新增 Go 用例覆盖 `q` 的大小写不敏感匹配、无匹配、控制字符与超长拒绝；Node 用例覆盖搜索参数、结果筛选映射、自动读取一次、展开状态与格式化。Go／Node 全量通过。
 - `0.4.8` 改版控制台账户列表：暂停账户按 `/status` 的 `quota_paused` 自动排到末尾并用红色卡片显示，不需要先查询额度；列表每页 10 个账户，支持翻页、按名称或 ID 搜索、点击暂停徽标跳转；额度详情默认折叠，行内摘要显示钱包余额与各窗口使用率/重置时间。新增 Node 用例覆盖排序、跳过暂停账户的自动查询、分页、搜索、详情展开状态和摘要；Go／Node 全量通过。
 - `0.4.7` 新增额度耗尽自动暂停（默认开启）及思考强度映射；暂停信号、人工停用保护、解除修订和旧文件回放由 Go／Node、独立复核及两套隔离宿主覆盖。CPA 原生界面的重复停用仍无法可靠归因是已知限制。思考映射按模型配置、默认关闭；未配置映射时请求体与 `0.4.4` 完全一致。2026-11-06 生产上线后已观察到真实结构化额度耗尽事件，自动复查恢复仍待生产到期窗口验证。
 
@@ -257,7 +259,7 @@ plugins:
 ## 发布 tag
 
 - 发布 tag 使用 `open-design-vX.Y.Z` 形式，不创建或覆盖上游 `v*` tag；不使用或复用不安全的 `open-design-v0.4.6`。
-- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对，三者必须同步（`0.4.8`）。
+- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对，三者必须同步（`0.4.9`）。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本。
 - `open-design-v0.4.7` 已发布并标记 Latest，五平台构建全绿（[release run 42167937013](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42167937013)）；`open-design-v0.4.4` 已从 draft 转为正式 Release。`0.4.5` 与 `0.4.6` 的发布运行未产出可用资产，`0.4.6` 禁止使用；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release。分支与生产交付状态见验证记录。
 

@@ -2,7 +2,7 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.7`，本开发分支源码版本为 `0.4.8`（控制台账户列表暂停置底、额度摘要、分页与搜索；额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.7`，本开发分支源码版本为 `0.4.9`（请求日志页改版：搜索、筛选、统计卡片、可展开行与分页；额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
@@ -11,6 +11,8 @@
 > **`0.4.6` tag 不得使用。** 该版本的暂停恢复路径会覆盖旧文件与人工停用状态，发布工作流失败且未生成 Release。`0.4.7` 已修复旧文件回放、解除修订、插件控制台人工停用保护与 Windows 粗时钟复查误判，通过独立复核、两套隔离宿主验收和五平台 Release 构建，并已于 2026-11-06 完成生产升级。CPA 原生界面的停用仍无法可靠归因（已知限制）：暂停期间请在插件控制台启停账户。
 
 ## 功能
+
+`0.4.9` 改版控制台「请求日志」页：顶部工具栏支持按模型／上游模型／错误类型／请求 ID 的自由文本搜索，结果筛选（全部／成功／失败／本地拒绝）、按账户筛选与每页条数；汇总统计改为四张卡片（总请求、成功率、Token 总量、上游已尝试），模型分布折叠展示；日志行按时间、模型／上游、思考强度、结果、账户、耗时、用量排列，点击展开请求 ID、起止时间、HTTP 状态与 token 明细，失败行红色标记；底部分页显示「第 X / Y 页」。打开日志页只读取一次日志与统计，之后仅在点「刷新」或切换筛选时请求；后端 `request-logs` 新增 `q` 自由文本筛选，仍只匹配元数据字段，列表依旧不返回正文、headers、query 或任何密钥。
 
 `0.4.8` 重新整理控制台账户列表：额度暂停账户自动排到列表末尾，显示红色卡片、`额度耗尽 · 自动暂停` 徽标与本机恢复倒计时，不需要先查询额度；每页默认 10 个账户并支持翻页、按名称或 ID 搜索、点击暂停徽标跳到暂停账户；额度详情默认折叠，列表行直接显示钱包余额与各窗口使用率/重置时间摘要，减少页面长度并提高信息密度。
 
@@ -106,7 +108,8 @@ GitHub 最新 Release 为 `open-design-v0.4.7`，已发布并标记 Latest，五
 - 写入为异步：25ms 合并持久化，失败后 2 秒重试；`plugin.quiesce`／`plugin.shutdown` 会先取消延迟任务再同步 flush。
 - 清空日志是持久化操作：先写入 clear tombstone（含保留策略），再更新内存，因此崩溃恢复后旧日志不会复活。
 - usage 字段可为 `null`：响应没有出现对应 usage 时保持未知，不写成 0。
-- 统计给出总数、成功／失败、流式、成功率、token 汇总、带／不带 usage 的数量、上游已尝试与**本地拒绝**数，并按模型聚合。`attempted=yes|no` 可筛选两类请求。
+- 统计给出总数、成功／失败、流式、成功率、token 汇总、带／不带 usage 的数量、上游已尝试与**本地拒绝**数，并按模型聚合。`attempted=yes|no` 可筛选两类请求；`q` 是大小写不敏感的自由文本筛选，只匹配客户端／上游模型、账户 ID、请求 ID 与错误类型，最长 128 字节且拒绝控制字符。
+- 控制台打开「请求日志」标签页时读取一次日志与统计，之后只在点击刷新或切换筛选／分页时请求；日志行只展示元数据，展开详情也不会请求正文。
 
 ### 官方模型覆盖
 
@@ -155,7 +158,7 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 3. 点击账户的“获取模型”，搜索、勾选模型并保存映射；已有别名会保留，新增别名默认加 `open-design-` 前缀。
 4. 在客户端填入 CPA 的 API 地址和 CPA 客户端 API key，使用已保存的客户端模型名调用 `/v1/chat/completions`。
 5. 如需额度，在新增或编辑账户时展开可选额度配置：同一账号的 control Key 用于查钱包，再填 Workspace ID 可查套餐窗口。打开「凭据 · 额度」会按账户顺序自动查询一次（也可点该账户的「刷新额度」重查）；两项都留空可照常推理。查询和趋势估算不改变账号启停或调度。
-6. 如需排查请求，在「请求日志」标签页手动刷新元数据列表或读取统计；如需按模型看官方覆盖，在「模型映射 · 覆盖」里对单个模型点「检查覆盖」；如需发一次小型真实请求，在同一页点「发送测试」并确认。三者都不会自动触发。
+6. 如需排查请求，打开「请求日志」标签页会读取一次元数据列表与统计，之后用搜索／结果／账户筛选或点「刷新」再次请求；如需按模型看官方覆盖，在「模型映射 · 覆盖」里对单个模型点「检查覆盖」；如需发一次小型真实请求，在同一页点「发送测试」并确认。覆盖检查与测试请求都不会自动触发。
 
 管理页需要 CPA 管理认证。插件数据目录默认为 `plugins/open-design-data`，可通过 `data_dir` 修改；容器部署请持久化插件目录、CPA 的 `auth-dir` 和该数据目录（请求日志快照与 journal 也在其中）。
 
@@ -175,7 +178,7 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 | `POST /v0/management/open-design/quota-pause/resume` | 显式解除指定账户的插件额度暂停，body 为 `{credential_id}`；不验证余额 |
 | `POST /v0/management/open-design/quota-pause/recheck` | 对暂停账户立即发起官方复查，body 为 `{credential_id}` |
 | `GET` / `POST /v0/management/open-design/models/reasoning` | 读取或保存每个模型的思考强度映射 |
-| `GET /v0/management/open-design/request-logs` | 分页读取元数据日志，支持 `limit`、`offset`、`status`、`model`、`credential_id`、`attempted`、`since`、`until` |
+| `GET /v0/management/open-design/request-logs` | 分页读取元数据日志，支持 `limit`、`offset`、`status`、`model`、`q`、`credential_id`、`attempted`、`since`、`until` |
 | `GET /v0/management/open-design/request-stats` | 读取汇总统计（含本地拒绝数） |
 | `DELETE /v0/management/open-design/request-logs` | 持久化清空日志（也接受 `POST /request-logs/clear`） |
 | `GET` / `POST /v0/management/open-design/config` | 读取或修改请求日志开关、保留天数与条数上限，以及 `pause.enabled`／`pause.max_seconds` |

@@ -978,6 +978,7 @@ type requestLogFilter struct {
 	model      string
 	credential string
 	attempted  string
+	search     string
 	since      *time.Time
 	until      *time.Time
 }
@@ -998,6 +999,9 @@ func (f requestLogFilter) matches(entry RequestLogEntry) bool {
 	if f.attempted == "no" && (entry.UpstreamAttempted == nil || *entry.UpstreamAttempted) {
 		return false
 	}
+	if f.search != "" && !requestLogMatchesSearch(entry, f.search) {
+		return false
+	}
 	if f.since != nil && entry.StartedAt.Before(*f.since) {
 		return false
 	}
@@ -1005,6 +1009,22 @@ func (f requestLogFilter) matches(entry RequestLogEntry) bool {
 		return false
 	}
 	return true
+}
+
+// requestLogMatchesSearch implements the console's free-text filter over safe
+// metadata fields. The needle is already lowercased and length-checked by the
+// query parser; the haystacks are bounded at record time.
+func requestLogMatchesSearch(entry RequestLogEntry, needle string) bool {
+	fields := []string{entry.Model, entry.UpstreamModel, entry.CredentialID, entry.RequestID}
+	if entry.ErrorKind != nil {
+		fields = append(fields, *entry.ErrorKind)
+	}
+	for _, field := range fields {
+		if field != "" && strings.Contains(strings.ToLower(field), needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *requestLogStore) query(filter requestLogFilter) ([]RequestLogEntry, int, map[string]any) {
@@ -1543,6 +1563,12 @@ func parseRequestLogQuery(query url.Values) (requestLogFilter, error) {
 		filter.attempted = attempted
 	default:
 		return filter, fail(http.StatusBadRequest, "attempted must be yes, no or all")
+	}
+	if search := value("q"); search != "" {
+		if len(search) > 128 || strings.IndexFunc(search, unicode.IsControl) >= 0 {
+			return filter, fail(http.StatusBadRequest, "invalid q filter")
+		}
+		filter.search = strings.ToLower(search)
 	}
 	if raw := value("since"); raw != "" {
 		parsed, err := parseRequestLogTime(raw)

@@ -409,3 +409,53 @@ func TestRequestLogAttemptedStatsAndFilteringPreserveLegacyNil(t *testing.T) {
 		t.Fatalf("invalid attempted filter status = %d body = %s", status, raw)
 	}
 }
+
+func TestRequestLogSearchMatchesSafeMetadataCaseInsensitively(t *testing.T) {
+	s, _ := newTestService(t)
+	now := time.Now().UTC()
+	attempted := true
+	quotaKind := "insufficient_balance"
+	for _, entry := range []RequestLogEntry{
+		{ID: "req-alpha", StartedAt: now, FinishedAt: now, Status: "success", Model: "od-flash", UpstreamModel: "deepseek-v4.1-flash", CredentialID: "cred-main", RequestID: "chatcmpl-ABC", UpstreamAttempted: &attempted},
+		{ID: "req-beta", StartedAt: now, FinishedAt: now, Status: "error", Model: "od-pro", ErrorKind: &quotaKind, UpstreamAttempted: &attempted},
+		{ID: "req-gamma", StartedAt: now, FinishedAt: now, Status: "success", Model: "other", UpstreamAttempted: &attempted},
+	} {
+		s.requestLogs.record(entry)
+	}
+	for needle, want := range map[string][]string{
+		"deepseek":         {"req-alpha"},
+		"CHATCMPl":         {"req-alpha"},
+		"cred-main":        {"req-alpha"},
+		"INSUFFICIENT":     {"req-beta"},
+		"od-":              {"req-alpha", "req-beta"},
+		"no-such-metadata": nil,
+	} {
+		status, body, raw := managementCall(t, s, http.MethodGet, apiBase+"/request-logs", map[string][]string{"q": {needle}}, nil)
+		if status != http.StatusOK {
+			t.Fatalf("search %q status = %d body = %s", needle, status, raw)
+		}
+		logs, _ := body["logs"].([]any)
+		got := make([]string, 0, len(logs))
+		for _, item := range logs {
+			got = append(got, item.(map[string]any)["id"].(string))
+		}
+		if len(got) != len(want) {
+			t.Fatalf("search %q ids = %#v, want %#v", needle, got, want)
+		}
+		found := map[string]bool{}
+		for _, id := range got {
+			found[id] = true
+		}
+		for _, id := range want {
+			if !found[id] {
+				t.Fatalf("search %q ids = %#v, want %#v", needle, got, want)
+			}
+		}
+	}
+	if status, _, raw := managementCall(t, s, http.MethodGet, apiBase+"/request-logs", map[string][]string{"q": {"bad\nneedle"}}, nil); status != http.StatusBadRequest {
+		t.Fatalf("control-character search status = %d body = %s", status, raw)
+	}
+	if status, _, raw := managementCall(t, s, http.MethodGet, apiBase+"/request-logs", map[string][]string{"q": {strings.Repeat("x", 129)}}, nil); status != http.StatusBadRequest {
+		t.Fatalf("over-length search status = %d body = %s", status, raw)
+	}
+}

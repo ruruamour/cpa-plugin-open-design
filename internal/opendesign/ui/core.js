@@ -602,6 +602,34 @@
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
 
+  // Dense log rows keep seconds but drop the date for today's entries, so the
+  // time column stays comparable while an older page still identifies its day.
+  function formatLogTime(value, now = Date.now()) {
+    const stamp = quotaTimestamp(value);
+    if (!stamp) return '';
+    const date = new Date(stamp);
+    const current = new Date(Number.isFinite(now) ? now : Date.now());
+    const pad = number => String(number).padStart(2, '0');
+    const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    if (date.toDateString() === current.toDateString()) return clock;
+    const day = `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    return date.getFullYear() === current.getFullYear() ? `${day} ${clock}` : `${date.getFullYear()}-${day} ${clock}`;
+  }
+
+  function formatLogDuration(ms) {
+    if (!Number.isSafeInteger(ms) || ms < 0) return '';
+    if (ms < 1000) return `${ms} ms`;
+    if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)} s`;
+    const seconds = Math.floor(ms / 1000);
+    return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+  }
+
+  function formatCount(value) {
+    const n = safeInteger(value);
+    if (n === null) return '';
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
   // Forecast copy follows the backend states. It is deliberately an estimate
   // based on recent consumption: no "N days left" promise and no pricing math.
   function forecastView(forecast) {
@@ -1219,6 +1247,9 @@
     formatUSD,
     formatDuration,
     formatTime,
+    formatLogTime,
+    formatLogDuration,
+    formatCount,
     forecastView,
     buildModelsPayload,
     buildModelsSaveBody,

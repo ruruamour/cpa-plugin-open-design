@@ -118,10 +118,13 @@
     modelCoverageGeneration: 0,
     modelCoverageRevisions: {},
     busy: false,
-    // Optional routes are opt-in: only an explicit operator action fills these.
-    // Switching tabs never triggers a request.
+    // Optional routes stay lazy: the credentials quota walk and the request-log
+    // first page are the only requests a tab activation can start. Everything
+    // else still needs its explicit button.
     activeTab: 'overview',
-    logQuery: { offset: 0, limit: 50, status: '', model: '', credentialID: '', attempted: '' },
+    logQuery: { offset: 0, limit: 50, status: '', search: '', credentialID: '', attempted: '' },
+    logExpanded: {},
+    logAutoLoaded: false,
     requestLogs: [],
     logPage: { loaded: false, total: 0, offset: 0, limit: 50, has_more: false, next_offset: null, retention: null },
     requestStats: null,
@@ -712,8 +715,10 @@
 
   // --- tabs ----------------------------------------------------------------
   //
-  // Switching a tab only toggles hidden/aria-selected. It never calls fetch, so
-  // opening the console or browsing sections cannot hit the optional routes.
+  // Switching a tab toggles hidden/aria-selected. The only implicit reads are
+  // the credentials quota walk and the request-log first page, both guarded by
+  // an authenticated management session; config, runtime and error rules stay
+  // behind their explicit buttons.
 
   const TABS = [
     { name: 'overview', button: 'tabOverview', panel: 'overviewPanel' },
@@ -749,6 +754,7 @@
     // response cannot start the next account after the operator moved on.
     if (target.name !== 'credentials') cancelQuotaAutoLoad();
     if (target.name === 'credentials') void autoLoadQuotaForAccounts();
+    if (target.name === 'logs') void autoLoadRequestLogs();
     return target.name;
   }
 
@@ -977,7 +983,9 @@
     state.reasoningGeneration += 1;
     state.serverModelsGeneration += 1;
     state.requestLogs = [];
-    state.logQuery = { offset: 0, limit: 50, status: '', model: '', credentialID: '', attempted: '' };
+    state.logQuery = { offset: 0, limit: 50, status: '', search: '', credentialID: '', attempted: '' };
+    state.logExpanded = {};
+    state.logAutoLoaded = false;
     state.logPage = { loaded: false, total: 0, offset: 0, limit: 50, has_more: false, next_offset: null, retention: null };
     state.requestStats = null;
     state.config = null;
@@ -990,10 +998,8 @@
     state.modelTestGeneration += 1;
     const status = $('logsFilterStatus');
     if (status) status.value = '';
-    const attempted = $('logsFilterAttempted');
-    if (attempted) attempted.value = '';
-    const model = $('logsFilterModel');
-    if (model) model.value = '';
+    const search = $('logsFilterSearch');
+    if (search) search.value = '';
     const credential = $('logsFilterCredential');
     if (credential) credential.value = '';
     const limit = $('logsFilterLimit');
@@ -2676,7 +2682,7 @@
 
   function syncOptionalBusyControls() {
     const logBusy = optionalLogBusy();
-    for (const id of ['refreshLogs', 'refreshStats', 'clearLogs', 'logsFilterStatus', 'logsFilterCredential', 'logsFilterModel', 'logsFilterAttempted', 'logsFilterLimit']) {
+    for (const id of ['refreshLogs', 'clearLogs', 'logsFilterSearch', 'logsFilterStatus', 'logsFilterCredential', 'logsFilterLimit']) {
       setDisabled(id, logBusy);
     }
     setDisabled('logsPrev', logBusy || state.logPage.offset <= 0);
@@ -2716,11 +2722,37 @@
     return status ? `请求失败（HTTP ${status}）：${formatError(error)}` : '请求失败，未连接到管理接口。';
   }
 
-  function logStatusLabel(status, failed) {
-    if (failed) return '失败';
-    if (status === 'success') return '成功';
-    if (status === 'error') return '失败';
-    return '未知';
+  // Error kinds are short machine identifiers from a closed set or from the
+  // upstream's own error code. Known ones get readable Chinese; anything else
+  // is shown verbatim, never as HTML.
+  const LOG_ERROR_KIND_LABELS = {
+    insufficient_balance: '额度耗尽',
+    invalid_api_key: 'Key 无效',
+    rate_limited: '上游限流',
+    rate_limit_exceeded: '上游限流',
+    upstream_transport_error: '上游网络失败',
+    upstream_protocol_error: '上游协议错误',
+    response_limit_exceeded: '响应超限',
+    host_contract_error: '宿主契约错误',
+    plugin_unavailable: '插件不可用',
+    model_not_enabled: '模型未启用',
+    request_canceled: '客户端取消',
+    count_tokens_unavailable: '不支持计数',
+  };
+
+  function logErrorKindLabel(kind) {
+    if (!kind) return '';
+    return LOG_ERROR_KIND_LABELS[kind] || kind;
+  }
+
+  // A local rejection never reached the upstream, so it gets its own label and
+  // tone; an error kind the console knows is promoted to the headline.
+  function logStatusInfo(record) {
+    if (record.upstream_attempted === false) return { label: '本地拒绝', tone: 'warn', error: false };
+    const failed = record.status === 'error' || (record.http_status !== null && record.http_status >= 400);
+    if (failed) return { label: logErrorKindLabel(record.error_kind) || '失败', tone: 'bad', error: true };
+    if (record.status === 'success') return { label: '成功', tone: 'good', error: false };
+    return { label: '未知', tone: '', error: false };
   }
 
   function credentialLabel(id) {
@@ -2728,124 +2760,208 @@
     return item ? item.label : (id || '未知账户');
   }
 
-  function logRow(record) {
-    const failed = record.status === 'error' || (record.http_status !== null && record.http_status >= 400);
-    const head = [el('span', {
-      className: `badge ${failed ? 'off' : 'on'}`,
-      text: logStatusLabel(record.status, failed),
-    })];
-    if (record.upstream_attempted === false) head.push(el('span', { className: 'badge', text: '本地拒绝' }));
-    if (record.http_status !== null && record.upstream_attempted !== false) head.push(el('span', { className: 'mono', text: `上游 HTTP ${record.http_status}` }));
-    if (record.stream) head.push(el('span', { className: 'badge', text: '流式' }));
-    const details = [];
-    if (record.model) details.push(`模型 ${record.model}`);
-    if (record.started_at) details.push(`时间 ${Core.formatTime(record.started_at) || record.started_at}`);
-    if (record.upstream_model && record.upstream_model !== record.model) details.push(`上游 ${record.upstream_model}`);
-    // Only the conversion is shown: an unmapped request is indistinguishable from
-    // one that never carried a strength, so the row stays quiet in both cases.
-    if (record.reasoning_mapping) {
-      details.push(`思考强度 ${Core.reasoningConversionText(record.reasoning_effort, record.reasoning_mapping)}`);
-    } else if (record.reasoning_effort) {
-      details.push(`思考强度 ${Core.reasoningLabel(record.reasoning_effort)}`);
-    }
-    details.push(`账户 ${credentialLabel(record.credential_id)}`);
-    if (record.duration_ms !== null) details.push(`耗时 ${record.duration_ms} ms`);
-    if (record.total_tokens !== null) details.push(`Token ${record.total_tokens}`);
-    else if (record.input_tokens !== null || record.output_tokens !== null) {
-      details.push(`Token ${record.input_tokens ?? '?'} / ${record.output_tokens ?? '?'}`);
-    }
-    if (record.error_kind) details.push(`错误 ${record.error_kind}`);
-    if (record.request_id) details.push(`请求 ${record.request_id}`);
-    return el('div', { className: 'log-row', attrs: { 'data-log-id': record.id } }, [
-      el('div', { className: 'log-head' }, head),
-      el('div', { className: 'log-detail', text: details.join(' · ') }),
+  function logReasoningText(record) {
+    // Only the conversion is shown when the plugin mapped it; otherwise an
+    // explicit strength is shown as passed through. A request without either
+    // stays quiet instead of claiming the upstream received nothing.
+    if (record.reasoning_mapping) return Core.reasoningConversionText(record.reasoning_effort, record.reasoning_mapping);
+    return record.reasoning_effort ? Core.reasoningLabel(record.reasoning_effort) : '';
+  }
+
+  function logDatum(label, value, options = {}) {
+    return el('div', {}, [
+      el('span', { className: 'log-datum-label', text: `${label} ` }),
+      el('span', {
+        className: `log-datum-value${options.error ? ' error' : ''}${options.mono ? ' mono' : ''}`,
+        text: value || '—',
+      }),
     ]);
+  }
+
+  function logRow(record) {
+    const info = logStatusInfo(record);
+    const local = record.upstream_attempted === false;
+    const reasoning = logReasoningText(record);
+    const duration = Core.formatLogDuration(record.duration_ms);
+    const tokens = record.total_tokens !== null
+      ? Core.formatCount(record.total_tokens)
+      : (record.input_tokens !== null || record.output_tokens !== null
+        ? `${Core.formatCount(record.input_tokens) || '?'} / ${Core.formatCount(record.output_tokens) || '?'}`
+        : '');
+    const http = record.http_status !== null && !local ? `HTTP ${record.http_status}` : '';
+    const cell = (label, content, sub) => el('div', { className: 'log-cell' }, [
+      el('span', { className: 'log-cell-label', text: `${label} ` }),
+      content,
+      sub ? el('span', { className: 'log-sub', text: sub }) : null,
+    ]);
+    const textCell = (label, value, options = {}) => cell(label, el('span', {
+      className: `log-primary${options.mono ? ' mono' : ''}`,
+      text: value || '—',
+      attrs: options.title ? { title: options.title } : null,
+    }), options.sub || '');
+    const upstreamModel = record.upstream_model && record.upstream_model !== record.model ? record.upstream_model : '';
+    const key = record.id || `${record.started_at}|${record.model}`;
+    const summary = el('summary', { className: 'log-main' }, [
+      textCell('时间', Core.formatLogTime(record.started_at) || record.started_at || '', { mono: true }),
+      textCell('模型 / 上游', record.model || '未知模型', {
+        mono: true,
+        title: upstreamModel || record.model,
+        sub: upstreamModel || '',
+      }),
+      reasoning ? textCell('思考强度', reasoning) : el('div', { className: 'log-cell' }),
+      cell('结果', el('span', { className: `badge ${info.tone}`, text: info.label }), [http, local ? '本地退避' : (record.stream ? '流式' : '非流式')].filter(Boolean).join(' · ')),
+      textCell('账户', credentialLabel(record.credential_id), { title: record.credential_id }),
+      textCell('耗时', duration || '', { mono: true }),
+      textCell('用量', tokens || '', { mono: true, sub: tokens && record.total_tokens !== null && (record.input_tokens !== null || record.output_tokens !== null)
+        ? `${Core.formatCount(record.input_tokens) || '?'} / ${Core.formatCount(record.output_tokens) || '?'}`
+        : '' }),
+      el('span', { className: 'log-chevron', text: '›' }),
+    ]);
+    const detail = el('div', { className: 'log-detail' }, [
+      el('div', { className: 'log-detail-grid' }, [
+        logDatum('请求 ID', record.request_id, { mono: true }),
+        logDatum('开始时间', Core.formatTime(record.started_at)),
+        logDatum('结束时间', Core.formatTime(record.finished_at)),
+        logDatum('耗时', duration),
+        logDatum('HTTP 状态', record.http_status !== null ? String(record.http_status) : ''),
+        logDatum('上游已尝试', record.upstream_attempted === null ? '未记录' : (record.upstream_attempted ? '是' : '否（本地拒绝）')),
+        logDatum('错误类型', record.error_kind, { mono: true, error: Boolean(record.error_kind) }),
+        reasoning ? logDatum('思考强度', reasoning) : null,
+        logDatum('输入 Token', Core.formatCount(record.input_tokens), { mono: true }),
+        logDatum('输出 Token', Core.formatCount(record.output_tokens), { mono: true }),
+        logDatum('账户 ID', record.credential_id, { mono: true }),
+      ]),
+    ]);
+    const entry = el('details', {
+      className: `log-entry${info.error ? ' failed' : ''}`,
+      attrs: { 'data-log-id': record.id },
+    }, [summary, detail]);
+    entry.open = state.logExpanded[key] === true;
+    entry.addEventListener('toggle', () => {
+      if (entry.open) state.logExpanded[key] = true;
+      else delete state.logExpanded[key];
+    });
+    return entry;
   }
 
   function renderRequestLogs() {
     const list = $('requestLogList');
     if (!list) return;
     if (!state.logPage.loaded) {
-      list.replaceChildren(el('p', { className: 'empty', text: '尚未读取。点「刷新日志」后才会请求 GET /request-logs。' }));
+      list.replaceChildren(el('p', {
+        className: 'empty',
+        text: optionalLogBusy() ? '正在读取请求日志…' : '尚未读取。打开本页或点「刷新」后读取。',
+      }));
     } else if (!state.requestLogs.length) {
-      list.replaceChildren(el('p', { className: 'empty', text: '没有匹配的请求日志。' }));
+      list.replaceChildren(el('p', { className: 'empty', text: '没有匹配的请求日志。调整搜索或筛选条件后重试。' }));
     } else {
       list.replaceChildren(...state.requestLogs.map(logRow));
     }
+    const count = $('logsCount');
+    if (count) count.textContent = state.logPage.loaded ? `共 ${state.logPage.total} 条` : '尚未读取';
     const info = $('logsPageInfo');
     if (info) {
       if (!state.logPage.loaded) info.textContent = '尚未读取日志。';
       else {
+        const limit = state.logPage.limit || 50;
+        const pages = Math.max(1, Math.ceil(state.logPage.total / limit));
+        const page = Math.min(pages, Math.floor(state.logPage.offset / limit) + 1);
         const start = state.logPage.total ? state.logPage.offset + 1 : 0;
         const end = state.logPage.offset + state.requestLogs.length;
-        info.textContent = `显示 ${start}-${end} / 共 ${state.logPage.total} 条`;
+        info.textContent = `第 ${page} / ${pages} 页 · 显示 ${start}-${end} / 共 ${state.logPage.total} 条`;
       }
     }
     setDisabled('logsPrev', optionalLogBusy() || state.logPage.offset <= 0);
     setDisabled('logsNext', optionalLogBusy() || !state.logPage.has_more);
   }
 
+  function statCard(label, value, note) {
+    return el('div', { className: 'fact stat' }, [
+      el('span', { className: 'fact-label', text: label }),
+      el('span', { className: 'fact-value', text: value }),
+      note ? el('span', { className: 'fact-note' }, note) : null,
+    ]);
+  }
+
   function renderRequestStats() {
     const container = $('requestStats');
     const models = $('requestStatsModels');
+    const panel = $('requestStatsModelsPanel');
     const stats = state.requestStats;
     if (!container) return;
     if (!stats) {
-      container.replaceChildren(el('p', { className: 'empty', text: '点「读取统计」后才会请求 GET /request-stats。' }));
+      container.replaceChildren(el('p', { className: 'empty', text: '尚未读取统计。打开本页或点「刷新」后读取。' }));
       if (models) models.replaceChildren();
+      if (panel) panel.hidden = true;
       return;
     }
-    const facts = [
-      { label: '总请求', value: String(stats.total) },
-      { label: '成功', value: String(stats.success) },
-      { label: '失败', value: String(stats.failed) },
-      { label: '流式', value: String(stats.streams) },
-    ];
     const rate = Core.formatRatio(stats.success_rate);
-    if (rate) facts.push({ label: '成功率', value: rate });
-    if (stats.tokens.total !== null) facts.push({ label: 'Token 总量', value: String(stats.tokens.total) });
-    if (stats.tokens.input !== null) facts.push({ label: '输入 Token', value: String(stats.tokens.input) });
-    if (stats.tokens.output !== null) facts.push({ label: '输出 Token', value: String(stats.tokens.output) });
-    facts.push({ label: '有 usage 的请求', value: String(stats.tokens.requests_with_usage) });
-    facts.push({ label: '上游已尝试', value: String(stats.upstream_attempted) });
-    facts.push({ label: '本地拒绝', value: String(stats.local_rejected) });
-    facts.push({ label: '无 usage 的请求', value: String(stats.tokens.requests_without_usage) });
+    const totalTokens = Core.formatCount(stats.tokens.total);
+    const inputTokens = Core.formatCount(stats.tokens.input) || '—';
+    const outputTokens = Core.formatCount(stats.tokens.output) || '—';
+    const cards = [
+      statCard('总请求', String(stats.total), [
+        el('span', { text: `成功 ${stats.success} · 失败 ${stats.failed}` }),
+      ]),
+      statCard('成功率', rate || '—', [
+        el('span', { text: `流式 ${stats.streams} 次` }),
+      ]),
+      statCard('Token 总量', totalTokens || '—', [
+        el('span', { text: `输入 Token ${inputTokens} · 输出 Token ${outputTokens}` }),
+      ]),
+      statCard('上游已尝试', String(stats.upstream_attempted), [
+        el('span', { text: `本地拒绝 ${stats.local_rejected}` }),
+      ]),
+    ];
     const scope = retentionScopeText(stats.retention);
-    if (scope) facts.push({ label: '统计范围', value: scope });
-    renderFacts(container, facts);
-    if (!models) return;
-    if (!stats.models.length) {
-      models.replaceChildren(el('p', { className: 'empty', text: '统计范围内没有按模型聚合的数据。' }));
-      return;
+    if (scope) {
+      cards.push(el('div', { className: 'stats-scope', text: `有 usage 的请求 ${stats.tokens.requests_with_usage} · 无 usage 的请求 ${stats.tokens.requests_without_usage} · ${scope}` }));
     }
-    models.replaceChildren(...stats.models.map(item => {
-      const parts = [`共 ${item.total} 次`, `成功 ${item.success}`, `失败 ${item.failed}`,
-        `上游已尝试 ${item.upstream_attempted}`, `本地拒绝 ${item.local_rejected}`];
-      if (item.total_tokens !== null) parts.push(`Token ${item.total_tokens}`);
-      return el('div', { className: 'row', attrs: { 'data-stats-model': item.model } }, [
-        el('div', { className: 'row-main' }, [
-          el('span', { className: 'name mono', text: item.model }),
-          el('span', { className: `badge ${item.failed ? 'warn' : 'good'}`, text: item.failed ? '有失败' : '全部成功' }),
-        ]),
-        el('div', { className: 'row-detail hint', text: parts.join(' · ') }),
-      ]);
-    }));
+    container.replaceChildren(...cards);
+    if (models) {
+      if (!stats.models.length) {
+        models.replaceChildren(el('p', { className: 'empty', text: '统计范围内没有按模型聚合的数据。' }));
+      } else {
+        models.replaceChildren(...stats.models.map(item => {
+          const parts = [`共 ${item.total} 次`, `成功 ${item.success}`, `失败 ${item.failed}`,
+            `上游已尝试 ${item.upstream_attempted}`, `本地拒绝 ${item.local_rejected}`];
+          if (item.total_tokens !== null) parts.push(`Token ${Core.formatCount(item.total_tokens)}`);
+          return el('div', { className: 'row', attrs: { 'data-stats-model': item.model } }, [
+            el('div', { className: 'row-main' }, [
+              el('span', { className: 'name mono', text: item.model }),
+              el('span', { className: `badge ${item.failed ? 'warn' : 'good'}`, text: item.failed ? '有失败' : '全部成功' }),
+            ]),
+            el('div', { className: 'row-detail hint', text: parts.join(' · ') }),
+          ]);
+        }));
+      }
+    }
+    if (panel) panel.hidden = false;
+    const summary = $('requestStatsModelsSummary');
+    if (summary) summary.textContent = `按模型分布（${stats.models.length}）`;
   }
 
   function readLogQuery() {
-    const status = $('logsFilterStatus');
-    const model = $('logsFilterModel');
+    const result = $('logsFilterStatus');
+    const search = $('logsFilterSearch');
     const credential = $('logsFilterCredential');
-    const attempted = $('logsFilterAttempted');
     const limit = $('logsFilterLimit');
     const parsedLimit = limit ? Number(limit.value) : 50;
+    // The visible result selector folds the old status/attempted pair into one
+    // control: "本地拒绝" means the request never reached the upstream.
+    const value = result ? result.value : '';
+    const status = value === 'success' || value === 'error' ? value : '';
+    const attempted = value === 'local' ? 'no' : '';
+    const searchText = search
+      ? search.value.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 128)
+      : '';
     return {
       offset: state.logQuery.offset,
       limit: [25, 50, 100].includes(parsedLimit) ? parsedLimit : 50,
-      status: status ? status.value : '',
-      model: model ? model.value.trim() : '',
+      status,
+      search: searchText,
       credentialID: credential ? credential.value : '',
-      attempted: attempted ? attempted.value : '',
+      attempted,
     };
   }
 
@@ -2860,10 +2976,14 @@
       if (limit) limit.value = String(query.limit);
     }
     state.logQuery = { ...query };
+    // A different page or filter set starts a new result list; keeping the old
+    // expansion map would only leave stale keys behind.
+    if (options.reset === true || query.offset !== state.logPage.offset) state.logExpanded = {};
     const generation = state.optionalGeneration;
     const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('logs', true);
     message('logsState', '正在读取请求日志…');
+    renderRequestLogs();
     const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
       const raw = await api().requestLogs(query);
@@ -2921,31 +3041,50 @@
     loadRequestLogs({ offset: Math.max(0, state.logPage.offset - state.logPage.limit) });
   }
 
-  async function loadRequestStats() {
+  async function loadRequestStats(options = {}) {
+    const silent = options.silent === true;
     if (optionalLogBusy()) return;
     const generation = state.optionalGeneration;
     const sessionGeneration = state.sessionGeneration;
     setOptionalBusy('stats', true);
-    message('logsState', '正在读取请求统计…');
+    if (!silent) message('logsState', '正在读取请求统计…');
     const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
       const raw = await api().requestStats();
       if (!stillCurrent()) return;
       state.requestStats = Core.normalizeRequestStats(raw);
       renderRequestStats();
-      message('logsState', '统计已更新。');
+      if (!silent) message('logsState', '统计已更新。');
     } catch (error) {
       if (!stillCurrent()) return;
       if (optionalAuthFailure(error)) return;
       state.requestStats = null;
       renderRequestStats();
-      message('logsState', optionalErrorText(error), 'error');
+      if (!silent) message('logsState', optionalErrorText(error), 'error');
     } finally {
       if (stillCurrent()) {
         setOptionalBusy('stats', false);
         renderRequestLogs();
       }
     }
+  }
+
+  // One refresh button reads both the page and its summary card. Stats stay
+  // silent here so the log-page message (with its counts) is what the operator
+  // sees; a stats failure still empties the cards but does not mask the list.
+  async function refreshRequestLogs() {
+    if (optionalLogBusy()) return;
+    await loadRequestLogs({ reset: true });
+    if (!state.verified || optionalLogBusy()) return;
+    await loadRequestStats({ silent: true });
+  }
+
+  // Opening the logs tab reads one page and the summary once per session. The
+  // buttons and filter changes remain explicit for every later read.
+  async function autoLoadRequestLogs() {
+    if (!state.verified || state.logAutoLoaded || optionalLogBusy()) return;
+    state.logAutoLoaded = true;
+    await refreshRequestLogs();
   }
 
   async function clearRequestLogs() {
@@ -2961,6 +3100,7 @@
       if (!stillCurrent()) return;
       state.requestLogs = [];
       state.requestStats = null;
+      state.logExpanded = {};
       state.logPage = { ...state.logPage, loaded: true, total: 0, offset: 0, has_more: false, next_offset: null };
       state.logQuery = { ...state.logQuery, offset: 0 };
       renderRequestLogs();
@@ -4353,9 +4493,7 @@
       tab.addEventListener('keydown', handleTabKey);
     }
     const refreshLogs = $('refreshLogs');
-    if (refreshLogs) refreshLogs.addEventListener('click', () => loadRequestLogs({ reset: true }));
-    const refreshStats = $('refreshStats');
-    if (refreshStats) refreshStats.addEventListener('click', loadRequestStats);
+    if (refreshLogs) refreshLogs.addEventListener('click', refreshRequestLogs);
     const clearLogs = $('clearLogs');
     if (clearLogs) clearLogs.addEventListener('click', clearRequestLogs);
     const themeToggle = $('themeToggle');
@@ -4368,15 +4506,15 @@
     if (logsFilterStatus) logsFilterStatus.addEventListener('change', () => loadRequestLogs({ reset: true }));
     const logsFilterCredential = $('logsFilterCredential');
     if (logsFilterCredential) logsFilterCredential.addEventListener('change', () => loadRequestLogs({ reset: true }));
-    const logsFilterModel = $('logsFilterModel');
-    if (logsFilterModel) {
-      logsFilterModel.addEventListener('change', () => loadRequestLogs({ reset: true }));
-      logsFilterModel.addEventListener('keydown', event => {
-        if (event.key === 'Enter') loadRequestLogs({ reset: true });
+    const logsFilterSearch = $('logsFilterSearch');
+    if (logsFilterSearch) {
+      logsFilterSearch.addEventListener('change', () => loadRequestLogs({ reset: true }));
+      logsFilterSearch.addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        if (typeof event.preventDefault === 'function') event.preventDefault();
+        loadRequestLogs({ reset: true });
       });
     }
-    const logsFilterAttempted = $('logsFilterAttempted');
-    if (logsFilterAttempted) logsFilterAttempted.addEventListener('change', () => loadRequestLogs({ reset: true }));
     const logsFilterLimit = $('logsFilterLimit');
     if (logsFilterLimit) logsFilterLimit.addEventListener('change', () => loadRequestLogs({ reset: true }));
     const loadConfigButton = $('loadConfig');
@@ -4584,6 +4722,8 @@
       handleTabKey,
       loadRequestLogs,
       loadRequestStats,
+      refreshRequestLogs,
+      autoLoadRequestLogs,
       clearRequestLogs,
       nextLogsPage,
       previousLogsPage,
