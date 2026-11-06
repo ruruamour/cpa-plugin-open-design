@@ -6461,7 +6461,7 @@ function pausedCredential(id, label = id, resumeInMs = 3600_000) {
   };
 }
 
-test('额度暂停账户自动排到列表末尾并以红色卡片显示，自动查询跳过暂停账户', async () => {
+test('额度暂停账户自动排到列表末尾并以红色卡片显示，且仍能读取额度', async () => {
   const credentials = [
     activeCredential('active-1', '正常一'),
     pausedCredential('paused-1', '暂停一'),
@@ -6489,10 +6489,38 @@ test('额度暂停账户自动排到列表末尾并以红色卡片显示，自�
     '渲染暂停排序本身不得触发额度查询');
 
   consoleApi.handlers.activateTab('credentials');
-  await new Promise(resolve => setTimeout(resolve, 30));
+  await new Promise(resolve => setTimeout(resolve, 40));
   const queried = calls.filter(call => call.url.includes('/quota'))
     .map(call => new URL(call.url, 'https://cpa.example').searchParams.get('credential_id'));
-  assert.deepEqual(queried, ['active-1', 'active-2'], '自动额度查询必须跳过已暂停账户');
+  assert.deepEqual(queried, ['active-1', 'active-2', 'paused-1', 'paused-2'],
+    '额度查询覆盖包括暂停账户在内的全部已配置账户，正常账户优先');
+  const pausedRow = [...view.document.getElementById('accountList').children]
+    .find(row => row.getAttribute('data-credential-id') === 'paused-1');
+  assert.match(pausedRow.textContent, /\$12\.345/, '暂停账户仍显示钱包余额');
+  assert.match(pausedRow.textContent, /剩余 800/, '暂停账户仍显示窗口剩余额度');
+});
+
+test('额度读取失败或未配置时，暂停卡片仍给出明确状态', async () => {
+  const credentials = [
+    { ...pausedCredential('paused-nokey', '无授权'), billing_configured: false },
+    pausedCredential('paused-fail', '查询失败'),
+  ];
+  const { view, consoleApi } = quotaPage(async url => {
+    if (url.includes('/quota')) return respond(200, quotaContract({
+      state: 'error',
+      wallet: { state: 'error', data: null, error: { kind: 'unauthorized', message: 'control key 未获官方接受' } },
+      funding: { state: 'not_requested', data: null, error: null },
+    }));
+    return respond(404, { error: 'not found' });
+  }, credentials);
+
+  const rows = () => [...view.document.getElementById('accountList').children];
+  const byId = id => rows().find(row => row.getAttribute('data-credential-id') === id);
+  assert.match(byId('paused-nokey').textContent, /未配置额度查询/, '未配置授权的暂停账户说明不能查询');
+  assert.match(byId('paused-nokey').textContent, /额度耗尽 · 自动暂停/, '缺少额度授权不影响暂停徽标');
+
+  await consoleApi.handlers.refreshQuota({ id: 'paused-fail', label: '查询失败', billing_configured: true, workspace_id: 'ws-1' });
+  assert.match(byId('paused-fail').textContent, /查询失败/, '查询失败的暂停账户显示失败而不是空白');
 });
 
 test('账户列表按每页 10 个翻页，暂停账户保持在各页末尾', () => {

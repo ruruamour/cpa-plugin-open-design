@@ -1684,18 +1684,28 @@
     const generation = (state.quotaAutoGeneration += 1);
     state.quotaAutoRunning = true;
     try {
-      for (const item of state.status.credentials.slice()) {
+      // A paused account may still have a snapshot in memory, so a single walk
+      // covers every configured, enabled account: paused ones are queried last
+      // so the operator's normal accounts keep the first upstream call. A
+      // paused account with a known snapshot is skipped, because a fresh read
+      // would only return throttled.
+      const items = state.status.credentials.slice();
+      const ordered = [
+        ...items.filter(item => item && !item.quota_paused),
+        ...items.filter(item => item && item.quota_paused),
+      ];
+      for (const item of ordered) {
         if (generation !== state.quotaAutoGeneration) return;
-        // Paused accounts are already identified by /status; the automatic
-        // walk does not spend an upstream query on them. The details panel
-        // still offers a manual refresh.
-        if (!item || !item.billing_configured || item.disabled || item.quota_paused) continue;
+        if (!item || !item.billing_configured || item.disabled) continue;
         if (state.quotaBusy[item.id]) continue;
         // A snapshot still inside the 60s window would only come back throttled,
         // so the walk skips it instead of spending a request to learn nothing.
         const known = state.quotas[item.id];
         const next = known && known.next_refresh_at ? Date.parse(known.next_refresh_at) : NaN;
         if (!Number.isNaN(next) && next > Date.now()) continue;
+        // The pause badge keeps its own countdown, so a paused account without a
+        // snapshot is still readable; it still gets one read so its wallet and
+        // exhausted windows are visible instead of a blank card.
         await refreshQuota(item, { automatic: true });
       }
     } finally {
@@ -1756,8 +1766,11 @@
 
   function quotaSummary(item, quota) {
     if (!item.billing_configured) return [quotaSummaryText('额度', '未配置额度查询', '可在「编辑」中填写 controlKey')];
-    if (!quota && item.quota_paused) return [quotaSummaryText('额度', '暂停期间未自动查询', '展开详情可手动刷新')];
-    if (!quota) return [quotaSummaryText('额度', '尚未查询', '打开本页会按顺序查询一次')];
+    if (!quota) {
+      return [item.quota_paused
+        ? quotaSummaryText('额度', '正在查询…', '暂停不影响额度读取')
+        : quotaSummaryText('额度', '尚未查询', '打开本页会按顺序查询一次')];
+    }
     const parts = [];
     const wallet = quotaSummaryWallet(quota);
     if (wallet) parts.push(wallet);
