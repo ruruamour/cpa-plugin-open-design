@@ -4302,6 +4302,104 @@ test('a paused account offers 解除额度暂停 and never flips the disabled sw
   assert.ok(!calls.some(call => call.url.endsWith('/credentials')), 'resuming a pause must not toggle the account');
 });
 
+test('paused accounts sort after active ones by their recorded resume time', () => {
+  const at = hour => `2030-01-01T${String(hour).padStart(2, '0')}:00:00Z`;
+  const active = id => ({ id, label: id, disabled: false });
+  const paused = (id, resumeAt) => ({
+    id, label: id, disabled: false, quota_paused: true,
+    quota_pause: resumeAt ? { reason: 'quota_exhausted', resume_at: resumeAt } : {},
+  });
+  const view = fakePage();
+  const api = view.context.OpenDesignConsole;
+  api.render.applyStatus(statusBody({
+    credentials: [
+      active('active-a'),
+      paused('paused-late', at(9)),
+      active('active-b'),
+      paused('paused-early', at(2)),
+      paused('paused-unknown'),
+      paused('paused-tie-a', at(5)),
+      paused('paused-tie-b', at(5)),
+    ],
+  }));
+  const displayed = accountRows(view).map(row => row.getAttribute('data-credential-id'));
+  // Active accounts keep the operator's order; paused accounts follow, earliest
+  // resume first, an unusable deadline last, and exact ties stay stable.
+  assert.deepEqual(displayed, [
+    'active-a', 'active-b', 'paused-early', 'paused-tie-a', 'paused-tie-b',
+    'paused-late', 'paused-unknown',
+  ]);
+  // Display ordering is a view only: the status snapshot itself is never sorted.
+  assert.deepEqual([...api.state.status.credentials].map(item => item.id), [
+    'active-a', 'paused-late', 'active-b', 'paused-early', 'paused-unknown',
+    'paused-tie-a', 'paused-tie-b',
+  ]);
+});
+
+test('the account header sums remaining quota from active accounts only', () => {
+  const credentials = [
+    { id: 'active-a', label: 'A', disabled: false, quota_paused: false },
+    { id: 'active-b', label: 'B', disabled: false, quota_paused: false },
+    { id: 'paused-c', label: 'C', disabled: false, quota_paused: true, quota_pause: { resume_at: '2030-01-01T00:00:00Z' } },
+    { id: 'off-d', label: 'D', disabled: true },
+  ];
+  const view = fakePage();
+  const api = view.context.OpenDesignConsole;
+  const Core = view.context.OpenDesignCore;
+  const quota = (id, walletUSD, windows) => Core.normalizeQuota(quotaContract({
+    credential_id: id,
+    wallet: { state: 'available', data: { balanceUsd: walletUSD } },
+    funding: { state: 'available', data: { codingPlan: { windows } } },
+  }));
+  const window = (durationSeconds, remainingCredits) => ({ durationSeconds, remainingCredits });
+  const total = view.document.getElementById('accountQuotaTotal');
+  // Every account is either paused or manually disabled, so nothing is summed.
+  api.render.applyStatus(statusBody({ credentials: [credentials[2], credentials[3]] }));
+  assert.match(total.textContent, /暂无活动中账户/);
+  api.render.applyStatus(statusBody({ credentials }));
+  // Active accounts exist but no snapshot has arrived yet: report them as
+  // pending instead of showing a zero total.
+  assert.match(total.children[0].textContent, /正在按账户顺序查询额度…（活动 2 个账户）/);
+
+  api.state.quotas['active-a'] = quota('active-a', '12.34', [
+    window(18000, '800'), window(604800, '1234'),
+  ]);
+  // Paused and disabled snapshots exist but must never inflate the total.
+  api.state.quotas['paused-c'] = quota('paused-c', '999.00', [
+    window(18000, '5000'), window(604800, '5000'),
+  ]);
+  api.state.quotas['off-d'] = quota('off-d', '777.00', [
+    window(18000, '7000'), window(604800, '7000'),
+  ]);
+  api.render.renderAccounts();
+  const usageRows = node => [...node.children].filter(child => child.className === 'usage');
+  assert.match(total.children[0].textContent, /当前可用总额度（活动中 2 个账户）/);
+  assert.deepEqual(usageRows(total).map(node => ({
+    head: [...node.children[0].children].map(child => child.textContent),
+    sub: node.children[1].textContent,
+  })), [
+    { head: ['窗口 5 小时', '800'], sub: '1 个账户剩余 credits' },
+    { head: ['窗口 7 天', '1,234'], sub: '1 个账户剩余 credits' },
+    { head: ['钱包余额', '$12.34'], sub: '1 个账户' },
+  ]);
+  assert.equal(total.children[total.children.length - 1].textContent, '已查询 1 / 2 个账户 · 1 个待查询');
+
+  api.state.quotas['active-b'] = quota('active-b', '0.66', [
+    window(18000, '200'), window(604800, '66'),
+  ]);
+  api.render.renderAccounts();
+  assert.match(total.children[0].textContent, /当前可用总额度（活动中 2 个账户）/);
+  assert.deepEqual(usageRows(total).map(node => ({
+    head: [...node.children[0].children].map(child => child.textContent),
+    sub: node.children[1].textContent,
+  })), [
+    { head: ['窗口 5 小时', '1,000'], sub: '2 个账户剩余 credits' },
+    { head: ['窗口 7 天', '1,300'], sub: '2 个账户剩余 credits' },
+    { head: ['钱包余额', '$13.00'], sub: '2 个账户' },
+  ]);
+  assert.equal(total.children[total.children.length - 1].textContent, '已查询 2 / 2 个账户');
+});
+
 test('old-session quota actions cannot trigger a status refresh in a new session', async () => {
   for (const action of ['resumeQuotaPause', 'recheckQuotaPause']) {
     const pendingAction = deferred();

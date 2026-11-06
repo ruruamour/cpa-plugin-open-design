@@ -1347,8 +1347,17 @@
   const ACCOUNT_PAGE_SIZE = 10;
 
   // Paused accounts are a plugin-owned scheduling state, already present in the
-  // /status payload. Sorting them last needs no quota request, and keeps the
-  // operator's normal accounts at the top of the page.
+  // /status payload, so both the grouping and the ordering need no quota request.
+  // Active accounts keep the operator's own order; paused accounts follow, sorted
+  // by the recorded pause deadline (earliest recovery first) so the next account
+  // to come back is the first red row. A pause without a usable deadline keeps
+  // its original position after the dated ones.
+  function accountPauseResumeAt(item) {
+    const value = item && item.quota_pause ? item.quota_pause.resume_at : '';
+    const at = Date.parse(value || '');
+    return Number.isFinite(at) ? at : Infinity;
+  }
+
   function accountDisplayItems() {
     const query = state.accountSearch.trim().toLowerCase();
     const entries = state.status.credentials
@@ -1358,7 +1367,12 @@
         String(item.id || '').toLowerCase().includes(query));
     entries.sort((left, right) => {
       const paused = (left.item.quota_paused ? 1 : 0) - (right.item.quota_paused ? 1 : 0);
-      return paused || left.index - right.index;
+      if (paused) return paused;
+      if (!left.item.quota_paused) return left.index - right.index;
+      const leftAt = accountPauseResumeAt(left.item);
+      const rightAt = accountPauseResumeAt(right.item);
+      if (leftAt !== rightAt) return leftAt < rightAt ? -1 : 1;
+      return left.index - right.index;
     });
     return entries.map(entry => entry.item);
   }
@@ -1393,6 +1407,84 @@
     if (index < 0) return;
     state.accountPage = Math.floor(index / ACCOUNT_PAGE_SIZE) + 1;
     renderAccounts();
+  }
+
+  // Sum what the official quota snapshots already say. Only active accounts
+  // count: the operator enabled them and no quota pause is in effect. Credits
+  // are summed per window duration, because each window is a separate quota
+  // pool that the upstream fills independently; the wallet is summed separately.
+  // Accounts whose snapshot has not arrived yet are reported as pending instead
+  // of silently contributing zero.
+  function accountCreditValue(value) {
+    const raw = String(value == null ? '' : value).trim();
+    return /^[0-9]+$/.test(raw) ? BigInt(raw) : null;
+  }
+
+  function renderAccountQuotaTotal(items) {
+    const node = $('accountQuotaTotal');
+    if (!node) return;
+    const active = items.filter(item => item && !item.disabled && !item.quota_paused);
+    if (!active.length) {
+      node.replaceChildren(el('span', { className: 'hint', text: '当前可用总额度：暂无活动中账户。' }));
+      return;
+    }
+    const windows = new Map();
+    let queried = 0;
+    let walletCents = 0;
+    let wallets = 0;
+    for (const item of active) {
+      const quota = state.quotas[item.id];
+      if (!quota) continue;
+      queried += 1;
+      const wallet = quota.wallet || {};
+      if ((wallet.state === 'available' || wallet.state === 'stale') && wallet.data && wallet.data.balanceUsd) {
+        const balance = Number(wallet.data.balanceUsd);
+        if (Number.isFinite(balance)) {
+          walletCents += Math.round(balance * 100);
+          wallets += 1;
+        }
+      }
+      const plan = quota.funding && quota.funding.data ? quota.funding.data.codingPlan : null;
+      for (const window of plan && Array.isArray(plan.windows) ? plan.windows : []) {
+        const remaining = accountCreditValue(window.remainingCredits);
+        if (remaining === null || !window.durationSeconds) continue;
+        const entry = windows.get(window.durationSeconds) || { remaining: 0n, accounts: 0 };
+        entry.remaining += remaining;
+        entry.accounts += 1;
+        windows.set(window.durationSeconds, entry);
+      }
+    }
+    const parts = [];
+    for (const [duration, entry] of [...windows.entries()].sort((left, right) => left[0] - right[0])) {
+      parts.push(el('span', { className: 'usage' }, [
+        el('span', { className: 'usage-head' }, [
+          el('span', { className: 'usage-label', text: `窗口 ${Core.formatDuration(duration)}` }),
+          el('span', { className: 'usage-value', text: Core.formatCredits(String(entry.remaining)) }),
+        ]),
+        el('span', { className: 'usage-sub', text: `${entry.accounts} 个账户剩余 credits` }),
+      ]));
+    }
+    if (wallets) {
+      parts.push(el('span', { className: 'usage' }, [
+        el('span', { className: 'usage-head' }, [
+          el('span', { className: 'usage-label', text: '钱包余额' }),
+          el('span', { className: 'usage-value', text: `$${(walletCents / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` }),
+        ]),
+        el('span', { className: 'usage-sub', text: `${wallets} 个账户` }),
+      ]));
+    }
+    const pending = active.length - queried;
+    const head = parts.length
+      ? `当前可用总额度（活动中 ${active.length} 个账户）`
+      : `当前可用总额度：正在按账户顺序查询额度…（活动 ${active.length} 个账户）`;
+    node.replaceChildren(
+      el('span', { className: 'hint', text: head }),
+      ...parts,
+      el('span', {
+        className: 'hint',
+        text: parts.length ? `已查询 ${queried} / ${active.length} 个账户${pending ? ` · ${pending} 个待查询` : ''}` : '',
+      }),
+    );
   }
 
   function renderAccountRow(item) {
@@ -1463,6 +1555,7 @@
       pausedBadge.textContent = `${pausedCount} 个额度暂停`;
       pausedBadge.hidden = pausedCount === 0;
     }
+    renderAccountQuotaTotal(items);
     // The add/edit form stays collapsed until the operator opens it or clicks
     // an account's 编辑 action; a countdown re-render must not reopen it.
     const ordered = accountDisplayItems();

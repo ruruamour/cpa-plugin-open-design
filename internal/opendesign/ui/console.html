@@ -124,6 +124,9 @@
     .account-group-head { margin-top: 4px; padding: 2px 2px 0; color: var(--danger); font-size: 12.5px; font-weight: 700; }
     .account-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; }
     .account-tools .search { flex: 1 1 240px; width: auto; }
+    .account-total { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 20px; margin-top: 12px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
+    .account-total .hint { margin: 0; }
+    .account-total .usage { min-width: 130px; }
     .account-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 8px 16px; width: 100%; cursor: pointer; list-style: none; }
     .account-summary::-webkit-details-marker { display: none; }
     .usage { display: grid; gap: 3px; min-width: 0; align-content: start; }
@@ -414,6 +417,7 @@
         <input class="control search" id="accountSearch" type="search" autocomplete="off" spellcheck="false" placeholder="搜索账户名称或 ID">
         <span class="hint" id="accountFilterInfo"></span>
       </div>
+      <div class="account-total" id="accountQuotaTotal" role="status" aria-live="polite"></div>
       <div class="rows" id="accountList" aria-live="polite"></div>
       <div class="pager" id="accountPager" hidden>
         <span class="hint" id="accountPageInfo"></span>
