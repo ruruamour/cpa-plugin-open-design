@@ -1,5 +1,18 @@
 # OpenDesign 插件验证记录
 
+## 0.4.10 账户排序与活动额度汇总
+
+| 检查 | 结果与范围 |
+| --- | --- |
+| 暂停排序 | 账户列表先按 `quota_paused` 分组：活跃账户保持操作者顺序，暂停账户排在其后并按 `/status` 的 `quota_pause.resume_at` 升序排列；并列时保持原有相对顺序，无可用恢复时间者（`resume_at` 缺失或无法解析）排在最后。排序只读取 `/status`，不触发额度请求，也不修改状态快照本身。 |
+| 活动额度汇总 | 账户列表上方新增「当前可用总额度」，只统计 `disabled=false` 且 `quota_paused=false` 的账户：按 `durationSeconds` 分组汇总各窗口 `remainingCredits`（`BigInt` 精确求和），单独汇总钱包 `balanceUsd` 为两位小数美元；显示已查询／待查询账户数，尚未取得任何快照时显示正在查询提示，没有任何活动账户时显示「暂无活动中账户」。暂停与人工停用账户的快照不参与汇总。 |
+| Node 用例 | `tests/open-design-ui.test.cjs` 新增：活跃/暂停混合列表按 `resume_at` 升序（含并列、未知时间与活跃顺序不变、状态快照不被排序）、汇总排除暂停/停用账户、按窗口与钱包求和、待查询计数；全量 `node --test tests/*.test.cjs` 335/335 通过。 |
+| Go 与构建 | `go test ./...` 通过；`make smoke` 构建 `-buildmode=c-shared` 并运行本地 ABI 冒烟通过（假宿主＋本地假上游，不出网、不用真实 Key）。 |
+| 发布 | tag `open-design-v0.4.10`（提交 `d64ef976095c51ed2098601003943634e39d05e1`）。CI 运行 [42273191016](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42273191016) 成功；Release 运行 [42273570550](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42273570550) 前三次运行均因 GitHub 未分配 `macos-15` arm64 runner 而取消（每次排队约 15 分钟），第四次重跑取得 runner 后五平台与 `release` 作业全绿。五个资产 `sha256sum -c checksums.txt` 全部通过，`linux_amd64` 内 `.so` SHA256 `7814349a7a4e132db97c8a18636d73a9be3453438c003c42d345b63eb706106a` 与部署产物一致；draft 已转为正式 Release 并标记 Latest。 |
+| 生产升级 | 2026-11-06 由 ops 部署脚本升级 `nuoapi-net`：CI 产物 SHA256 `7814349a7a4e132db97c8a18636d73a9be3453438c003c42d345b63eb706106a`，本地 ABI 冒烟通过；备份 `/srv/cliproxy/_backups/open-design-20261106T190503Z`。部署后 `plugin_registered=true`、`effective_enabled=true`、`version=0.4.10`，`deploy_mode=hot_reload`、`service_pid_before/after=3656011`，未重启；`/proc/<pid>/maps` 中映射库哈希与产物一致，控制台页面含 `accountQuotaTotal` 与「当前可用总额度」。 |
+| 生产只读核验 | `/status` 返回 55 个凭据，其中 43 个额度暂停且都带可解析的 `resume_at`（最早 `2026-11-07T04:49:00Z`、最晚 `2026-11-07T18:52:57Z`），12 个活跃账户；排序数据完整。其余有效插件仍注册并启用，服务未重启。 |
+| 同内容部署更正 | `0.4.9` 时期的 `2026-11-06T143116Z` 备份清单曾把同内容重部署误记为 `hot_reload=true`：宿主 dlopen 的是内容寻址副本，`/plugins` 的选中路径在加载被拒绝时也会变化。已在备份目录追加 `manifest-correction.json` 说明，并在 ops 仓库改为校验 `/proc/<pid>/maps` 映射哈希；同内容重部署现在报告 `deploy_mode=already_loaded` 且跳过 PATCH。 |
+
 ## 0.4.9 控制台请求日志页改版
 
 | 检查 | 结果与范围 |
