@@ -19,4 +19,4 @@ jobs:
         env:
           CGO_ENABLED: '0'
         run: |
-          go test ./internal/opendesign -run 'TestQuotaRecovery|TestQuotaRecheck' -count=1 -v
+          go test ./internal/opendesign -run 'TestWindowsDiagRecoveryProof|TestQuotaRecoveryRequiresFreshEvidenceForAllModels' -count=1 -v
