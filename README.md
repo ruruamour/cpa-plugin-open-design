@@ -2,7 +2,7 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.10`，本开发分支源码版本为 `0.4.11`（暂停倒计时显示上游真实重置时间、额度可换算为美元、账户列表按暂停恢复时间排序与活动额度汇总；请求日志页改版：搜索、筛选、统计卡片、可展开行与分页；额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.11`（暂停倒计时显示上游真实重置时间、额度可换算为美元、账户列表按暂停恢复时间排序与活动额度汇总；请求日志页改版：搜索、筛选、统计卡片、可展开行与分页；额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
@@ -32,7 +32,7 @@
 
 `0.4.0` 于 2026-11-04 从提交 `e66497e` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台、错误规则同步和原有效插件核验通过。
 
-GitHub 最新 Release 为 `open-design-v0.4.10`，已发布并标记 Latest，五平台资产与 `checksums.txt` 齐全，并已于 2026-11-06 完成生产升级；`0.4.9`、`0.4.8` 同样已发布并完成生产升级。`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release，`0.4.1`～`0.4.4` 均已公开。`0.4.5`／`0.4.6` 的发布运行未产出可用资产，`0.4.6` 禁止使用。
+GitHub 最新 Release 为 `open-design-v0.4.11`，已发布并标记 Latest，五平台资产与 `checksums.txt` 齐全，并已于 2026-11-07 完成生产升级；`0.4.10`、`0.4.9`、`0.4.8` 同样已发布并完成生产升级。`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release，`0.4.1`～`0.4.4` 均已公开。`0.4.5`／`0.4.6` 的发布运行未产出可用资产，`0.4.6` 禁止使用。
 
 `0.3.0` 于 2026-11-03 从提交 `2601888` 的成功 CI 产物部署到 `nuoapi-net`；库哈希与本地验收库完全一致，服务、控制台和原有效插件核验通过。
 
@@ -171,7 +171,7 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 | 方法与路径 | 用途 |
 | --- | --- |
 | `GET /v0/management/open-design/credentials` | 列出账户（不回显 key） |
-| `POST /v0/management/open-design/credentials` | 创建或更新账户，body 为 `{id?, label?, api_key?, disabled?, control_key?, workspace_id?, clear_billing?}` |
+| `POST /v0/management/open-design/credentials` | 创建或更新账户，body 为 `{id?, label?, api_key?, disabled?, control_key?, workspace_id?, credits_per_usd?, clear_billing?}` |
 | `DELETE /v0/management/open-design/credentials?id=<id>` | 按查询参数删除账户 |
 | `GET /v0/management/open-design/status` | 插件状态与模型映射 |
 | `GET /v0/management/open-design/upstream-models` | 获取 OpenDesign `GET /models` 候选 |
@@ -240,7 +240,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 产物是 `dist/open-design.so`（Linux amd64，C shared ABI v1）。
 
-发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。源码 `Version`、`marketplace/registry.json` 与 `open-design-v0.4.7` tag 保持同步。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动"取最新"不适用于本 fork。
+发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。源码 `Version`、`marketplace/registry.json` 与 `open-design-v0.4.11` tag 保持同步。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动"取最新"不适用于本 fork。
 
 ## 当前验证边界
 

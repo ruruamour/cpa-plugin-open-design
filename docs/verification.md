@@ -1,5 +1,18 @@
 # OpenDesign 插件验证记录
 
+## 0.4.11 暂停真实重置提示与额度美元换算
+
+| 检查 | 结果与范围 |
+| --- | --- |
+| 上游重置提示 | 暂停记录新增 `estimate_at`：只取报错里的结构化重置提示（`reset_at` 等），钳制在 `blocked_at + 7 天` 内，不受 `pause.max_seconds` 缩短；早于暂停时间或缺失时不写入。已有暂停在新报错带来更晚提示时只延长展示时间，`resume_at`／`remaining_seconds` 仍是首次自动复查时间。自动复查节奏、解除条件与「等待复查」状态均未改变。 |
+| 每账户换算率 | 凭据新增可选 `credits_per_usd`（credits / $1），逐账户保存、可留空清除，非法值返回 `400 invalid credits_per_usd`；控制台在剩余 credits 旁显示 `≈ $N`，用 `BigInt` 按分四舍五入，未配置时只显示 credits，不从其他账户或共享默认值推断。 |
+| Go 用例 | `TestQuotaPauseViewKeepsTheRawResetHintSeparateFromTheReviewDeadline`：24h 复查上限下保留 7d 估计、超 7 天钳制、缺失提示不臆造。`TestCreditsPerUSDIsValidatedPerAccountAndNeverGuessed`：合法／非法值、逐账户隔离、空值清除与 400。`go test ./...` 通过。 |
+| Node 用例 | `tests/open-design-ui.test.cjs` 新增倒计时并列展示（复查时间与真实重置估计）、BigInt 换算与无换算率时的降级、账户标题与行内 `≈ $N` 展示；全量 `node --test tests/*.test.cjs` 338/338 通过。 |
+| 构建与冒烟 | `make test`（Node＋Go）与 `make smoke`（本地 ABI 冒烟，假宿主＋假上游）通过；ops 仓库部署模块 pytest 32/32 通过。 |
+| 发布 | tag `open-design-v0.4.11`（提交 `6bd7aadb0da9e8c3e99b72d7d3717f2d3b2823cd`）。CI 运行 [42340952831](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42340952831) 成功（58s）；Release 运行 [42341153176](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42341153176) 首次运行即五平台与 `release` 作业全绿。五个资产 `sha256sum -c checksums.txt` 全部通过，`linux_amd64` 内 `.so` SHA256 `bd71c56abb0501eb91bd60284d7ded9386bfc1ceda190e3abe334fbc32c3d5f2`；draft 已转为正式 Release 并标记 Latest。 |
+| 生产升级 | 2026-11-07 由 ops 部署脚本升级 `nuoapi-net`（ops 提交 `9a68363` 将 `EXPECTED_VERSION` 与模块 `VERSION` 同步为 `0.4.11`）：下载的 CI 产物 SHA256 `bd71c56abb0501eb91bd60284d7ded9386bfc1ceda190e3abe334fbc32c3d5f2`，本地 ABI 冒烟通过；备份 `/srv/cliproxy/_backups/open-design-20261107T050829Z`。部署后 `plugin_registered=true`、`effective_enabled=true`、`version=0.4.11`，`deploy_mode=hot_reload`、`hot_reload=true`、`service_pid_before/after=3656011`、`restarts_used=0`；宿主日志确认 `plugin hot reloaded active_version=0.4.11 retired_version=0.4.10`，`/proc/<pid>/maps` 中映射库哈希与产物一致。 |
+| 生产只读核验 | `/status` 返回 58 个凭据：46 个额度暂停（全部 `source=upstream`、`manual_disabled=false`、无人工停用冲突），12 个活跃；46 个暂停记录都带可解析的 `resume_at`（最早 `2026-11-07T04:49:00Z`、最晚 `2026-11-08T03:10:36Z`）。`estimate_at` 数为 0 符合预期——这些暂停建于 `0.4.11` 之前，只有新的额度耗尽观察才会写入该字段；`credits_per_usd` 尚未配置，控制台回退为只显示 credits。`/console` HTTP 200，标题为 `OpenDesign Bridge · 管理`，页面含 `accountCreditsPerUSD`、`credits_per_usd` 与 `accountQuotaTotal`。 |
+
 ## 0.4.10 账户排序与活动额度汇总
 
 | 检查 | 结果与范围 |
