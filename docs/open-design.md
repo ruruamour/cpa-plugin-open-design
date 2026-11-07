@@ -1,6 +1,6 @@
 # OpenDesign 插件说明
 
-本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`；生产版本为 `0.4.10`，本开发分支为 `0.4.10`（账户列表按暂停恢复时间排序、活动账户额度汇总；请求日志页搜索／筛选／统计／展开行／分页改版；额度耗尽自动暂停默认开启），`0.4.6` tag 不得使用。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射，并修复其快照一致性与控制台草稿问题；`0.4.7` 新增额度耗尽自动暂停。详见[验证记录](verification.md)。
+本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`；生产版本为 `0.4.10`，本开发分支为 `0.4.11`（暂停倒计时显示上游真实重置时间、额度可换算为美元；账户列表按暂停恢复时间排序、活动账户额度汇总；请求日志页搜索／筛选／统计／展开行／分页改版；额度耗尽自动暂停默认开启），`0.4.6` tag 不得使用。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射，并修复其快照一致性与控制台草稿问题；`0.4.7` 新增额度耗尽自动暂停。详见[验证记录](verification.md)。
 
 ## 范围
 
@@ -40,7 +40,7 @@ OpenDesign 生产接口：
 | 数据目录配置 | `data_dir` |
 
 - 推理 API key 与可选 control Key 保存在 CPA 的 `auth-dir`，通过 `host.auth.save` 写入；插件设置不保存 Key，管理接口不回显。
-- 管理接口按 CPA 精确路由契约提供：`GET /credentials` 列出账户；`POST /credentials` 创建或更新，body 为 `{id?, label?, api_key?, disabled?, control_key?, workspace_id?, clear_billing?}`；`DELETE /credentials?id=<id>` 按查询参数删除，不使用 `/credentials/{id}`。编辑时 Key 留空保留原值，`clear_billing:true` 显式清除额度授权和工作区。
+- 管理接口按 CPA 精确路由契约提供：`GET /credentials` 列出账户；`POST /credentials` 创建或更新，body 为 `{id?, label?, api_key?, disabled?, control_key?, workspace_id?, credits_per_usd?, clear_billing?}`；`DELETE /credentials?id=<id>` 按查询参数删除，不使用 `/credentials/{id}`。编辑时 Key 留空保留原值，`clear_billing:true` 显式清除额度授权和工作区。
 - 模型列表由管理页调用 OpenDesign `GET /models` 获取，支持搜索与可见项批量勾选。新增客户端别名默认以 `open-design-` 开头，已保存和手动编辑的别名保留。账户刷新不覆盖未保存的映射草稿。
 - 模型映射保存在插件数据目录；获取的上游模型列表不持久化。请求日志保存在同一数据目录（`request-logs.snapshot.json` 与 `request-logs.journal.jsonl`），只含元数据。容器部署时应持久化 CPA 插件目录、CPA 的 `auth-dir` 和该数据目录。
 - 管理页沿用 CPA 管理认证。手动输入的管理密钥按 CPA 管理页的现有方式处理，不写入 OpenDesign key 存储。
@@ -50,7 +50,7 @@ OpenDesign 生产接口：
 | 方法与路径 | 用途 |
 | --- | --- |
 | `GET /status` | 插件状态、模型映射与账户的额度暂停字段（含暂停同步失败提示；不含任何 key 或指纹） |
-| `GET` / `POST` / `DELETE /credentials` | 账户列表、创建或更新、删除 |
+| `GET` / `POST` / `DELETE /credentials` | 账户列表、创建或更新、删除（可选 `credits_per_usd` 每账户换算率） |
 | `GET /upstream-models` | 读取 OpenDesign `GET /models` 候选 |
 | `GET` / `POST /models` | 读取或保存模型映射 |
 | `POST /models/reasoning` | 保存单个模型的思考强度映射（完整替换） |
@@ -111,7 +111,7 @@ OpenDesign 生产接口：
 - 暂停状态保存在凭据 auth 文件里（`quota_block` 与 `quota_revision` 两个插件自有字段），参照 ClinePass 的 QuotaBlock 做法；写入时先读取、比对并重读，再原子替换文件，只改这两个键和 `disabled`，尽量保留未知字段。插件进程内写入串行化，但跨进程没有 CAS：宿主或运维在最后一次读取与替换之间并发写入仍可能被覆盖。
 - 插件通过 `AuthData.Disabled` 向宿主投影有效禁用状态；`quota_block.manual_disabled` 单独记录控制台操作员的选择。恢复只清除插件自己的暂停标记，不会把控制台停用（`manual_disabled=true`）的账户重新启用。CPA 原生界面的停用不经过该记录，仍可能被恢复路径覆盖。内存中的解除修订标记不跨进程重启；单进程写入是受支持的使用方式。
 - 触发信号很窄：`error.code=insufficient_balance` 且状态为 `402`，或者同一机器码出现在 `2xx` 响应体/SSE 事件中且 `error.details.coding_plan_exhausted=true`。裸 `402`、文本里的 `payment required`、普通 `429` 与普通 `insufficient_quota` 都不会触发账户级暂停。
-- 截止时间只取结构化的 reset 字段（`error.details.reset_at`／`resets_at`／`resetAt`／`resetsAt`，RFC3339，允许 `resets at ` 前缀）或 `Retry-After`；缺省 30 分钟，钳制在 1 分钟～7 天之间，并受配置的 `pause.max_seconds` 上限约束。没有新 reset 提示的迟到重复错误只更新观察时间；带新提示的会重算，但不会超过 `BlockedAt + pause.max_seconds`。
+- 截止时间只取结构化的 reset 字段（`error.details.reset_at`／`resets_at`／`resetAt`／`resetsAt`，RFC3339，允许 `resets at ` 前缀）或 `Retry-After`；缺省 30 分钟，钳制在 1 分钟～7 天之间，并受配置的 `pause.max_seconds` 上限约束。没有新 reset 提示的迟到重复错误只更新观察时间；带新提示的会重算，但不会超过 `BlockedAt + pause.max_seconds`。控制台另显示不受该上限约束的原始重置提示（`estimate_at`，钳制在 7 天内）：`resume_at`／`remaining_seconds` 仍是首次自动复查时间，`estimate_at` 只用于「预计 M 后恢复」的展示。
 - 到期本身不解除暂停；启用自动暂停时，后台按账号和模型串行请求官方预检。只接受最新耗尽观察之后发起、生成时间新鲜的结果；所有模型均为 `available`、Workspace 成员一致、无同 key 推理在途且凭据／版本未变时才解除。缓存、失败、未授权和不完整模型集合均不能证明恢复。
 - 复查读取一律新发官方请求：不复用 60 秒的模型级缓存/节流窗口，也不加入控制台已发起的那次查询。加入旧请求会拿到「复查开始前就已发出」的响应，永远不能作为恢复证明。若同模型已有查询在途，复查先等它结束再自己发一次；等待受本次复查预算约束。
 - 复查失败按 5 分钟起、每次翻倍、最长 30 分钟的退避重试，避免在数天的周额度窗口里反复打官方接口；手动复查不受退避限制。策略实际取值变化（含重注册时重新解码配置）才作废进行中的自动复查轮次，重复提交相同配置不会作废。
@@ -244,6 +244,7 @@ plugins:
 
 ## 当前验证边界
 
+- `0.4.11` 暂停倒计时与额度换算：暂停记录新增 `estimate_at`（上游报错里的原始重置时间，钳制在 7 天内，不随 `pause.max_seconds` 缩短），`GET /status` 与凭据响应的 `quota_pause` 会带上它；控制台倒计时显示「N 后复查 · 预计 M 后恢复」，复查节奏与到点后的「等待复查」状态不变。账户新增可选 `credits_per_usd`（每账户独立，可留空清除），控制台在剩余额度旁显示 `≈ $N`，用 BigInt 精确换算，未填写时只显示 credits。新增 Go 用例覆盖 estimate_at 的保留／钳制／缺失与换算率的逐账户校验与清除；Node 用例覆盖倒计时文案、BigInt 换算与汇总／行内显示；Go／Node 全量通过。
 - `0.4.10` 调整控制台账户列表：暂停账户在活跃账户之后按 `/status` 的 `quota_pause.resume_at` 升序排列（无可用恢复时间者排最后并保持原有相对顺序），活跃账户保持操作者顺序；列表上方新增「当前可用总额度」，只汇总启用且未暂停账户的窗口剩余 credits（按 `durationSeconds` 分组）与钱包美元余额，并显示已查询／待查询账户数。新增 Node 用例覆盖排序（含并列与未知时间）、总额排除暂停／停用账户、按窗口求和、钱包汇总与待查询提示；Go／Node 全量通过。
 - `0.4.9` 改版控制台「请求日志」页：新增自由文本搜索（后端 `q`，只匹配安全元数据字段）、结果／账户筛选、每页条数、四张统计卡片、可展开日志行与分页；失败行红色标记，详情展示请求 ID、起止时间、HTTP 状态与 token 明细。打开标签页只读取一次日志与统计。新增 Go 用例覆盖 `q` 的大小写不敏感匹配、无匹配、控制字符与超长拒绝；Node 用例覆盖搜索参数、结果筛选映射、自动读取一次、展开状态与格式化。Go／Node 全量通过。
 - `0.4.8` 改版控制台账户列表：暂停账户按 `/status` 的 `quota_paused` 自动排到末尾并用红色卡片显示，不需要先查询额度；列表每页 10 个账户，支持翻页、按名称或 ID 搜索、点击暂停徽标跳转；额度详情默认折叠，行内摘要显示钱包余额与各窗口使用率/重置时间。新增 Node 用例覆盖排序、跳过暂停账户的自动查询、分页、搜索、详情展开状态和摘要；Go／Node 全量通过。
@@ -260,7 +261,7 @@ plugins:
 ## 发布 tag
 
 - 发布 tag 使用 `open-design-vX.Y.Z` 形式，不创建或覆盖上游 `v*` tag；不使用或复用不安全的 `open-design-v0.4.6`。
-- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对，三者必须同步（`0.4.10`）。
+- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对，三者必须同步（`0.4.11`）。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本。
 - `open-design-v0.4.10` 已发布并标记 Latest，五平台构建全绿（[release run 42273570550](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42273570550)）；前三次运行因 GitHub 未分配 `macos-15` arm64 runner 被取消（各排队约 15 分钟），第四次重跑取得 runner 后完成。`open-design-v0.4.9` 已发布并标记 Latest，五平台构建全绿（[release run 42206328455](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42206328455)）；首次运行因 GitHub 未分配 `macos-15` arm64 runner 被取消两次（各排队 15 分钟），第三次重跑取得 runner 后完成。`open-design-v0.4.7` 已发布并标记 Latest，五平台构建全绿（[release run 42167937013](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42167937013)）；`open-design-v0.4.4` 已从 draft 转为正式 Release。`0.4.5` 与 `0.4.6` 的发布运行未产出可用资产，`0.4.6` 禁止使用；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release。分支与生产交付状态见验证记录。
 
