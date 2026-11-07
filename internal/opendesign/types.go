@@ -221,8 +221,14 @@ type Credential struct {
 	APIKey      string `json:"api_key"`
 	ControlKey  string `json:"control_key,omitempty"`
 	WorkspaceID string `json:"workspace_id,omitempty"`
-	Disabled    bool   `json:"disabled"`
-	BaseURL     string `json:"base_url,omitempty"`
+	// CreditsPerUSD is the decimal string the operator recorded for this
+	// account's plan: how many official credits one US dollar of usage is worth.
+	// It is presentation-only (the console shows an approximate USD equivalent)
+	// and it differs between plans, so it is never inferred from a shared
+	// default or derived from another account.
+	CreditsPerUSD string `json:"credits_per_usd,omitempty"`
+	Disabled      bool   `json:"disabled"`
+	BaseURL       string `json:"base_url,omitempty"`
 	// ModelRevision changes whenever the model mapping changes. CPA rebuilds a
 	// credential's model list only when the auth file content changes, so a
 	// mapping update without a revision bump would never reach the host.

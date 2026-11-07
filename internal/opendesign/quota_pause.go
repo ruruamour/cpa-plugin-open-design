@@ -68,13 +68,23 @@ func (s *Service) observeQuotaBlock(source Credential, upstreamModel string, req
 					block.RetryAt = retry
 				}
 			}
+			if estimate := quotaPauseEstimate(block.BlockedAt, now, apiErr.quotaResetAt); !estimate.IsZero() &&
+				(block.EstimateAt == nil || estimate.After(*block.EstimateAt)) {
+				block.EstimateAt = &estimate
+			}
 		} else {
 			manual := current.Disabled
+			estimate := quotaPauseEstimate(now, now, apiErr.quotaResetAt)
+			var estimateAt *time.Time
+			if !estimate.IsZero() {
+				estimateAt = &estimate
+			}
 			block = &QuotaBlock{
 				KeyHash: quotaPauseKeyHash(current.APIKey), ManualDisabled: &manual,
 				Source: "upstream", Reason: "quota_exhausted", BlockedAt: now,
 				ObservedAt: now, RetryAt: quotaPauseDeadline(now, apiErr.quotaResetAt, settings),
-				ModelID: strings.TrimSpace(upstreamModel),
+				EstimateAt: estimateAt,
+				ModelID:    strings.TrimSpace(upstreamModel),
 			}
 			addQuotaBlockModel(block, upstreamModel)
 		}

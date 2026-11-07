@@ -176,10 +176,12 @@ test('page is self-contained, uses no Cline branding and renders safely with tex
   assert.ok(page.includes('OpenDesign Bridge'));
   assert.ok(page.includes('OpenDesign Cloud'));
   assert.ok(!/cline/i.test(page), 'the console must not reuse Cline branding');
-  // Quota display is implemented against /tmp/open-design-quota-contract.md, but
-  // pricing and exchange-rate math are still out of scope; request statistics are implemented below.
-  assert.ok(!/price|价格|汇率|\$\s*\d+\s*(per|\/)\s*(1k|1m|million|token)|还能用\s*\d+\s*天/i.test(page),
-    'unimplemented pricing/exchange-rate/"N days left" claims must not appear');
+  // Quota display is implemented against /tmp/open-design-quota-contract.md. The
+  // only permitted money value is the "≈ $N" equivalent derived from the
+  // operator-supplied credits-per-dollar rate; token rates, per-token lists and
+  // "N days left" claims must never appear.
+  assert.ok(!/\$\s*\d+\s*(per|\/)\s*(1k|1m|million|token)|还能用\s*\d+\s*天/i.test(page),
+    'unimplemented per-token rates and "N days left" claims must not appear');
   assert.ok(!/<script[^>]+src=/i.test(page), 'no external scripts');
   assert.ok(!/<img/i.test(page), 'no logos or remote images');
   assert.ok(!source('console.js').includes('.innerHTML'), 'console rendering must not assign HTML');
@@ -525,7 +527,7 @@ test('model mapping validates aliases, deduplicates, and derives a safe payload'
   const core = fakePage().context.OpenDesignCore;
   const credentialView = (overrides = {}) => ({
     id: 'cred-1', label: '主账户', disabled: false, billing_configured: false,
-    billing_revision: '', workspace_id: '',
+    billing_revision: '', workspace_id: '', credits_per_usd: '',
     // The quota pause is a separate, plugin-owned flag: `disabled` stays the
     // operator's own choice and the two are never conflated.
     quota_paused: false, effective_disabled: false, quota_pause: null,
@@ -4281,7 +4283,7 @@ test('a paused account offers 解除额度暂停 and never flips the disabled sw
   await api.render.loadStatus();
   const row = view.document.getElementById('accountList').children[0];
   assert.match(row.textContent, /额度耗尽 · 自动暂停/);
-  assert.match(row.textContent, /约 .*后恢复/);
+  assert.match(row.textContent, /约 .*后复查/);
   // The row exposes an explicit resume control, but nothing runs on render.
   const actionsRow = row.children[1];
   const actionTexts = [...actionsRow.children].map(node => node.textContent);
@@ -4334,6 +4336,76 @@ test('paused accounts sort after active ones by their recorded resume time', () 
     'active-a', 'paused-late', 'active-b', 'paused-early', 'paused-unknown',
     'paused-tie-a', 'paused-tie-b',
   ]);
+});
+
+test('a later upstream reset hint is shown beside the shorter review deadline', () => {
+  const core = fakePage().context.OpenDesignCore;
+  const now = Date.now();
+  const hours = value => new Date(now + value * 3600_000).toISOString();
+  const pause = core.normalizeQuotaPause({
+    reason: 'quota_exhausted', resume_at: hours(1), estimate_at: hours(72),
+  });
+  assert.equal(pause.estimate_at, hours(72));
+  // The upstream's 7-day window reset is worth showing, but it never replaces the
+  // review deadline the plugin actually acts on.
+  assert.match(core.quotaPauseCountdown(pause, now), /1 小时后复查 · 预计 3 天后恢复/);
+  assert.match(core.quotaPauseText(pause, now), /1 小时后复查，预计 3 天后恢复/);
+  // Without a hint the countdown keeps its previous wording.
+  const plain = core.normalizeQuotaPause({ reason: 'quota_exhausted', resume_at: hours(2) });
+  assert.equal(core.quotaPauseCountdown(plain, now), '约 2 小时后复查');
+  assert.equal(core.quotaPauseCountdown({ resume_at: hours(2), estimate_at: 'not-a-time' }, now), '约 2 小时后复查');
+  // A hint that is not later than the deadline adds nothing.
+  assert.equal(core.quotaPauseCountdown({ resume_at: hours(2), estimate_at: hours(1) }, now), '约 2 小时后复查');
+  // An unusable or absent hint stays absent in the normalized shape.
+  assert.equal(core.normalizeQuotaPause({ resume_at: hours(1), estimate_at: 'nope' }).estimate_at, '');
+  assert.equal(core.normalizeQuotaPause({ resume_at: hours(1) }).estimate_at, '');
+});
+
+test('credits convert to an approximate dollar value only with a configured rate', () => {
+  const core = fakePage().context.OpenDesignCore;
+  // 5000 credits = $1, and the number the operator records is the credits per $1.
+  assert.equal(core.formatCreditsUSD('47387', '5000'), '≈ $947.74');
+  assert.equal(core.formatCreditsUSD('47387', ''), '', 'no rate means no dollar value');
+  assert.equal(core.formatCreditsUSD('47387', '0'), '');
+  assert.equal(core.formatCreditsUSD('', '5000'), '');
+  assert.equal(core.formatCreditsUSD('47387', 'abc'), '', 'a malformed rate must not divide');
+  // BigInt math keeps large credit counts exact instead of rounding to a float.
+  assert.equal(core.formatCreditsUSD('123456789012345678901234567890', '5000'), '≈ $2469135780246913578024691357.80');
+});
+
+test('the account header and rows show the equivalent dollar value of remaining credits', () => {
+  const credentials = [
+    { id: 'active-a', label: 'A', disabled: false, quota_paused: false, billing_configured: true, workspace_id: 'ws-a', credits_per_usd: '5000' },
+    { id: 'active-b', label: 'B', disabled: false, quota_paused: false, billing_configured: true, workspace_id: 'ws-b' },
+  ];
+  const view = fakePage();
+  const api = view.context.OpenDesignConsole;
+  const Core = view.context.OpenDesignCore;
+  const quota = (id, windows) => Core.normalizeQuota(quotaContract({
+    credential_id: id,
+    funding: { state: 'available', data: { codingPlan: { windows } } },
+  }));
+  api.render.applyStatus(statusBody({ credentials }));
+  api.state.quotas['active-a'] = quota('active-a', [{ durationSeconds: 18000, remainingCredits: '50000' }]);
+  api.render.renderAccounts();
+  const total = view.document.getElementById('accountQuotaTotal');
+  const usage = [...total.children].find(child => child.className === 'usage');
+  // Only the account that recorded a rate produces a dollar equivalent.
+  assert.deepEqual([...usage.children[0].children].map(child => child.textContent), ['窗口 5 小时', '50,000 · ≈ $1000.00']);
+  assert.match(usage.children[1].textContent, /约合 \$1000\.00/);
+  // The row summary shows the same equivalent next to the plain credits.
+  const row = accountRows(view).find(node => node.getAttribute('data-credential-id') === 'active-a');
+  const summary = flattenNodes(row.children[2]).filter(node => node.className === 'usage');
+  assert.match(summary.map(node => node.textContent).join(' | '), /剩余 50,000 \(≈ \$1000\.00\)/);
+  // A sibling without a rate keeps showing credits alone.
+  api.state.quotas['active-b'] = quota('active-b', [{ durationSeconds: 18000, remainingCredits: '2000' }]);
+  api.render.renderAccounts();
+  const rows = accountRows(view);
+  const plainRow = rows.find(node => node.getAttribute('data-credential-id') === 'active-b');
+  const plainSummary = flattenNodes(plainRow.children[2]).filter(node => node.className === 'usage')
+    .map(node => node.textContent).join(' | ');
+  assert.match(plainSummary, /剩余 2,000/);
+  assert.doesNotMatch(plainSummary, /≈ \$/);
 });
 
 test('the account header sums remaining quota from active accounts only', () => {
@@ -4691,7 +4763,7 @@ test('暂停倒计时在页面内本地变化，且不发出任何网络请求',
   // recovered/expiring wording.
   const readBadge = () => view.document.getElementById('accountList').children[0].children[0].textContent;
   assert.match(readBadge(), /额度耗尽 · 自动暂停/);
-  assert.match(readBadge(), /约 .*后恢复/);
+  assert.match(readBadge(), /约 .*后复查/);
   const requestsAfterLoad = calls.length;
 
   // The scheduled tick is local: it re-renders through the same renderer with no
@@ -6706,7 +6778,7 @@ test('额度暂停账户自动排到列表末尾并以红色卡片显示，且�
   assert.ok(rows[2].className.includes('paused'), '暂停行使用红色卡片样式');
   assert.equal(rows[2].getAttribute('data-account-paused'), 'true');
   assert.match(rows[2].textContent, /额度耗尽 · 自动暂停/);
-  assert.match(rows[2].textContent, /约 .*后恢复/);
+  assert.match(rows[2].textContent, /约 .*后复查/);
   assert.equal(view.document.getElementById('accountPausedCount').textContent, '2 个额度暂停');
   assert.equal(view.document.getElementById('accountPausedCount').hidden, false);
   assert.equal(calls.filter(call => call.url.includes('/quota')).length, 0,

@@ -403,6 +403,10 @@
               <span>Workspace ID（可选，查询套餐时填写）</span>
               <input class="control mono" id="accountWorkspaceID" autocomplete="off" spellcheck="false" placeholder="用于查询套餐额度">
             </label>
+            <label class="field">
+              <span>套餐额度换算（可选，credits / $1）</span>
+              <input class="control mono" id="accountCreditsPerUSD" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="例如 5000；留空则只显示 credits">
+            </label>
           </div>
           <label class="check" id="accountClearBillingRow" hidden>
             <input id="accountClearBilling" type="checkbox">

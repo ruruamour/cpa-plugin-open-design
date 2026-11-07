@@ -1421,9 +1421,12 @@
   }
 
   function renderAccountQuotaTotal(items) {
+    // The credits->USD rate is a single account-wide setting, not a per-window
+    // value; take the first one the operator configured for the visible totals.
     const node = $('accountQuotaTotal');
     if (!node) return;
     const active = items.filter(item => item && !item.disabled && !item.quota_paused);
+    const creditsPerUSD = (active.find(item => item.credits_per_usd) || {}).credits_per_usd || '';
     if (!active.length) {
       node.replaceChildren(el('span', { className: 'hint', text: '当前可用总额度：暂无活动中账户。' }));
       return;
@@ -1456,12 +1459,15 @@
     }
     const parts = [];
     for (const [duration, entry] of [...windows.entries()].sort((left, right) => left[0] - right[0])) {
+      const usd = Core.formatCreditsUSD(String(entry.remaining), creditsPerUSD);
+      const sub = [`${entry.accounts} 个账户剩余 credits`];
+      if (usd) sub.push(`约合 ${usd.slice(2)}`);
       parts.push(el('span', { className: 'usage' }, [
         el('span', { className: 'usage-head' }, [
           el('span', { className: 'usage-label', text: `窗口 ${Core.formatDuration(duration)}` }),
-          el('span', { className: 'usage-value', text: Core.formatCredits(String(entry.remaining)) }),
+          el('span', { className: 'usage-value', text: [Core.formatCredits(String(entry.remaining)), usd].filter(Boolean).join(' · ') }),
         ]),
-        el('span', { className: 'usage-sub', text: `${entry.accounts} 个账户剩余 credits` }),
+        el('span', { className: 'usage-sub', text: sub.join(' · ') }),
       ]));
     }
     if (wallets) {
@@ -1666,7 +1672,7 @@
     return card;
   }
 
-  function quotaWindowBlock(window) {
+  function quotaWindowBlock(window, item) {
     const block = el('div', { className: 'quota-window' });
     const title = window.durationSeconds ? `窗口 ${Core.formatDuration(window.durationSeconds)}` : '额度窗口';
     block.append(el('div', { className: 'quota-window-head' }, [
@@ -1683,7 +1689,8 @@
     }
     if (remaining) {
       block.append(el('p', { className: 'quota-value', text: `${remaining} credits` }));
-      block.append(el('p', { className: 'quota-meta', text: '剩余 credits' }));
+      const usd = Core.formatCreditsUSD(window.remainingCredits, item && item.credits_per_usd);
+      block.append(el('p', { className: 'quota-meta', text: usd ? `剩余 credits · 约合 ${usd.slice(2)}` : '剩余 credits' }));
     } else {
       block.append(el('p', { className: 'quota-note', text: '剩余 credits：未知' }));
     }
@@ -1743,7 +1750,7 @@
         const plan = funding.data.codingPlan;
         card.append(el('p', { className: 'quota-meta', text: `套餐：${plan.tier || '未知'}` }));
         for (const window of plan.windows) {
-          const block = quotaWindowBlock({ ...window, forecast: { state: '' } });
+          const block = quotaWindowBlock({ ...window, forecast: { state: '' } }, item);
           card.append(block);
         }
       }
@@ -1765,7 +1772,7 @@
       card.append(el('p', { className: 'quota-meta', text: `资金检查：${checkName}` }));
     }
     card.append(el('p', { className: 'quota-note', text: '本次预检未指定模型。具体模型的套餐覆盖和实际扣费以官方为准；各窗口分别生效，额度不能相加。' }));
-    for (const window of plan.windows) card.append(quotaWindowBlock(window));
+    for (const window of plan.windows) card.append(quotaWindowBlock(window, item));
     card.append(el('p', { className: 'quota-note', text: `窗口数据查询时间：${Core.formatTime(funding.fetched_at) || '未知'}` }));
     return card;
   }
@@ -1842,11 +1849,12 @@
     return null;
   }
 
-  function quotaSummaryWindow(window) {
+  function quotaSummaryWindow(window, item) {
     const title = window.durationSeconds ? `窗口 ${Core.formatDuration(window.durationSeconds)}` : '额度窗口';
     const percent = Core.creditsPercent(window.usedCredits, window.limitCredits);
     const sub = [];
-    if (window.remainingCredits) sub.push(`剩余 ${Core.formatCredits(window.remainingCredits)}`);
+    const usd = Core.formatCreditsUSD(window.remainingCredits, item && item.credits_per_usd);
+    if (window.remainingCredits) sub.push(`剩余 ${Core.formatCredits(window.remainingCredits)}${usd ? ` (${usd})` : ''}`);
     if (window.resetsAt) sub.push(`重置于 ${Core.formatTime(window.resetsAt)}`);
     const parts = [
       el('span', { className: 'usage-head' }, [
@@ -1875,7 +1883,7 @@
     if (wallet) parts.push(wallet);
     const windows = quota.funding && quota.funding.data && quota.funding.data.codingPlan
       ? quota.funding.data.codingPlan.windows : [];
-    for (const window of windows.slice(0, 4)) parts.push(quotaSummaryWindow(window));
+    for (const window of windows.slice(0, 4)) parts.push(quotaSummaryWindow(window, item));
     if (!parts.length) {
       const funding = quota.funding || {};
       if (funding.state === 'error') parts.push(quotaSummaryText('额度', '查询失败', '展开查看原因'));
@@ -2259,6 +2267,7 @@
       billing: $('billingFields'),
       controlKey: $('accountControlKey'),
       workspaceID: $('accountWorkspaceID'),
+      creditsPerUSD: $('accountCreditsPerUSD'),
       clearBilling: $('accountClearBilling'),
     };
   }
@@ -2268,6 +2277,7 @@
     return {
       controlKey: nodes.controlKey ? nodes.controlKey.value.trim() : '',
       workspaceID: nodes.workspaceID ? nodes.workspaceID.value.trim() : '',
+      creditsPerUSD: nodes.creditsPerUSD ? nodes.creditsPerUSD.value.trim() : '',
       clear: Boolean(nodes.clearBilling && nodes.clearBilling.checked),
     };
   }
@@ -2280,6 +2290,7 @@
       nodes.controlKey.setAttribute('placeholder', '粘贴 OpenDesign 官方 control key');
     }
     if (nodes.workspaceID) nodes.workspaceID.value = '';
+    if (nodes.creditsPerUSD) nodes.creditsPerUSD.value = '';
     if (nodes.clearBilling) nodes.clearBilling.checked = false;
     if (nodes.billing) nodes.billing.open = false;
   }
@@ -2308,7 +2319,7 @@
 
   function editAccount(item) {
     if (state.busy) return;
-    state.accountEdit = { id: item.id, label: item.label, billing_configured: item.billing_configured === true };
+    state.accountEdit = { id: item.id, label: item.label, billing_configured: item.billing_configured === true, credits_per_usd: item.credits_per_usd || '' };
     const editor = $('accountEditor');
     if (editor) editor.open = true;
     const editorSummary = $('accountEditorSummary');
@@ -2330,6 +2341,9 @@
         : '粘贴 OpenDesign 官方 control key');
     }
     if (nodes.workspaceID) nodes.workspaceID.value = item.workspace_id || '';
+    // A stored rate is not a secret, so it can be shown again for editing; an
+    // unset rate stays empty and the console falls back to credits only.
+    if (nodes.creditsPerUSD) nodes.creditsPerUSD.value = item.credits_per_usd || '';
     const clearRow = $('accountClearBillingRow');
     if (clearRow) clearRow.hidden = !item.billing_configured;
     if (nodes.billing) nodes.billing.open = Boolean(item.billing_configured || item.workspace_id);
@@ -2394,6 +2408,7 @@
       return;
     }
     const billing = readBillingInput();
+    const creditsPerUSDAtEdit = editing ? (editing.credits_per_usd || '') : '';
     if (billing.clear && billing.controlKey) {
       message('accountState', '已勾选「清除额度授权」，不会再保存新的 controlKey。取消勾选后再保存。', 'error');
       return;
@@ -2417,6 +2432,7 @@
         else {
           if (billing.controlKey) body.control_key = billing.controlKey;
           if (billing.workspaceID) body.workspace_id = billing.workspaceID;
+          if (billing.creditsPerUSD !== creditsPerUSDAtEdit) body.credits_per_usd = billing.creditsPerUSD;
         }
         const result = await api().updateCredential(editing.id, body);
         if (sessionGeneration !== state.sessionGeneration) return;
@@ -2434,6 +2450,7 @@
         const extra = {};
         if (billing.controlKey) extra.control_key = billing.controlKey;
         if (billing.workspaceID) extra.workspace_id = billing.workspaceID;
+        if (billing.creditsPerUSD) extra.credits_per_usd = billing.creditsPerUSD;
         const result = await api().addCredential(label, key, extra);
         if (sessionGeneration !== state.sessionGeneration) return;
         saved = true;

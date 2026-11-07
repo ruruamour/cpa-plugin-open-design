@@ -16,6 +16,21 @@ var (
 	quotaCredits         = regexp.MustCompile(`^\d+$`)
 )
 
+// creditsPerUSDValue validates an operator-recorded plan rate. The value is a
+// positive decimal string; anything else (empty, zero, malformed, oversized)
+// stays unknown so the console never divides by a guessed or malformed number.
+// It is presentation-only: the plugin still blocks and recovers purely on the
+// upstream's own windows.
+func creditsPerUSDValue(value string) string {
+	raw := strings.TrimSpace(value)
+	if len(raw) > 0 && len(raw) <= 32 && quotaUnsignedDecimal.MatchString(raw) {
+		if positive, ok := new(big.Rat).SetString(raw); ok && positive.Sign() > 0 {
+			return raw
+		}
+	}
+	return ""
+}
+
 // These validators follow the official vela-wallet.ts reader and
 // vela-billing.ts parseBillingPreflight at 5a0c477. Unknown fields are ignored;
 // only explicitly validated fields are copied into management responses.

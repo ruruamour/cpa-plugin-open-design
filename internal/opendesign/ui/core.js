@@ -31,6 +31,9 @@
       reason: safeCode(data.reason, 40),
       source: safeCode(data.source, 40),
       resume_at: safeTimestamp(data.resume_at),
+      // The upstream's own reset hint, later than resume_at when the plugin's
+      // review cap is shorter than the exhausted window.
+      estimate_at: safeTimestamp(data.estimate_at),
       blocked_at: safeTimestamp(data.blocked_at),
       model_id: safeIdentity(data.model_id, 512),
       multiple_models: data.multiple_models === true,
@@ -65,7 +68,30 @@
     const remaining = quotaPauseRemaining(pause, now);
     if (remaining === null) return '额度暂停';
     if (remaining <= 0) return '额度暂停（等待复查）';
+    const estimate = quotaPauseEstimateRemaining(pause, now);
+    if (estimate !== null && estimate > remaining) {
+      return `额度暂停（${formatDuration(remaining)}后复查，预计 ${formatDuration(estimate)}后恢复）`;
+    }
     return `额度暂停（剩余 ${formatDuration(remaining)}）`;
+  }
+
+  // Credits are the upstream's own unit; the published plan defines exactly how
+  // many of them one US dollar of usage is worth, so a conversion is a fixed
+  // ratio the operator records, never an inferred one. It is possible only when
+  // that rate is configured, and is only ever shown as an approximate USD value.
+  function creditsToUSD(credits, creditsPerUSD) {
+    const rate = creditText(creditsPerUSD);
+    const amount = creditText(credits);
+    if (!rate || !amount) return '';
+    const divisor = BigInt(rate);
+    if (divisor <= 0n) return '';
+    const cents = (BigInt(amount) * 10000n + divisor / 2n) / divisor;
+    return `${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
+  }
+
+  function formatCreditsUSD(credits, creditsPerUSD) {
+    const usd = creditsToUSD(credits, creditsPerUSD);
+    return usd ? `≈ $${usd}` : '';
   }
 
   // Compact copy for the account card. Paused accounts are moved to the bottom
@@ -76,12 +102,29 @@
     return pause.reason === 'quota_exhausted' ? '额度耗尽 · 自动暂停' : '额度暂停';
   }
 
+  // Seconds until the upstream's own reset hint, which may be later than the
+  // automatic recheck deadline. Absent when the server did not report one.
+  function quotaPauseEstimateRemaining(pause, now = Date.now()) {
+    if (!pause || !pause.estimate_at) return null;
+    const at = Date.parse(pause.estimate_at || '');
+    if (!Number.isFinite(at)) return null;
+    const remaining = Math.floor((at - now) / 1000);
+    return remaining > 0 ? remaining : null;
+  }
+
   function quotaPauseCountdown(pause, now = Date.now()) {
     if (!pause) return '';
     if (pause.awaiting_recheck === true) return '等待复查';
     const remaining = quotaPauseRemaining(pause, now);
     if (remaining === null) return '';
-    return remaining > 0 ? `约 ${formatDuration(remaining)}后恢复` : '等待复查';
+    if (remaining <= 0) return '等待复查';
+    // Over the deadline the let-through of the upstream's own reset estimate is
+    // more useful than the plugin's shorter review cadence, so say both.
+    const estimate = quotaPauseEstimateRemaining(pause, now);
+    if (estimate !== null && estimate > remaining) {
+      return `${formatDuration(remaining)}后复查 · 预计 ${formatDuration(estimate)}后恢复`;
+    }
+    return `约 ${formatDuration(remaining)}后复查`;
   }
 
   function quotaPauseSummary(pause, now = Date.now()) {
@@ -111,6 +154,7 @@
           quota_paused: item.quota_paused === true,
           effective_disabled: item.effective_disabled === true,
           quota_pause: normalizeQuotaPause(item.quota_pause),
+          credits_per_usd: creditText(item.credits_per_usd),
         });
       }
     }
@@ -1231,6 +1275,7 @@
     normalizeStatus,
     normalizeQuotaPause,
     quotaPauseRemaining,
+    quotaPauseEstimateRemaining,
     quotaPauseText,
     quotaPauseTitle,
     quotaPauseCountdown,
@@ -1243,6 +1288,8 @@
     modelCoverageSignalText,
     modelCoverageErrorText,
     creditsPercent,
+    creditsToUSD,
+    formatCreditsUSD,
     formatCredits,
     formatUSD,
     formatDuration,

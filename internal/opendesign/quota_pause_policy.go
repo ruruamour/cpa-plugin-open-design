@@ -36,6 +36,11 @@ type QuotaBlock struct {
 	BlockedAt      time.Time `json:"blocked_at"`
 	ObservedAt     time.Time `json:"observed_at"`
 	RetryAt        time.Time `json:"retry_at"`
+	// EstimateAt is the raw upstream reset hint, bounded to seven days from the
+	// block but not shortened by pause.max_seconds. RetryAt stays the first
+	// automatic recheck; the console may show EstimateAt because a 7-day window
+	// reset is a more truthful recovery estimate than a 24-hour review cap.
+	EstimateAt *time.Time `json:"estimate_at,omitempty"`
 	// ModelID/MultipleModels remain readable for existing auth files and UIs.
 	// ModelIDs is the complete bounded set of models that reported exhaustion;
 	// ModelsAmbiguous means it cannot safely be treated as a complete set.
@@ -105,6 +110,18 @@ func normalizeQuotaBlock(c Credential, now time.Time) (*QuotaBlock, bool) {
 		block.RetryAt = latest
 		changed = true
 	}
+	if block.EstimateAt != nil {
+		estimate := block.EstimateAt.UTC()
+		switch {
+		case estimate.Before(block.BlockedAt):
+			block.EstimateAt = nil
+			changed = true
+		case estimate.After(block.BlockedAt.Add(quotaPauseMaxWindow)):
+			latest := block.BlockedAt.Add(quotaPauseMaxWindow)
+			block.EstimateAt = &latest
+			changed = true
+		}
+	}
 	return block, changed
 }
 
@@ -125,6 +142,10 @@ func cloneQuotaBlock(block *QuotaBlock) *QuotaBlock {
 	if block.ManualDisabled != nil {
 		manual := *block.ManualDisabled
 		copy.ManualDisabled = &manual
+	}
+	if block.EstimateAt != nil {
+		estimate := *block.EstimateAt
+		copy.EstimateAt = &estimate
 	}
 	return &copy
 }
@@ -262,6 +283,21 @@ func quotaPauseDeadline(now, resetAt time.Time, settings pauseSettings) time.Tim
 		deadline = latest
 	}
 	return deadline.UTC()
+}
+
+// quotaPauseEstimate keeps the upstream reset hint for display. Unlike
+// RetryAt it is not shortened by pause.max_seconds, because the automatic
+// recheck cadence is deliberately shorter than a coding-plan window; the
+// operator still needs to see when the exhausted window itself resets. It is
+// bounded by the absolute seven-day limit and never moves before BlockedAt.
+func quotaPauseEstimate(blockedAt, now, resetAt time.Time) time.Time {
+	if resetAt.IsZero() || !resetAt.After(now) {
+		return time.Time{}
+	}
+	if latest := blockedAt.Add(quotaPauseMaxWindow); resetAt.After(latest) {
+		resetAt = latest
+	}
+	return resetAt.UTC()
 }
 
 func isQuotaExhaustionCode(kind string) bool {

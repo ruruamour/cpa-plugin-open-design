@@ -266,6 +266,12 @@ func quotaPauseView(c Credential, now time.Time, syncError, recheckStatus string
 		// again: nothing in the plugin verifies the upstream quota here.
 		pause["awaiting_recheck"] = true
 	}
+	// The raw reset hint can be later than RetryAt when pause.max_seconds is
+	// shorter than the exhausted window. Expose it separately so the console
+	// never presents the review cap as the quota's actual reset time.
+	if block.EstimateAt != nil {
+		pause["estimate_at"] = *block.EstimateAt
+	}
 	if syncError != "" {
 		pause["error"] = syncError
 	}
@@ -280,6 +286,10 @@ func credentialView(c Credential, now time.Time, syncError, recheckStatus string
 		"id": c.ID, "label": c.Label, "disabled": c.Disabled,
 		"billing_configured": c.ControlKey != "", "workspace_id": c.WorkspaceID,
 		"billing_revision": c.billingRevision,
+		// This account's own plan rate. Credits are the upstream's unit, so the
+		// console may show an approximate USD equivalent only when the operator
+		// states the ratio this account is billed at.
+		"credits_per_usd": creditsPerUSDValue(c.CreditsPerUSD),
 	}
 	// A quota block is a separate, plugin-owned scheduling restriction. The
 	// `disabled` field keeps the operator's own choice so the console can show
@@ -306,13 +316,17 @@ func (s *Service) listCredentials() (any, error) {
 }
 
 type credentialInput struct {
-	ID           string  `json:"id"`
-	Label        string  `json:"label"`
-	APIKey       *string `json:"api_key"`
-	ControlKey   *string `json:"control_key"`
-	WorkspaceID  *string `json:"workspace_id"`
-	ClearBilling bool    `json:"clear_billing"`
-	Disabled     *bool   `json:"disabled"`
+	ID          string  `json:"id"`
+	Label       string  `json:"label"`
+	APIKey      *string `json:"api_key"`
+	ControlKey  *string `json:"control_key"`
+	WorkspaceID *string `json:"workspace_id"`
+	// CreditsPerUSD is the plan rate used only to show an approximate USD
+	// equivalent in the console. An explicit empty string clears it, which
+	// restores "credits only" display for plans whose ratio is unconfirmed.
+	CreditsPerUSD *string `json:"credits_per_usd"`
+	ClearBilling  bool    `json:"clear_billing"`
+	Disabled      *bool   `json:"disabled"`
 }
 
 // saveCredentialRequest creates a credential, or updates the one named by "id".
@@ -335,8 +349,18 @@ func (s *Service) saveCredentialRequest(r ManagementRequest) (any, error) {
 
 func applyBillingInput(c *Credential, in credentialInput) error {
 	if in.ClearBilling {
-		c.ControlKey, c.WorkspaceID = "", ""
+		c.ControlKey, c.WorkspaceID, c.CreditsPerUSD = "", "", ""
 		return nil
+	}
+	if in.CreditsPerUSD != nil {
+		rate := strings.TrimSpace(*in.CreditsPerUSD)
+		if rate == "" {
+			c.CreditsPerUSD = ""
+		} else if validated := creditsPerUSDValue(rate); validated == "" {
+			return fail(http.StatusBadRequest, "invalid credits_per_usd")
+		} else {
+			c.CreditsPerUSD = validated
+		}
 	}
 	if in.ControlKey != nil && strings.TrimSpace(*in.ControlKey) != "" {
 		key := strings.TrimSpace(*in.ControlKey)

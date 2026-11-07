@@ -245,3 +245,115 @@ func TestCredentialViewOmitsPauseDetailWhenNotPaused(t *testing.T) {
 		t.Fatalf("credential view is not serialisable: %v", err)
 	}
 }
+
+// A 7-day window reset is later than the default 24-hour review cap, so the raw
+// upstream hint must survive as its own field. The console needs it to show when
+// the exhausted window actually returns instead of presenting the review cap.
+func TestQuotaPauseViewKeepsTheRawResetHintSeparateFromTheReviewDeadline(t *testing.T) {
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	quotaFixtureAuthFile(t, s, host, id, nil)
+	now := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	setNow := setQuotaPauseFixtureClock(s, now)
+	source, _ := liveCredential(s, id)
+	sevenDays := now.Add(6*24*time.Hour + 22*time.Hour)
+	s.observeQuotaBlock(source, "fixture-model", &APIError{Status: 402, quotaExhausted: true, quotaResetAt: sevenDays})
+	setNow(now)
+
+	current, _ := liveCredential(s, id)
+	pause := pauseOf(t, credentialView(current, now, "", ""))
+	// The review deadline stays capped at the configured 24 hours.
+	if !current.QuotaBlock.RetryAt.Equal(now.Add(24 * time.Hour)) {
+		t.Fatalf("retry_at = %v, want the 24h review cap", current.QuotaBlock.RetryAt)
+	}
+	estimate, ok := pause["estimate_at"].(time.Time)
+	if !ok || !estimate.Equal(sevenDays) {
+		t.Fatalf("estimate_at = %#v, want the raw reset hint %v", pause["estimate_at"], sevenDays)
+	}
+	// remaining_seconds is derived from the deadline itself, so it may differ by a
+	// second from the exact cap; it must never be the raw 7-day hint.
+	remaining, ok := pause["remaining_seconds"].(int64)
+	if !ok || remaining > int64((24*time.Hour)/time.Second) || remaining < int64((24*time.Hour)/time.Second)-1 {
+		t.Fatalf("remaining_seconds = %#v, want the 24h review cap", pause["remaining_seconds"])
+	}
+
+	// A hint beyond the absolute seven-day bound is clamped, never dropped.
+	now = now.Add(time.Hour)
+	setNow(now)
+	s.observeQuotaBlock(source, "fixture-model", &APIError{Status: 402, quotaExhausted: true, quotaResetAt: now.Add(30 * 24 * time.Hour)})
+	current, _ = liveCredential(s, id)
+	if current.QuotaBlock.EstimateAt == nil || !current.QuotaBlock.EstimateAt.Equal(current.QuotaBlock.BlockedAt.Add(quotaPauseMaxWindow)) {
+		t.Fatalf("oversized hint was not clamped: %#v", current.QuotaBlock.EstimateAt)
+	}
+
+	// A pause with no reset hint must not invent one.
+	other := addCredential(t, s, host, "fixture-other", "fixture-inference-key-other")
+	quotaFixtureAuthFile(t, s, host, other, nil)
+	otherSource, _ := liveCredential(s, other)
+	s.observeQuotaBlock(otherSource, "fixture-model", &APIError{Status: 402, quotaExhausted: true})
+	otherCurrent, _ := liveCredential(s, other)
+	if otherCurrent.QuotaBlock.EstimateAt != nil {
+		t.Fatalf("a missing hint produced an estimate: %#v", otherCurrent.QuotaBlock.EstimateAt)
+	}
+	if _, ok := credentialView(otherCurrent, now, "", "")["quota_pause"].(map[string]any)["estimate_at"]; ok {
+		t.Fatal("a missing hint was exposed as a reset estimate")
+	}
+}
+
+// The plan rate is presentation-only and per account: it never becomes a shared
+// default, and a malformed value must not reach the console as a divisor.
+func TestCreditsPerUSDIsValidatedPerAccountAndNeverGuessed(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", ""},
+		{"5000", "5000"},
+		{" 5000 ", "5000"},
+		{"5000.5", "5000.5"},
+		{"0", ""},
+		{"0.0", ""},
+		{"-5", ""},
+		{"1e6", ""},
+		{"abc", ""},
+		{"5000cr", ""},
+		{strings.Repeat("9", 33), ""},
+	} {
+		if got := creditsPerUSDValue(tc.in); got != tc.want {
+			t.Fatalf("creditsPerUSDValue(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	s, host := newQuotaPauseTestService(t)
+	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
+	// A fresh account has no rate: the console must fall back to credits only.
+	_, body, _ := managementCall(t, s, http.MethodGet, apiBase+"/status", nil, nil)
+	if view := credentialByID(t, body, id); view["credits_per_usd"] != "" {
+		t.Fatalf("unconfigured rate = %#v, want empty", view["credits_per_usd"])
+	}
+	status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil,
+		map[string]any{"id": id, "credits_per_usd": "not-a-number"})
+	if status != http.StatusBadRequest || !strings.Contains(raw, "invalid credits_per_usd") {
+		t.Fatalf("malformed rate = %d %s", status, raw)
+	}
+	// Each account carries its own plan rate; the first account must not inherit
+	// the second's value.
+	if status, _, raw = managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil,
+		map[string]any{"id": id, "credits_per_usd": "5000"}); status != http.StatusOK {
+		t.Fatalf("setting the rate = %d %s", status, raw)
+	}
+	second := addCredential(t, s, host, "second", "fixture-inference-key-two")
+	_, body, _ = managementCall(t, s, http.MethodGet, apiBase+"/status", nil, nil)
+	if got := credentialByID(t, body, id)["credits_per_usd"]; got != "5000" {
+		t.Fatalf("stored rate = %#v", got)
+	}
+	if got := credentialByID(t, body, second)["credits_per_usd"]; got != "" {
+		t.Fatalf("a sibling account inherited a plan rate: %#v", got)
+	}
+	// An explicit empty value clears it again.
+	if status, _, raw = managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil,
+		map[string]any{"id": id, "credits_per_usd": ""}); status != http.StatusOK {
+		t.Fatalf("clearing the rate = %d %s", status, raw)
+	}
+	_, body, _ = managementCall(t, s, http.MethodGet, apiBase+"/status", nil, nil)
+	if got := credentialByID(t, body, id)["credits_per_usd"]; got != "" {
+		t.Fatalf("cleared rate = %#v, want empty", got)
+	}
+}
