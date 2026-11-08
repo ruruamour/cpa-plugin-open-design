@@ -1,10 +1,18 @@
 # OpenDesign 插件验证记录
 
-## 0.4.12 发布准备
+## 0.4.12 发布与生产升级
 
-本次候选包含 `408d483` 的首次复查时机与状态展示修复、`b978d8d` 的策略提交／退避并发修复，以及 `d423cb3` 的精确美元换算与逐账户汇总。下列「未发布」记录为这些功能在升版前的本地验证历史；`0.4.12` 的 CI、跨平台 Release、产物校验与部署结果将在完成后单独记录。
+本次包含 `408d483` 的首次复查时机与状态展示修复、`b978d8d` 的策略提交／退避并发修复，以及 `d423cb3` 的精确美元换算与逐账户汇总。下列「未发布」记录为这些功能在升版前的本地验证历史，正式版本状态以本节为准。
 
-2026-11-08 07:38 UTC 只读生产基线：版本 `0.4.11`，76 个凭据、0 个额度暂停、0 个人工停用、4 个模型映射；CPA `MainPID=3656011`、`NRestarts=0`、服务 active。该状态先于新版本部署，不作为 `0.4.12` 自动恢复的生产验收证据。
+| 检查 | 结果与范围 |
+| --- | --- |
+| 发布提交 | tag `open-design-v0.4.12` 指向 `ae3212e8274f6fb61368104ab7d3ffdd88c8f703`；插件与 registry 均为 `0.4.12`。 |
+| CI 与 Release | [CI 42459804687](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42459804687) 成功；[Release 42459806107](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42459806107) 首次运行即 Linux amd64／arm64、macOS amd64／arm64、Windows amd64 与 release 全绿。五个 ZIP 的根目录库名称与 `checksums.txt` 全部通过校验。 |
+| 正式发布 | [open-design-v0.4.12](https://github.com/ruruamour/cpa-plugin-open-design/releases/tag/open-design-v0.4.12) 已公开并设为 Latest；发布时间 `2026-11-08T07:44:57Z`。Linux amd64 `.so` SHA256 `b6d24779a123af347e9f8bcdacc19d05d17141fc3d4db47b4907b78c292d6a14`，与同提交 CI 产物完全一致，最高 GLIBC 2.34。 |
+| 生产部署 | 使用 ops 隔离分支 `release/open-design-0.4.12`（目标版本提交 `8dac64c`）的部署脚本，预检、本地 ABI 冒烟与部署均通过。备份 `/srv/cliproxy/_backups/open-design-20261108T074722Z`；`deploy_mode=hot_reload`、`hot_reload=true`、`restarts_used=0`，CPA PID 前后均为 `3656011`。实际映射库哈希与上述发布产物一致。 |
+| 只读核验 | 07:49 UTC `/status` 为 `0.4.12`，76 个凭据、0 个额度暂停、0 个人工停用、4 个模型映射；凭据 ID、人工选择及模型映射与部署前基线一致。五个原有效插件仍注册启用，`quota-pacer` 仍禁用；服务 active，`NRestarts=0`。 |
+| 控制台 | `/console` HTTP 200，字节哈希 `96b4fc7f97fa307314f0396ade4731fd3f94597c03795288dcf13ec74c1f89e4` 与发布源码按 `ui.go` 拼接结果一致；已包含状态刷新、历史提示、小数比率和逐账户精确汇总。 |
+| 验收边界 | 07:38 UTC 的 `0.4.11` 基线已是 76 个凭据、0 个暂停；不能把上线后的零暂停归功于此次升级。新版本自动恢复的生产耗尽／重置周期仍待实际事件观察，本次没有额外发送计费推理或人工解除暂停。 |
 
 ## 未发布：额度美元换算修复
 
