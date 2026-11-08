@@ -90,9 +90,9 @@ type Service struct {
 	// Recovery checks are serialized across accounts. Same-key inference is
 	// briefly refused only during a recovery commit, not while checks run.
 	quotaRecoveryGate chan struct{}
-	// quotaCommitGate serializes a quota-file commit with quiesce marking the
-	// plugin stopped. It is never taken on an inference path, so it adds no
-	// concurrency limit or queue to requests.
+	// quotaCommitGate serializes a quota-file commit with pause-policy changes
+	// and quiesce marking the plugin stopped. It is never taken on an inference
+	// path, so it adds no concurrency limit or queue to requests.
 	quotaCommitGate chan struct{}
 	// pauseGeneration changes whenever the effective pause policy changes.
 	// Automatic recheck rounds capture it and abort before writing when the
@@ -289,9 +289,14 @@ func (s *Service) configure(raw json.RawMessage) (err error) {
 	if err = os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
+	// Reconfiguration can load a changed pause policy from settings.json too.
+	// Match the config route's configMu -> quotaCommitGate -> mu order, and
+	// finish publishing before another recovery is allowed to commit.
+	s.quotaCommitGate <- struct{}{}
 	s.mu.Lock()
 	if s.loaded && filepath.Clean(cfg.DataDir) != filepath.Clean(s.cfg.DataDir) {
 		s.mu.Unlock()
+		<-s.quotaCommitGate
 		return fail(http.StatusConflict, "changing data_dir requires restarting the plugin with its complete data directory")
 	}
 	mappingChanged := s.loaded && !sameModels(s.cfg.Models, cfg.Models)
@@ -318,6 +323,7 @@ func (s *Service) configure(raw json.RawMessage) (err error) {
 	s.cfg = cfg
 	s.loaded = true
 	s.mu.Unlock()
+	<-s.quotaCommitGate
 	// A corrupt or unreadable log store must never block registration: the
 	// store falls back to an empty, writable state. Loading happens outside the
 	// service lock because it may parse up to the bounded snapshot and journal.

@@ -586,11 +586,7 @@ func TestQuotaRecoveryStaleUnversionedPauseKeepsManualDisable(t *testing.T) {
 	if !live.quotaBlocked() || !live.Disabled || live.QuotaBlock.ManualDisabled == nil || !*live.QuotaBlock.ManualDisabled {
 		t.Fatal("fixture did not publish a paused manual disable")
 	}
-	// Make the block due for the real automatic path, while preventing the
-	// fixture's background worker from racing this explicitly driven round.
-	s.mu.Lock()
-	s.quotaRecheckRetryAt[id] = s.quotaNow().Add(3 * time.Hour)
-	s.mu.Unlock()
+	// The fixture has no background worker; make its explicit automatic round due.
 	advance(2 * time.Hour)
 	started, release := parkQuotaHTTP(t, s, host, advance, "model-a", "member", "available")
 	defer release()

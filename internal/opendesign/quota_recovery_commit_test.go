@@ -12,10 +12,11 @@ import (
 )
 
 // quotaCommitFixture prepares a paused credential with a fake clock shared by the
-// recovery proof and the quota policy code.
+// recovery proof and the quota policy code. These tests drive rounds explicitly,
+// so registration does not start a competing background worker.
 func quotaCommitFixture(t *testing.T, models ...string) (*Service, *fakeHost, string, string, func(time.Duration)) {
 	t.Helper()
-	s, host := newQuotaPauseTestService(t)
+	s, host := quotaRevisionTestService(t)
 	advance := quotaTestClock(s)
 	s.mu.Lock()
 	s.modelCoverageNow = s.quotaNow
@@ -235,11 +236,6 @@ func TestQuotaRecoveryAutomaticRoundAbortsWhenPolicyGenerationChanges(t *testing
 	revision := newID()
 	c.QuotaRevision = revision
 	s.creds[id] = c
-	// The fixture has a real background worker and may retain an earlier wakeup.
-	// Mark the scheduled automatic retry as not yet due under the same lock that
-	// makes the block due, so only the explicit dueOnly round below can run.
-	// This does not affect recheckQuotaBlockMode's policy-generation checks.
-	s.quotaRecheckRetryAt[id] = now.Add(time.Hour)
 	s.mu.Unlock()
 	s.credentialMu.Lock()
 	err := s.persistQuotaBlockLocked(id, revision, false)

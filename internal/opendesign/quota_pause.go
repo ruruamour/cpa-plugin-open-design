@@ -595,11 +595,7 @@ func (s *Service) quotaPauseAction(r ManagementRequest) (any, error) {
 		}
 		return managementJSON(http.StatusOK, s.quotaPauseResponse())
 	}
-	s.mu.RLock()
-	revision := s.creds[id].QuotaRevision
-	s.mu.RUnlock()
 	err := s.recheckQuotaBlock(r.HostCallbackID, id)
-	s.setQuotaRecheckStatus(id, revision, err)
 	if err != nil {
 		return managementError(statusOf(err), err.Error())
 	}
@@ -625,7 +621,7 @@ func (s *Service) recheckQuotaBlock(callbackID, id string) error {
 // same workspace member, and no same-key inference may still be in flight. The
 // operator must configure the control key and inference key for the same account;
 // this API cannot independently prove that relationship.
-func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) error {
+func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) (result error) {
 	s.mu.RLock()
 	stop := s.stopCh
 	s.mu.RUnlock()
@@ -648,6 +644,7 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 	syncPending := s.quotaPauseErrors[id] != ""
 	enabled := s.cfg.pauseSettings().enabled
 	generation := s.pauseGeneration
+	retryAt := s.quotaRecheckRetryAt[id]
 	stopped := s.stopped
 	s.mu.RUnlock()
 	if stopped {
@@ -659,9 +656,16 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 	if !current.quotaBlocked() {
 		return nil
 	}
-	if dueOnly && (!enabled || quotaPauseReviewAt(current.QuotaBlock).After(now)) {
+	// The candidate may have waited behind another account or a manual round.
+	// Re-read its current backoff while owning the recovery gate; a skip must
+	// not erase a previous round's status or move its retry deadline.
+	if dueOnly && (!enabled || quotaPauseReviewAt(current.QuotaBlock).After(now) || retryAt.After(now)) {
 		return localFail(http.StatusConflict, "quota_recheck_not_due", "额度暂停尚未到复查时间，或自动暂停已关闭")
 	}
+	// Publish this exact round's result before releasing quotaRecoveryGate.
+	// The defer runs after any credential/commit locks are released, and uses
+	// the revision actually checked, not an earlier worker/HTTP snapshot.
+	defer func() { s.setQuotaRecheckStatus(id, current.QuotaRevision, result) }()
 	if inflight {
 		return localFail(http.StatusConflict, "quota_recheck_inflight", "仍有同一推理密钥的请求在途，请稍后复查")
 	}
@@ -868,7 +872,9 @@ func (s *Service) setQuotaRecheckStatus(id, revision string, err error) {
 			case "quota_recheck_unproven":
 				code = "unproven"
 			case "quota_state_changed", "quota_recheck_not_due", "plugin_unavailable":
-				code = ""
+				// An abandoned round has no new result. Keep any retry/status
+				// already established for the current pause instead of clearing it.
+				return
 			}
 		}
 	}
@@ -997,8 +1003,8 @@ func (s *Service) sweepQuotaBlocks(stop <-chan struct{}) {
 
 // recheckDueQuotaBlocks runs only on the worker, not on management reads. One
 // account is checked at a time, each model is checked serially, and failures
-// leave the block in place. The model preflight's normal refresh interval bounds
-// retry traffic even when many wakeups arrive between ticker ticks.
+// leave the block in place. The round rechecks the current retry deadline after
+// acquiring the recovery gate, and publishes its backoff before releasing it.
 func (s *Service) recheckDueQuotaBlocks(stop <-chan struct{}) {
 	now := s.quotaPauseTime()
 	s.mu.RLock()
@@ -1006,23 +1012,21 @@ func (s *Service) recheckDueQuotaBlocks(stop <-chan struct{}) {
 		s.mu.RUnlock()
 		return
 	}
-	type candidate struct{ id, revision string }
-	var candidates []candidate
+	var candidates []string
 	for id, c := range s.creds {
 		if !s.revoked[id] && c.quotaBlocked() && !quotaPauseReviewAt(c.QuotaBlock).After(now) && s.quotaPauseErrors[id] == "" &&
 			!s.quotaRecheckRetryAt[id].After(now) {
-			candidates = append(candidates, candidate{id: id, revision: c.QuotaRevision})
+			candidates = append(candidates, id)
 		}
 	}
 	s.mu.RUnlock()
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].id < candidates[j].id })
-	for _, item := range candidates {
+	sort.Strings(candidates)
+	for _, id := range candidates {
 		select {
 		case <-stop:
 			return
 		default:
 		}
-		err := s.recheckQuotaBlockMode("", item.id, true)
-		s.setQuotaRecheckStatus(item.id, item.revision, err)
+		_ = s.recheckQuotaBlockMode("", id, true)
 	}
 }

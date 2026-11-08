@@ -130,6 +130,12 @@ func (s *Service) updateConfigRequest(r ManagementRequest) (any, error) {
 	if err := cfg.validate(); err != nil {
 		return managementError(statusOf(err), err.Error())
 	}
+	// Serialize publishing a pause policy (including persistence) with the
+	// complete recovery file commit. A successful disable must not return while
+	// an older automatic round can still write its cleared state.
+	// Lock order: configMu -> quotaCommitGate -> mu; no credential/file lock.
+	s.quotaCommitGate <- struct{}{}
+	defer func() { <-s.quotaCommitGate }()
 	if err := s.saveSettings(cfg); err != nil {
 		return managementError(http.StatusInternalServerError, "could not persist plugin config")
 	}
