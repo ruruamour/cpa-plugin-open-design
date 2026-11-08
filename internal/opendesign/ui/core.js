@@ -31,8 +31,8 @@
       reason: safeCode(data.reason, 40),
       source: safeCode(data.source, 40),
       resume_at: safeTimestamp(data.resume_at),
-      // The upstream's own reset hint, later than resume_at when the plugin's
-      // review cap is shorter than the exhausted window.
+      // A historical reset/retry hint from the upstream error, not a live
+      // prediction: quota can become available before or after this time.
       estimate_at: safeTimestamp(data.estimate_at),
       blocked_at: safeTimestamp(data.blocked_at),
       model_id: safeIdentity(data.model_id, 512),
@@ -70,9 +70,9 @@
     if (remaining <= 0) return '额度暂停（等待复查）';
     const estimate = quotaPauseEstimateRemaining(pause, now);
     if (estimate !== null && estimate > remaining) {
-      return `额度暂停（${formatDuration(remaining)}后复查，预计 ${formatDuration(estimate)}后恢复）`;
+      return `额度暂停（${formatDuration(remaining)}后复查，上游原提示 ${formatDuration(estimate)}后重置或重试）`;
     }
-    return `额度暂停（剩余 ${formatDuration(remaining)}）`;
+    return `额度暂停（约 ${formatDuration(remaining)}后复查）`;
   }
 
   // Credits are the upstream's own unit; the published plan defines exactly how
@@ -102,8 +102,8 @@
     return pause.reason === 'quota_exhausted' ? '额度耗尽 · 自动暂停' : '额度暂停';
   }
 
-  // Seconds until the upstream's own reset hint, which may be later than the
-  // automatic recheck deadline. Absent when the server did not report one.
+  // Seconds until the historical upstream reset/retry hint. It is not evidence
+  // that quota remains exhausted until then; only a fresh recheck can tell.
   function quotaPauseEstimateRemaining(pause, now = Date.now()) {
     if (!pause || !pause.estimate_at) return null;
     const at = Date.parse(pause.estimate_at || '');
@@ -118,11 +118,10 @@
     const remaining = quotaPauseRemaining(pause, now);
     if (remaining === null) return '';
     if (remaining <= 0) return '等待复查';
-    // Over the deadline the let-through of the upstream's own reset estimate is
-    // more useful than the plugin's shorter review cadence, so say both.
+    // The upstream hint is from the old error, not a verified recovery time.
     const estimate = quotaPauseEstimateRemaining(pause, now);
     if (estimate !== null && estimate > remaining) {
-      return `${formatDuration(remaining)}后复查 · 预计 ${formatDuration(estimate)}后恢复`;
+      return `${formatDuration(remaining)}后复查 · 上游原提示 ${formatDuration(estimate)}后重置或重试`;
     }
     return `约 ${formatDuration(remaining)}后复查`;
   }

@@ -18,9 +18,14 @@ const (
 	quotaBlockMarker        = "[upstream:quota_block]"
 	quotaPauseMinWindow     = time.Minute
 	quotaPauseDefaultWindow = 30 * time.Minute
-	quotaPauseDefaultMax    = 24 * time.Hour
-	quotaPauseMaxWindow     = 7 * 24 * time.Hour
-	quotaPauseMaxModels     = 32
+	// quotaPauseFirstReviewWindow bounds how long a pause may wait for its first
+	// automatic review, independent of a long persisted RetryAt. Upstream reset
+	// hints (or Retry-After) can name a window many hours away even though the
+	// coding-plan quota may return earlier.
+	quotaPauseFirstReviewWindow = 30 * time.Minute
+	quotaPauseDefaultMax        = 24 * time.Hour
+	quotaPauseMaxWindow         = 7 * 24 * time.Hour
+	quotaPauseMaxModels         = 32
 )
 
 // QuotaBlock mirrors the ClinePass separation between an operator's Disabled
@@ -36,10 +41,10 @@ type QuotaBlock struct {
 	BlockedAt      time.Time `json:"blocked_at"`
 	ObservedAt     time.Time `json:"observed_at"`
 	RetryAt        time.Time `json:"retry_at"`
-	// EstimateAt is the raw upstream reset hint, bounded to seven days from the
-	// block but not shortened by pause.max_seconds. RetryAt stays the first
-	// automatic recheck; the console may show EstimateAt because a 7-day window
-	// reset is a more truthful recovery estimate than a 24-hour review cap.
+	// EstimateAt is the historical upstream reset/retry hint, bounded to seven
+	// days from the block but not shortened by pause.max_seconds. It does not
+	// prove when quota will recover. The first automatic review can be earlier
+	// than both EstimateAt and the persisted RetryAt.
 	EstimateAt *time.Time `json:"estimate_at,omitempty"`
 	// ModelID/MultipleModels remain readable for existing auth files and UIs.
 	// ModelIDs is the complete bounded set of models that reported exhaustion;
@@ -251,6 +256,27 @@ func (c Config) pauseSettings() pauseSettings {
 	return settings
 }
 
+// quotaPauseReviewAt resolves the effective time of the first automatic review
+// for a plugin-owned pause: min(persisted RetryAt, BlockedAt+30m). The persisted
+// RetryAt stays the historical upstream reset or configured deadline and is
+// never rewritten; a shorter configured deadline is therefore kept as-is. The
+// same value drives scheduling, the due re-check fences, retry backoff and the
+// console countdown. Callers must separately validate the block before using
+// this time to schedule a review; a nil or invalid block is not proof of recovery.
+func quotaPauseReviewAt(block *QuotaBlock) time.Time {
+	if block == nil {
+		return time.Time{}
+	}
+	if block.BlockedAt.IsZero() {
+		return block.RetryAt
+	}
+	firstReview := block.BlockedAt.Add(quotaPauseFirstReviewWindow)
+	if block.RetryAt.IsZero() || firstReview.Before(block.RetryAt) {
+		return firstReview
+	}
+	return block.RetryAt
+}
+
 // quotaPauseDeadline bounds a plugin pause independently of the CPA host's
 // cooldown. A missing or expired hint uses a bounded fallback; long hints are
 // clamped, rather than being mistaken for a missing hint and retried early.
@@ -285,11 +311,10 @@ func quotaPauseDeadline(now, resetAt time.Time, settings pauseSettings) time.Tim
 	return deadline.UTC()
 }
 
-// quotaPauseEstimate keeps the upstream reset hint for display. Unlike
-// RetryAt it is not shortened by pause.max_seconds, because the automatic
-// recheck cadence is deliberately shorter than a coding-plan window; the
-// operator still needs to see when the exhausted window itself resets. It is
-// bounded by the absolute seven-day limit and never moves before BlockedAt.
+// quotaPauseEstimate keeps the historical upstream reset or Retry-After hint
+// for display, not as evidence of recovery. Unlike RetryAt it is not shortened
+// by pause.max_seconds. It is bounded by the absolute seven-day limit and never
+// moves before BlockedAt.
 func quotaPauseEstimate(blockedAt, now, resetAt time.Time) time.Time {
 	if resetAt.IsZero() || !resetAt.After(now) {
 		return time.Time{}

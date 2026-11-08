@@ -4251,7 +4251,7 @@ test('quota pause is shown separately from the operator disabled switch', () => 
   assert.equal(paused.disabled, false);
   assert.equal(paused.quota_paused, true);
   assert.equal(paused.effective_disabled, true);
-  assert.match(core.quotaPauseText(paused.quota_pause), /额度暂停（剩余/);
+  assert.match(core.quotaPauseText(paused.quota_pause), /额度暂停（约 .*后复查）/);
   // A pause with no usable deadline still renders as a pause.
   assert.equal(core.quotaPauseText({ resume_at: '' }), '额度暂停');
   assert.equal(core.quotaPauseText(null), '');
@@ -4338,7 +4338,7 @@ test('paused accounts sort after active ones by their recorded resume time', () 
   ]);
 });
 
-test('a later upstream reset hint is shown beside the shorter review deadline', () => {
+test('a historical upstream reset or retry hint is not presented as a recovery prediction', () => {
   const core = fakePage().context.OpenDesignCore;
   const now = Date.now();
   const hours = value => new Date(now + value * 3600_000).toISOString();
@@ -4346,10 +4346,9 @@ test('a later upstream reset hint is shown beside the shorter review deadline', 
     reason: 'quota_exhausted', resume_at: hours(1), estimate_at: hours(72),
   });
   assert.equal(pause.estimate_at, hours(72));
-  // The upstream's 7-day window reset is worth showing, but it never replaces the
-  // review deadline the plugin actually acts on.
-  assert.match(core.quotaPauseCountdown(pause, now), /1 小时后复查 · 预计 3 天后恢复/);
-  assert.match(core.quotaPauseText(pause, now), /1 小时后复查，预计 3 天后恢复/);
+  // This is a hint from the old error, not proof that recovery must wait that long.
+  assert.equal(core.quotaPauseCountdown(pause, now), '1 小时后复查 · 上游原提示 3 天后重置或重试');
+  assert.equal(core.quotaPauseText(pause, now), '额度暂停（1 小时后复查，上游原提示 3 天后重置或重试）');
   // Without a hint the countdown keeps its previous wording.
   const plain = core.normalizeQuotaPause({ reason: 'quota_exhausted', resume_at: hours(2) });
   assert.equal(core.quotaPauseCountdown(plain, now), '约 2 小时后复查');
@@ -6817,6 +6816,144 @@ test('额度读取失败或未配置时，暂停卡片仍给出明确状态', as
 
   await consoleApi.handlers.refreshQuota({ id: 'paused-fail', label: '查询失败', billing_configured: true, workspace_id: 'ws-1' });
   assert.match(byId('paused-fail').textContent, /查询失败/, '查询失败的暂停账户显示失败而不是空白');
+});
+
+test('刷新账户状态能看到后台恢复，不发起上游额度查询', async () => {
+  const active = activeCredential('cred-1');
+  const { view, consoleApi, calls } = quotaPage(async url => {
+    if (url.endsWith('/status')) return respond(200, statusBody({ credentials: [active] }));
+    return respond(404, { error: 'not found' });
+  }, [pausedCredential('cred-1')]);
+  assert.match(quotaRow(view).textContent, /额度耗尽 · 自动暂停/);
+  await consoleApi.handlers.refreshAccountStatus();
+  assert.doesNotMatch(quotaRow(view).textContent, /额度耗尽 · 自动暂停/);
+  assert.match(view.document.getElementById('accountRefreshState').textContent, /账户状态已更新/);
+  assert.equal(calls.filter(call => call.url.endsWith('/status')).length, 1);
+  assert.equal(calls.filter(call => call.url.includes('/quota')).length, 0);
+  assert.match(pageHTML(), /id="refreshAccountStatus"/);
+});
+
+test('刷新账户状态失败时保留当前会话和草稿', async () => {
+  const { view, consoleApi } = quotaPage(async url => {
+    if (url.endsWith('/status')) return respond(500, { error: 'temporary error' });
+    return respond(404, { error: 'not found' });
+  }, [pausedCredential('cred-1')]);
+  consoleApi.state.mappings[0].id = 'unsaved-draft';
+  await consoleApi.handlers.refreshAccountStatus();
+  assert.ok(consoleApi.state.verified, 'a transient failure must not log out the page');
+  assert.equal(consoleApi.state.mappings[0].id, 'unsaved-draft');
+  assert.match(quotaRow(view).textContent, /额度耗尽 · 自动暂停/);
+  assert.match(view.document.getElementById('accountRefreshState').textContent, /刷新账户状态失败/);
+});
+
+test('后台恢复后丢弃旧额度快照，不把旧窗口计入可用总额', async () => {
+  const { consoleApi, calls } = quotaPage(async url => {
+    if (url.endsWith('/status')) return respond(200, statusBody({ credentials: [activeCredential('cred-1')] }));
+    if (url.includes('/quota')) return respond(200, quotaContract());
+    return respond(404, { error: 'not found' });
+  }, [pausedCredential('cred-1')]);
+  await consoleApi.handlers.refreshQuota({ id: 'cred-1', label: '暂停', billing_configured: true, workspace_id: 'ws-1' });
+  assert.ok(consoleApi.state.quotas['cred-1']);
+  const quotaCalls = calls.filter(call => call.url.includes('/quota')).length;
+  await consoleApi.handlers.refreshAccountStatus();
+  assert.equal(consoleApi.state.quotas['cred-1'], undefined);
+  assert.equal(calls.filter(call => call.url.includes('/quota')).length, quotaCalls,
+    'status refresh does not query official quota');
+});
+
+test('未看到暂停过程时按新额度版本丢弃旧快照', async () => {
+  const initial = { ...activeCredential('cred-1'), billing_revision: 'before-recovery' };
+  const recovered = { ...initial, billing_revision: 'after-recovery' };
+  const { consoleApi } = quotaPage(async url => {
+    if (url.endsWith('/status')) return respond(200, statusBody({ credentials: [recovered] }));
+    if (url.includes('/quota')) return respond(200, quotaContract());
+    return respond(404, { error: 'not found' });
+  }, [initial]);
+  await consoleApi.handlers.refreshQuota(initial);
+  assert.ok(consoleApi.state.quotas['cred-1']);
+  await consoleApi.handlers.refreshAccountStatus();
+  assert.equal(consoleApi.state.quotas['cred-1'], undefined);
+});
+
+test('刷新状态不打断串行额度查询，后续账户采用最新启停状态', async () => {
+  const initial = [
+    { ...activeCredential('a'), billing_revision: 'old' },
+    activeCredential('b'), activeCredential('c'),
+  ];
+  const next = [
+    { ...initial[0], billing_revision: 'new' }, initial[1], { ...initial[2], disabled: true },
+  ];
+  const gate = deferred();
+  const { consoleApi, calls } = quotaPage(async url => {
+    if (url.endsWith('/status')) return respond(200, statusBody({ credentials: next }));
+    if (url.includes('/quota')) {
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      if (id === 'a') return gate.promise;
+      return respond(200, quotaContract({ credential_id: id }));
+    }
+    return respond(404, { error: 'not found' });
+  }, initial);
+  consoleApi.handlers.activateTab('credentials');
+  await new Promise(resolve => setTimeout(resolve, 10));
+  await consoleApi.handlers.refreshAccountStatus();
+  const queried = () => calls.filter(call => call.url.includes('/quota'))
+    .map(call => new URL(call.url, 'https://cpa.example').searchParams.get('credential_id'));
+  assert.deepEqual(queried(), ['a'], 'status refresh must not overlap the pending account');
+  gate.resolve(respond(200, quotaContract({ credential_id: 'a' })));
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.deepEqual(queried(), ['a', 'b'], 'continue serially, but skip the newly disabled account');
+  assert.equal(consoleApi.state.quotas.a, undefined, 'discard the invalidated in-flight snapshot');
+  assert.ok(consoleApi.state.quotas.b);
+});
+
+test('查询在途时刷新状态并重新打开标签，新的自动查询仍等待旧请求', async () => {
+  const initial = [
+    { ...activeCredential('a'), billing_revision: 'old' }, activeCredential('b'),
+  ];
+  const next = [{ ...initial[0], billing_revision: 'new' }, initial[1]];
+  const gate = deferred();
+  let firstA = true;
+  const { consoleApi, calls } = quotaPage(async url => {
+    if (url.endsWith('/status')) return respond(200, statusBody({ credentials: next }));
+    if (url.includes('/quota')) {
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      if (id === 'a' && firstA) {
+        firstA = false;
+        return gate.promise;
+      }
+      return respond(200, quotaContract({ credential_id: id }));
+    }
+    return respond(404, { error: 'not found' });
+  }, initial);
+  const queried = () => calls.filter(call => call.url.includes('/quota'))
+    .map(call => new URL(call.url, 'https://cpa.example').searchParams.get('credential_id'));
+  consoleApi.handlers.activateTab('credentials');
+  await new Promise(resolve => setTimeout(resolve, 10));
+  await consoleApi.handlers.refreshAccountStatus();
+  consoleApi.handlers.activateTab('credentials');
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(queried(), ['a'], 'the new walk must wait for the previous in-flight fetch');
+  gate.resolve(respond(200, quotaContract({ credential_id: 'a' })));
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.deepEqual(queried(), ['a', 'a', 'b']);
+  assert.ok(consoleApi.state.quotas.a, 'the new revision must be queried after the old one ends');
+});
+
+test('窗口摘要标示查询时间、失败时旧数据与已到的重置时间', async () => {
+  const quota = quotaContract();
+  quota.funding.state = 'stale';
+  quota.funding.fetched_at = '2026-01-01T00:00:00Z';
+  quota.funding.data.codingPlan.windows[0].resetsAt = '2026-01-02T00:00:00Z';
+  const { view, consoleApi } = quotaPage(async url => {
+    if (url.includes('/quota')) return respond(200, quota);
+    return respond(404, { error: 'not found' });
+  }, [pausedCredential('cred-1')]);
+  await consoleApi.handlers.refreshQuota({ id: 'cred-1', label: '暂停账户', billing_configured: true, workspace_id: 'ws-1' });
+  const summary = quotaRow(view).children[2].children[0].textContent;
+  assert.match(summary, /剩余 800/);
+  assert.match(summary, /上次数据/);
+  assert.match(summary, /查询 .*2026/);
+  assert.match(summary, /重置时间已到，请刷新/);
 });
 
 test('账户列表按每页 10 个翻页，暂停账户保持在各页末尾', () => {

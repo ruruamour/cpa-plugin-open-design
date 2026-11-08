@@ -83,7 +83,12 @@ type Service struct {
 	// recovery fence for the parent session's automatic resume, never a
 	// concurrency limit; guarded by mu.
 	quotaInflight map[quotaInFlightKey]int
-	// Recovery checks are serialized across accounts without limiting inference.
+	// While recovery publishes a cleared block, new admissions for that same
+	// inference key must not slip in after its in-flight count was checked.
+	// Other keys are unaffected. Guarded by mu; contains a fingerprint, not a key.
+	quotaRecoveryCommitKey string
+	// Recovery checks are serialized across accounts. Same-key inference is
+	// briefly refused only during a recovery commit, not while checks run.
 	quotaRecoveryGate chan struct{}
 	// quotaCommitGate serializes a quota-file commit with quiesce marking the
 	// plugin stopped. It is never taken on an inference path, so it adds no

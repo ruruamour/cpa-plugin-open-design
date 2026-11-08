@@ -188,25 +188,25 @@ func TestQuotaPauseViewReportsRemainingSecondsOnlyBeforeDeadline(t *testing.T) {
 
 	_, body, _ := managementCall(t, s, http.MethodGet, apiBase+"/status", nil, nil)
 	pause := pauseOf(t, credentialByID(t, body, id))
-	if pause["remaining_seconds"] != float64(90*60) {
-		t.Fatalf("remaining_seconds = %#v, want 5400", pause["remaining_seconds"])
+	if pause["remaining_seconds"] != float64(30*60) {
+		t.Fatalf("remaining_seconds = %#v, want 1800 for the bounded first review", pause["remaining_seconds"])
 	}
 	if _, ok := pause["awaiting_recheck"]; ok {
 		t.Fatalf("a not-yet-due pause was marked as awaiting recheck: %#v", pause)
 	}
 	// The value follows the plugin clock, not the wall clock, and shrinks.
-	now = now.Add(30 * time.Minute)
+	now = now.Add(10 * time.Minute)
 	setNow(now)
 	_, body, _ = managementCall(t, s, http.MethodGet, apiBase+"/status", nil, nil)
 	pause = pauseOf(t, credentialByID(t, body, id))
-	if pause["remaining_seconds"] != float64(60*60) {
-		t.Fatalf("remaining_seconds after 30m = %#v, want 3600", pause["remaining_seconds"])
+	if pause["remaining_seconds"] != float64(20*60) {
+		t.Fatalf("remaining_seconds after 10m = %#v, want 1200", pause["remaining_seconds"])
 	}
 
 	// Past the deadline the pause stays recorded and is marked as awaiting a
 	// recheck instead of a countdown. This is a read-only view: it must not clear
 	// the block or issue a quota request.
-	now = now.Add(70 * time.Minute)
+	now = now.Add(25 * time.Minute)
 	setNow(now)
 	current, _ := liveCredential(s, id)
 	view := credentialView(current, now, "", "")
@@ -246,9 +246,8 @@ func TestCredentialViewOmitsPauseDetailWhenNotPaused(t *testing.T) {
 	}
 }
 
-// A 7-day window reset is later than the default 24-hour review cap, so the raw
-// upstream hint must survive as its own field. The console needs it to show when
-// the exhausted window actually returns instead of presenting the review cap.
+// Preserve a long upstream hint separately from both the stored deadline and
+// the effective first review; it is historical data, not proof of recovery.
 func TestQuotaPauseViewKeepsTheRawResetHintSeparateFromTheReviewDeadline(t *testing.T) {
 	s, host := newQuotaPauseTestService(t)
 	id := addCredential(t, s, host, "fixture", "fixture-inference-key")
@@ -262,19 +261,22 @@ func TestQuotaPauseViewKeepsTheRawResetHintSeparateFromTheReviewDeadline(t *test
 
 	current, _ := liveCredential(s, id)
 	pause := pauseOf(t, credentialView(current, now, "", ""))
-	// The review deadline stays capped at the configured 24 hours.
+	// The stored deadline stays capped at the configured 24 hours.
 	if !current.QuotaBlock.RetryAt.Equal(now.Add(24 * time.Hour)) {
-		t.Fatalf("retry_at = %v, want the 24h review cap", current.QuotaBlock.RetryAt)
+		t.Fatalf("retry_at = %v, want the 24h stored deadline cap", current.QuotaBlock.RetryAt)
 	}
 	estimate, ok := pause["estimate_at"].(time.Time)
 	if !ok || !estimate.Equal(sevenDays) {
 		t.Fatalf("estimate_at = %#v, want the raw reset hint %v", pause["estimate_at"], sevenDays)
 	}
-	// remaining_seconds is derived from the deadline itself, so it may differ by a
-	// second from the exact cap; it must never be the raw 7-day hint.
+	// The display uses the effective first review, not the stored 24h
+	// deadline or the historical 7-day hint.
 	remaining, ok := pause["remaining_seconds"].(int64)
-	if !ok || remaining > int64((24*time.Hour)/time.Second) || remaining < int64((24*time.Hour)/time.Second)-1 {
-		t.Fatalf("remaining_seconds = %#v, want the 24h review cap", pause["remaining_seconds"])
+	if !ok || remaining != int64((30*time.Minute)/time.Second) {
+		t.Fatalf("remaining_seconds = %#v, want the 30m first review", pause["remaining_seconds"])
+	}
+	if got := pause["resume_at"].(time.Time); !got.Equal(now.Add(30 * time.Minute)) {
+		t.Fatalf("resume_at = %v, want the effective first review", got)
 	}
 
 	// A hint beyond the absolute seven-day bound is clamped, never dropped.

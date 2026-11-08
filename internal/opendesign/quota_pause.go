@@ -342,6 +342,10 @@ func (s *Service) publishQuotaResumeLocked(expected quotaCommitSnapshot, path st
 		s.credentialEpoch[expected.id]++
 		live.runtimeEpoch = s.credentialEpoch[expected.id]
 		s.invalidateBillingLocked(expected.id)
+		// Browsers may miss the whole paused interval. Advance the opaque cache
+		// generation so their old quota snapshot is invalidated even when both
+		// their previous and newly read account states are unpaused.
+		live.billingRevision = newID()
 		s.clearModelTestsLocked(expected.id)
 		s.creds[expected.id] = live
 		delete(s.quotaPauseErrors, expected.id)
@@ -615,7 +619,8 @@ func (s *Service) recheckQuotaBlock(callbackID, id string) error {
 	return s.recheckQuotaBlockMode(callbackID, id, false)
 }
 
-// recheckQuotaBlockMode serializes recovery checks without limiting inference.
+// recheckQuotaBlockMode serializes recovery checks without a concurrency cap.
+// During the final commit it briefly refuses admissions for the same key.
 // Every known failed model must have a fresh official available result for the
 // same workspace member, and no same-key inference may still be in flight. The
 // operator must configure the control key and inference key for the same account;
@@ -654,7 +659,7 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 	if !current.quotaBlocked() {
 		return nil
 	}
-	if dueOnly && (!enabled || current.QuotaBlock.RetryAt.After(now)) {
+	if dueOnly && (!enabled || quotaPauseReviewAt(current.QuotaBlock).After(now)) {
 		return localFail(http.StatusConflict, "quota_recheck_not_due", "额度暂停尚未到复查时间，或自动暂停已关闭")
 	}
 	if inflight {
@@ -712,8 +717,8 @@ func (s *Service) recheckQuotaBlockMode(callbackID, id string, dueOnly bool) err
 		proofs = append(proofs, quotaRecoveryProof{view: view, model: model, started: started})
 	}
 
-	// Match the global lock order used by model/config updates. No new same-key
-	// inference can be admitted while the block remains published in memory.
+	// Match the global lock order used by model/config updates. The commit
+	// atomically fences new same-key admissions with its final in-flight check.
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
 	if err := s.commitQuotaRecovery(current, block, proofs, generation, dueOnly); err != nil {
@@ -745,31 +750,48 @@ func (s *Service) commitQuotaRecovery(current Credential, block *QuotaBlock, pro
 	defer s.authFileMu.Unlock()
 
 	now := s.quotaPauseTime()
-	s.mu.RLock()
+	s.mu.Lock()
 	live, exists := s.creds[current.ID]
 	dir, filename := s.authDir, s.authFiles[current.ID]
 	stopped := s.stopped
 	inflight := s.quotaHasInFlightLocked(live)
 	syncPending := s.quotaPauseErrors[current.ID] != ""
-	// Capture the policy under the same RLock that reads the live credential. The
-	// config writer publishes s.cfg/s.pauseGeneration under mu, so re-reading
-	// them after the unlock would race and could accept a round the operator
-	// cancelled.
 	enabled := s.cfg.pauseSettings().enabled
 	liveGeneration := s.pauseGeneration
 	clock := s.modelCoverageNow
-	s.mu.RUnlock()
+	stateOK := exists && live.quotaBlocked() && live.APIKey == current.APIKey &&
+		live.ControlKey == current.ControlKey && live.WorkspaceID == current.WorkspaceID &&
+		live.runtimeEpoch == current.runtimeEpoch && live.QuotaRevision == current.QuotaRevision &&
+		!inflight && !syncPending
+	policyOK := !dueOnly || (enabled && stateOK && !quotaPauseReviewAt(live.QuotaBlock).After(now) && liveGeneration == generation)
+	// Atomically reserve this key with the last no-in-flight check. Another
+	// credential sharing the key (including StorageJSON-only requests) must not
+	// admit a new inference while the cleared state is being written/published.
+	// The global recovery gate serializes commits, so only one key is reserved.
+	reservedKey := ""
+	if !stopped && stateOK && policyOK {
+		reservedKey = quotaPauseKeyHash(live.APIKey)
+		s.quotaRecoveryCommitKey = reservedKey
+	}
+	s.mu.Unlock()
 	if stopped {
 		return quotaRecheckUnavailable()
 	}
-	if !exists || !live.quotaBlocked() || live.APIKey != current.APIKey ||
-		live.ControlKey != current.ControlKey || live.WorkspaceID != current.WorkspaceID ||
-		live.runtimeEpoch != current.runtimeEpoch || live.QuotaRevision != current.QuotaRevision ||
-		inflight || syncPending {
+	if !stateOK {
 		return localFail(http.StatusConflict, "quota_state_changed", "额度暂停状态或凭据已变化，请刷新后重试")
 	}
-	if dueOnly && (!enabled || live.QuotaBlock.RetryAt.After(now) || liveGeneration != generation) {
+	if !policyOK {
 		return localFail(http.StatusConflict, "quota_recheck_not_due", "额度暂停策略已变化，已放弃本轮复查")
+	}
+	defer func() {
+		s.mu.Lock()
+		if s.quotaRecoveryCommitKey == reservedKey {
+			s.quotaRecoveryCommitKey = ""
+		}
+		s.mu.Unlock()
+	}()
+	if hook := s.quotaInFlightTestHook.Load(); hook != nil && hook.afterRecoveryFence != nil {
+		hook.afterRecoveryFence()
 	}
 	path, err := credentialFilePath(dir, filename)
 	if err != nil {
@@ -880,8 +902,8 @@ func (s *Service) setQuotaRecheckStatus(id, revision string, err error) {
 	// mu is already held, so read the injected clock directly instead of calling
 	// quotaPauseTime, which takes the same lock.
 	now := s.quotaNow()
-	if remaining := c.QuotaBlock.RetryAt.Sub(now); remaining > delay {
-		// A later upstream reset hint is the better estimate; cap it anyway.
+	if remaining := quotaPauseReviewAt(c.QuotaBlock).Sub(now); remaining > delay {
+		// A later effective review time is the better estimate; cap it anyway.
 		delay = remaining
 		if delay > quotaRecheckBackoffMax {
 			delay = quotaRecheckBackoffMax
@@ -987,7 +1009,7 @@ func (s *Service) recheckDueQuotaBlocks(stop <-chan struct{}) {
 	type candidate struct{ id, revision string }
 	var candidates []candidate
 	for id, c := range s.creds {
-		if !s.revoked[id] && c.quotaBlocked() && !c.QuotaBlock.RetryAt.After(now) && s.quotaPauseErrors[id] == "" &&
+		if !s.revoked[id] && c.quotaBlocked() && !quotaPauseReviewAt(c.QuotaBlock).After(now) && s.quotaPauseErrors[id] == "" &&
 			!s.quotaRecheckRetryAt[id].After(now) {
 			candidates = append(candidates, candidate{id: id, revision: c.QuotaRevision})
 		}

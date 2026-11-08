@@ -7,11 +7,12 @@ import (
 
 // Non-throttling inference in-flight tracking.
 //
-// The plugin never limits concurrency: this bookkeeping exists only so a
-// recovery decision (implemented by the parent session) can prove that no
-// inference admitted for a credential's current key is still running before it
-// clears a quota block. Every inference therefore adds one counter after the
-// live credential was re-verified, and drops it exactly once when the request
+// There is no inference concurrency cap or queue: this bookkeeping lets a
+// recovery decision prove that no inference admitted for the same key is still
+// running before it clears a quota block. During the short recovery commit, a
+// same-key admission is refused so it cannot race that final check. Every
+// inference adds one counter after the live credential was re-verified, and
+// drops it exactly once when the request
 // (or its terminal stream pump) has finished.
 //
 // The fence is keyed by credential id plus the inference key fingerprint: the id
@@ -55,13 +56,15 @@ type quotaInFlightLease struct {
 
 // quotaInFlightTestHook lets tests observe the exact admission/release
 // interleaving. It is stored per Service (never globally) and is nil in
-// production. Both callbacks run outside Service.mu, so a callback may take any
-// plugin lock; the hook pointer itself is read atomically, and a test installs
-// it before starting the request it wants to observe.
+// production. All callbacks run outside Service.mu. afterRecoveryFence runs
+// with credentialMu, quotaCommitGate and authFileMu held and must not acquire
+// them again. The pointer itself is read atomically, and a test installs it
+// before starting the request it wants to observe.
 type quotaInFlightTestHook struct {
-	beforeAdmit   func()
-	beforeObserve func()
-	beforeRelease func(quotaInFlightKey)
+	beforeAdmit        func()
+	beforeObserve      func()
+	beforeRelease      func(quotaInFlightKey)
+	afterRecoveryFence func()
 }
 
 // admitQuotaInFlight re-verifies the live credential and reserves one in-flight
@@ -81,8 +84,8 @@ type quotaInFlightTestHook struct {
 // counted under its key, so a credential record for the same key that appears
 // later is fenced too.
 //
-// No concurrency cap, queue or deadline is added here; admission is only a
-// counter.
+// No concurrency cap, queue or deadline is added here. The same-key recovery
+// commit fence may refuse an admission before the counter is incremented.
 func (s *Service) admitQuotaInFlight(source Credential, requestAuthID string) (*quotaInFlightLease, error) {
 	if hook := s.quotaInFlightTestHook.Load(); hook != nil && hook.beforeAdmit != nil {
 		hook.beforeAdmit()
@@ -140,6 +143,13 @@ func (s *Service) admitQuotaInFlight(source Credential, requestAuthID string) (*
 		if source.quotaBlocked() {
 			return nil, localFail(http.StatusTooManyRequests, "quota_blocked", quotaBlockMarker+" upstream account quota is temporarily paused")
 		}
+	}
+	// A different active credential (or a StorageJSON-only request) can share
+	// this key with the paused one. Refuse it while recovery is committing:
+	// otherwise it could start after the no-in-flight check but before the
+	// cleared block is published. No other inference keys are affected.
+	if key.keyHash != "" && key.keyHash == s.quotaRecoveryCommitKey {
+		return nil, localFail(http.StatusTooManyRequests, "quota_blocked", quotaBlockMarker+" upstream account quota recovery is being committed")
 	}
 	if s.quotaInflight == nil {
 		s.quotaInflight = map[quotaInFlightKey]int{}

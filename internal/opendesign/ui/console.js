@@ -167,11 +167,13 @@
 
   // Logout invalidates every request; editing one credential invalidates only
   // its own quota and model-coverage requests so other accounts can finish.
-  function invalidateQuota(credentialID) {
-    // Any invalidation also cancels an in-flight walk: a logout clears every
-    // snapshot, and editing one account must not continue with stale rows.
-    state.quotaAutoGeneration += 1;
-    state.quotaAutoRunning = false;
+  function invalidateQuota(credentialID, options = {}) {
+    // Explicit edits and logout cancel the walk; a status-only update can
+    // invalidate one account while the walk re-resolves each remaining row.
+    if (credentialID === undefined || options.keepAutoWalk !== true) {
+      state.quotaAutoGeneration += 1;
+      state.quotaAutoRunning = false;
+    }
     if (credentialID === undefined) {
       state.quotaGeneration += 1;
       state.quotaRevisions = {};
@@ -1132,12 +1134,26 @@
         ? '401：管理密钥无效或已过期，请重新输入当前 CPA 入口的管理密钥。'
         : '403：管理请求被拒绝，请确认管理密钥和来源 IP。')) return false;
       if (authGeneration !== state.authGeneration || !statusReadCurrent(read)) return false;
-      if (isUpstreamSource(error) && isAuthStatus(error.status)) {
+      if (options.preserveOnError) {
+        // A transient status failure does not invalidate the verified session or
+        // its drafts. Only a real management 401/403 above may do that.
+        message('accountRefreshState', `刷新账户状态失败：${formatError(error)}`, 'error');
+      } else if (isUpstreamSource(error) && isAuthStatus(error.status)) {
         message('authState', `读取状态失败（上游）：${formatError(error)}`, 'error');
       } else {
         showAuth(`读取状态失败：${formatError(error)}`);
       }
       return false;
+    }
+  }
+
+  // The background worker can recover an account while this page stays open.
+  // This explicit status read updates the badge without querying upstream quota.
+  async function refreshAccountStatus() {
+    if (!state.verified || state.busy) return;
+    const sessionGeneration = state.sessionGeneration;
+    if (await loadStatus({ preserveOnError: true }) && sessionGeneration === state.sessionGeneration) {
+      message('accountRefreshState', '账户状态已更新；未重新查询额度。', 'ok');
     }
   }
 
@@ -1150,15 +1166,20 @@
 
   function invalidateChangedQuotas(credentials) {
     const previous = state.billingSignatures || {};
+    const previouslyPaused = new Set(state.status.credentials.filter(item => item.quota_paused).map(item => item.id));
     const next = {};
     for (const item of credentials) {
       next[item.id] = billingSignature(item);
-      if (Object.prototype.hasOwnProperty.call(previous, item.id) && previous[item.id] !== next[item.id]) {
-        invalidateQuota(item.id);
+      // A recovery invalidates the server's quota cache even when the billing
+      // identity is unchanged. Do not count the old snapshot as current after
+      // the account rejoins the active totals.
+      if ((Object.prototype.hasOwnProperty.call(previous, item.id) && previous[item.id] !== next[item.id]) ||
+          (previouslyPaused.has(item.id) && !item.quota_paused)) {
+        invalidateQuota(item.id, { keepAutoWalk: true });
       }
     }
     for (const id of Object.keys(previous)) {
-      if (!Object.prototype.hasOwnProperty.call(next, id)) invalidateQuota(id);
+      if (!Object.prototype.hasOwnProperty.call(next, id)) invalidateQuota(id, { keepAutoWalk: true });
     }
     state.billingSignatures = next;
   }
@@ -1325,7 +1346,7 @@
     } else {
       parts.push('未配置官方 controlKey 或 Workspace ID，无法复查额度，仍须人工处理。');
     }
-    parts.push('暂停期间请在本页启用/停用；CPA 原生入口和并发文件改写无法可靠归因，请勿在那里改动同一账户。');
+    parts.push('页面不会自动更新账户状态；可点「刷新状态」查看复查结果。暂停期间请在本页启用/停用；CPA 原生入口和并发文件改写无法可靠归因，请勿在那里改动同一账户。');
     if (!quotaPauseHasModels(pause)) parts.push('耗尽模型集合不完整，无法自动确认恢复，只能人工解除。');
     else if (pause.multiple_models) parts.push('多个模型报告过额度耗尽，须逐一复查并确认属于同一 Workspace 成员。');
     const recheckMessages = {
@@ -1786,6 +1807,10 @@
     state.quotaAutoRunning = false;
   }
 
+  // A tab switch cancels a walk, not its already-sent fetch. A later walk in
+  // the same session must wait for that fetch before starting another one.
+  let quotaAutoInFlight = null;
+
   async function autoLoadQuotaForAccounts() {
     const generation = (state.quotaAutoGeneration += 1);
     state.quotaAutoRunning = true;
@@ -1800,8 +1825,16 @@
         ...items.filter(item => item && !item.quota_paused),
         ...items.filter(item => item && item.quota_paused),
       ];
-      for (const item of ordered) {
+      for (const original of ordered) {
         if (generation !== state.quotaAutoGeneration) return;
+        const pending = quotaAutoInFlight;
+        if (pending && pending.sessionGeneration === state.sessionGeneration) {
+          await pending.promise;
+          if (generation !== state.quotaAutoGeneration) return;
+        }
+        // A concurrent status refresh may delete, disable or reconfigure a row.
+        // Re-resolve it before continuing rather than using the old snapshot.
+        const item = original && state.status.credentials.find(current => current.id === original.id);
         if (!item || !item.billing_configured || item.disabled) continue;
         if (state.quotaBusy[item.id]) continue;
         // A snapshot still inside the 60s window would only come back throttled,
@@ -1812,7 +1845,13 @@
         // The pause badge keeps its own countdown, so a paused account without a
         // snapshot is still readable; it still gets one read so its wallet and
         // exhausted windows are visible instead of a blank card.
-        await refreshQuota(item, { automatic: true });
+        const flight = { promise: refreshQuota(item, { automatic: true }), sessionGeneration: state.sessionGeneration };
+        quotaAutoInFlight = flight;
+        try {
+          await flight.promise;
+        } finally {
+          if (quotaAutoInFlight === flight) quotaAutoInFlight = null;
+        }
       }
     } finally {
       if (generation === state.quotaAutoGeneration) state.quotaAutoRunning = false;
@@ -1849,13 +1888,18 @@
     return null;
   }
 
-  function quotaSummaryWindow(window, item) {
+  function quotaSummaryWindow(window, item, funding) {
     const title = window.durationSeconds ? `窗口 ${Core.formatDuration(window.durationSeconds)}` : '额度窗口';
     const percent = Core.creditsPercent(window.usedCredits, window.limitCredits);
     const sub = [];
     const usd = Core.formatCreditsUSD(window.remainingCredits, item && item.credits_per_usd);
     if (window.remainingCredits) sub.push(`剩余 ${Core.formatCredits(window.remainingCredits)}${usd ? ` (${usd})` : ''}`);
-    if (window.resetsAt) sub.push(`重置于 ${Core.formatTime(window.resetsAt)}`);
+    if (window.resetsAt) {
+      sub.push(`重置于 ${Core.formatTime(window.resetsAt)}`);
+      if (Date.parse(window.resetsAt) <= Date.now()) sub.push('重置时间已到，请刷新');
+    }
+    if (funding.state === 'stale') sub.push('上次数据');
+    if (funding.fetched_at) sub.push(`查询 ${Core.formatTime(funding.fetched_at)}`);
     const parts = [
       el('span', { className: 'usage-head' }, [
         el('span', { className: 'usage-label', text: title }),
@@ -1883,7 +1927,7 @@
     if (wallet) parts.push(wallet);
     const windows = quota.funding && quota.funding.data && quota.funding.data.codingPlan
       ? quota.funding.data.codingPlan.windows : [];
-    for (const window of windows.slice(0, 4)) parts.push(quotaSummaryWindow(window, item));
+    for (const window of windows.slice(0, 4)) parts.push(quotaSummaryWindow(window, item, quota.funding));
     if (!parts.length) {
       const funding = quota.funding || {};
       if (funding.state === 'error') parts.push(quotaSummaryText('额度', '查询失败', '展开查看原因'));
@@ -4570,6 +4614,8 @@
     if (accountSearch) accountSearch.addEventListener('input', () => filterAccounts(accountSearch.value));
     const accountPausedCount = $('accountPausedCount');
     if (accountPausedCount) accountPausedCount.addEventListener('click', showPausedAccounts);
+    const refreshAccounts = $('refreshAccountStatus');
+    if (refreshAccounts) refreshAccounts.addEventListener('click', refreshAccountStatus);
     const fetchButton = $('fetchModels');
     if (fetchButton) fetchButton.addEventListener('click', fetchModels);
     const saveButton = $('saveModels');
@@ -4807,6 +4853,7 @@
       previousAccountsPage,
       filterAccounts,
       showPausedAccounts,
+      refreshAccountStatus,
       resumeQuotaPause,
       recheckQuotaPause,
       selectAccount,

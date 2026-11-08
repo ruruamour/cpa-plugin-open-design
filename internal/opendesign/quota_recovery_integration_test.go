@@ -112,6 +112,30 @@ func TestQuotaRecoveryRequiresFreshEvidenceForAllModels(t *testing.T) {
 	}
 }
 
+func TestQuotaRecoveryInvalidatesUIQuotaRevisionEvenIfPauseWasMissed(t *testing.T) {
+	s, host, id, path := quotaRecoveryFixture(t, false, "model-a")
+	before, _ := liveCredential(s, id)
+	if before.billingRevision == "" {
+		t.Fatal("fixture has no quota cache revision")
+	}
+	queueRecoveryEvidence(t, host, "model-a", "member", "available")
+	if err := s.recheckQuotaBlock("callback", id); err != nil {
+		t.Fatalf("official recovery failed: %v", err)
+	}
+	after, _ := liveCredential(s, id)
+	if after.quotaBlocked() || after.billingRevision == "" || after.billingRevision == before.billingRevision {
+		t.Fatal("recovery did not advance the opaque UI quota cache revision")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields["billing_revision"] != nil {
+		t.Fatal("internal billing cache revision leaked into the credential file")
+	}
+}
+
 func TestQuotaRecoveryRejectsCachedEvidence(t *testing.T) {
 	s, host, id, path := quotaRecoveryFixture(t, false, "model-a")
 	queueRecoveryEvidence(t, host, "model-a", "member", "available")

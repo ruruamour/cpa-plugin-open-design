@@ -130,6 +130,68 @@ func TestQuotaRecoveryRejectsEvidenceThatAgedWhileWaitingForTheCommitLock(t *tes
 	requireQuotaStillBlocked(t, s, id, path)
 }
 
+func TestQuotaRecoveryCommitFencesNewAdmissionsForSharedKey(t *testing.T) {
+	for _, failWrite := range []bool{false, true} {
+		name := "successful commit"
+		if failWrite {
+			name = "failed commit"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, host, id, path, advance := quotaCommitFixture(t, "model-a")
+			paused, _ := liveCredential(s, id)
+			siblingID := addCredential(t, s, host, "same-key", paused.APIKey)
+			sibling, _ := liveCredential(s, siblingID)
+			fenced, releaseFenceCh := make(chan struct{}), make(chan struct{})
+			releaseFence := sync.OnceFunc(func() { close(releaseFenceCh) })
+			defer releaseFence()
+			s.quotaInFlightTestHook.Store(&quotaInFlightTestHook{
+				afterRecoveryFence: func() { close(fenced); <-releaseFenceCh },
+			})
+			started, releaseHTTP := parkQuotaHTTP(t, s, host, advance, "model-a", "member", "available")
+			defer releaseHTTP()
+			result := make(chan error, 1)
+			go func() { result <- s.recheckQuotaBlock("callback", id) }()
+			awaitParked(t, started)
+			releaseHTTP()
+			awaitParked(t, fenced)
+
+			// Both a live sibling and an id-less StorageJSON fallback share the
+			// paused key; neither may slip past the no-in-flight check.
+			for _, source := range []Credential{sibling, {APIKey: paused.APIKey}} {
+				lease, err := s.admitQuotaInFlight(source, source.ID)
+				if lease != nil {
+					lease.release(s)
+				}
+				var apiErr *APIError
+				if !errors.As(err, &apiErr) || apiErr.Kind != "quota_blocked" {
+					t.Fatalf("same-key admission was not fenced: %v", err)
+				}
+			}
+			// An unrelated inference key remains usable during the file commit.
+			other, err := s.admitQuotaInFlight(Credential{APIKey: "other-inference-key"}, "")
+			if err != nil {
+				t.Fatalf("unrelated key was blocked: %v", err)
+			}
+			other.release(s)
+			if failWrite {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			releaseFence()
+			if err := waitRecheck(t, result); (err != nil) != failWrite {
+				t.Fatalf("commit error = %v, failWrite=%v", err, failWrite)
+			}
+			// The temporary fence must be released on success and every failure.
+			lease, err := s.admitQuotaInFlight(sibling, sibling.ID)
+			if err != nil {
+				t.Fatalf("commit left its shared-key admission fence behind: %v", err)
+			}
+			lease.release(s)
+		})
+	}
+}
+
 func TestQuotaRecoveryRejectsControlKeyChangedOnDiskWithoutWatcher(t *testing.T) {
 	s, host, id, path, advance := quotaCommitFixture(t, "model-a")
 	started, release := parkQuotaHTTP(t, s, host, advance, "model-a", "member", "available")

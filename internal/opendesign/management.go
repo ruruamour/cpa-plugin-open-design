@@ -247,18 +247,19 @@ func stringOf(v any) string {
 func quotaPauseView(c Credential, now time.Time, syncError, recheckStatus string) map[string]any {
 	block := c.QuotaBlock
 	_, modelsComplete := quotaBlockModels(block)
+	reviewAt := quotaPauseReviewAt(block)
 	pause := map[string]any{
 		"reason":           block.Reason,
 		"source":           block.Source,
 		"blocked_at":       block.BlockedAt,
 		"observed_at":      block.ObservedAt,
-		"resume_at":        block.RetryAt,
+		"resume_at":        reviewAt,
 		"manual_disabled":  c.Disabled,
 		"model_id":         block.ModelID,
 		"multiple_models":  block.MultipleModels,
 		"models_ambiguous": !modelsComplete,
 	}
-	if remaining := block.RetryAt.Sub(now); remaining > 0 {
+	if remaining := reviewAt.Sub(now); remaining > 0 {
 		pause["remaining_seconds"] = int64(remaining / time.Second)
 	} else {
 		// The deadline is a review hint, not a recovery. Report that a recheck is
@@ -266,9 +267,8 @@ func quotaPauseView(c Credential, now time.Time, syncError, recheckStatus string
 		// again: nothing in the plugin verifies the upstream quota here.
 		pause["awaiting_recheck"] = true
 	}
-	// The raw reset hint can be later than RetryAt when pause.max_seconds is
-	// shorter than the exhausted window. Expose it separately so the console
-	// never presents the review cap as the quota's actual reset time.
+	// The historical upstream hint is separate from the review deadline; it may
+	// have come from Retry-After and is not a promise of when quota recovers.
 	if block.EstimateAt != nil {
 		pause["estimate_at"] = *block.EstimateAt
 	}

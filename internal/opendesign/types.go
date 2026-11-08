@@ -243,8 +243,9 @@ type Credential struct {
 	// temporary plugin-owned scheduling restriction, following ClinePass.
 	QuotaBlock    *QuotaBlock `json:"quota_block,omitempty"`
 	QuotaRevision string      `json:"quota_revision,omitempty"`
-	// billingRevision is an opaque in-memory identity for UI cache invalidation.
-	// It is random, never derived from a key and never persisted in auth files.
+	// billingRevision is an opaque in-memory generation for UI cache invalidation
+	// after identity changes or quota recovery. It is random, never derived from
+	// a key and never persisted in auth files.
 	// runtimeEpoch fences model tests against credential identity changes, even
 	// when a key or disabled flag is changed and later restored.
 	runtimeEpoch    uint64

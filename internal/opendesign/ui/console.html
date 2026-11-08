@@ -364,11 +364,13 @@
           <p class="hint">账户列表只显示标签、启用状态和操作；API key 不会回显，编辑时也不能读取原 key。打开本标签页会按账户顺序逐个查询一次额度（不并发），离开即停止。</p>
         </div>
         <div class="panel-actions">
+          <button class="button compact" id="refreshAccountStatus" type="button" title="重新读取账户状态，不发起上游额度查询">刷新状态</button>
           <button class="button compact" id="openErrorRules" type="button" title="配置 CPA 的重试调度：命中规则后是停止还是继续换号，以及是否冷却失败的账号">错误规则</button>
           <span class="badge" id="accountCount">0 个账户</span>
           <button class="badge danger" id="accountPausedCount" type="button" title="跳到额度暂停账户" hidden>0 个额度暂停</button>
         </div>
       </div>
+      <p class="state" id="accountRefreshState" role="status" aria-live="polite" hidden></p>
       <details class="account-editor" id="accountEditor">
         <summary id="accountEditorSummary">添加账户</summary>
       <form class="stack" id="accountForm" autocomplete="off">
@@ -664,13 +666,13 @@
                 识别到额度耗尽时自动暂停该账户
               </label>
               <label class="field narrow">
-                <span>单次上限（秒，60-604800）</span>
+                <span>上游提示复查上限（秒，60-604800）</span>
                 <input class="control" id="configPauseMaxSeconds" type="number" min="60" max="604800" step="60" inputmode="numeric">
               </label>
               <button class="button primary" id="savePauseConfig" type="submit">保存额度暂停设置</button>
             </form>
             <p class="hint" style="margin-top: 8px;">
-              开发中，请勿在生产启用。插件会将暂停状态投影到 CPA，并在本地拦截；到点后串行复查，只有新鲜官方结果确认有余量才解除，查询失败继续暂停。请确认 controlKey 与推理 key 属于同一账号，插件无法自动验证两者归属。
+              开发中，请勿在生产启用。插件会将暂停状态投影到 CPA，并在本地拦截；首次复查按上游提示与暂停后 30 分钟中较早者安排，账号逐个检查，实际执行可能排队。只有新鲜官方结果确认有余量才解除，查询失败继续暂停；上游原提示不代表恢复时间。请确认 controlKey 与推理 key 属于同一账号，插件无法自动验证两者归属。
             </p>
             <p class="hint" style="margin-top: 8px;">
               暂停期间请在本控制台启用/停用账户，不要使用 CPA 原生界面：原生入口和并发文件改写会直接写入同一份凭据文件，插件无法可靠区分一次停用是插件引发、宿主引发还是人工操作，两边同时改动可能让暂停与启用状态互相覆盖。未配置官方 controlKey（或缺少 Workspace ID）时无法自动复查额度，仍须人工处理。
