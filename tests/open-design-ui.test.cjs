@@ -4363,13 +4363,44 @@ test('a historical upstream reset or retry hint is not presented as a recovery p
 test('credits convert to an approximate dollar value only with a configured rate', () => {
   const core = fakePage().context.OpenDesignCore;
   // 5000 credits = $1, and the number the operator records is the credits per $1.
-  assert.equal(core.formatCreditsUSD('47387', '5000'), '≈ $947.74');
+  assert.equal(core.formatCreditsUSD('5000', '5000'), '≈ $1.00', 'the rate is credits per $1');
+  assert.equal(core.formatCreditsUSD('47387', '5000'), '≈ $9.48');
+  // The backend accepts positive decimal rates; a legal fractional rate keeps working.
+  assert.equal(core.formatCreditsUSD('10001', '5000.5'), '≈ $2.00');
+  assert.equal(core.formatCreditsUSD('1', '8'), '≈ $0.13', 'half a cent rounds up');
+  assert.equal(core.formatCreditsUSD('1', '200'), '≈ $0.01', 'half of the first cent rounds up');
+  assert.equal(core.formatCreditsUSD('0', '5000.5'), '≈ $0.00', 'known zero remains a valid amount');
   assert.equal(core.formatCreditsUSD('47387', ''), '', 'no rate means no dollar value');
-  assert.equal(core.formatCreditsUSD('47387', '0'), '');
+  for (const rate of ['0', '0.0', '-5', '1e6', 'abc', '5000cr', '   ', '9'.repeat(33), 5000]) {
+    assert.equal(core.formatCreditsUSD('47387', rate), '', `invalid rate ${JSON.stringify(rate)} must not divide`);
+  }
   assert.equal(core.formatCreditsUSD('', '5000'), '');
-  assert.equal(core.formatCreditsUSD('47387', 'abc'), '', 'a malformed rate must not divide');
   // BigInt math keeps large credit counts exact instead of rounding to a float.
-  assert.equal(core.formatCreditsUSD('123456789012345678901234567890', '5000'), '≈ $2469135780246913578024691357.80');
+  assert.equal(core.formatCreditsUSD('123456789012345678901234567890', '5000'), '≈ $24691357802469135780246913.58');
+  // Fractional cents are summed exactly and rounded once, not per account.
+  const parts = Array.from({ length: 3 }, () => ({ credits: '1', creditsPerUSD: '8' }));
+  assert.deepEqual({ ...core.sumCreditsUSD(parts) }, { usd: '0.38', converted: 3, accounts: 3 });
+  const subCent = Array.from({ length: 3 }, () => ({ credits: '1', creditsPerUSD: '300' }));
+  assert.deepEqual({ ...core.sumCreditsUSD(subCent) }, { usd: '0.01', converted: 3, accounts: 3 });
+  assert.deepEqual({ ...core.sumCreditsUSD([
+    { credits: '5000', creditsPerUSD: '5000' },
+    { credits: '5000' },
+  ]) }, { usd: '1.00', converted: 1, accounts: 2 }, 'missing rate keeps credits but adds no dollars');
+  assert.deepEqual({ ...core.sumCreditsUSD([{ credits: '5000' }]) },
+    { usd: '', converted: 0, accounts: 1 }, 'no configured rate must not invent a zero-dollar total');
+});
+
+test('normalizeStatus keeps a legal fractional rate and drops invalid ones', () => {
+  const core = fakePage().context.OpenDesignCore;
+  const rateOf = credits_per_usd => core.normalizeStatus(statusBody({
+    credentials: [{ id: 'cred-1', label: '主账户', disabled: false, credits_per_usd }],
+  })).credentials[0].credits_per_usd;
+  assert.equal(rateOf(' 5000.5 '), '5000.5');
+  assert.equal(rateOf('5000'), '5000');
+  assert.equal(rateOf(''), '');
+  for (const rate of ['0', '0.0', '-5', '1e6', 'abc', '9'.repeat(33), 5000]) {
+    assert.equal(rateOf(rate), '', `invalid rate ${JSON.stringify(rate)} stays unknown`);
+  }
 });
 
 test('the account header and rows show the equivalent dollar value of remaining credits', () => {
@@ -4390,12 +4421,12 @@ test('the account header and rows show the equivalent dollar value of remaining 
   const total = view.document.getElementById('accountQuotaTotal');
   const usage = [...total.children].find(child => child.className === 'usage');
   // Only the account that recorded a rate produces a dollar equivalent.
-  assert.deepEqual([...usage.children[0].children].map(child => child.textContent), ['窗口 5 小时', '50,000 · ≈ $1000.00']);
-  assert.match(usage.children[1].textContent, /约合 \$1000\.00/);
+  assert.deepEqual([...usage.children[0].children].map(child => child.textContent), ['窗口 5 小时', '50,000 · ≈ $10.00']);
+  assert.match(usage.children[1].textContent, /约合 \$10\.00/);
   // The row summary shows the same equivalent next to the plain credits.
   const row = accountRows(view).find(node => node.getAttribute('data-credential-id') === 'active-a');
   const summary = flattenNodes(row.children[2]).filter(node => node.className === 'usage');
-  assert.match(summary.map(node => node.textContent).join(' | '), /剩余 50,000 \(≈ \$1000\.00\)/);
+  assert.match(summary.map(node => node.textContent).join(' | '), /剩余 50,000 \(≈ \$10\.00\)/);
   // A sibling without a rate keeps showing credits alone.
   api.state.quotas['active-b'] = quota('active-b', [{ durationSeconds: 18000, remainingCredits: '2000' }]);
   api.render.renderAccounts();
@@ -4405,6 +4436,52 @@ test('the account header and rows show the equivalent dollar value of remaining 
     .map(node => node.textContent).join(' | ');
   assert.match(plainSummary, /剩余 2,000/);
   assert.doesNotMatch(plainSummary, /≈ \$/);
+});
+
+test('the account header converts each account by its own rate and only sums configured ones', () => {
+  const credentials = [
+    { ...activeCredential('a'), credits_per_usd: '5000' },
+    { ...activeCredential('b'), credits_per_usd: '10000' },
+  ];
+  const view = fakePage();
+  const api = view.context.OpenDesignConsole;
+  const Core = view.context.OpenDesignCore;
+  const remaining = id => Core.normalizeQuota(quotaContract({
+    credential_id: id,
+    wallet: { state: 'not_configured', data: null },
+    funding: { state: 'available', data: { codingPlan: { windows: [{ durationSeconds: 18000, remainingCredits: '5000' }] } } },
+  }));
+  api.render.applyStatus(statusBody({ credentials }));
+  api.state.quotas.a = remaining('a');
+  api.state.quotas.b = remaining('b');
+  api.render.renderAccounts();
+  const total = view.document.getElementById('accountQuotaTotal');
+  const usage = () => [...total.children].find(child => child.className === 'usage');
+  const money = () => [...usage().children[0].children].map(child => child.textContent);
+  const sub = () => usage().children[1].textContent;
+  assert.deepEqual(money(), ['窗口 5 小时', '10,000 · ≈ $1.50'], '5000/5000 + 5000/10000');
+  const firstOrder = total.textContent;
+
+  // Swapping the accounts must not change either the credits or the dollars.
+  api.render.applyStatus(statusBody({ credentials: [credentials[1], credentials[0]] }));
+  api.render.renderAccounts();
+  assert.equal(total.textContent, firstOrder);
+  assert.deepEqual(money(), ['窗口 5 小时', '10,000 · ≈ $1.50']);
+
+  // An account without a rate still contributes credits, never dollars.
+  api.render.applyStatus(statusBody({ credentials: [...credentials, activeCredential('c')] }));
+  api.state.quotas.c = remaining('c');
+  api.render.renderAccounts();
+  assert.deepEqual(money(), ['窗口 5 小时', '15,000 · ≈ $1.50']);
+  assert.match(sub(), /已换算 2\/3 个账户/);
+  assert.match(sub(), /美元仅含已配置部分/);
+
+  // Once every contributing account has a rate the normal total needs no caveat.
+  api.render.applyStatus(statusBody({ credentials: [...credentials, { ...activeCredential('c'), credits_per_usd: '5000' }] }));
+  api.render.renderAccounts();
+  assert.deepEqual(money(), ['窗口 5 小时', '15,000 · ≈ $2.50']);
+  assert.doesNotMatch(sub(), /已换算/);
+  assert.doesNotMatch(sub(), /美元仅含已配置部分/);
 });
 
 test('the account header sums remaining quota from active accounts only', () => {

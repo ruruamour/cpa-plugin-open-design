@@ -75,23 +75,92 @@
     return `额度暂停（约 ${formatDuration(remaining)}后复查）`;
   }
 
-  // Credits are the upstream's own unit; the published plan defines exactly how
-  // many of them one US dollar of usage is worth, so a conversion is a fixed
-  // ratio the operator records, never an inferred one. It is possible only when
-  // that rate is configured, and is only ever shown as an approximate USD value.
-  function creditsToUSD(credits, creditsPerUSD) {
-    const rate = creditText(creditsPerUSD);
+  // The backend accepts a plan rate as a positive decimal string of at most 32
+  // characters. Mirror that exact contract so a legal fractional rate survives
+  // normalization, and a numeric, signed, exponent or zero value can never
+  // become a divisor.
+  function rateText(value) {
+    if (typeof value !== 'string') return '';
+    const raw = value.trim();
+    if (!raw || raw.length > 32 || !/^[0-9]+(?:\.[0-9]+)?$/.test(raw)) return '';
+    return /[1-9]/.test(raw) ? raw : '';
+  }
+
+  // Exact decimal -> rational, so money can be added and rounded with BigInt.
+  function decimalRatio(value) {
+    const raw = rateText(value);
+    if (!raw) return null;
+    const fraction = raw.split('.')[1] || '';
+    return { numerator: BigInt(raw.replace('.', '')), denominator: 10n ** BigInt(fraction.length) };
+  }
+
+  function gcd(left, right) {
+    let a = left < 0n ? -left : left;
+    let b = right < 0n ? -right : right;
+    while (b) { const next = a % b; a = b; b = next; }
+    return a;
+  }
+
+  function addRatios(left, right) {
+    if (!left) return right;
+    if (!right) return left;
+    // Use the least common denominator before multiplying, especially when
+    // many accounts share the same rate; reduction keeps intermediate BigInts
+    // small without rounding any account's fraction.
+    const common = gcd(left.denominator, right.denominator);
+    const leftScale = right.denominator / common;
+    const rightScale = left.denominator / common;
+    const numerator = left.numerator * leftScale + right.numerator * rightScale;
+    const denominator = left.denominator * leftScale;
+    const divisor = gcd(numerator, denominator);
+    return divisor > 1n
+      ? { numerator: numerator / divisor, denominator: denominator / divisor }
+      : { numerator, denominator };
+  }
+
+  // credits / (rate credits per $1) * 100, kept as an exact cents fraction.
+  function usdCentsRatio(credits, creditsPerUSD) {
     const amount = creditText(credits);
-    if (!rate || !amount) return '';
-    const divisor = BigInt(rate);
-    if (divisor <= 0n) return '';
-    const cents = (BigInt(amount) * 10000n + divisor / 2n) / divisor;
+    const rate = decimalRatio(creditsPerUSD);
+    if (!amount || !rate) return null;
+    return { numerator: BigInt(amount) * 100n * rate.denominator, denominator: rate.numerator };
+  }
+
+  function formatUSDCents(cents) {
     return `${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
+  }
+
+  function roundUSDCents(ratio) {
+    // Positive half-up rounding: floor(numerator / denominator + 1/2).
+    return (ratio.numerator * 2n + ratio.denominator) / (ratio.denominator * 2n);
+  }
+
+  function creditsToUSD(credits, creditsPerUSD) {
+    const ratio = usdCentsRatio(credits, creditsPerUSD);
+    return ratio ? formatUSDCents(roundUSDCents(ratio)) : '';
   }
 
   function formatCreditsUSD(credits, creditsPerUSD) {
     const usd = creditsToUSD(credits, creditsPerUSD);
     return usd ? `≈ $${usd}` : '';
+  }
+
+  // Sum each account's exact cents value, then round the total once. A missing
+  // or malformed rate contributes credits but no dollars.
+  function sumCreditsUSD(items) {
+    let total = null;
+    let converted = 0;
+    let accounts = 0;
+    for (const item of Array.isArray(items) ? items : []) {
+      const amount = creditText(item && item.credits);
+      if (!amount) continue;
+      accounts += 1;
+      const ratio = usdCentsRatio(amount, item && item.creditsPerUSD);
+      if (!ratio) continue;
+      converted += 1;
+      total = addRatios(total, ratio);
+    }
+    return { usd: total ? formatUSDCents(roundUSDCents(total)) : '', converted, accounts };
   }
 
   // Compact copy for the account card. Paused accounts are moved to the bottom
@@ -153,7 +222,7 @@
           quota_paused: item.quota_paused === true,
           effective_disabled: item.effective_disabled === true,
           quota_pause: normalizeQuotaPause(item.quota_pause),
-          credits_per_usd: creditText(item.credits_per_usd),
+          credits_per_usd: rateText(item.credits_per_usd),
         });
       }
     }
@@ -1289,6 +1358,8 @@
     creditsPercent,
     creditsToUSD,
     formatCreditsUSD,
+    rateText,
+    sumCreditsUSD,
     formatCredits,
     formatUSD,
     formatDuration,

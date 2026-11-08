@@ -51,6 +51,10 @@
 
 不同模型的套餐覆盖和消耗可能不同。当前页面不维护模型价格或倍率表，不把 credits 换算成单个模型的剩余 token、请求次数，也不把套餐 credits 换算成钱包 USD。具体请求的准入和扣费遵循官方对该模型的规则。
 
+账户可选配置 `credits_per_usd`（credits / $1），只用于显示套餐剩余额度的参考美元价值，不会改变钱包余额。当前开发分支修复了旧版金额放大 100 倍的问题：5000 credits、换算率 5000 时应显示 `≈ $1.00`。换算率支持最长 32 字符的正十进制字符串，包括 `5000.5`；空值、零、负数和指数形式均不参与换算。计算使用 BigInt 分数，按美分四舍五入。
+
+活动账户汇总按各账户独立换算，先精确求和再舍入一次，避免每个账户不足一美分的部分被提前丢掉。未配置换算率的账户仍计入 credits 总数，但不计入美元小计；页面会显示「已换算 N/M 个账户，美元仅含已配置部分」。这些修复尚未发布或部署。
+
 ## 官方模型覆盖
 
 `GET /v0/management/open-design/model-coverage?credential_id=<id>&model_id=<上游模型 ID>` 使用与共享额度相同的 control Key 和 Workspace ID，向官方 `funding-check` **带上 `modelId`**，读取该模型的 `modelCovered`、`funding`、`fundingCheck`。

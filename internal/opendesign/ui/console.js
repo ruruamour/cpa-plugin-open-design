@@ -1442,12 +1442,11 @@
   }
 
   function renderAccountQuotaTotal(items) {
-    // The credits->USD rate is a single account-wide setting, not a per-window
-    // value; take the first one the operator configured for the visible totals.
+    // Each account records its own credits-per-dollar rate, so dollars are
+    // converted per account instead of applying one account's rate to everyone.
     const node = $('accountQuotaTotal');
     if (!node) return;
     const active = items.filter(item => item && !item.disabled && !item.quota_paused);
-    const creditsPerUSD = (active.find(item => item.credits_per_usd) || {}).credits_per_usd || '';
     if (!active.length) {
       node.replaceChildren(el('span', { className: 'hint', text: '当前可用总额度：暂无活动中账户。' }));
       return;
@@ -1472,17 +1471,26 @@
       for (const window of plan && Array.isArray(plan.windows) ? plan.windows : []) {
         const remaining = accountCreditValue(window.remainingCredits);
         if (remaining === null || !window.durationSeconds) continue;
-        const entry = windows.get(window.durationSeconds) || { remaining: 0n, accounts: 0 };
+        const entry = windows.get(window.durationSeconds) || { remaining: 0n, accounts: 0, usdParts: [] };
         entry.remaining += remaining;
         entry.accounts += 1;
+        entry.usdParts.push({ credits: String(remaining), creditsPerUSD: item.credits_per_usd });
         windows.set(window.durationSeconds, entry);
       }
     }
     const parts = [];
     for (const [duration, entry] of [...windows.entries()].sort((left, right) => left[0] - right[0])) {
-      const usd = Core.formatCreditsUSD(String(entry.remaining), creditsPerUSD);
+      // Sum exact per-account fractions first and round the total only once, so
+      // several sub-cent amounts cannot each disappear before being added.
+      const money = Core.sumCreditsUSD(entry.usdParts);
+      const usd = money.usd ? `≈ $${money.usd}` : '';
       const sub = [`${entry.accounts} 个账户剩余 credits`];
-      if (usd) sub.push(`约合 ${usd.slice(2)}`);
+      if (usd) {
+        const covered = money.converted < entry.accounts
+          ? `（已换算 ${money.converted}/${entry.accounts} 个账户，美元仅含已配置部分）`
+          : '';
+        sub.push(`约合 ${usd.slice(2)}${covered}`);
+      }
       parts.push(el('span', { className: 'usage' }, [
         el('span', { className: 'usage-head' }, [
           el('span', { className: 'usage-label', text: `窗口 ${Core.formatDuration(duration)}` }),
