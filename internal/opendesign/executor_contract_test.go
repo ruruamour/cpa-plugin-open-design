@@ -242,8 +242,13 @@ func TestStreamCloseCarriesSingularErrorDetail(t *testing.T) {
 	if detail["code"] != "server_overloaded" {
 		t.Fatalf("code = %v", detail["code"])
 	}
-	if detail["http_status"] != http.StatusBadGateway {
-		t.Fatalf("http_status = %v, want 502", detail["http_status"])
+	// An error carried inside an HTTP 200 frame is reported as 502, which no
+	// rule matches, so the account is not cooled for an upstream hiccup.
+	if status, _ := detail["http_status"].(float64); status != 0 {
+		t.Fatalf("http_status = %v, want none", detail["http_status"])
+	}
+	if text, _ := detail["message"].(string); !strings.Contains(text, "server misbehaving") {
+		t.Fatalf("detail message = %q, want the transient transport hint", text)
 	}
 	if text, _ := detail["message"].(string); !strings.Contains(text, "overloaded") {
 		t.Fatalf("detail message = %q", text)

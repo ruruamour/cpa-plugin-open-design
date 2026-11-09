@@ -442,11 +442,27 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// HostErrorDetails returns the client-safe message plus the HTTP status the host
-// should surface. The signature is what cmd/passbridge expects.
+// HostErrorDetails returns the message and HTTP status the host should
+// schedule on. The signature is what cmd/passbridge expects.
+//
+// Stock CPA decides cooldown and credential rotation from the status and text
+// it receives, and it matches request-scoped rules before either decision. A
+// rule hit is therefore forwarded unchanged. A credential fault keeps its real
+// status so the host cools that account down. Anything else is rewritten to an
+// absent status plus a transport phrase the host already treats as transient,
+// which rotates to the next account without a cooldown. The phrase is appended
+// so a custom rule can still match the marker on a host that classifies the
+// stream error from its text alone.
 func (s *Service) HostErrorDetails(err error) (string, int) {
 	if err == nil {
 		return "", http.StatusInternalServerError
 	}
-	return redact(err.Error(), s.allKeys()...), statusOf(err)
+	message := redact(err.Error(), s.allKeys()...)
+	status := statusOf(err)
+	switch hostSchedulingClass(s.currentErrorRules(), status, message, streamErrorCode(err)) {
+	case hostScheduleRule, hostScheduleCredential:
+		return message, status
+	default:
+		return withHostTransportHint(message), 0
+	}
 }

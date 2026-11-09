@@ -173,6 +173,83 @@ func errorRulesForMetadata(rules []RequestErrorRule) []any {
 	return out
 }
 
+// hostScheduleRule means a saved request-scoped rule matches, so the host must
+// see the original status and message and apply that rule itself.
+// hostScheduleCredential means no rule matches but the failure is about the
+// account, so the host's own cooldown should stand. hostScheduleNeutral means
+// neither applies and the account must not be cooled or pinned to this request.
+const (
+	hostScheduleNeutral int = iota
+	hostScheduleRule
+	hostScheduleCredential
+)
+
+// hostTransportHint is a phrase stock CPA already classifies as a transient
+// transport failure: with no HTTP status attached it skips the credential
+// cooldown and keeps rotating. It is appended, never substituted, so the
+// plugin marker that a request-scoped rule matches stays intact.
+const hostTransportHint = "server misbehaving"
+
+// hostSchedulingClass reports how the host should treat one plugin error.
+//
+// Rules win, exactly as the conductor evaluates them: the status must be equal
+// and one substring or regular expression must match. Only a credential-owned
+// failure keeps its status. A bare 402, an unrecognized 403 and an
+// unclassified 400 stay neutral, because cooling or pinning an account on them
+// punished healthy accounts in production. A known model or context failure is
+// the exception: the host rotates and cools that model only when it can see
+// the real status.
+func hostSchedulingClass(rules []RequestErrorRule, status int, message, kind string) int {
+	if matchedErrorRule(rules, status, message) {
+		return hostScheduleRule
+	}
+	switch kind {
+	case "invalid_api_key", "rate_limit_exceeded", "insufficient_quota", "insufficient_balance",
+		"model_not_found", "context_length_exceeded", "quota_blocked":
+		return hostScheduleCredential
+	}
+	switch status {
+	case http.StatusUnauthorized, http.StatusTooManyRequests:
+		return hostScheduleCredential
+	}
+	return hostScheduleNeutral
+}
+
+// matchedErrorRule mirrors the host's request-scoped matching: status is exact
+// and at least one substring or regular expression must match the message.
+func matchedErrorRule(rules []RequestErrorRule, status int, message string) bool {
+	for i := range rules {
+		rule := &rules[i]
+		if rule.Status != status {
+			continue
+		}
+		for _, condition := range rule.Match {
+			if condition != "" && strings.Contains(message, condition) {
+				return true
+			}
+		}
+		for _, pattern := range rule.MatchRegexr {
+			if pattern == "" {
+				continue
+			}
+			expression, err := regexp.Compile(pattern)
+			if err == nil && expression.MatchString(message) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// withHostTransportHint marks a neutral failure the way the host already
+// understands, without hiding the marker or the diagnostic text.
+func withHostTransportHint(message string) string {
+	if strings.Contains(strings.ToLower(message), hostTransportHint) {
+		return message
+	}
+	return message + ": " + hostTransportHint
+}
+
 // currentErrorRules returns the live policy.
 func (s *Service) currentErrorRules() []RequestErrorRule {
 	s.mu.RLock()

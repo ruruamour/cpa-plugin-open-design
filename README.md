@@ -2,7 +2,7 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前生产部署版本为 `0.4.12`（及时复查额度恢复、策略与退避并发保护、精确美元换算及逐账户汇总；账户与请求日志控制台；额度耗尽自动暂停默认开启，安装边界见下文）。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前版本为 `0.4.13`（未识别的上游故障不再误冷却或终止换号；规则命中与凭据类故障仍按原状态交给宿主），生产仍为已发布的 `0.4.12`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
@@ -11,6 +11,8 @@
 > **`0.4.6` tag 不得使用。** 该版本的暂停恢复路径会覆盖旧文件与人工停用状态，发布工作流失败且未生成 Release。`0.4.7` 已修复旧文件回放、解除修订、插件控制台人工停用保护与 Windows 粗时钟复查误判，通过独立复核、两套隔离宿主验收和五平台 Release 构建，并已于 2026-11-06 完成生产升级。CPA 原生界面的停用仍无法可靠归因（已知限制）：暂停期间请在插件控制台启停账户。
 
 ## 功能
+
+`0.4.13` 修正交给宿主的错误：命中的请求级规则原样转发，凭据类故障保留真实状态以便冷却，其余未识别故障（裸 403、裸 402、524、未分类的 5xx 与传输错误）不再带状态码，并标成宿主认识的瞬时传输故障，从而换号而不冷却。请求日志仍记录真实上游状态。本版本尚未发布，生产仍是 `0.4.12`。
 
 `0.4.12` 已于 2026-11-08 发布并热加载上线：后台首次复查不再被历史上游重置提示推迟超过暂停后 30 分钟；复查需要排队且仍必须通过模型级官方新鲜证明，截图上的共享剩余额度不会直接解除暂停。界面将旧错误提示标为历史信息，不再断言它是恢复时间。
 
@@ -245,7 +247,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 产物是 `dist/open-design.so`（Linux amd64，C shared ABI v1）。
 
-发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。源码 `Version`、`marketplace/registry.json` 与 `open-design-v0.4.11` tag 保持同步。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动"取最新"不适用于本 fork。
+发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。源码 `Version`、`marketplace/registry.json` 与发布 tag 保持同步；当前源码为 `0.4.13`，尚未发布，已发布的最新 tag 仍是 `open-design-v0.4.12`。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动"取最新"不适用于本 fork。
 
 ## 当前验证边界
 
