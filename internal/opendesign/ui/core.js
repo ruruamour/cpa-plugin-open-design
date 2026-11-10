@@ -58,16 +58,22 @@
     return remaining > 0 ? remaining : 0;
   }
 
+  function quotaPauseWaitingText(pause, now) {
+    const estimate = quotaPauseEstimateRemaining(pause, now);
+    return estimate === null ? '等待复查' : `等待复查 · 上游原提示 ${formatDuration(estimate)}后重置或重试`;
+  }
+
   function quotaPauseText(pause, now = Date.now()) {
     if (!pause) return '';
     // Reaching the recorded deadline never means "resumed". The plugin marks the
     // pause as due for an official recheck instead (and it may still need a
     // manual resume), so that state reads as waiting for the recheck even if the
-    // recorded deadline is missing or the local clock disagrees.
-    if (pause.awaiting_recheck === true) return '额度暂停（等待复查）';
+    // recorded deadline is missing or the local clock disagrees. The old upstream
+    // reset hint stays visible: it is not a recovery promise.
+    if (pause.awaiting_recheck === true) return `额度暂停（${quotaPauseWaitingText(pause, now)}）`;
     const remaining = quotaPauseRemaining(pause, now);
     if (remaining === null) return '额度暂停';
-    if (remaining <= 0) return '额度暂停（等待复查）';
+    if (remaining <= 0) return `额度暂停（${quotaPauseWaitingText(pause, now)}）`;
     const estimate = quotaPauseEstimateRemaining(pause, now);
     if (estimate !== null && estimate > remaining) {
       return `额度暂停（${formatDuration(remaining)}后复查，上游原提示 ${formatDuration(estimate)}后重置或重试）`;
@@ -183,10 +189,10 @@
 
   function quotaPauseCountdown(pause, now = Date.now()) {
     if (!pause) return '';
-    if (pause.awaiting_recheck === true) return '等待复查';
+    if (pause.awaiting_recheck === true) return quotaPauseWaitingText(pause, now);
     const remaining = quotaPauseRemaining(pause, now);
     if (remaining === null) return '';
-    if (remaining <= 0) return '等待复查';
+    if (remaining <= 0) return quotaPauseWaitingText(pause, now);
     // The upstream hint is from the old error, not a verified recovery time.
     const estimate = quotaPauseEstimateRemaining(pause, now);
     if (estimate !== null && estimate > remaining) {

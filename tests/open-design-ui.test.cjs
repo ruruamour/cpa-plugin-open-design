@@ -4871,6 +4871,15 @@ test('后端标记 awaiting_recheck 时即使本地时钟未到期也显示等�
   assert.equal(core.quotaPauseText(pause), '额度暂停（等待复查）');
   // The flag wins even when the recorded deadline is missing or unparsable.
   assert.equal(core.quotaPauseText({ resume_at: '', awaiting_recheck: true }), '额度暂停（等待复查）');
+  // An overdue recheck still keeps a future upstream reset hint. The hint is not
+  // a promise that the account resumes then.
+  const hinted = core.normalizeQuotaPause({
+    reason: 'quota_exhausted', awaiting_recheck: true,
+    resume_at: new Date(Date.now() - 3600_000).toISOString(),
+    estimate_at: new Date(Date.now() + 4 * 86400_000).toISOString(),
+  });
+  assert.equal(core.quotaPauseCountdown(hinted), '等待复查 · 上游原提示 4 天后重置或重试');
+  assert.match(core.quotaPauseText(hinted), /^额度暂停（等待复查 · 上游原提示 4 天后重置或重试）$/);
   assert.equal(core.quotaPauseText({ resume_at: '' }), '额度暂停');
   assert.equal(core.normalizeQuotaPause({ awaiting_recheck: 'yes' }).awaiting_recheck, false);
 });
