@@ -459,7 +459,21 @@ func (s *Service) HostErrorDetails(err error) (string, int) {
 	}
 	message := redact(err.Error(), s.allKeys()...)
 	status := statusOf(err)
-	switch hostSchedulingClass(s.currentErrorRules(), status, message, streamErrorCode(err)) {
+	kind := streamErrorCode(err)
+	if s == nil {
+		// Lifecycle failures from the host bridge are not upstream faults. Keep
+		// their status so a call after ABI shutdown still reports 503 instead of
+		// looking like a transient transport error the host should retry.
+		switch kind {
+		case "plugin_stopped", "plugin_unavailable", "plugin_panic", "serialization_error":
+			return message, status
+		}
+	}
+	var rules []RequestErrorRule
+	if s != nil {
+		rules = s.currentErrorRules()
+	}
+	switch hostSchedulingClass(rules, status, message, kind) {
 	case hostScheduleRule, hostScheduleCredential:
 		return message, status
 	default:

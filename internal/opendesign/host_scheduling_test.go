@@ -1,6 +1,7 @@
 package opendesign
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -143,6 +144,46 @@ func TestHostSchedulingPreservesCredentialFaults(t *testing.T) {
 			}
 			if strings.Contains(message, hostTransportHint) {
 				t.Fatalf("credential fault was neutralized: %q", message)
+			}
+		})
+	}
+}
+
+// A callback can arrive after ABI shutdown cleared the host's service pointer,
+// so HostErrorDetails runs with a nil receiver. Rules are unreadable then, which
+// must behave like an empty policy: credential faults keep their status, other
+// failures become neutral transport errors, and generic redaction still runs.
+// The bridge's own lifecycle errors keep their status so post-shutdown calls
+// still report 503 instead of being rewritten as an upstream transport fault.
+func TestHostSchedulingNilServiceAfterShutdown(t *testing.T) {
+	var s *Service
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantHint   bool
+	}{
+		{"api credential status", &APIError{Status: http.StatusUnauthorized, Kind: "upstream_error", Message: "sk-nil-service-fixture rejected"}, http.StatusUnauthorized, false},
+		{"api credential kind", &APIError{Status: http.StatusForbidden, Kind: "invalid_api_key", Message: "sk-nil-service-fixture"}, http.StatusForbidden, false},
+		{"api neutral", &APIError{Status: http.StatusForbidden, Kind: "upstream_error", Message: "sk-nil-service-fixture forbidden"}, 0, true},
+		{"plugin stopped", localFail(http.StatusServiceUnavailable, "plugin_stopped", "plugin is not initialized"), http.StatusServiceUnavailable, false},
+		{"api builtin rule unreadable", upstreamErrorFromResponse(http.StatusServiceUnavailable, nil,
+			[]byte(`{"error":{"code":"server_overloaded","message":"overloaded"}}`)), 0, true},
+		{"non-api neutral", errors.New("dial tcp: connection refused sk-nil-service-fixture"), 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			message, status := hostWire(s, tc.err)
+			if status != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", status, tc.wantStatus)
+			}
+			if got := strings.Contains(message, hostTransportHint); got != tc.wantHint {
+				t.Fatalf("transport hint present = %v, want %v: %q", got, tc.wantHint, message)
+			}
+			if strings.Contains(message, "sk-nil-service-fixture") {
+				t.Fatalf("message leaked an unredacted secret: %q", message)
+			}
+			if !strings.Contains(message, redact(tc.err.Error())) {
+				t.Fatalf("message %q dropped the redacted diagnostic", message)
 			}
 		})
 	}
