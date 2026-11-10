@@ -14,34 +14,26 @@ func TestSchedulingViewProjectsHostCooldowns(t *testing.T) {
 	other := addCredential(t, s, host, "other", "sk-other-secret")
 	now := time.Now().UTC()
 	credentialUntil := now.Add(2 * time.Hour).Truncate(time.Second)
-	modelUntil := now.Add(30 * time.Minute).Truncate(time.Second)
 	expired := now.Add(-time.Minute).Truncate(time.Second)
 	host.mu.Lock()
 	host.authList = []map[string]any{
 		{"id": id, "name": id + ".json", "provider": Provider, "auth_index": "idx-primary", "status": "active"},
-		{"id": other, "name": other + ".json", "provider": Provider, "auth_index": "idx-other", "status": "active"},
+		{"id": other, "name": other + ".json", "provider": Provider, "auth_index": "idx-other", "status": "error"},
 		{"id": "foreign", "name": "foreign.json", "provider": "other", "auth_index": "idx-foreign"},
 	}
 	host.authRuntime = map[string]map[string]any{
 		"idx-primary": {
 			"id": id, "name": id + ".json", "provider": Provider, "auth_index": "idx-primary",
-			"unavailable": false,
-			"model_states": map[string]any{
-				Provider + "/public-model": map[string]any{
-					"unavailable": true, "next_retry_after": modelUntil, "quota": map[string]any{"reason": "quota"},
-					"status_message": "quota",
-				},
-				"public-model": map[string]any{
-					"unavailable": true, "next_retry_after": modelUntil.Add(-time.Minute), "quota": map[string]any{"reason": "quota"},
-				},
-				"old-model":         map[string]any{"unavailable": true, "next_retry_after": expired},
-				"sk-primary-secret": map[string]any{"unavailable": true, "next_retry_after": modelUntil, "status_message": "contains sk-primary-secret"},
-			},
+			"unavailable": true, "next_retry_after": expired,
+			"status_message": "contains sk-primary-secret",
+			// The live plugin callback does not return these. They must not become a
+			// model cooldown even if a newer host starts sending them undecoded.
+			"model_states": map[string]any{"public-model": map[string]any{"unavailable": true}},
 		},
 		"idx-other": {
 			"id": other, "name": other + ".json", "provider": Provider, "auth_index": "idx-other",
 			"unavailable": true, "next_retry_after": credentialUntil,
-			"status_message": "transient upstream error",
+			"status_message": "Error 403: the user is not subscribed to required model plan",
 		},
 	}
 	host.calls = nil
@@ -59,28 +51,29 @@ func TestSchedulingViewProjectsHostCooldowns(t *testing.T) {
 	}
 	accounts := indexAccounts(t, body)
 	primary := accounts[id]
-	if primary["state"] != "model_cooldown" {
-		t.Fatalf("primary state = %#v, want model_cooldown", primary["state"])
+	if primary["state"] != "restricted" {
+		t.Fatalf("primary state = %#v, want restricted once the retry time has passed", primary["state"])
 	}
-	cooldowns := primary["cooldowns"].([]any)
-	if len(cooldowns) != 2 {
-		t.Fatalf("primary cooldowns = %#v, want the live model and the redacted key", cooldowns)
+	if _, ok := primary["cooldowns"]; ok {
+		t.Fatalf("plugin view invented cooldowns: %#v", primary["cooldowns"])
 	}
-	model := cooldowns[0].(map[string]any)
-	if model["scope"] != "model" || model["model"] != "public-model" || model["reason"] != "quota" || model["retry_at"] != modelUntil.Format(time.RFC3339) {
-		t.Fatalf("model cooldown = %#v", model)
-	}
-	secret := cooldowns[1].(map[string]any)
-	if secret["model"] != "[redacted]" {
-		t.Fatalf("secret model key = %#v", secret)
+	primaryHost := primary["host"].(map[string]any)
+	if primaryHost["next_retry_after"] != nil || !strings.Contains(primaryHost["message"].(string), "[redacted]") {
+		t.Fatalf("primary host = %#v", primaryHost)
 	}
 	second := accounts[other]
 	if second["state"] != "credential_cooldown" {
 		t.Fatalf("other state = %#v", second["state"])
 	}
-	rows := second["cooldowns"].([]any)
-	if len(rows) != 1 || rows[0].(map[string]any)["scope"] != "credential" || rows[0].(map[string]any)["reason"] != "transient_error" {
-		t.Fatalf("credential cooldown = %#v", rows)
+	secondHost := second["host"].(map[string]any)
+	if secondHost["next_retry_after"] != credentialUntil.Format(time.RFC3339) {
+		t.Fatalf("credential retry = %#v", secondHost)
+	}
+	if secondHost["message"] != "Error 403: the user is not subscribed to required model plan" {
+		t.Fatalf("status message was rewritten: %#v", secondHost["message"])
+	}
+	if strings.Contains(raw, `"reason"`) {
+		t.Fatalf("account view invented a cooldown reason: %s", raw)
 	}
 	methods := []string{}
 	for _, call := range host.calls {
@@ -99,7 +92,7 @@ func TestSchedulingViewKeepsUnknownHostRestricted(t *testing.T) {
 	host.mu.Lock()
 	host.authList = []map[string]any{{
 		"id": id, "name": id + ".json", "provider": Provider,
-		"unavailable": true, "next_retry_after": time.Now().UTC().Add(time.Hour),
+		"unavailable": true,
 	}}
 	host.mu.Unlock()
 
@@ -109,10 +102,11 @@ func TestSchedulingViewKeepsUnknownHostRestricted(t *testing.T) {
 	}
 	account := indexAccounts(t, body)[id]
 	if account["state"] != "restricted" {
-		t.Fatalf("state = %#v, want restricted when the runtime callback is unavailable", account["state"])
+		t.Fatalf("state = %#v, want restricted when unavailable has no retry time", account["state"])
 	}
-	if rows := account["cooldowns"].([]any); len(rows) != 0 {
-		t.Fatalf("cooldowns = %#v, want none without a runtime model list", rows)
+	hostView := account["host"].(map[string]any)
+	if hostView["next_retry_after"] != nil {
+		t.Fatalf("restricted account invented a retry time: %#v", hostView)
 	}
 }
 

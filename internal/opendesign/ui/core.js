@@ -205,7 +205,6 @@
   const SCHEDULING_STATES = {
     available: true,
     credential_cooldown: true,
-    model_cooldown: true,
     restricted: true,
     host_disabled: true,
     manual_disabled: true,
@@ -222,27 +221,11 @@
         if (!item || typeof item !== 'object') continue;
         const id = text(item.id);
         if (!id) continue;
-        const cooldowns = [];
-        if (Array.isArray(item.cooldowns)) {
-          for (const row of item.cooldowns) {
-            if (!row || typeof row !== 'object') continue;
-            const scope = row.scope === 'credential' || row.scope === 'model' ? row.scope : '';
-            const retryAt = safeTimestamp(row.retry_at);
-            if (!scope || !retryAt) continue;
-            cooldowns.push({
-              scope,
-              model: scope === 'model' ? safeIdentity(row.model, 128) : '',
-              reason: safeCode(row.reason, 40),
-              retry_at: retryAt,
-            });
-          }
-        }
         const state = SCHEDULING_STATES[item.state] ? item.state : 'unknown';
         accounts.push({
           id,
           state,
           quota_paused: item.quota_paused === true,
-          cooldowns,
           host: item.host && typeof item.host === 'object' ? {
             disabled: item.host.disabled === true,
             unavailable: item.host.unavailable === true,

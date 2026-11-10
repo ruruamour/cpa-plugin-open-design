@@ -6903,22 +6903,31 @@ test('凭据卡片只读显示宿主冷却，不清除也不改额度暂停', as
       host: { available: true },
       accounts: [{
         id: 'cred-1',
-        state: 'model_cooldown',
+        state: 'credential_cooldown',
         quota_paused: false,
-        host: { disabled: false, unavailable: false, status: 'active', message: '', next_retry_after: '' },
-        cooldowns: [{ scope: 'model', model: 'flash', reason: 'quota', retry_at: until }],
+        host: { disabled: false, unavailable: true, status: 'error', message: '上游暂时不可用', next_retry_after: until },
+      }, {
+        id: 'cred-2',
+        state: 'restricted',
+        quota_paused: false,
+        host: { disabled: false, unavailable: true, status: 'error', message: '', next_retry_after: '' },
       }],
     });
     return respond(404, { error: 'not found' });
-  }, [activeCredential('cred-1', '主账户')]);
+  }, [activeCredential('cred-1', '主账户'), activeCredential('cred-2', '受限账户')]);
 
   consoleApi.handlers.activateTab('credentials');
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(calls.filter(call => call.url.endsWith('/scheduling')).length, 1);
-  const row = quotaRow(view).textContent;
-  assert.match(row, /模型冷却/);
-  assert.match(row, /flash · 额度或频率限制 · 冷却至/);
-  assert.doesNotMatch(row, /清除冷却/);
+  const rows = [...view.document.getElementById('accountList').children];
+  const cooling = rows.find(row => row.getAttribute('data-credential-id') === 'cred-1').textContent;
+  const restricted = rows.find(row => row.getAttribute('data-credential-id') === 'cred-2').textContent;
+  assert.match(cooling, /账号冷却/);
+  assert.match(cooling, /上游暂时不可用/);
+  assert.match(cooling, /冷却至/);
+  assert.match(restricted, /调度受限/);
+  assert.match(restricted, /当前状态未提供模型范围/);
+  assert.doesNotMatch(`${cooling}\n${restricted}`, /模型冷却|清除冷却/);
   assert.equal(calls.filter(call => call.method !== 'GET').length, 0, '展示调度状态不得发起写请求');
 });
 

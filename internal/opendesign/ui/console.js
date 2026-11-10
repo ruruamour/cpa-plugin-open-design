@@ -1190,22 +1190,9 @@
   const SCHEDULE_BADGE = {
     available: ['参与调度', 'badge good'],
     credential_cooldown: ['账号冷却', 'badge warn'],
-    model_cooldown: ['模型冷却', 'badge warn'],
     restricted: ['调度受限', 'badge warn'],
     host_disabled: ['宿主停用', 'badge warn'],
     unknown: ['调度状态待查询', 'badge'],
-  };
-
-  const SCHEDULE_REASON = {
-    quota: '额度或频率限制',
-    credential_quota: '账号额度限制',
-    unauthorized: '鉴权失败',
-    payment_required: '额度或套餐受限',
-    not_found: '模型不可用',
-    model_not_supported: '模型不支持',
-    transient_error: '瞬时上游故障',
-    cloudflare_challenge: '出口校验',
-    unknown: '原因未分类',
   };
 
   function scheduleBadge(item) {
@@ -1215,28 +1202,22 @@
     const stateName = schedule ? schedule.state : 'unknown';
     const preset = SCHEDULE_BADGE[stateName] || SCHEDULE_BADGE.unknown;
     const title = stateName === 'restricted'
-      ? '宿主没有提供可区分的模型范围，不能判断具体哪个模型在冷却'
-      : (stateName === 'model_cooldown' ? '只影响列出的模型，其他模型仍按原有资格调度' : '');
+      ? '插件接口没有模型范围，不能判断具体哪个模型在冷却'
+      : (stateName === 'credential_cooldown' ? '宿主标记整个账号暂不可用' : '');
     return el('span', { className: preset[1], text: preset[0], attrs: title ? { title } : {} });
   }
 
   function scheduleDetail(item) {
     const schedule = accountSchedule(item.id);
-    if (!schedule) return null;
+    if (!schedule || !schedule.host) return null;
     const now = Date.now();
     const lines = [];
-    const message = schedule.host && schedule.host.message;
-    if (message && schedule.state !== 'model_cooldown') lines.push(message);
-    for (const row of schedule.cooldowns) {
-      const at = Date.parse(row.retry_at);
-      if (!Number.isFinite(at) || at <= now) continue;
-      const reason = SCHEDULE_REASON[row.reason] || '原因未分类';
-      const who = row.scope === 'model' && row.model ? row.model : '账号';
-      lines.push(`${who} · ${reason} · 冷却至 ${Core.formatTime(row.retry_at)}`);
-    }
-    if (!lines.length && schedule.state === 'restricted') {
-      const retry = schedule.host && schedule.host.next_retry_after;
-      lines.push(retry && Date.parse(retry) > now ? `冷却至 ${Core.formatTime(retry)}` : '当前状态未提供模型范围');
+    if (schedule.host.message) lines.push(schedule.host.message);
+    const retry = schedule.host.next_retry_after;
+    if (schedule.state === 'credential_cooldown' && retry && Date.parse(retry) > now) {
+      lines.push(`冷却至 ${Core.formatTime(retry)}`);
+    } else if (schedule.state === 'restricted') {
+      lines.push('当前状态未提供模型范围');
     }
     if (!lines.length) return null;
     return el('div', { className: 'schedule-detail' }, lines.map(line => el('span', { text: line })));
