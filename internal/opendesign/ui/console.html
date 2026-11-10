@@ -69,7 +69,7 @@
     button:disabled { cursor: not-allowed; opacity: .55; }
     :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     [hidden] { display: none !important; }
-    .shell { max-width: 1040px; margin: 0 auto; padding: 22px clamp(14px, 3vw, 32px) 48px; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 22px clamp(14px, 3vw, 32px) 48px; }
     .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-bottom: 8px; }
     .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
     .mark { width: 30px; height: 30px; flex: none; border-radius: 8px; background: linear-gradient(135deg, var(--accent), #7c5cff); }
@@ -121,10 +121,32 @@
     .account-editor { border: 1px solid var(--line); border-radius: 9px; padding: 9px 12px; background: var(--surface); }
     .account-editor > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
     .account-editor[open] > summary { margin-bottom: 10px; }
-    .account-row { align-items: flex-start; }
+    .account-row { display: block; padding: 0; overflow: hidden; }
     .account-row.paused { border-color: color-mix(in srgb, var(--danger) 42%, var(--line)); background: color-mix(in srgb, var(--danger) 6%, var(--surface)); }
     .account-row.restricted { border-color: color-mix(in srgb, #b54708 36%, var(--line)); }
-    .schedule-detail { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 12px; }
+    .account-summary { display: grid; grid-template-columns: minmax(220px, .95fr) minmax(0, 2fr) 18px; gap: 12px 24px; align-items: center; padding: 14px 18px; cursor: pointer; list-style: none; }
+    .account-summary::-webkit-details-marker { display: none; }
+    .account-summary:hover { background: color-mix(in srgb, var(--accent) 3%, transparent); }
+    .account-identity { display: grid; gap: 5px; min-width: 0; }
+    .account-title { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px; min-width: 0; }
+    .account-title .name { font-size: 14px; font-weight: 700; overflow-wrap: anywhere; }
+    .account-identity .badge { border-radius: 4px; min-height: 20px; padding: 0 5px; font-size: 11px; }
+    .account-id { color: var(--muted); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .account-timing, .account-quota-meta { color: var(--muted); font-size: 11.5px; line-height: 1.5; overflow-wrap: anywhere; }
+    .account-timing { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+    .account-pause-time { color: var(--danger); font-weight: 600; }
+    .account-quota-meta.error { color: var(--danger); }
+    .account-quota-meta[data-quota-status="partial"], .account-quota-meta[data-quota-status="stale"] { color: #a87816; }
+    .account-usage { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); gap: 10px 20px; align-items: start; min-width: 0; }
+    .account-usage .usage-value { font-size: 12px; font-weight: 500; }
+    .account-usage .usage-sub { font-size: 11px; }
+    .account-chevron { color: var(--muted); font-size: 20px; text-align: right; transition: transform .16s; }
+    .account-row[open] > summary .account-chevron { transform: rotate(90deg); }
+    .account-body { padding: 0 18px 14px; border-top: 1px solid var(--line); }
+    .account-body .row-actions { padding: 10px 0; justify-content: flex-end; }
+    .account-body .quota { padding-top: 10px; }
+    .account-load-state { margin: 8px 0; font-size: 12px; color: var(--muted); min-height: 18px; }
+    .schedule-detail { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 12px; padding-bottom: 8px; overflow-wrap: anywhere; }
     .schedule-detail .mono { color: var(--ink); }
     .account-group-head { margin-top: 4px; padding: 2px 2px 0; color: var(--danger); font-size: 12.5px; font-weight: 700; }
     .account-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; }
@@ -132,9 +154,7 @@
     .account-total { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 20px; margin-top: 12px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
     .account-total .hint { margin: 0; }
     .account-total .usage { min-width: 130px; }
-    .account-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 8px 16px; width: 100%; cursor: pointer; list-style: none; }
-    .account-summary::-webkit-details-marker { display: none; }
-    .usage { display: grid; gap: 3px; min-width: 0; align-content: start; }
+    .usage { display: grid; gap: 5px; min-width: 0; align-content: start; }
     .usage-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 12px; }
     .usage-label { color: var(--muted); overflow-wrap: anywhere; }
     .usage-percent { font-weight: 700; color: var(--ink); }
@@ -181,11 +201,13 @@
     .quota-window-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 10px; }
     .quota-window-title { font-weight: 600; font-size: 12.5px; }
     .meter { display: block; width: 100%; height: 6px; border-radius: 999px; background: color-mix(in srgb, var(--ink) 12%, var(--surface)); overflow: hidden; }
-    .account-details > summary { cursor: pointer; color: var(--muted); }
-    .account-details[open] > summary { margin-bottom: 8px; }
-    .account-details > summary:hover { color: var(--ink); }
-    .meter > span { display: block; height: 100%; background: var(--accent); }
-    .meter.warn > span { background: #b54708; }
+    .meter > span { display: block; height: 100%; background: var(--good); }
+    .meter.warn > span { background: #c79528; }
+    .meter.exhausted > span { background: var(--danger); }
+    .usage.exhausted .usage-percent { color: var(--danger); }
+    .usage.warn .usage-percent { color: #a87816; }
+    .usage.good .usage-percent { color: var(--good); }
+    .usage-reset.expired { color: #a87816; }
     .quota-forecast { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
     .quota-trend { margin-top: 8px; }
     .quota-trend > summary { cursor: pointer; font-size: 12px; color: var(--muted); }
@@ -256,6 +278,13 @@
     .error-rule-name { overflow-wrap: anywhere; }
     #errorRulesState { white-space: pre-wrap; }
     @media (max-width: 760px) {
+      .account-summary { grid-template-columns: minmax(0, 1fr) 18px; gap: 10px; padding: 12px; }
+      .account-identity { grid-column: 1; }
+      .account-usage { grid-column: 1 / -1; grid-row: 2; grid-template-columns: repeat(auto-fit, minmax(min(100%, 135px), 1fr)); gap: 10px 14px; }
+      .account-total .usage { flex: 1 1 42%; min-width: 0; }
+      .account-chevron { grid-column: 2; grid-row: 1; }
+      .account-body { padding: 0 12px 12px; }
+      .account-body .row-actions { justify-content: flex-start; }
       .split { grid-template-columns: minmax(0, 1fr); }
       .mapping-row { grid-template-columns: minmax(0, 1fr); }
       .mapping-row .arrow { display: none; }
@@ -366,9 +395,10 @@
       <div class="panel-head">
         <div>
           <h2 id="accountsTitle">账户</h2>
-          <p class="hint">账户列表显示标签、启用状态、额度暂停和 CPA 当前冷却；API key 不会回显。冷却只读，清除仍在 CPA 自己的凭据页。打开本标签页会按账户顺序逐个查询一次额度（不并发），离开即停止。</p>
+          <p class="hint">点击卡片展开操作与详情。额度按顺序查询；重置时间来自官方数据，不代表保证恢复。CPA 冷却只读，清除请到 CPA 凭据页。</p>
         </div>
         <div class="panel-actions">
+          <button class="button compact" id="refreshAccountQuotas" type="button" title="按列表顺序逐个刷新额度，不并发；60 秒内不重复查询上游">刷新额度</button>
           <button class="button compact" id="refreshAccountStatus" type="button" title="重新读取账户状态，不发起上游额度查询">刷新状态</button>
           <button class="button compact" id="openErrorRules" type="button" title="配置 CPA 的重试调度：命中规则后是停止还是继续换号，以及是否冷却失败的账号">错误规则</button>
           <span class="badge" id="accountCount">0 个账户</span>
@@ -429,6 +459,7 @@
         <span class="hint" id="accountFilterInfo"></span>
       </div>
       <div class="account-total" id="accountQuotaTotal" role="status" aria-live="polite"></div>
+      <p class="account-load-state" id="quotaLoadState" role="status" aria-live="polite" hidden></p>
       <div class="rows" id="accountList" aria-live="polite"></div>
       <div class="pager" id="accountPager" hidden>
         <span class="hint" id="accountPageInfo"></span>

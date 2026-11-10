@@ -106,10 +106,13 @@
     authGeneration: 0,
     accountEdit: null,
     authCollapsed: false,
-    // Quota snapshots are keyed by credential id. They are only fetched when the
-    // operator asks (no polling, no automatic per-account upstream request).
+    // Quota snapshots stay page-local. Opening the credentials tab walks the
+    // configured accounts serially; pending rows are not in-flight requests.
     quotas: {},
     quotaBusy: {},
+    quotaErrors: {},
+    quotaPending: [],
+    quotaProgress: null,
     quotaGeneration: 0,
     quotaRevisions: {},
     // Set while the credentials tab walks the accounts one by one. It is cleared
@@ -123,9 +126,8 @@
     modelCoverageGeneration: 0,
     modelCoverageRevisions: {},
     busy: false,
-    // Optional routes stay lazy: the credentials quota walk and the request-log
-    // first page are the only requests a tab activation can start. Everything
-    // else still needs its explicit button.
+    // Credentials tab starts read-only scheduling and serial quota reads;
+    // other optional panels still need an explicit operator action.
     activeTab: 'overview',
     logQuery: { offset: 0, limit: 50, status: '', search: '', credentialID: '', attempted: '' },
     logExpanded: {},
@@ -178,18 +180,22 @@
     if (credentialID === undefined || options.keepAutoWalk !== true) {
       state.quotaAutoGeneration += 1;
       state.quotaAutoRunning = false;
+      state.quotaPending = [];
     }
     if (credentialID === undefined) {
       state.quotaGeneration += 1;
       state.quotaRevisions = {};
       state.quotas = {};
       state.quotaBusy = {};
+      state.quotaErrors = {};
+      state.quotaProgress = null;
       invalidateModelCoverage();
       return;
     }
     state.quotaRevisions[credentialID] = (state.quotaRevisions[credentialID] || 0) + 1;
     delete state.quotas[credentialID];
     delete state.quotaBusy[credentialID];
+    delete state.quotaErrors[credentialID];
     invalidateModelCoverage(credentialID);
   }
 
@@ -1164,18 +1170,25 @@
     const sessionGeneration = state.sessionGeneration;
     if (await loadStatus({ preserveOnError: true }) && sessionGeneration === state.sessionGeneration) {
       await loadScheduling();
+      if (sessionGeneration !== state.sessionGeneration || !state.verified) return;
       const note = state.schedulingState ? `账户状态已更新；${state.schedulingState}` : '账户状态已更新；未重新查询额度。';
       message('accountRefreshState', note, state.scheduling && state.scheduling.host_available ? 'ok' : '');
     }
   }
 
+  let schedulingReadSequence = 0;
   async function loadScheduling() {
     if (!state.verified || !api() || typeof api().scheduling !== 'function') return;
+    const generation = state.sessionGeneration;
+    const sequence = ++schedulingReadSequence;
+    const stillCurrent = () => state.verified && generation === state.sessionGeneration && sequence === schedulingReadSequence;
     try {
       const raw = await api().scheduling();
+      if (!stillCurrent()) return;
       state.scheduling = Core.normalizeScheduling(raw);
       state.schedulingState = state.scheduling.host_available ? '' : (state.scheduling.host_note || '宿主调度状态暂时不可读。');
     } catch (error) {
+      if (!stillCurrent()) return;
       state.schedulingState = `调度状态读取失败：${formatError(error)}`;
     }
     renderAccounts();
@@ -1188,8 +1201,9 @@
   }
 
   const SCHEDULE_BADGE = {
-    available: ['参与调度', 'badge good'],
-    credential_cooldown: ['账号冷却', 'badge warn'],
+    // Do not turn a missing model scope into a promise about every model.
+    available: ['已启用', 'badge on'],
+    credential_cooldown: ['调度受限', 'badge warn'],
     restricted: ['调度受限', 'badge warn'],
     host_disabled: ['宿主停用', 'badge warn'],
     unknown: ['调度状态待查询', 'badge'],
@@ -1201,9 +1215,8 @@
     const schedule = accountSchedule(item.id);
     const stateName = schedule ? schedule.state : 'unknown';
     const preset = SCHEDULE_BADGE[stateName] || SCHEDULE_BADGE.unknown;
-    const title = stateName === 'restricted'
-      ? '插件接口没有模型范围，不能判断具体哪个模型在冷却'
-      : (stateName === 'credential_cooldown' ? '宿主标记整个账号暂不可用' : '');
+    const title = stateName === 'restricted' || stateName === 'credential_cooldown'
+      ? '插件接口没有模型范围，具体可用性以 CPA 实际调度为准' : '';
     return el('span', { className: preset[1], text: preset[0], attrs: title ? { title } : {} });
   }
 
@@ -1342,7 +1355,7 @@
     return el('button', {
       text: label,
       className: options.className || 'button',
-      attrs: { type: 'button', 'data-action': action },
+      attrs: { type: 'button', 'data-action': action, ...options.attrs },
       disabled: options.disabled,
       on: options.on,
     });
@@ -1371,6 +1384,12 @@
     // upstream quota there and does not reactivate the account.
     for (const item of state.status.credentials) {
       const pause = item.quota_pause;
+      // Historical hints and host retry deadlines also expire while the page
+      // stays open. A local repaint marks them overdue, never clears a block.
+      for (const value of [pause?.estimate_at, accountSchedule(item.id)?.host?.next_retry_after]) {
+        const at = Date.parse(value || '');
+        if (at > now) next = Math.min(next, at);
+      }
       if (!pause) continue;
       const at = Date.parse(pause.resume_at || '');
       if (Number.isFinite(at) && at > now) {
@@ -1575,6 +1594,10 @@
       ]));
     }
     const pending = active.length - queried;
+    if (!parts.length && !state.quotaAutoRunning) {
+      node.replaceChildren(el('span', { className: 'hint', text: `当前可用总额度：暂无可用快照（活动中 ${active.length} 个账户）` }));
+      return;
+    }
     const head = parts.length
       ? `当前可用总额度（活动中 ${active.length} 个账户）`
       : `当前可用总额度：正在按账户顺序查询额度…（活动 ${active.length} 个账户）`;
@@ -1588,26 +1611,50 @@
     );
   }
 
-  function renderAccountRow(item) {
-    const editing = Boolean(state.accountEdit && state.accountEdit.id === item.id);
+  function renderAccountIdentity(item) {
     const pause = item.quota_pause;
-    const detail = el('div', { className: 'row-main' }, [
+    const title = el('div', { className: 'account-title' }, [
       el('span', { className: 'name', text: item.label }),
-      // A paused account is still enabled in the operator's switch, but showing
-      // both badges together reads as a contradiction. The red pause badge is
-      // the scheduling state; only an actual manual disable needs its own badge.
-      item.disabled ? el('span', { className: 'badge off', text: '已停用' })
-        : (pause ? null : el('span', { className: 'badge on', text: '已启用' })),
-      // A quota pause is separate from the operator's own switch: it never
-      // changes `disabled`, so it gets its own badges and its own controls.
-      pause ? el('span', { className: 'badge danger', text: Core.quotaPauseTitle(pause) }) : null,
-      pause ? el('span', { className: 'badge danger-soft', text: Core.quotaPauseCountdown(pause) }) : null,
-      scheduleBadge(item),
+      item.disabled ? el('span', { className: 'badge off', text: '已停用' }) : null,
+      pause ? el('span', { className: 'badge danger', text: Core.quotaPauseTitle(pause) }) : scheduleBadge(item),
       pause && pause.multiple_models ? el('span', { className: 'badge', text: '多个模型' }) : null,
       pause && pause.error ? el('span', { className: 'badge off', text: '同步待重试' }) : null,
-      editing ? el('span', { className: 'badge', text: '正在编辑' }) : null,
+      state.accountEdit && state.accountEdit.id === item.id ? el('span', { className: 'badge', text: '正在编辑' }) : null,
     ]);
-    const actions = el('div', { className: 'row-actions' }, [
+    const timing = el('div', { className: 'account-timing' });
+    if (pause) {
+      timing.append(el('span', {
+        className: 'account-pause-time', text: Core.quotaPauseCompact(pause),
+        attrs: { title: Core.quotaPauseCountdown(pause) },
+      }));
+      if (pause.estimate_at) {
+        const expired = Date.parse(pause.estimate_at) <= Date.now();
+        timing.append(el('span', {
+          text: `上游原提示 ${Core.formatQuotaTime(pause.estimate_at)} 重置或重试${expired ? ' · 已到' : ''}`,
+          attrs: { title: `旧报错中的提示：${Core.formatTime(pause.estimate_at)}；不代表届时一定恢复，须官方复查确认。` },
+        }));
+      }
+    } else {
+      const schedule = accountSchedule(item.id);
+      const retry = schedule && schedule.host && schedule.host.next_retry_after;
+      if (retry && Date.parse(retry) > Date.now()) {
+        timing.append(el('span', { text: `冷却至 ${Core.formatQuotaTime(retry)}`, attrs: { title: Core.formatTime(retry) } }));
+      }
+    }
+    const quota = state.quotas[item.id];
+    const status = quotaLoadStatus(item, quota);
+    return el('div', { className: 'account-identity' }, [
+      title,
+      el('div', { className: 'account-id mono', text: item.id, attrs: { title: item.id } }),
+      timing.children.length ? timing : null,
+      el('div', { className: `account-quota-meta${status.error ? ' error' : ''}`, text: status.text,
+        attrs: { 'data-quota-status': status.state, title: status.title || status.text } }),
+    ]);
+  }
+
+  function renderAccountRow(item) {
+    const pause = item.quota_pause;
+    const actions = el('div', { className: 'row-actions', attrs: { 'data-account-actions': item.id } }, [
       button('获取模型', 'fetch-account', {
         className: 'button compact',
         disabled: item.disabled,
@@ -1636,21 +1683,43 @@
     ]);
     const schedule = accountSchedule(item.id);
     const restricted = !pause && schedule && (schedule.state === 'credential_cooldown' || schedule.state === 'restricted' || schedule.state === 'host_disabled');
-    return el('div', {
+    const card = el('details', {
       className: `row account-row${pause ? ' paused' : ''}${restricted ? ' restricted' : ''}`,
       attrs: { 'data-credential-id': item.id, 'data-account-paused': pause ? 'true' : 'false' },
-    }, [
-      detail,
-      actions,
-      scheduleDetail(item),
-      renderQuota(item),
-    ]);
+    });
+    card.open = state.accountExpanded[item.id] === true;
+    card.addEventListener('toggle', () => {
+      // Ignore toggle events queued for a detached card after a countdown repaint.
+      if (card.isConnected === false) return;
+      state.accountExpanded[item.id] = card.open === true;
+    });
+    card.append(
+      el('summary', { className: 'account-summary', attrs: { title: '展开或收起账户操作与额度详情' } }, [
+        renderAccountIdentity(item),
+        el('div', { className: 'account-usage', attrs: { 'data-quota-summary': item.id } }, quotaSummary(item, state.quotas[item.id])),
+        el('span', { className: 'account-chevron', text: '›', attrs: { 'aria-hidden': 'true' } }),
+      ]),
+      el('div', { className: 'account-body' }, [actions, scheduleDetail(item), renderQuota(item)]),
+    );
+    return card;
   }
 
   function renderAccounts() {
     scheduleQuotaView();
+    renderQuotaProgress();
     const list = $('accountList');
     if (!list) return;
+    // Native details.toggle is asynchronous. Capture connected disclosures
+    // before replacing the list, even if a fetch finished before that event.
+    for (const row of list.children) {
+      const id = row.getAttribute('data-credential-id');
+      if (row.isConnected === true && row.tagName === 'DETAILS' && state.status.credentials.some(item => item.id === id)) {
+        state.accountExpanded[id] = row.open === true;
+      }
+    }
+    const focused = document.activeElement;
+    const focusedID = focused?.closest?.('.account-row')?.getAttribute('data-credential-id');
+    const focusedAction = focused?.getAttribute?.('data-action');
     const items = state.status.credentials;
     const pausedCount = items.filter(item => item.quota_paused).length;
     const count = $('accountCount');
@@ -1691,8 +1760,18 @@
       list.replaceChildren(...visible.map(renderAccountRow));
     }
     if (state.busy) setRowButtonsDisabled(list, true);
-    // The clear-billing checkbox only makes sense while editing an account that
-    // actually has billing credentials stored.
+    // Repainting a running query must not throw keyboard focus back to <body>.
+    if (focusedID) {
+      const row = [...list.children].find(node => node.getAttribute('data-credential-id') === focusedID);
+      const summary = row?.querySelector?.('summary.account-summary');
+      const target = focusedAction
+        ? [...(row?.querySelectorAll?.('[data-action]') || [])].find(node => node.getAttribute('data-action') === focusedAction)
+        : summary;
+      const usable = target && !target.disabled &&
+        (typeof target.getClientRects !== 'function' || target.getClientRects().length > 0);
+      (usable ? target : summary)?.focus?.({ preventScroll: true });
+    }
+    // The add/edit form only clears billing for a configured account.
     const clearRow = $('accountClearBillingRow');
     if (clearRow) clearRow.hidden = !(state.accountEdit && state.accountEdit.billing_configured);
     renderCredentialOptions();
@@ -1883,57 +1962,126 @@
   function cancelQuotaAutoLoad() {
     state.quotaAutoGeneration += 1;
     state.quotaAutoRunning = false;
+    state.quotaPending = [];
+    renderQuotaProgress();
   }
 
-  // A tab switch cancels a walk, not its already-sent fetch. A later walk in
-  // the same session must wait for that fetch before starting another one.
-  let quotaAutoInFlight = null;
+  // Manual refreshes share the same slot. They do not add another queue or
+  // run alongside the tab walk; a new walk waits for an already-sent request.
+  let quotaRefreshInFlight = null;
+
+  function quotaRefreshActive() {
+    return Boolean(quotaRefreshInFlight && quotaRefreshInFlight.sessionGeneration === state.sessionGeneration) ||
+      Object.values(state.quotaBusy).some(Boolean);
+  }
 
   async function autoLoadQuotaForAccounts() {
+    if (!state.verified || state.activeTab !== 'credentials' || state.quotaAutoRunning) return;
     const generation = (state.quotaAutoGeneration += 1);
+    const candidates = state.status.credentials.filter(item => {
+      const next = Date.parse(state.quotas[item.id]?.next_refresh_at || '');
+      return item.billing_configured && !item.disabled && !(next > Date.now());
+    });
+    const ordered = [
+      ...candidates.filter(item => !item.quota_paused),
+      ...candidates.filter(item => item.quota_paused),
+    ];
+    state.quotaPending = ordered.map(item => item.id);
+    const progress = { total: ordered.length, completed: 0, failed: 0, skipped: 0 };
+    const sessionGeneration = state.sessionGeneration;
+    state.quotaProgress = progress;
     state.quotaAutoRunning = true;
+    renderAccounts();
     try {
-      // A paused account may still have a snapshot in memory, so a single walk
-      // covers every configured, enabled account: paused ones are queried last
-      // so the operator's normal accounts keep the first upstream call. A
-      // paused account with a known snapshot is skipped, because a fresh read
-      // would only return throttled.
-      const items = state.status.credentials.slice();
-      const ordered = [
-        ...items.filter(item => item && !item.quota_paused),
-        ...items.filter(item => item && item.quota_paused),
-      ];
       for (const original of ordered) {
         if (generation !== state.quotaAutoGeneration) return;
-        const pending = quotaAutoInFlight;
+        const pending = quotaRefreshInFlight;
         if (pending && pending.sessionGeneration === state.sessionGeneration) {
           await pending.promise;
           if (generation !== state.quotaAutoGeneration) return;
         }
-        // A concurrent status refresh may delete, disable or reconfigure a row.
-        // Re-resolve it before continuing rather than using the old snapshot.
-        const item = original && state.status.credentials.find(current => current.id === original.id);
-        if (!item || !item.billing_configured || item.disabled) continue;
-        if (state.quotaBusy[item.id]) continue;
-        // A snapshot still inside the 60s window would only come back throttled,
-        // so the walk skips it instead of spending a request to learn nothing.
-        const known = state.quotas[item.id];
-        const next = known && known.next_refresh_at ? Date.parse(known.next_refresh_at) : NaN;
-        if (!Number.isNaN(next) && next > Date.now()) continue;
-        // The pause badge keeps its own countdown, so a paused account without a
-        // snapshot is still readable; it still gets one read so its wallet and
-        // exhausted windows are visible instead of a blank card.
-        const flight = { promise: refreshQuota(item, { automatic: true }), sessionGeneration: state.sessionGeneration };
-        quotaAutoInFlight = flight;
-        try {
-          await flight.promise;
-        } finally {
-          if (quotaAutoInFlight === flight) quotaAutoInFlight = null;
+        // Re-resolve after every wait: a status refresh can delete, disable or
+        // reconfigure a row without cancelling the rest of the serial walk.
+        const item = state.status.credentials.find(current => current.id === original.id);
+        state.quotaPending = state.quotaPending.filter(id => id !== original.id);
+        const next = Date.parse(state.quotas[original.id]?.next_refresh_at || '');
+        if (!item || !item.billing_configured || item.disabled || state.quotaBusy[item.id] || next > Date.now()) {
+          state.quotaProgress.skipped += 1;
+          renderAccounts();
+          continue;
         }
+        const outcome = await refreshQuota(item, { automatic: true });
+        // Stopping the walk does not cancel the sent request. Count its result
+        // only in this round, never in a replacement round or a new login.
+        if (state.quotaProgress === progress && sessionGeneration === state.sessionGeneration) {
+          if (outcome === 'updated' || outcome === 'failed') progress.completed += 1;
+          else progress.skipped += 1;
+          if (outcome === 'failed') progress.failed += 1;
+          renderQuotaProgress();
+        }
+        if (generation !== state.quotaAutoGeneration) return;
       }
     } finally {
-      if (generation === state.quotaAutoGeneration) state.quotaAutoRunning = false;
+      if (generation === state.quotaAutoGeneration) {
+        state.quotaAutoRunning = false;
+        state.quotaPending = [];
+        renderAccounts();
+      }
     }
+  }
+
+  function renderQuotaProgress() {
+    const node = $('quotaLoadState');
+    const progress = state.quotaProgress;
+    setDisabled('refreshAccountQuotas', state.busy || !state.verified || (!state.quotaAutoRunning && quotaRefreshActive()));
+    const button = $('refreshAccountQuotas');
+    if (button) {
+      button.textContent = state.quotaAutoRunning ? '停止查询' : '刷新额度';
+      button.title = state.quotaAutoRunning ? '停止后续查询；已发出的请求仍会完成' : '按账号顺序串行刷新，60 秒内不重复查询上游';
+    }
+    if (!node) return;
+    node.hidden = !progress;
+    if (!progress) return;
+    const processed = progress.completed + progress.skipped;
+    const current = state.status.credentials.find(item => state.quotaBusy[item.id]);
+    const text = state.quotaAutoRunning
+      ? `额度查询 ${processed} / ${progress.total} · 待查 ${state.quotaPending.length}${current ? ` · 正在查询「${current.label}」` : ''}`
+      : (processed < progress.total ? `额度查询已停止 · 已处理 ${processed} / ${progress.total}`
+        : `额度查询完成 · ${progress.completed} 个已查询${progress.skipped ? ` · ${progress.skipped} 个已跳过` : ''}`);
+    node.textContent = `${text}${progress.failed ? ` · ${progress.failed} 个失败` : ''}`;
+  }
+
+  function quotaLoadStatus(item, quota) {
+    const wallet = quota && quota.wallet;
+    const funding = quota && quota.funding;
+    const fundingAt = funding?.fetched_at;
+    const walletAt = wallet?.fetched_at;
+    const balance = (wallet?.state === 'available' || wallet?.state === 'stale') && wallet.data?.balanceUsd
+      ? `钱包 ${Core.formatUSD(wallet.data.balanceUsd)}` : '';
+    const tier = funding?.data?.codingPlan?.tier;
+    const partTime = part => `${part?.state === 'stale' ? '上次数据' : '查询'} ${Core.formatQuotaTime(part?.fetched_at) || '时间未知'}`;
+    // Combine only equally fresh components with the same displayed query
+    // minute. Otherwise each amount keeps its own timestamp and freshness.
+    const sameSample = funding?.state === 'available' && wallet?.state === 'available' && fundingAt && walletAt &&
+      Core.formatQuotaTime(fundingAt) === Core.formatQuotaTime(walletAt);
+    const meta = sameSample
+      ? [tier, `查询 ${Core.formatQuotaTime(fundingAt)}`, balance].filter(Boolean).join(' · ')
+      : [funding?.data ? `套餐${tier ? ` ${tier}` : ''} · ${partTime(funding)}` : '',
+        balance ? `${balance} · ${partTime(wallet)}` : ''].filter(Boolean).join('；');
+    if (!item.billing_configured) return { state: 'not_configured', text: '未配置额度查询' };
+    const stale = quota?.state === 'stale' || wallet?.state === 'stale' || funding?.state === 'stale';
+    if (state.quotaBusy[item.id]) return { state: 'loading', text: ['正在查询…', stale ? '上次数据' : '', meta].filter(Boolean).join(' · ') };
+    const failure = state.quotaErrors[item.id];
+    const position = state.quotaPending.indexOf(item.id);
+    if (position >= 0) return { state: 'pending', text: [`待查询 · 队列第 ${position + 1} 个`, failure ? '上次查询失败' : '', stale ? '上次数据' : '', meta].filter(Boolean).join(' · ') };
+    if (failure) return { state: 'error', error: true, text: ['查询失败', meta ? `上次数据 ${meta}` : '请重试'].join(' · '), title: failure };
+    if (!quota || quota.state === 'needs_refresh') return { state: 'needs_refresh', text: ['尚未查询', item.disabled ? '已停用，不自动查询' : ''].filter(Boolean).join(' · ') };
+    const labels = { available: '已更新', stale: '上次数据', error: '查询失败',
+      partial: wallet?.error ? '钱包查询失败' : funding?.error ? '套餐查询失败' : '部分查询失败' };
+    const error = funding?.error || wallet?.error;
+    return { state: quota.state, error: quota.state === 'error',
+      text: [labels[quota.state] || '暂无数据', meta].filter(Boolean).join(' · '),
+      title: error ? quotaErrorText('额度查询', error) : meta };
   }
 
   function quotaRefreshHint(quota) {
@@ -1944,91 +2092,55 @@
     return `两次上游查询至少间隔 60 秒，约 ${seconds} 秒后可再次刷新。`;
   }
 
-  function quotaSummaryText(label, value, sub) {
-    return el('span', { className: 'usage' }, [
-      el('span', { className: 'usage-head' }, [el('span', { className: 'usage-label', text: label })]),
-      el('span', { className: 'usage-value', text: value }),
-      sub ? el('span', { className: 'usage-sub', text: sub }) : null,
-    ]);
-  }
-
-  function quotaSummaryWallet(quota) {
-    const wallet = quota.wallet || {};
-    if ((wallet.state === 'available' || wallet.state === 'stale') && wallet.data && wallet.data.balanceUsd) {
-      return quotaSummaryText(
-        '钱包余额',
-        Core.formatUSD(wallet.data.balanceUsd),
-        [wallet.state === 'stale' ? '上次数据' : '已更新', wallet.fetched_at ? `查询 ${Core.formatTime(wallet.fetched_at)}` : '']
-          .filter(Boolean).join(' · '),
-      );
-    }
-    if (wallet.state === 'error') return quotaSummaryText('钱包余额', '查询失败', '展开查看原因');
-    return null;
-  }
-
-  function quotaSummaryWindow(window, item, funding) {
-    const title = window.durationSeconds ? `窗口 ${Core.formatDuration(window.durationSeconds)}` : '额度窗口';
+  function quotaSummaryWindow(window, item) {
+    const title = window.durationSeconds ? Core.formatDuration(window.durationSeconds) : '额度窗口';
     const percent = Core.creditsPercent(window.usedCredits, window.limitCredits);
-    const sub = [];
+    const tone = percent ? (percent.basisPoints >= 10000 ? 'exhausted' : percent.basisPoints >= 8000 ? 'warn' : 'good') : '';
     const usd = Core.formatCreditsUSD(window.remainingCredits, item && item.credits_per_usd);
-    if (window.remainingCredits) sub.push(`剩余 ${Core.formatCredits(window.remainingCredits)}${usd ? ` (${usd})` : ''}`);
-    if (window.resetsAt) {
-      sub.push(`重置于 ${Core.formatTime(window.resetsAt)}`);
-      if (Date.parse(window.resetsAt) <= Date.now()) sub.push('重置时间已到，请刷新');
-    }
-    if (funding.state === 'stale') sub.push('上次数据');
-    if (funding.fetched_at) sub.push(`查询 ${Core.formatTime(funding.fetched_at)}`);
-    const parts = [
+    const expired = window.resetsAt && Date.parse(window.resetsAt) <= Date.now();
+    const meterAttrs = percent
+      ? { role: 'progressbar', 'aria-label': `${title}已用额度`, 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent.basisPoints / 100 }
+      : { 'aria-label': `${title}额度未知` };
+    return el('span', { className: `usage${tone ? ` ${tone}` : ''}` }, [
       el('span', { className: 'usage-head' }, [
         el('span', { className: 'usage-label', text: title }),
         el('span', { className: 'usage-percent', text: percent ? percent.text : '—' }),
       ]),
-    ];
-    if (percent) {
-      parts.push(el('span', { className: `meter${percent.basisPoints >= 8000 ? ' warn' : ''}` }, [
-        el('span', { attrs: { style: `width:${percent.text}` }, text: '' }),
-      ]));
-    }
-    parts.push(el('span', { className: 'usage-sub', text: sub.join(' · ') || '等待官方数据' }));
-    return el('span', { className: 'usage' }, parts);
+      el('span', { className: `meter${tone ? ` ${tone}` : ''}`, attrs: meterAttrs },
+        percent ? [el('span', { attrs: { style: `width:${percent.text}` } })] : []),
+      el('span', { className: `usage-sub usage-reset${expired ? ' expired' : ''}`,
+        text: window.resetsAt ? `重置于 ${Core.formatQuotaTime(window.resetsAt)}${expired ? ' · 待更新' : ''}` : '重置时间 —',
+        attrs: { title: window.resetsAt ? `官方窗口重置时间：${Core.formatTime(window.resetsAt)}` : '官方未提供重置时间' } }),
+      el('span', { className: 'usage-value', text: window.remainingCredits
+        ? `剩余 ${Core.formatCredits(window.remainingCredits)}${usd ? ` (${usd})` : ''}` : '剩余额度 —' }),
+    ]);
   }
 
   function quotaSummary(item, quota) {
-    if (!item.billing_configured) return [quotaSummaryText('额度', '未配置额度查询', '可在「编辑」中填写 controlKey')];
-    if (!quota) {
-      return [item.quota_paused
-        ? quotaSummaryText('额度', '正在查询…', '暂停不影响额度读取')
-        : quotaSummaryText('额度', '尚未查询', '打开本页会按顺序查询一次')];
-    }
-    const parts = [];
-    const wallet = quotaSummaryWallet(quota);
-    if (wallet) parts.push(wallet);
-    const windows = quota.funding && quota.funding.data && quota.funding.data.codingPlan
-      ? quota.funding.data.codingPlan.windows : [];
-    for (const window of windows.slice(0, 4)) parts.push(quotaSummaryWindow(window, item, quota.funding));
-    if (!parts.length) {
-      const funding = quota.funding || {};
-      if (funding.state === 'error') parts.push(quotaSummaryText('额度', '查询失败', '展开查看原因'));
-      else if (funding.state === 'not_requested' || !quota.workspace_id) parts.push(quotaSummaryText('额度', '未填写 Workspace ID', '钱包查询不影响推理'));
-      else parts.push(quotaSummaryText('额度', '暂无数据', '展开查看说明'));
-    }
-    return parts;
+    const windows = quota?.funding?.data?.codingPlan?.windows || [];
+    // The official window set is authoritative. Do not borrow Cline's three
+    // billing periods or manufacture zeroes when OpenDesign supplied no data.
+    if (windows.length) return windows.slice(0, 4).map(window => quotaSummaryWindow(window, item));
+    const status = quotaLoadStatus(item, quota);
+    const sub = !item.billing_configured ? '编辑账户可配置额度查询'
+      : (quota?.funding?.state === 'not_requested' ? '未填写 Workspace ID' : status.text);
+    return [el('span', { className: 'usage quota-placeholder' }, [
+      el('span', { className: 'usage-head' }, [
+        el('span', { className: 'usage-label', text: '套餐额度' }),
+        el('span', { className: 'usage-percent', text: '—' }),
+      ]),
+      el('span', { className: 'meter', attrs: { 'aria-label': '套餐额度未知' } }),
+      el('span', { className: 'usage-sub', text: sub }),
+    ])];
   }
 
   function renderQuota(item) {
     const quota = state.quotas[item.id];
     const busy = Boolean(state.quotaBusy[item.id]);
-    const details = el('details', {
-      className: 'quota account-details',
+    const details = el('div', {
+      className: 'quota',
       attrs: { 'data-quota-id': item.id },
     });
-    details.open = state.accountExpanded[item.id] === true;
-    details.addEventListener('toggle', () => {
-      state.accountExpanded[item.id] = details.open === true;
-    });
-    const summary = el('summary', { className: 'account-summary', attrs: { title: '展开额度详情与刷新' } });
-    summary.append(...quotaSummary(item, quota));
-    details.append(summary);
     const head = el('div', { className: 'quota-head' }, [
       el('span', { className: 'quota-window-title', text: '额度详情' }),
       quota ? quotaStateBadge(quota.state) : el('span', { className: 'badge', text: item.billing_configured ? '未查询' : '未配置' }),
@@ -2036,7 +2148,8 @@
     ]);
     const refresh = button(busy ? '刷新中…' : '刷新额度', 'refresh-quota', {
       className: 'button compact',
-      disabled: busy || !item.billing_configured,
+      disabled: quotaRefreshActive() || !item.billing_configured,
+      attrs: { title: quotaRefreshActive() ? '请等待当前账户查询结束；可点顶部「停止查询」停止后续批量查询' : '查询此账户的最新额度' },
       on: () => refreshQuota(item),
     });
     head.append(refresh);
@@ -2052,8 +2165,9 @@
       ]));
     } else if (!quota) {
       cards.append(el('div', { className: 'quota-card' }, [
-        el('h4', { text: '尚未查询' }),
-        el('p', { className: 'quota-note', text: '打开本页会按账户顺序自动查询一次，也可以点「刷新额度」立即读取。' }),
+        el('h4', { text: quotaLoadStatus(item, quota).text }),
+        state.quotaErrors[item.id] ? el('p', { className: 'quota-note', text: state.quotaErrors[item.id] }) : null,
+        el('p', { className: 'quota-note', text: '打开本页会按账户顺序自动查询一次，也可以点「刷新额度」读取。' }),
       ]));
     } else {
       cards.append(quotaWalletCard(item, quota));
@@ -2840,21 +2954,38 @@
   // Refreshes one account. The explicit button and the serial tab walk share it;
   // automatic runs stay silent on success so opening the tab does not spam the
   // status line with one message per account.
-  async function refreshQuota(item, options = {}) {
+  function refreshQuota(item, options = {}) {
     const automatic = options.automatic === true;
     if (!item || !item.billing_configured) {
       if (!automatic) message('accountState', '该账户还没有配置官方 controlKey，无法查询额度。点「编辑」添加后再试。', 'error');
-      return;
+      return Promise.resolve('skipped');
     }
-    if (state.quotaBusy[item.id]) return;
+    if (quotaRefreshActive()) {
+      if (!automatic) message('accountState', '请等待当前账户查询结束；可先点顶部「停止查询」停止后续批量查询。');
+      return Promise.resolve('skipped');
+    }
+    const flight = { sessionGeneration: state.sessionGeneration, promise: null };
+    quotaRefreshInFlight = flight;
+    flight.promise = performQuotaRefresh(item, options).finally(() => {
+      if (quotaRefreshInFlight === flight) {
+        quotaRefreshInFlight = null;
+        renderAccounts();
+      }
+    });
+    return flight.promise;
+  }
+
+  async function performQuotaRefresh(item, options) {
+    const automatic = options.automatic === true;
     const generation = state.quotaGeneration;
     const revision = state.quotaRevisions[item.id] || 0;
     const stillCurrent = () => generation === state.quotaGeneration && revision === (state.quotaRevisions[item.id] || 0);
     state.quotaBusy[item.id] = true;
+    delete state.quotaErrors[item.id];
     renderAccounts();
     try {
       const raw = await api().quota(item.id, { refresh: true });
-      if (!stillCurrent()) return;
+      if (!stillCurrent()) return 'invalidated';
       const quota = Core.normalizeQuota(raw);
       if (quota.credential_id !== item.id) throw new Error('额度响应与当前账户不一致，请重新查询。');
       if (quota.state === 'needs_refresh') {
@@ -2863,26 +2994,29 @@
         if (previous) previous.next_refresh_at = quota.next_refresh_at;
         else state.quotas[item.id] = quota;
         if (!automatic) message('accountState', `额度刷新已节流：${quotaRefreshHint(quota)}`, '');
+        return 'skipped';
       } else {
         state.quotas[item.id] = quota;
-        const failed = quota.state === 'error';
+        const failed = ['error', 'partial', 'stale'].includes(quota.state) ||
+          Boolean(quota.wallet.error || quota.funding.error);
         // The serial walk reports failures only: a toast per healthy account on
         // every tab switch would bury the one account that actually needs help.
         if (!automatic || failed) {
+          const error = quota.funding.error || quota.wallet.error;
           message('accountState', failed
-            ? `账户「${item.label}」额度查询失败：${quotaErrorText('未取得数据', quota.error)}；管理登录未受影响。`
+            ? `账户「${item.label}」额度查询失败：${quotaErrorText('未取得完整新数据', error)}；管理登录未受影响。`
             : `账户「${item.label}」额度已更新（${QUOTA_STATE_TEXT[quota.state] || quota.state}）。`, failed ? 'error' : '');
         }
+        return failed ? 'failed' : (quota.state === 'not_configured' ? 'skipped' : 'updated');
       }
-      renderAccounts();
     } catch (error) {
       // A logout/key switch bumps both generations; the old answer (including a
       // 401) must neither repaint nor log the new session out.
-      if (!stillCurrent()) return;
+      if (!stillCurrent()) return 'invalidated';
       if (managementAuthFailure(error, error.status === 401
         ? '401：管理密钥无效或已过期，请重新验证后再查询额度。'
         : '403：管理请求被拒绝，请确认管理密钥和来源 IP。')) {
-        return;
+        return 'invalidated';
       } else {
         // A transport failure leaves the last snapshot uncertain too. Preserve
         // its timestamp, but withdraw any forecast until a successful refresh.
@@ -2893,7 +3027,9 @@
             if (part && part.data) part.state = 'stale';
           }
         }
+        state.quotaErrors[item.id] = formatError(error);
         message('accountState', `账户「${item.label}」额度查询失败：${formatError(error)}。请稍后重试。`, 'error');
+        return 'failed';
       }
     } finally {
       if (stillCurrent()) {
@@ -4692,6 +4828,14 @@
     if (accountSearch) accountSearch.addEventListener('input', () => filterAccounts(accountSearch.value));
     const accountPausedCount = $('accountPausedCount');
     if (accountPausedCount) accountPausedCount.addEventListener('click', showPausedAccounts);
+    const refreshAllQuotas = $('refreshAccountQuotas');
+    if (refreshAllQuotas) refreshAllQuotas.addEventListener('click', () => {
+      if (!state.verified || state.busy) return;
+      if (state.quotaAutoRunning) {
+        cancelQuotaAutoLoad();
+        renderAccounts();
+      } else if (!quotaRefreshActive()) void autoLoadQuotaForAccounts();
+    });
     const refreshAccounts = $('refreshAccountStatus');
     if (refreshAccounts) refreshAccounts.addEventListener('click', refreshAccountStatus);
     const fetchButton = $('fetchModels');

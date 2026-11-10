@@ -4,6 +4,17 @@
 
 `0.4.0` 的 ctypes 与原版 CPA 假上游冒烟同时覆盖日志／统计、`/config`、`/runtime`、`/model-test`、`/model-coverage` 和 `/error-rules`。`--cpa-live` 还包含一段双账号真实宿主轮换验证：假上游按凭据返回生产 400 `tier_limit_exceeded`，宿主必须按规则换到另一账号并返回 200，冷却后跳过失败账号，`stop` 规则下不换号。所有账户与请求均为本地 fixture，验收记录见 `docs/verification.md`。
 
+## `check-console-browser.py` — 紧凑凭据卡片的真实浏览器检查
+
+需要本机 Python `playwright` 与 Microsoft Edge／Chromium。默认优先使用 `microsoft-edge`，也可显式指定路径：
+
+```bash
+python3 scripts/check-console-browser.py
+python3 scripts/check-console-browser.py --browser /usr/bin/google-chrome --out /tmp/open-design-console-browser
+```
+
+脚本将 `ui.go` 同样拼接的控制台交给隔离浏览器，所有网络请求均拦截为本地合成 fixture，不读真实凭据、不请求生产或官方接口。覆盖 1440px／390px、明暗主题、默认折叠、键盘展开、重绘及翻页保留、串行 pending／loading、离开停止、60 秒快照跳过、真实零／100% 窗口、失败保留旧值、无横向溢出及 JS 错误。截图和 `result.json` 写到 `--out`，不属于插件发布包。
+
 ## `smoke-abi.py` — 原生 C ABI v1 冒烟
 
 用 `ctypes` 真正 `dlopen` `dist/open-design.so`，按 CPA `internal/pluginhost/loader_unix.go` 的方式调用唯一导出 `cliproxy_plugin_init`，并向插件提供宿主回调函数表：

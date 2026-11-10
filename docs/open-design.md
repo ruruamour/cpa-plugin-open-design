@@ -1,6 +1,6 @@
 # OpenDesign 插件说明
 
-本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`；当前版本为 `0.4.15`（额度暂停的复查到期后仍保留上游重置提示；`0.4.14` 只读显示 CPA 账号级冷却，均尚未发布），生产已热加载 `0.4.14`，已发布版本仍为 `0.4.12`（及时复查额度恢复、策略／退避并发保护、精确美元换算与逐账户汇总；请求日志与账户控制台；额度耗尽自动暂停默认开启），`0.4.6` tag 不得使用。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射，并修复其快照一致性与控制台草稿问题；`0.4.7` 新增额度耗尽自动暂停。详见[验证记录](verification.md)。
+本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`；当前源码版本为 `0.4.16`（紧凑凭据卡片、官方窗口额度与时间直接可见、准确的串行查询进度），生产已本地构建热加载 `0.4.15`，GitHub 最新 Release 仍为 `open-design-v0.4.12`（及时复查额度恢复、策略／退避并发保护、精确美元换算与逐账户汇总；请求日志与账户控制台；额度耗尽自动暂停默认开启），`0.4.6` tag 不得使用。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射，并修复其快照一致性与控制台草稿问题；`0.4.7` 新增额度耗尽自动暂停。详见[验证记录](verification.md)。
 
 ## 范围
 
@@ -66,6 +66,7 @@ OpenDesign 生产接口：
 | `POST /error-rules/sync` | 只重新推送当前策略 |
 | `POST /error-rules/reset` | 恢复内置默认策略并推送 |
 | `GET` / `POST /config` | 日志开关、保留天数与条数上限；额度暂停开关与单次上限 |
+| `GET /scheduling` | 只读公开账号运行状态；回调不带模型冷却列表，不能还原模型范围 |
 | `GET /runtime` | 插件可见运行时状态 |
 | `POST /model-test` | 显式单次非流式模型测试 |
 
@@ -81,7 +82,11 @@ OpenDesign 生产接口：
 
 ## 控制台布局
 
-控制台固定为 5 个标签页。切换标签页不会自动发起请求，唯一例外是「凭据 · 额度」：打开该标签页会按账户顺序逐个查询一次额度（串行，不并发），离开标签页即停止；其余路由仍只由按钮手动触发：
+`0.4.16` 的账号卡片默认折叠操作与长说明，但额度不折叠：左侧显示名称、ID、暂停／调度受限状态和时间，右侧直接显示官方窗口使用率、剩余 credits、可选美元换算和重置时间。窗口种类不套用 Cline 的周期；未知不补为 0。钱包与套餐的新鲜度或时间不同时分别标注；部分失败不挡住成功部分。点击卡片或用键盘 Enter／空格展开操作，重绘和翻页保留展开状态。
+
+查询进度区分「待查询」「正在查询」「查询失败」及「上次数据」；顶部整批刷新可随时停止后续查询，已发出的请求仍会完成。单账户刷新与批量读取共用前端串行槽，不叠加查询。普通状态刷新不触发额度查询。复查时间、旧报错的重置／重试提示和 CPA 重试时间分别表达，不承诺到点恢复；公开账号标志不带模型范围，因此卡片只显示「调度受限」，不把聚合标志当作全账号不可用。
+
+控制台固定为 5 个标签页。打开「凭据 · 额度」会读取一次调度快照，并按账户顺序串行查询额度；离开即停止后续额度查询。请求日志首次打开读取一次日志与统计，其他可选功能仍由按钮触发：
 
 | 标签页 | 内容 |
 | --- | --- |
@@ -262,7 +267,7 @@ plugins:
 ## 发布 tag
 
 - 发布 tag 使用 `open-design-vX.Y.Z` 形式，不创建或覆盖上游 `v*` tag；不使用或复用不安全的 `open-design-v0.4.6`。
-- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对，三者必须同步（当前源码 `0.4.15`，尚未发布）。
+- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对，三者必须同步（当前源码 `0.4.16`，尚未发布）。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本。
 - `open-design-v0.4.11` 已发布并标记 Latest，五平台构建全绿（[release run 42341153176](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42341153176)），首次运行即完成。`open-design-v0.4.10` 已发布并标记 Latest，五平台构建全绿（[release run 42273570550](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42273570550)）；前三次运行因 GitHub 未分配 `macos-15` arm64 runner 被取消（各排队约 15 分钟），第四次重跑取得 runner 后完成。`open-design-v0.4.9` 已发布并标记 Latest，五平台构建全绿（[release run 42206328455](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42206328455)）；首次运行因 GitHub 未分配 `macos-15` arm64 runner 被取消两次（各排队 15 分钟），第三次重跑取得 runner 后完成。`open-design-v0.4.7` 已发布并标记 Latest，五平台构建全绿（[release run 42167937013](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42167937013)）；`open-design-v0.4.4` 已从 draft 转为正式 Release。`0.4.5` 与 `0.4.6` 的发布运行未产出可用资产，`0.4.6` 禁止使用；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release。分支与生产交付状态见验证记录。
 

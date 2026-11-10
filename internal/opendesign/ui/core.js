@@ -201,6 +201,25 @@
     return `约 ${formatDuration(remaining)}后复查`;
   }
 
+  // Short card labels retain the distinction between an official reset time,
+  // a plugin recheck deadline and an old upstream hint. Full timestamps remain
+  // available in the expanded details and title attributes.
+  function formatQuotaTime(value, now = Date.now()) {
+    const full = formatTime(value);
+    if (!full) return '';
+    return full.slice(0, 4) === String(new Date(now).getFullYear())
+      ? full.slice(5).replaceAll('-', '/') : full.replaceAll('-', '/');
+  }
+
+  function quotaPauseCompact(pause, now = Date.now()) {
+    if (!pause) return '';
+    const remaining = quotaPauseRemaining(pause, now);
+    if (pause.awaiting_recheck === true || remaining === 0) return '等待复查';
+    if (remaining === null) return '复查时间待确认';
+    // Minute precision keeps a badge compact and avoids second-by-second jumps.
+    return `约 ${formatDuration(Math.max(60, Math.ceil(remaining / 60) * 60))}后复查`;
+  }
+
   function quotaPauseSummary(pause, now = Date.now()) {
     const title = quotaPauseTitle(pause);
     if (!title) return '';
@@ -1397,6 +1416,8 @@
     quotaPauseTitle,
     quotaPauseCountdown,
     quotaPauseSummary,
+    quotaPauseCompact,
+    formatQuotaTime,
     normalizeUpstreamModels,
     normalizeQuota,
     normalizeModelCoverage,

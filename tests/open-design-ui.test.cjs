@@ -104,7 +104,7 @@ function storage(initial = {}) {
   };
 }
 
-function fakePage({ url = 'https://cpa.example/v0/resource/plugins/open-design/console', persistent = {}, session = {}, fetchImpl, confirmImpl } = {}) {
+function fakePage({ url = 'https://cpa.example/v0/resource/plugins/open-design/console', persistent = {}, session = {}, fetchImpl, confirmImpl, bootstrap = false } = {}) {
   const nodes = new Map();
   const document = {
     documentElement: new FakeNode('html'),
@@ -148,7 +148,9 @@ function fakePage({ url = 'https://cpa.example/v0/resource/plugins/open-design/c
     confirm: confirmImpl || (() => true),
     setTimeout,
     clearTimeout,
-    __OPEN_DESIGN_NO_BOOTSTRAP__: true,
+    // Most tests drive the exported handlers directly. A test that needs the
+    // real button bindings opts in to the page bootstrap.
+    __OPEN_DESIGN_NO_BOOTSTRAP__: bootstrap !== true,
   });
   context.window = context;
   context.globalThis = context;
@@ -170,12 +172,60 @@ function respond(status, body) {
   return { status, body };
 }
 
+// Account cards are <details class="row account-row"> now. These helpers locate
+// the summary/body by class and the action/quota blocks by data attribute, so a
+// test never depends on the card's child index.
+const accountRow = (view, id) => {
+  const rows = [...view.document.getElementById('accountList').children];
+  return id ? rows.find(row => row.getAttribute('data-credential-id') === id) : rows[0];
+};
+const accountSummary = row => {
+  const summary = [...row.children].find(child => child.tagName === 'SUMMARY');
+  assert.ok(summary, 'account card must render a direct <summary>');
+  return summary;
+};
+const accountBody = row => [...row.children].find(child => hasClass(child, 'account-body'));
+const accountIdentity = row => {
+  const identity = [...accountSummary(row).children]
+    .find(child => hasClass(child, 'account-identity'));
+  assert.ok(identity, 'account summary must directly contain .account-identity');
+  return identity;
+};
+const accountSummaryQuota = row => {
+  const id = row.getAttribute('data-credential-id');
+  const usage = [...accountSummary(row).children]
+    .find(child => child.getAttribute('data-quota-summary') === id);
+  assert.ok(usage, 'account summary must contain [data-quota-summary] for its id');
+  return usage;
+};
+const accountActions = row => {
+  const id = row.getAttribute('data-credential-id');
+  const body = accountBody(row);
+  const actions = body && [...body.children]
+    .find(child => child.getAttribute('data-account-actions') === id);
+  if (!actions) throw new Error('account body must render [data-account-actions] for its id');
+  return actions;
+};
+const accountAction = (row, action) => [...accountActions(row).children]
+  .find(node => node.getAttribute('data-action') === action);
+const accountQuotaDetail = row => {
+  const id = row.getAttribute('data-credential-id');
+  const body = accountBody(row);
+  return (body && [...body.children].find(child => child.getAttribute('data-quota-id') === id)) || null;
+};
+const hasClass = (node, className) => Boolean(node && node.className) &&
+  String(node.className).split(/\s+/).includes(className);
+const accountQuotaStatus = row => byClass(accountIdentity(row), 'account-quota-meta');
+const flattenNodes = node => [node, ...Array.from(node.children || []).flatMap(flattenNodes)];
+
 test('page is self-contained, uses no Cline branding and renders safely with textContent', () => {
   const page = pageHTML();
   assert.ok(!page.includes('/*__OPEN_DESIGN_'));
   assert.ok(page.includes('OpenDesign Bridge'));
   assert.ok(page.includes('OpenDesign Cloud'));
-  assert.ok(!/cline/i.test(page), 'the console must not reuse Cline branding');
+  // The contract explicitly forbids assuming the vendor's 5h/weekly/monthly
+  // window set, so source comments may mention it. Check visible markup only.
+  assert.ok(!/cline/i.test(page.replace(/<script[\s\S]*?<\/script>/gi, '')), 'the console must not reuse Cline branding');
   // Quota display is implemented against /tmp/open-design-quota-contract.md. The
   // only permitted money value is the "≈ $N" equivalent derived from the
   // operator-supplied credits-per-dollar rate; token rates, per-token lists and
@@ -315,9 +365,11 @@ test('account labels are rendered as text, never as trusted HTML', () => {
   consoleApi.render.applyStatus(statusBody({ credentials: [{ id: 'cred-1', label, disabled: true }] }));
   const list = view.document.getElementById('accountList');
   const row = list.children[0];
-  assert.equal(row.children[0].children[0].textContent, label);
-  assert.equal(row.children[0].children[1].textContent, '已停用');
-  assert.ok(!Array.from(row.children).some(child => child.tagName === 'IMG' || child.tagName === 'B'));
+  const identity = accountIdentity(row);
+  const title = byClass(identity, 'account-title');
+  assert.equal(byClass(title, 'name').textContent, label);
+  assert.ok([...title.children].some(child => child.textContent === '已停用'));
+  assert.ok(!flattenNodes(row).some(node => node.tagName === 'IMG' || node.tagName === 'B'));
   assert.equal(view.context.pwned, undefined);
 });
 
@@ -374,7 +426,7 @@ test('row action buttons are wired to real click listeners', async () => {
   consoleApi.state.status = view.context.OpenDesignCore.normalizeStatus(statusBody());
   consoleApi.render.renderAccounts();
   const row = view.document.getElementById('accountList').children[0];
-  const actions = Array.from(row.children[1].children);
+  const actions = Array.from(accountActions(row).children);
   const toggle = actions.find(node => node.getAttribute('data-action') === 'toggle-account');
   const remove = actions.find(node => node.getAttribute('data-action') === 'delete-account');
   assert.ok(toggle && remove);
@@ -653,7 +705,7 @@ function twoAccountPage(extra = {}) {
 }
 
 const accountRows = view => [...view.document.getElementById('accountList').children];
-const actionOf = (row, action) => Array.from(row.children[1].children).find(node => node.getAttribute('data-action') === action);
+const actionOf = (row, action) => accountAction(row, action);
 
 test('editing an account reuses POST /credentials and omits the key when left empty', async () => {
   const updated = statusBody({
@@ -1127,10 +1179,9 @@ function quotaPage(fetchImpl, credentials) {
   return { view, consoleApi, calls };
 }
 
-const quotaRow = view => view.document.getElementById('accountList').children[0];
-const quotaText = view => quotaRow(view).children[2].textContent;
-const flattenNodes = node => [node, ...Array.from(node.children || []).flatMap(flattenNodes)];
-const quotaButtons = view => flattenNodes(quotaRow(view).children[2])
+const quotaRow = (view, id) => accountRow(view, id);
+const quotaText = view => accountQuotaDetail(quotaRow(view)).textContent;
+const quotaButtons = view => flattenNodes(accountQuotaDetail(quotaRow(view)))
   .filter(node => node.tagName === 'BUTTON');
 
 test('loading status never requests quota; only the explicit refresh button does', async () => {
@@ -1337,7 +1388,7 @@ test('quota editors are optional, keep secrets out of the page and never auto-qu
     return respond(404, { error: 'not found' });
   });
   const row = quotaRow(view);
-  await Array.from(row.children[1].children).find(node => node.getAttribute('data-action') === 'edit-account').emit('click');
+  await accountAction(row, 'edit-account').emit('click');
   // The control key is never read back into the page.
   assert.equal(view.document.getElementById('accountControlKey').value, '');
   assert.equal(view.document.getElementById('accountWorkspaceID').value, 'ws-1');
@@ -1371,7 +1422,7 @@ test('clear_billing is only sent when the operator explicitly checks it', async 
     return respond(404, { error: 'not found' });
   });
   const row = quotaRow(view);
-  await Array.from(row.children[1].children).find(node => node.getAttribute('data-action') === 'edit-account').emit('click');
+  await accountAction(row, 'edit-account').emit('click');
   view.document.getElementById('accountControlKey').value = '';
   view.document.getElementById('accountWorkspaceID').value = '';
   view.document.getElementById('accountClearBilling').checked = true;
@@ -1571,32 +1622,49 @@ test('creating an account can save the optional control key, and editing keeps t
 });
 
 
-test('editing one account does not strand a concurrent quota refresh for another account', async () => {
+test('editing one account releases the shared refresh slot without stranding another account', async () => {
+  // Manual refreshes now share one serial slot, so this replaces the old
+  // "two concurrent refreshes" premise while keeping its intent: invalidating
+  // one account's in-flight read must neither corrupt the other account nor
+  // leave the single slot stuck for everyone else.
   const pending = new Map();
   const credentials = [
     { id: 'cred-1', label: '一', billing_configured: true, workspace_id: 'ws-1' },
     { id: 'cred-2', label: '二', billing_configured: true, workspace_id: 'ws-2' },
   ];
-  const { consoleApi } = quotaPage(async url => {
-    const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
-    const request = deferred();
-    pending.set(id, request);
-    return request.promise;
+  const { consoleApi, calls } = quotaPage(async url => {
+    if (url.includes('/quota')) {
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      const request = deferred();
+      pending.set(id, request);
+      return request.promise;
+    }
+    return respond(404, { error: 'not found' });
   }, credentials);
   const one = consoleApi.handlers.refreshQuota(credentials[0]);
-  const two = consoleApi.handlers.refreshQuota(credentials[1]);
-  await new Promise(resolve => setImmediate(resolve));
+  await waitFor(() => pending.has('cred-1'), 'the first quota request');
+  // A second manual refresh must not run beside it, even for another account.
+  const blocked = await consoleApi.handlers.refreshQuota(credentials[1]);
+  assert.equal(blocked, 'skipped');
+  assert.equal(pending.has('cred-2'), false, 'no second request is sent while the slot is busy');
+
   consoleApi.render.applyStatus(statusBody({ credentials: [
     { ...credentials[0], workspace_id: 'ws-new' }, credentials[1],
   ] }));
-  assert.equal(consoleApi.state.quotaBusy['cred-1'], undefined);
-  assert.equal(consoleApi.state.quotaBusy['cred-2'], true);
+  assert.equal(consoleApi.state.quotaBusy['cred-1'], undefined, 'the invalidated account stops showing busy');
   pending.get('cred-1').resolve(respond(200, quotaContract()));
+  assert.equal(await one, 'invalidated');
+
+  // The shared slot is free again: the unrelated account refreshes normally and
+  // its answer applies.
+  const two = consoleApi.handlers.refreshQuota(credentials[1]);
+  await waitFor(() => pending.has('cred-2'), 'the unrelated account request after the slot released');
   pending.get('cred-2').resolve(respond(200, quotaContract({ credential_id: 'cred-2', workspace_id: 'ws-2' })));
-  await Promise.all([one, two]);
+  assert.equal(await two, 'updated');
   assert.equal(consoleApi.state.quotas['cred-1'], undefined, 'obsolete account configuration is discarded');
   assert.equal(consoleApi.state.quotas['cred-2'].workspace_id, 'ws-2', 'unrelated response still applies');
   assert.equal(consoleApi.state.quotaBusy['cred-2'], undefined, 'unrelated button is released');
+  assert.equal(calls.filter(call => call.url.includes('/quota')).length, 2, 'exactly one request per manual refresh');
 });
 
 test('transport errors mark the old snapshot stale and suppress its forecast', async () => {
@@ -4285,7 +4353,7 @@ test('a paused account offers 解除额度暂停 and never flips the disabled sw
   assert.match(row.textContent, /额度耗尽 · 自动暂停/);
   assert.match(row.textContent, /约 .*后复查/);
   // The row exposes an explicit resume control, but nothing runs on render.
-  const actionsRow = row.children[1];
+  const actionsRow = accountActions(row);
   const actionTexts = [...actionsRow.children].map(node => node.textContent);
   assert.ok(actionTexts.includes('解除额度暂停'), `expected a resume control, got ${actionTexts.join(',')}`);
   assert.equal(calls.filter(call => call.url.endsWith('/quota-pause/resume')).length, 0,
@@ -4425,14 +4493,14 @@ test('the account header and rows show the equivalent dollar value of remaining 
   assert.match(usage.children[1].textContent, /约合 \$10\.00/);
   // The row summary shows the same equivalent next to the plain credits.
   const row = accountRows(view).find(node => node.getAttribute('data-credential-id') === 'active-a');
-  const summary = flattenNodes(row.children[2]).filter(node => node.className === 'usage');
+  const summary = flattenNodes(accountSummaryQuota(row)).filter(node => node.className === 'usage');
   assert.match(summary.map(node => node.textContent).join(' | '), /剩余 50,000 \(≈ \$10\.00\)/);
   // A sibling without a rate keeps showing credits alone.
   api.state.quotas['active-b'] = quota('active-b', [{ durationSeconds: 18000, remainingCredits: '2000' }]);
   api.render.renderAccounts();
   const rows = accountRows(view);
   const plainRow = rows.find(node => node.getAttribute('data-credential-id') === 'active-b');
-  const plainSummary = flattenNodes(plainRow.children[2]).filter(node => node.className === 'usage')
+  const plainSummary = flattenNodes(accountSummaryQuota(plainRow)).filter(node => node.className === 'usage')
     .map(node => node.textContent).join(' | ');
   assert.match(plainSummary, /剩余 2,000/);
   assert.doesNotMatch(plainSummary, /≈ \$/);
@@ -4506,8 +4574,9 @@ test('the account header sums remaining quota from active accounts only', () => 
   assert.match(total.textContent, /暂无活动中账户/);
   api.render.applyStatus(statusBody({ credentials }));
   // Active accounts exist but no snapshot has arrived yet: report them as
-  // pending instead of showing a zero total.
-  assert.match(total.children[0].textContent, /正在按账户顺序查询额度…（活动 2 个账户）/);
+  // waiting for data instead of showing a zero total.
+  assert.match(total.children[0].textContent, /暂无可用快照（活动中 2 个账户）/);
+  assert.ok(!/\$0\b|0 credits/.test(total.textContent), 'a missing snapshot is never a fake zero');
 
   api.state.quotas['active-a'] = quota('active-a', '12.34', [
     window(18000, '800'), window(604800, '1234'),
@@ -4671,7 +4740,7 @@ test('仅完整模型集合与有效额度配置显示重查按钮，多个模�
   api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
   await api.render.loadStatus();
   const row = () => view.document.getElementById('accountList').children[0];
-  const recheckButton = () => [...row().children[1].children].find(node => node.textContent === '重查额度');
+  const recheckButton = () => [...accountActions(row()).children].find(node => node.textContent === '重查额度');
   assert.ok(recheckButton(), '完整的多模型集合应允许主动复查');
   assert.match(row().textContent, /须逐一复查并确认属于同一 Workspace 成员/);
   await recheckButton().emit('click');
@@ -4801,7 +4870,7 @@ test('人工停用与额度暂停是两个独立徽标，解除暂停不会发�
   assert.match(row.textContent, /已停用/, '人工停用状态单独显示');
   assert.match(row.textContent, /额度耗尽 · 自动暂停/, '额度暂停状态单独显示');
   assert.match(row.textContent, /已停用/);
-  const actionTexts = [...row.children[1].children].map(node => node.textContent);
+  const actionTexts = [...accountActions(row).children].map(node => node.textContent);
   assert.ok(actionTexts.includes('启用'), 'the operator switch reflects the manual disable');
 
   await api.handlers.resumeQuotaPause(api.state.status.credentials[0]);
@@ -4837,7 +4906,7 @@ test('暂停倒计时在页面内本地变化，且不发出任何网络请求',
   // Only the badge row is inspected: the pause footer legitimately contains the
   // words "不代表额度已恢复", so the badge itself must stay free of any
   // recovered/expiring wording.
-  const readBadge = () => view.document.getElementById('accountList').children[0].children[0].textContent;
+  const readBadge = () => accountSummary(view.document.getElementById('accountList').children[0]).textContent;
   assert.match(readBadge(), /额度耗尽 · 自动暂停/);
   assert.match(readBadge(), /约 .*后复查/);
   const requestsAfterLoad = calls.length;
@@ -4873,13 +4942,17 @@ test('后端标记 awaiting_recheck 时即使本地时钟未到期也显示等�
   assert.equal(core.quotaPauseText({ resume_at: '', awaiting_recheck: true }), '额度暂停（等待复查）');
   // An overdue recheck still keeps a future upstream reset hint. The hint is not
   // a promise that the account resumes then.
+  // Pin `now` for both the fixture and the assertions: the remaining time is
+  // floored to whole seconds, so calling Date.now() again a few milliseconds
+  // later would render "3 天 23 小时" and make this test flaky.
+  const now = Date.now();
   const hinted = core.normalizeQuotaPause({
     reason: 'quota_exhausted', awaiting_recheck: true,
-    resume_at: new Date(Date.now() - 3600_000).toISOString(),
-    estimate_at: new Date(Date.now() + 4 * 86400_000).toISOString(),
+    resume_at: new Date(now - 3600_000).toISOString(),
+    estimate_at: new Date(now + 4 * 86400_000).toISOString(),
   });
-  assert.equal(core.quotaPauseCountdown(hinted), '等待复查 · 上游原提示 4 天后重置或重试');
-  assert.match(core.quotaPauseText(hinted), /^额度暂停（等待复查 · 上游原提示 4 天后重置或重试）$/);
+  assert.equal(core.quotaPauseCountdown(hinted, now), '等待复查 · 上游原提示 4 天后重置或重试');
+  assert.match(core.quotaPauseText(hinted, now), /^额度暂停（等待复查 · 上游原提示 4 天后重置或重试）$/);
   assert.equal(core.quotaPauseText({ resume_at: '' }), '额度暂停');
   assert.equal(core.normalizeQuotaPause({ awaiting_recheck: 'yes' }).awaiting_recheck, false);
 });
@@ -6929,13 +7002,24 @@ test('凭据卡片只读显示宿主冷却，不清除也不改额度暂停', as
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(calls.filter(call => call.url.endsWith('/scheduling')).length, 1);
   const rows = [...view.document.getElementById('accountList').children];
-  const cooling = rows.find(row => row.getAttribute('data-credential-id') === 'cred-1').textContent;
-  const restricted = rows.find(row => row.getAttribute('data-credential-id') === 'cred-2').textContent;
-  assert.match(cooling, /账号冷却/);
+  const coolingRow = rows.find(row => row.getAttribute('data-credential-id') === 'cred-1');
+  const restrictedRow = rows.find(row => row.getAttribute('data-credential-id') === 'cred-2');
+  const cooling = coolingRow.textContent;
+  const restricted = restrictedRow.textContent;
+  // The host exposes no model scope, so both states use the same conservative
+  // badge. Only the readable schedule detail distinguishes them.
+  const coolingBadges = [...byClass(accountIdentity(coolingRow), 'account-title').children]
+    .map(node => node.textContent);
+  const restrictedBadges = [...byClass(accountIdentity(restrictedRow), 'account-title').children]
+    .map(node => node.textContent);
+  assert.ok(coolingBadges.includes('调度受限'), 'credential_cooldown uses the unified 调度受限 badge');
+  assert.ok(restrictedBadges.includes('调度受限'), 'restricted uses the unified 调度受限 badge');
+  assert.ok(!coolingBadges.includes('账号冷却'), 'a hosted cooldown is not a whole-account ban label');
   assert.match(cooling, /上游暂时不可用/);
   assert.match(cooling, /冷却至/);
-  assert.match(restricted, /调度受限/);
   assert.match(restricted, /当前状态未提供模型范围/);
+  assert.ok(!/账号冷却|整账号封禁/.test(`${cooling}\n${restricted}`),
+    'a credential cooldown or a scoped restriction is never presented as a whole-account ban');
   assert.doesNotMatch(`${cooling}\n${restricted}`, /模型冷却|清除冷却/);
   assert.equal(calls.filter(call => call.method !== 'GET').length, 0, '展示调度状态不得发起写请求');
 });
@@ -7057,12 +7141,17 @@ test('查询在途时刷新状态并重新打开标签，新的自动查询仍�
   assert.deepEqual(queried(), ['a'], 'the new walk must wait for the previous in-flight fetch');
   gate.resolve(respond(200, quotaContract({ credential_id: 'a' })));
   await new Promise(resolve => setTimeout(resolve, 50));
-  assert.deepEqual(queried(), ['a', 'a', 'b']);
-  assert.ok(consoleApi.state.quotas.a, 'the new revision must be queried after the old one ends');
+  // The old answer belongs to the replaced billing revision, so it is skipped
+  // rather than counted as a query; the walk then continues serially with b and
+  // never overlaps the still-open request.
+  assert.deepEqual(queried(), ['a', 'b']);
+  assert.equal(consoleApi.state.quotas.a, undefined, 'an invalidated snapshot is never stored');
+  assert.ok(consoleApi.state.quotas.b, 'the walk continues after the invalidated account');
 });
 
 test('窗口摘要标示查询时间、失败时旧数据与已到的重置时间', async () => {
   const quota = quotaContract();
+  quota.state = 'stale';
   quota.funding.state = 'stale';
   quota.funding.fetched_at = '2026-01-01T00:00:00Z';
   quota.funding.data.codingPlan.windows[0].resetsAt = '2026-01-02T00:00:00Z';
@@ -7071,11 +7160,17 @@ test('窗口摘要标示查询时间、失败时旧数据与已到的重置时�
     return respond(404, { error: 'not found' });
   }, [pausedCredential('cred-1')]);
   await consoleApi.handlers.refreshQuota({ id: 'cred-1', label: '暂停账户', billing_configured: true, workspace_id: 'ws-1' });
-  const summary = quotaRow(view).children[2].children[0].textContent;
-  assert.match(summary, /剩余 800/);
-  assert.match(summary, /上次数据/);
-  assert.match(summary, /查询 .*2026/);
-  assert.match(summary, /重置时间已到，请刷新/);
+  const row = quotaRow(view);
+  const summary = accountSummary(row);
+  const identity = accountIdentity(row).textContent;
+  const windows = accountSummaryQuota(row).textContent;
+  // Query time, stale marker and wallet live in the summary identity metadata;
+  // the right-hand block holds only the official windows.
+  assert.match(identity, /上次数据/);
+  assert.match(identity, /\d{2}\/\d{2} \d{2}:\d{2}/, 'the stale snapshot keeps its short query time visible');
+  assert.match(windows, /剩余 800/);
+  assert.match(windows, /重置于/);
+  assert.match(windows, /待更新/, 'an already-elapsed reset time is flagged instead of promising recovery');
 });
 
 test('账户列表按每页 10 个翻页，暂停账户保持在各页末尾', () => {
@@ -7139,19 +7234,714 @@ test('额度详情默认折叠为紧凑摘要，展开状态在倒计时重绘�
     return respond(404, { error: 'not found' });
   });
   await consoleApi.handlers.refreshQuota({ id: 'cred-1', label: '主账户', billing_configured: true, workspace_id: 'ws-1' });
-  const details = () => view.document.getElementById('accountList').children[0].children[2];
-  assert.equal(details().tagName, 'DETAILS');
+  const details = () => accountRow(view, 'cred-1');
+  assert.equal(details().tagName, 'DETAILS', 'the account card itself is the disclosure');
   assert.equal(details().open, false, '详情默认折叠');
-  const summary = details().children[0];
+  const summary = accountSummary(details());
   assert.equal(summary.tagName, 'SUMMARY');
-  assert.match(summary.textContent, /\$12\.345/, '摘要保留钱包余额');
-  assert.match(summary.textContent, /20\.00%/, '摘要保留窗口使用率');
-  assert.match(summary.textContent, /剩余 800/, '摘要保留剩余额度');
-  assert.match(summary.textContent, /重置于/, '摘要保留重置时间');
+  // Wallet balance and the short query time live in the identity metadata.
+  assert.match(accountIdentity(details()).textContent, /\$12\.345/, '摘要保留钱包余额');
+  assert.match(accountSummaryQuota(details()).textContent, /20\.00%/, '摘要保留窗口使用率');
+  assert.match(accountSummaryQuota(details()).textContent, /剩余 800/, '摘要保留剩余额度');
+  assert.match(accountSummaryQuota(details()).textContent, /重置于/, '摘要保留重置时间');
   assert.doesNotMatch(summary.textContent, /本次预检未指定模型/, '长说明应在展开的详情里');
+  assert.match(accountQuotaDetail(details()).textContent, /本次预检未指定模型/, '长说明仍保留在 body 内');
+  assert.ok(![...summary.children].some(child => child.getAttribute('data-account-actions')),
+    'summary must not contain the action buttons');
+  assert.doesNotMatch(summary.textContent, /刷新额度|解除额度暂停|获取模型/, 'summary is not an action surface');
 
   details().open = true;
   await details().emit('toggle');
   consoleApi.render.renderAccounts();
   assert.equal(details().open, true, '本地倒计时重绘不得收起用户展开的详情');
+});
+
+// ---- summary contract: real windows only, no actions, serial progress -------
+
+const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+async function waitFor(predicate, label, attempts = 40) {
+  for (let i = 0; i < attempts; i += 1) {
+    if (predicate()) return;
+    await tick();
+  }
+  assert.ok(predicate(), `timed out waiting for ${label}`);
+}
+
+test('摘要展示官方返回的 3 个真实窗口：0%、100% 与未知百分比都不伪造', () => {
+  const view = fakePage();
+  const api = view.context.OpenDesignConsole;
+  const Core = view.context.OpenDesignCore;
+  const now = Date.now();
+  const reset = seconds => new Date(now + seconds * 1000).toISOString();
+  api.render.applyStatus(statusBody({
+    credentials: [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: true, workspace_id: 'ws-1' }],
+  }));
+  api.state.quotas['cred-1'] = Core.normalizeQuota(quotaContract({
+    funding: {
+      state: 'available',
+      data: {
+        codingPlan: {
+          tier: 'plus',
+          windows: [
+            { durationSeconds: 3600, usedCredits: '0', limitCredits: '100', remainingCredits: '100', resetsAt: reset(3600) },
+            { durationSeconds: 7200, usedCredits: '100', limitCredits: '100', remainingCredits: '0', resetsAt: reset(7200) },
+            { durationSeconds: 10800, remainingCredits: '', resetsAt: '' },
+          ],
+        },
+      },
+    },
+  }));
+  api.render.renderAccounts();
+  const row = accountRow(view, 'cred-1');
+  const summary = accountSummaryQuota(row);
+  const usages = [...summary.children].filter(node => hasClass(node, 'usage'));
+  assert.equal(usages.length, 3, 'the official three-window answer must render exactly three windows');
+  assert.deepEqual(usages.map(node => byClass(node, 'usage-percent').textContent), ['0.00%', '100.00%', '—']);
+  const meterOf = node => byClass(node, 'meter');
+  // The summary label is the official duration; it is never forced into a
+  // vendor billing period such as "5 小时" or "每周".
+  assert.deepEqual([...byClass(usages[0], 'usage-head').children].map(node => node.textContent), ['1 小时', '0.00%']);
+  assert.deepEqual([...byClass(usages[1], 'usage-head').children].map(node => node.textContent), ['2 小时', '100.00%']);
+  // The progress bar is driven by the official used/limit ratio only.
+  assert.equal(meterOf(usages[0]).children[0].getAttribute('style'), 'width:0.00%');
+  assert.equal(meterOf(usages[1]).children[0].getAttribute('style'), 'width:100.00%');
+  assert.match(usages[0].textContent, /剩余 100/);
+  assert.match(usages[1].textContent, /剩余 0/, 'an official zero remaining is a fact, not an unknown');
+  assert.ok(hasClass(usages[1], 'exhausted'), 'a full window is toned as exhausted');
+  assert.match(usages[0].textContent, /重置于 \d{2}\/\d{2} \d{2}:\d{2}/, 'the reset time is a short date');
+  assert.match(usages[2].textContent, /剩余额度 —/);
+  assert.match(usages[2].textContent, /重置时间 —/);
+  assert.equal(meterOf(usages[2]).children.length, 0, 'an unknown window has an empty meter, not 0%');
+  assert.ok(!/0\.00%/.test(usages[2].textContent), 'an unknown window is never filled in as 0%');
+  assert.ok(!/剩余 0\b/.test(usages[2].textContent), 'an unknown window is never filled in as zero credits');
+  assert.doesNotMatch(summary.textContent, /窗口 5 小时|窗口 7 天|窗口 1 个月|每周|每月/,
+    'the console must not append assumed Cline billing periods');
+
+  // No official window list means one empty placeholder, never synthesized zeros.
+  api.state.quotas['cred-1'] = Core.normalizeQuota(quotaContract({
+    funding: { state: 'available', data: { codingPlan: { tier: 'plus', windows: [] } } },
+  }));
+  api.render.renderAccounts();
+  const placeholder = accountSummaryQuota(accountRow(view, 'cred-1'));
+  const placeholders = [...placeholder.children].filter(node => hasClass(node, 'usage'));
+  assert.equal(placeholders.length, 1, 'an absent window list renders a single placeholder');
+  assert.match(placeholders[0].textContent, /套餐额度/);
+  assert.match(placeholders[0].textContent, /—/);
+  const meter = byClass(placeholders[0], 'meter');
+  assert.ok(meter);
+  assert.equal(meter.children.length, 0, 'the placeholder progress bar is empty');
+  assert.doesNotMatch(placeholder.textContent, /0\.00%|剩余 0\b/, 'unknown data never becomes a zero');
+});
+
+test('账户摘要是纯信息：不含操作与长说明，展开后原动作仍可点击', async () => {
+  const { view, consoleApi } = quotaPage(async url => {
+    if (url.includes('/quota')) return respond(200, quotaContract());
+    return respond(404, { error: 'not found' });
+  });
+  await consoleApi.handlers.refreshQuota({ id: 'cred-1', label: '主账户', billing_configured: true, workspace_id: 'ws-1' });
+  const row = accountRow(view, 'cred-1');
+  const summary = accountSummary(row);
+  assert.equal(row.tagName, 'DETAILS');
+  assert.equal(row.open, false, '账户卡片默认折叠');
+  assert.equal(summary.tagName, 'SUMMARY');
+  assert.ok(hasClass(summary, 'account-summary'), 'the direct summary uses .account-summary');
+  assert.ok([...summary.children].some(child => hasClass(child, 'account-chevron')),
+    'the summary carries its own chevron affordance');
+  assert.ok(!flattenNodes(summary).some(node => node.tagName === 'BUTTON'), 'summary contains no action buttons');
+  assert.doesNotMatch(summary.textContent, /获取模型|编辑|停用|解除额度暂停|刷新额度|删除/);
+  assert.doesNotMatch(summary.textContent, /本次预检未指定模型|仅为估算|两次上游查询至少间隔/, 'long notes stay in the body');
+  const quotaDetail = accountQuotaDetail(row);
+  assert.equal(quotaDetail.tagName, 'DIV', 'the old detailed quota block is a plain div inside the body');
+  assert.ok([...accountBody(row).children].includes(quotaDetail), 'the quota block sits directly in .account-body');
+  assert.notEqual(quotaDetail.tagName, 'DETAILS', 'the old detailed quota content is no longer nested in its own details');
+
+  // The original actions live in the body and still work once expanded.
+  row.open = true;
+  await row.emit('toggle');
+  assert.equal(consoleApi.state.accountExpanded['cred-1'], true);
+  const edit = accountAction(row, 'edit-account');
+  assert.ok(edit, 'the original action buttons remain available after expansion');
+  await edit.emit('click');
+  assert.match(view.document.getElementById('accountFormTitle').textContent, /编辑账户/);
+  assert.equal(view.document.getElementById('accountLabel').value, '主账户');
+});
+
+test('串行额度查询区分待查询/正在查询/查询失败，并在 #quotaLoadState 报告进度和失败数', async () => {
+  const credentials = [
+    { id: 'account-a', label: 'A', disabled: false, billing_configured: true, workspace_id: 'ws-a' },
+    { id: 'account-b', label: 'B', disabled: false, billing_configured: true, workspace_id: 'ws-b' },
+    { id: 'account-c', label: 'C', disabled: false, billing_configured: true, workspace_id: 'ws-c' },
+  ];
+  const gates = new Map();
+  const { view, consoleApi, calls } = quotaPage(url => {
+    if (url.includes('/quota')) {
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      const gate = deferred();
+      gates.set(id, gate);
+      return gate.promise;
+    }
+    return respond(404, { error: 'not found' });
+  }, credentials);
+  const stateText = () => view.document.getElementById('quotaLoadState').textContent;
+  consoleApi.handlers.activateTab('credentials');
+  await waitFor(() => gates.has('account-a'), 'the first quota request');
+
+  // A is genuinely in flight; B and C are queued, not "loading".
+  let rowA = accountRow(view, 'account-a');
+  let rowB = accountRow(view, 'account-b');
+  let rowC = accountRow(view, 'account-c');
+  assert.match(accountQuotaStatus(rowA).textContent, /正在查询…/);
+  assert.equal(accountQuotaStatus(rowA).getAttribute('data-quota-status'), 'loading');
+  assert.match(accountQuotaStatus(rowB).textContent, /待查询 · 队列第 1 个/);
+  assert.equal(accountQuotaStatus(rowB).getAttribute('data-quota-status'), 'pending');
+  assert.match(accountQuotaStatus(rowC).textContent, /待查询 · 队列第 2 个/);
+  assert.doesNotMatch(accountQuotaStatus(rowB).textContent, /正在查询/);
+  assert.match(stateText(), /额度查询 0 \/ 3/);
+  assert.match(stateText(), /待查 2/);
+  assert.match(stateText(), /正在查询「A」/);
+  assert.equal(view.document.getElementById('quotaLoadState').hidden, false);
+
+  gates.get('account-a').resolve(respond(200, quotaContract({ credential_id: 'account-a', workspace_id: 'ws-a' })));
+  await waitFor(() => gates.has('account-b'), 'the second quota request');
+  rowA = accountRow(view, 'account-a');
+  rowB = accountRow(view, 'account-b');
+  rowC = accountRow(view, 'account-c');
+  assert.match(accountQuotaStatus(rowA).textContent, /已更新/);
+  assert.match(accountQuotaStatus(rowB).textContent, /正在查询…/);
+  assert.match(accountQuotaStatus(rowC).textContent, /待查询 · 队列第 1 个/);
+  assert.match(stateText(), /额度查询 1 \/ 3/);
+  assert.match(stateText(), /正在查询「B」/);
+
+  // A transport failure must end the busy spinner and state the failure on the card.
+  gates.get('account-b').reject(new Error('fixture connection lost'));
+  await waitFor(() => gates.has('account-c'), 'the third quota request');
+  rowB = accountRow(view, 'account-b');
+  assert.match(accountQuotaStatus(rowB).textContent, /查询失败/);
+  assert.equal(accountQuotaStatus(rowB).getAttribute('data-quota-status'), 'error');
+  assert.doesNotMatch(accountQuotaStatus(rowB).textContent, /正在查询|刷新中/);
+  assert.match(stateText(), /2 \/ 3/);
+  assert.match(stateText(), /正在查询「C」/);
+
+  gates.get('account-c').resolve(respond(200, quotaContract({ credential_id: 'account-c', workspace_id: 'ws-c' })));
+  await waitFor(() => /额度查询完成/.test(stateText()), 'the serial walk to finish');
+  // The completion line reports updated+failed attempts as processed and the
+  // failure count separately; a failed account must never look successful.
+  assert.match(stateText(), /3 个已查询/);
+  assert.match(stateText(), /1 个失败/);
+  assert.doesNotMatch(stateText(), /已跳过|全部成功/);
+  assert.equal(consoleApi.state.quotaAutoRunning, false);
+  assert.deepEqual([...gates.keys()], ['account-a', 'account-b', 'account-c'], 'queries stay strictly serial');
+  assert.deepEqual(calls.filter(call => call.url.includes('/quota'))
+    .map(call => new URL(call.url, 'https://cpa.example').searchParams.get('credential_id')),
+  ['account-a', 'account-b', 'account-c']);
+  for (const id of ['account-a', 'account-b', 'account-c']) {
+    assert.equal(consoleApi.state.quotaBusy[id], undefined, `${id} must release its busy state`);
+  }
+});
+
+test('已过复查时间显示等待复查，历史上游原提示独立一行且不承诺恢复', () => {
+  const view = fakePage();
+  const api = view.context.OpenDesignConsole;
+  const now = Date.now();
+  api.render.applyStatus(statusBody({
+    credentials: [{
+      id: 'cred-1', label: '主账户', disabled: false,
+      billing_configured: true, workspace_id: 'ws-1',
+      quota_paused: true, effective_disabled: true,
+      quota_pause: {
+        reason: 'quota_exhausted', source: 'upstream', awaiting_recheck: true,
+        resume_at: new Date(now - 3600_000).toISOString(),
+        estimate_at: new Date(now + 4 * 86400_000).toISOString(),
+        manual_disabled: false, model_id: 'open-design/flash',
+      },
+    }],
+  }));
+  const row = accountRow(view, 'cred-1');
+  const identity = accountIdentity(row);
+  const text = identity.textContent;
+  assert.match(text, /等待复查/, 'an overdue recheck deadline reads as waiting for a recheck');
+  // estimate_at comes from the old upstream error, so it is labelled as the
+  // original hint (上游原提示), never as a verified reset time.
+  assert.match(text, /上游原提示/);
+  assert.match(text, /重置或重试/);
+  assert.doesNotMatch(text, /上游重置提示/);
+  assert.doesNotMatch(text, /已恢复|即将恢复|恢复时间|保证恢复/,
+    'a historical upstream hint never promises that the account recovered');
+
+  const timing = byClass(identity, 'account-timing');
+  const lines = [...timing.children];
+  assert.equal(lines.length, 2, 'the pause deadline and the historical hint are separate lines');
+  const recheck = lines[0];
+  const hint = lines[1];
+  assert.ok(hasClass(recheck, 'account-pause-time'));
+  assert.match(recheck.textContent, /等待复查/);
+  assert.doesNotMatch(recheck.textContent, /恢复/);
+  assert.match(hint.textContent, /上游原提示/);
+  assert.match(hint.textContent, /\d{2}\/\d{2} \d{2}:\d{2}/, 'the hint keeps a short timestamp');
+  assert.match(hint.getAttribute('title') || '', /不代表.*恢复|须官方复查/,
+    'the hint title must retain the no-recovery caveat');
+});
+
+test('额度数据与账户展开状态在重绘和翻页后保留', async () => {
+  const credentials = Array.from({ length: 11 }, (_, index) => activeCredential(`active-${index}`, `正常 ${index}`));
+  const { view, consoleApi } = quotaPage(async url => {
+    if (url.includes('/quota')) {
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      return respond(200, quotaContract({ credential_id: id, workspace_id: `ws-${id}` }));
+    }
+    return respond(404, { error: 'not found' });
+  }, credentials);
+  const Core = view.context.OpenDesignCore;
+  const quotaFor = id => Core.normalizeQuota(quotaContract({
+    credential_id: id,
+    funding: {
+      state: 'available',
+      data: { codingPlan: { windows: [{ durationSeconds: 18000, usedCredits: '200', limitCredits: '1000', remainingCredits: '800' }] } },
+    },
+  }));
+  consoleApi.state.quotas['active-0'] = quotaFor('active-0');
+  consoleApi.state.quotas['active-10'] = quotaFor('active-10');
+  consoleApi.render.renderAccounts();
+
+  let first = accountRow(view, 'active-0');
+  assert.match(accountSummaryQuota(first).textContent, /剩余 800/);
+  first.open = true;
+  await first.emit('toggle');
+  assert.equal(consoleApi.state.accountExpanded['active-0'], true);
+
+  // A normal repaint keeps both the data and the expansion.
+  consoleApi.render.renderAccounts();
+  first = accountRow(view, 'active-0');
+  assert.equal(first.open, true, 'a repaint keeps the expanded card open');
+  assert.match(accountSummaryQuota(first).textContent, /剩余 800/, 'a repaint keeps the quota snapshot');
+
+  // Page 2 has its own card; expanding it and paging back and forth keeps each
+  // account's own expansion and its data.
+  consoleApi.handlers.nextAccountsPage();
+  assert.equal(accountRow(view, 'active-0'), undefined);
+  let second = accountRow(view, 'active-10');
+  assert.match(accountSummaryQuota(second).textContent, /剩余 800/);
+  second.open = true;
+  await second.emit('toggle');
+  assert.equal(consoleApi.state.accountExpanded['active-10'], true);
+
+  consoleApi.handlers.previousAccountsPage();
+  first = accountRow(view, 'active-0');
+  assert.equal(first.open, true, 'paging back keeps the first page expansion');
+  assert.match(accountSummaryQuota(first).textContent, /剩余 800/);
+
+  consoleApi.handlers.nextAccountsPage();
+  second = accountRow(view, 'active-10');
+  assert.equal(second.open, true, 'paging forward keeps the second page expansion');
+  assert.match(accountSummaryQuota(second).textContent, /剩余 800/);
+});
+
+test('quotaPauseCompact 与 formatQuotaTime 保持短标签和年份边界', () => {
+  const core = fakePage().context.OpenDesignCore;
+  const now = new Date(2026, 10, 10, 12, 0).getTime();
+  const at = seconds => new Date(now + seconds * 1000).toISOString();
+  assert.equal(core.formatQuotaTime(new Date(2026, 0, 2, 3, 4).toISOString(), now), '01/02 03:04');
+  assert.equal(core.formatQuotaTime(new Date(2025, 11, 31, 23, 59).toISOString(), now), '2025/12/31 23:59');
+  assert.equal(core.formatQuotaTime('', now), '');
+  assert.equal(core.formatQuotaTime('not-a-time', now), '');
+
+  assert.equal(core.quotaPauseCompact(null, now), '');
+  assert.equal(core.quotaPauseCompact({ resume_at: at(-1) }, now), '等待复查');
+  assert.equal(core.quotaPauseCompact({ resume_at: '', awaiting_recheck: true }, now), '等待复查');
+  assert.equal(core.quotaPauseCompact({ resume_at: '' }, now), '复查时间待确认');
+  // Minute precision rounds up, so a 30-second wait never collapses to "0 秒".
+  assert.equal(core.quotaPauseCompact({ resume_at: at(30) }, now), '约 1 分钟后复查');
+  assert.equal(core.quotaPauseCompact({ resume_at: at(3600) }, now), '约 1 小时后复查');
+  assert.equal(core.quotaPauseCompact({ resume_at: at(3660) }, now), '约 1 小时 1 分钟后复查');
+});
+
+// ---- serial slot: manual refresh vs. automatic walk, stop control ----------
+
+test('自动串行查询 A 在途时，B 的单独刷新不得并发，单账号按钮被禁用', async () => {
+  const credentials = [
+    { id: 'account-a', label: 'A', disabled: false, billing_configured: true, workspace_id: 'ws-a' },
+    { id: 'account-b', label: 'B', disabled: false, billing_configured: true, workspace_id: 'ws-b' },
+  ];
+  const gates = new Map();
+  const { view, consoleApi } = quotaPage(url => {
+    if (url.includes('/quota')) {
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      const gate = deferred();
+      gates.set(id, gate);
+      return gate.promise;
+    }
+    return respond(404, { error: 'not found' });
+  }, credentials);
+  consoleApi.handlers.activateTab('credentials');
+  await waitFor(() => gates.has('account-a'), 'the automatic walk to start account A');
+
+  const rowB = accountRow(view, 'account-b');
+  const refreshB = [...accountQuotaDetail(rowB).children]
+    .flatMap(node => flattenNodes(node))
+    .find(node => node.tagName === 'BUTTON' && node.getAttribute('data-action') === 'refresh-quota');
+  assert.ok(refreshB, 'B keeps its own refresh control');
+  assert.equal(refreshB.disabled, true, 'the per-account button is disabled while another query is in flight');
+
+  const outcome = await consoleApi.handlers.refreshQuota(credentials[1]);
+  assert.equal(gates.has('account-b'), false, 'calling B while A is in flight must not send a second request');
+  assert.equal(consoleApi.state.quotaBusy['account-b'], undefined);
+  assert.ok(outcome === undefined || outcome === 'skipped' || outcome === 'invalidated',
+    `a blocked manual refresh must not report a successful outcome, got ${outcome}`);
+  assert.deepEqual([...gates.keys()], ['account-a']);
+
+  gates.get('account-a').resolve(respond(200, quotaContract({ credential_id: 'account-a', workspace_id: 'ws-a' })));
+  await waitFor(() => gates.has('account-b'), 'the same serial walk to reach account B');
+  assert.deepEqual([...gates.keys()], ['account-a', 'account-b'], 'B is queried by the walk, never concurrently');
+  gates.get('account-b').resolve(respond(200, quotaContract({ credential_id: 'account-b', workspace_id: 'ws-b' })));
+  await waitFor(() => !consoleApi.state.quotaAutoRunning, 'the walk to finish');
+});
+
+test('手动刷新 B 在途时，打开凭据页的自动串行查询先等 B 完成', async () => {
+  const credentials = [
+    { id: 'account-a', label: 'A', disabled: false, billing_configured: true, workspace_id: 'ws-a' },
+    { id: 'account-b', label: 'B', disabled: false, billing_configured: true, workspace_id: 'ws-b' },
+  ];
+  const requests = [];
+  const { consoleApi } = quotaPage(url => {
+    if (url.includes('/quota')) {
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      const gate = deferred();
+      requests.push({ id, gate });
+      return gate.promise;
+    }
+    return respond(404, { error: 'not found' });
+  }, credentials);
+  const ids = () => requests.map(request => request.id);
+  const manualB = consoleApi.handlers.refreshQuota(credentials[1]);
+  await waitFor(() => requests.length === 1, 'the manual B request');
+
+  consoleApi.handlers.activateTab('credentials');
+  await tick();
+  await tick();
+  assert.deepEqual(ids(), ['account-b'], 'the automatic walk must wait for the in-flight manual refresh');
+  assert.equal(consoleApi.state.quotaAutoRunning, true, 'the walk is queued behind the manual request, not running beside it');
+  assert.equal(consoleApi.state.quotaBusy['account-a'], undefined);
+
+  requests[0].gate.resolve(respond(200, quotaContract({ credential_id: 'account-b', workspace_id: 'ws-b' })));
+  assert.equal(await manualB, 'updated');
+  // Answer every follow-up request the walk issues; it must never have started
+  // one before the manual B answer.
+  for (let round = 0; round < 12 && consoleApi.state.quotaAutoRunning; round += 1) {
+    await tick();
+    const open = requests.find(request => !request.answered && !request.settled);
+    if (!open) { await tick(); continue; }
+    open.answered = true;
+    open.gate.resolve(respond(200, quotaContract({ credential_id: open.id, workspace_id: `ws-${open.id.slice(-1)}` })));
+    await tick();
+  }
+  await waitFor(() => !consoleApi.state.quotaAutoRunning, 'the walk to finish');
+  assert.equal(requests[0].id, 'account-b', 'the manual request was the only one in flight');
+  assert.ok(requests.length >= 2, 'the walk eventually queried an account after the manual request finished');
+  assert.ok(!consoleApi.state.quotaBusy['account-a'] && !consoleApi.state.quotaBusy['account-b'],
+    'both accounts release their busy flags');
+});
+
+test('顶部刷新按钮在自动查询中变为“停止查询”，停止只影响后续账户', async () => {
+  const credentials = [
+    { id: 'account-a', label: 'A', disabled: false, billing_configured: true, workspace_id: 'ws-a' },
+    { id: 'account-b', label: 'B', disabled: false, billing_configured: true, workspace_id: 'ws-b' },
+    { id: 'account-c', label: 'C', disabled: false, billing_configured: true, workspace_id: 'ws-c' },
+  ];
+  const gates = new Map();
+  const view = fakePage({
+    bootstrap: true,
+    fetchImpl: url => {
+      if (url.includes('/quota')) {
+        const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+        const gate = deferred();
+        gates.set(id, gate);
+        return gate.promise;
+      }
+      return respond(404, { error: 'not found' });
+    },
+  });
+  await tick();
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.render.applyStatus(statusBody({ credentials }));
+  consoleApi.render.renderAccounts();
+  const top = view.document.getElementById('refreshAccountQuotas');
+  assert.ok(top.listeners.get('click'), 'the bound page wires the top refresh button');
+  assert.equal(top.textContent, '刷新额度');
+
+  consoleApi.handlers.activateTab('credentials');
+  await waitFor(() => gates.has('account-a'), 'the first automatic request');
+  assert.equal(top.textContent, '停止查询', 'the same button becomes a stop control while the walk runs');
+  assert.match(`${top.getAttribute('title') || ''}${top.title || ''}`, /停止后续|已发出的请求/);
+
+  await top.emit('click');
+  assert.equal(top.textContent, '刷新额度', 'stopping restores the refresh label');
+  assert.equal(consoleApi.state.quotaAutoRunning, false);
+  assert.match(view.document.getElementById('quotaLoadState').textContent, /已停止/);
+  assert.equal(gates.has('account-b'), false, 'no new account is started after the stop');
+
+  // The already-sent request is not cancelled; its answer still applies, but it
+  // does not start the next account.
+  gates.get('account-a').resolve(respond(200, quotaContract({ credential_id: 'account-a', workspace_id: 'ws-a' })));
+  await waitFor(() => consoleApi.state.quotaBusy['account-a'] === undefined, 'the in-flight request to settle');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(gates.has('account-b'), false, 'the stopped walk never starts B');
+  assert.equal(gates.has('account-c'), false, 'the stopped walk never starts C');
+});
+
+// ---- explicit refresh outcomes --------------------------------------------
+
+test('refreshQuota 返回明确 outcome：updated/failed/skipped，partial 与 stale 的组件错误算 failed', async () => {
+  const fresh = quotaPage(async () => respond(200, quotaContract()));
+  assert.equal(await fresh.consoleApi.handlers.refreshQuota(fresh.consoleApi.state.status.credentials[0]), 'updated');
+
+  // A 200 answer with a failing component is a failure, even when the wallet
+  // half is still usable.
+  const partial = quotaPage(async () => respond(200, quotaContract({
+    state: 'partial',
+    wallet: { state: 'available', fetched_at: '2026-11-03T00:00:00Z', data: { balanceUsd: '7', updatedAt: null }, error: null },
+    funding: { state: 'error', fetched_at: null, data: null, error: { kind: 'forbidden', message: '无权限' } },
+  })));
+  assert.equal(await partial.consoleApi.handlers.refreshQuota(partial.consoleApi.state.status.credentials[0]), 'failed');
+
+  // Stale data with a component error is likewise a failed refresh, not a fresh
+  // success and not a silent skip.
+  const stale = quotaPage(async () => respond(200, quotaContract({
+    state: 'stale',
+    wallet: { state: 'stale', fetched_at: '2026-11-02T00:00:00Z', data: { balanceUsd: '3.5', updatedAt: null }, error: { kind: 'timeout', message: '上游超时' } },
+    funding: { state: 'stale', fetched_at: '2026-11-02T00:00:00Z', data: { codingPlan: { tier: 'pro', windows: [] } }, error: { kind: 'timeout', message: '上游超时' } },
+  })));
+  assert.equal(await stale.consoleApi.handlers.refreshQuota(stale.consoleApi.state.status.credentials[0]), 'failed');
+
+  const throttled = quotaPage(async () => respond(200, quotaContract({ state: 'needs_refresh' })));
+  assert.equal(await throttled.consoleApi.handlers.refreshQuota(throttled.consoleApi.state.status.credentials[0]), 'skipped');
+
+  const transport = quotaPage(async () => { throw new Error('fixture connection lost'); });
+  assert.equal(await transport.consoleApi.handlers.refreshQuota(transport.consoleApi.state.status.credentials[0]), 'failed');
+  assert.match(accountQuotaStatus(quotaRow(transport.view)).textContent, /查询失败/);
+
+  const unconfigured = quotaPage(async () => respond(200, quotaContract()), [
+    { id: 'cred-1', label: '主账户', disabled: false, billing_configured: false, workspace_id: '' },
+  ]);
+  const none = await unconfigured.consoleApi.handlers.refreshQuota(unconfigured.consoleApi.state.status.credentials[0]);
+  assert.ok(['skipped', 'invalidated'].includes(none), `an unconfigured account must report a non-success outcome, got ${none}`);
+  assert.equal(unconfigured.calls.filter(call => call.url.includes('/quota')).length, 0);
+});
+test('revision 失效的单账号刷新返回 invalidated，不计为已查询', async () => {
+  const initial = [{ ...activeCredential('a'), billing_revision: 'old' }, activeCredential('b')];
+  const next = [{ ...initial[0], billing_revision: 'new' }, initial[1]];
+  const gate = deferred();
+  const { view, consoleApi } = quotaPage(async url => {
+    if (url.endsWith('/status')) return respond(200, statusBody({ credentials: next }));
+    if (url.includes('/quota')) return gate.promise;
+    return respond(404, { error: 'not found' });
+  }, initial);
+  const pending = consoleApi.handlers.refreshQuota(consoleApi.state.status.credentials[0]);
+  await waitFor(() => consoleApi.state.quotaBusy.a === true, 'the A request to start');
+  await consoleApi.handlers.refreshAccountStatus();
+  gate.resolve(respond(200, quotaContract({ credential_id: 'a', workspace_id: 'ws-a' })));
+  assert.equal(await pending, 'invalidated', 'a replaced billing revision is not an update');
+  assert.equal(consoleApi.state.quotas.a, undefined, 'the stale snapshot is discarded');
+  assert.doesNotMatch(view.document.getElementById('quotaLoadState').textContent, /已查询/);
+});
+
+// ---- freshness metadata, pending-vs-error priority, scheduling races ------
+
+test('钱包与套餐新鲜度/时间不同时分别标注，不把旧钱包说成套餐刚更新', () => {
+  const view = fakePage();
+  const api = view.context.OpenDesignConsole;
+  const Core = view.context.OpenDesignCore;
+  api.render.applyStatus(statusBody({
+    credentials: [{ id: 'cred-1', label: '主账户', disabled: false, billing_configured: true, workspace_id: 'ws-1' }],
+  }));
+  const stamp = (hours) => {
+    // Fixed clock-independent offsets, formatted the same short way the UI does.
+    return new Date(Date.UTC(2026, 0, 5, hours, 0)).toISOString();
+  };
+  const withParts = (wallet, funding) => Core.normalizeQuota(quotaContract({ wallet, funding }));
+
+  // Wallet is a day older than the coding plan: both timestamps must appear and
+  // each label must sit with its own amount.
+  const mixed = withParts(
+    { state: 'stale', fetched_at: stamp(10), data: { balanceUsd: '3.5', updatedAt: null }, error: { kind: 'timeout', message: '上游超时' } },
+    {
+      state: 'available',
+      fetched_at: stamp(11),
+      data: { funding: 'coding_plan', codingPlan: { tier: 'pro', windows: [{ durationSeconds: 3600, remainingCredits: '10' }] } },
+      error: null,
+    },
+  );
+  mixed.state = 'partial';
+  api.state.quotas['cred-1'] = mixed;
+  api.render.renderAccounts();
+  let meta = accountQuotaStatus(accountRow(view, 'cred-1')).textContent;
+  const walletBadge = Core.formatQuotaTime(stamp(10));
+  const fundingBadge = Core.formatQuotaTime(stamp(11));
+  assert.ok(meta.includes(walletBadge), `wallet keeps its own time, got ${meta}`);
+  assert.ok(meta.includes(fundingBadge), `funding keeps its own time, got ${meta}`);
+  assert.match(meta, /上次数据/, 'the wallet part is marked as stale');
+  // The wallet amount must not be glued to the funding sample time in a single
+  // "查询 <time>" claim.
+  assert.ok(!new RegExp(`钱包 \\$3\\.5[^；]*查询 ${fundingBadge}`).test(meta),
+    `the stale wallet must not be labelled with the fresh funding time: ${meta}`);
+
+  // Equally fresh parts from the same sample may share one compact timestamp.
+  const same = withParts(
+    { state: 'available', fetched_at: stamp(12), data: { balanceUsd: '4', updatedAt: null }, error: null },
+    {
+      state: 'available',
+      fetched_at: stamp(12),
+      data: { funding: 'coding_plan', codingPlan: { tier: 'pro', windows: [{ durationSeconds: 3600, remainingCredits: '10' }] } },
+      error: null,
+    },
+  );
+  same.state = 'available';
+  api.state.quotas['cred-1'] = same;
+  api.render.renderAccounts();
+  meta = accountQuotaStatus(accountRow(view, 'cred-1')).textContent;
+  assert.match(meta, /已更新/);
+  assert.equal(meta.split(Core.formatQuotaTime(stamp(12))).length - 1, 1,
+    `a shared sample timestamp is printed exactly once: ${meta}`);
+  assert.match(meta, /钱包 \$4/);
+});
+
+test('上一轮查询失败不会遮住新一轮的待查询状态，失败备注保留在 pending 文本里', async () => {
+  const credentials = [
+    { id: 'account-a', label: 'A', disabled: false, billing_configured: true, workspace_id: 'ws-a' },
+    { id: 'account-b', label: 'B', disabled: false, billing_configured: true, workspace_id: 'ws-b' },
+  ];
+  const requests = [];
+  const { view, consoleApi } = quotaPage(url => {
+    if (url.includes('/quota')) {
+      const id = new URL(url, 'https://cpa.example').searchParams.get('credential_id');
+      const gate = deferred();
+      requests.push({ id, gate });
+      return gate.promise;
+    }
+    return respond(404, { error: 'not found' });
+  }, credentials);
+  // Round 1: A fails in transport, leaving an error note behind.
+  consoleApi.state.quotaErrors['account-a'] = 'HTTP 502：fixture failure';
+  consoleApi.state.quotas['account-a'] = view.context.OpenDesignCore.normalizeQuota(quotaContract({
+    credential_id: 'account-a',
+    state: 'stale',
+    wallet: { state: 'stale', fetched_at: '2026-01-01T00:00:00Z', data: { balanceUsd: '1', updatedAt: null }, error: { kind: 'upstream', message: 'x' } },
+    funding: { state: 'stale', fetched_at: '2026-01-01T00:00:00Z', data: { codingPlan: { tier: 'pro', windows: [] } }, error: { kind: 'upstream', message: 'x' } },
+  }));
+  consoleApi.render.renderAccounts();
+  let rowA = accountRow(view, 'account-a');
+  assert.equal(accountQuotaStatus(rowA).getAttribute('data-quota-status'), 'error');
+
+  // Round 2 starts; A is queued behind the in-flight first account. The stale
+  // error must no longer dominate the status: pending wins, with a note that the
+  // previous attempt failed.
+  consoleApi.handlers.activateTab('credentials');
+  await waitFor(() => requests.length === 1, 'the first request of the new round');
+  const inFlight = accountRow(view, requests[0].id);
+  const queued = accountRow(view, requests[0].id === 'account-a' ? 'account-b' : 'account-a');
+
+  // The account that is actually being queried says so, even though it carries a
+  // failure note from the previous round.
+  const inFlightStatus = accountQuotaStatus(inFlight);
+  assert.match(inFlightStatus.textContent, /正在查询/);
+  assert.equal(inFlightStatus.getAttribute('data-quota-status'), 'loading');
+
+  // The account still queued must show pending, not the previous hard error,
+  // while the failure remains visible as a note. This also applies to account A
+  // when its earlier error is still in quotaErrors.
+  const queuedStatus = accountQuotaStatus(queued);
+  const queuedText = queuedStatus.textContent;
+  assert.match(queuedText, /待查询/, `a queued account shows pending even after an earlier failure: ${queuedText}`);
+  assert.notEqual(queuedStatus.getAttribute('data-quota-status'), 'error');
+  assert.ok(!hasClass(queuedStatus, 'error'), 'the pending row is not styled as a hard error');
+
+  // Force A to be the queued account to prove its stale error does not mask it.
+  consoleApi.state.quotaErrors['account-b'] = 'HTTP 502：fixture failure';
+  consoleApi.render.renderAccounts();
+  const queuedB = accountQuotaStatus(accountRow(view, 'account-b'));
+  assert.match(queuedB.textContent, /待查询/);
+  assert.match(queuedB.textContent, /上次查询失败|上次失败/, 'the earlier failure stays visible as a note');
+  assert.notEqual(queuedB.getAttribute('data-quota-status'), 'error');
+});
+
+test('登出并重登后，迟到的调度快照不得覆盖新会话', async () => {
+  const pendingScheduling = [];
+  const view = fakePage({
+    fetchImpl: url => {
+      if (url.endsWith('/scheduling')) {
+        const gate = deferred();
+        pendingScheduling.push(gate);
+        return gate.promise;
+      }
+      if (url.endsWith('/status')) return respond(200, statusBody({
+        credentials: [activeCredential('cred-1', '主账户')],
+      }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.render.applyStatus(statusBody({ credentials: [activeCredential('cred-1', '主账户')] }));
+
+  // Session A asks for scheduling, then the operator logs out and back in; the
+  // new session asks again (sequence+generation fencing).
+  consoleApi.handlers.activateTab('credentials');
+  await waitFor(() => pendingScheduling.length === 1, 'session A scheduling request');
+  consoleApi.handlers.clearAuth();
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.render.applyStatus(statusBody({ credentials: [activeCredential('cred-1', '主账户')] }));
+  consoleApi.handlers.activateTab('credentials');
+  await waitFor(() => pendingScheduling.length === 2, 'session B scheduling request');
+
+  // The new answer lands first, then the old one arrives late.
+  pendingScheduling[1].resolve(respond(200, {
+    observed_at: new Date().toISOString(),
+    host: { available: true },
+    accounts: [{ id: 'cred-1', state: 'available', host: { disabled: false, unavailable: false } }],
+  }));
+  await tick();
+  pendingScheduling[0].resolve(respond(200, {
+    observed_at: new Date().toISOString(),
+    host: { available: false, note: '旧会话的调度快照' },
+    accounts: [{ id: 'cred-1', state: 'credential_cooldown', host: { disabled: false, unavailable: true, message: '旧快照', next_retry_after: new Date(Date.now() + 3600_000).toISOString() } }],
+  }));
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  const text = accountRow(view, 'cred-1').textContent;
+  assert.doesNotMatch(text, /旧快照|调度受限/, 'a late snapshot from the replaced session must be dropped');
+  assert.doesNotMatch(text, /冷却至/);
+  assert.equal(consoleApi.state.scheduling && consoleApi.state.scheduling.host_available, true,
+    'the new session keeps its own scheduling snapshot');
+});
+
+test('同一会话内较早的调度请求迟到也不覆盖较新的结果', async () => {
+  const pendingScheduling = [];
+  const view = fakePage({
+    fetchImpl: url => {
+      if (url.endsWith('/scheduling')) {
+        const gate = deferred();
+        pendingScheduling.push(gate);
+        return gate.promise;
+      }
+      if (url.endsWith('/status')) return respond(200, statusBody({ credentials: [activeCredential('cred-1', '主账户')] }));
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const consoleApi = view.context.OpenDesignConsole;
+  consoleApi.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  consoleApi.render.applyStatus(statusBody({ credentials: [activeCredential('cred-1', '主账户')] }));
+  consoleApi.handlers.activateTab('credentials');
+  await waitFor(() => pendingScheduling.length === 1, 'first scheduling read');
+  consoleApi.handlers.refreshAccountStatus();
+  await waitFor(() => pendingScheduling.length === 2, 'second scheduling read');
+
+  pendingScheduling[1].resolve(respond(200, { host: { available: true }, accounts: [] }));
+  await tick();
+  pendingScheduling[0].resolve(respond(200, {
+    host: { available: true },
+    accounts: [{ id: 'cred-1', state: 'credential_cooldown', host: { message: '过期的旧结果', next_retry_after: new Date(Date.now() + 3600_000).toISOString() } }],
+  }));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.doesNotMatch(accountRow(view, 'cred-1').textContent, /过期的旧结果/,
+    'an out-of-order older response must be discarded by the request sequence');
 });
