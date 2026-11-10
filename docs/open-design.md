@@ -1,6 +1,6 @@
 # OpenDesign 插件说明
 
-本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`；当前版本为 `0.4.13`（未识别故障不再误冷却或终止换号，尚未发布），生产仍为 `0.4.12`（及时复查额度恢复、策略／退避并发保护、精确美元换算与逐账户汇总；请求日志与账户控制台；额度耗尽自动暂停默认开启），`0.4.6` tag 不得使用。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射，并修复其快照一致性与控制台草稿问题；`0.4.7` 新增额度耗尽自动暂停。详见[验证记录](verification.md)。
+本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork。插件 ID 与 provider 为 `open-design`；当前版本为 `0.4.14`（凭据卡片只读显示 CPA 冷却与调度状态；`0.4.13` 让未识别故障不再误冷却或终止换号，均尚未发布），生产仍为 `0.4.12`（及时复查额度恢复、策略／退避并发保护、精确美元换算与逐账户汇总；请求日志与账户控制台；额度耗尽自动暂停默认开启），`0.4.6` tag 不得使用。本 fork 不是 OpenDesign 官方发布，也不是 ClinePassBridge 的官方下游。`0.3.0` 已通过本地验收，并由提交 `2601888` 的成功 CI 产物升级 `nuoapi-net`；`0.4.0` 在其上增加重试调度／错误规则，并由提交 `e66497e` 的成功 CI 产物于 2026-11-04 完成生产升级；`0.4.1` 修复 Windows 上的请求日志持久化与跨平台测试问题，`0.4.2` 把其余持久化写入也纳入同一重试发布路径，`0.4.3` 让额度查询在打开「凭据 · 额度」时按账户顺序自动执行，`0.4.4` 识别 OpenDesign 的 `insufficient_balance` 额度耗尽报文并新增对应默认规则，`0.4.5` 新增每个模型独立的思考强度映射，并修复其快照一致性与控制台草稿问题；`0.4.7` 新增额度耗尽自动暂停。详见[验证记录](verification.md)。
 
 ## 范围
 
@@ -262,7 +262,7 @@ plugins:
 ## 发布 tag
 
 - 发布 tag 使用 `open-design-vX.Y.Z` 形式，不创建或覆盖上游 `v*` tag；不使用或复用不安全的 `open-design-v0.4.6`。
-- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对，三者必须同步（当前源码 `0.4.13`，尚未发布）。
+- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对，三者必须同步（当前源码 `0.4.14`，尚未发布）。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本。
 - `open-design-v0.4.11` 已发布并标记 Latest，五平台构建全绿（[release run 42341153176](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42341153176)），首次运行即完成。`open-design-v0.4.10` 已发布并标记 Latest，五平台构建全绿（[release run 42273570550](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42273570550)）；前三次运行因 GitHub 未分配 `macos-15` arm64 runner 被取消（各排队约 15 分钟），第四次重跑取得 runner 后完成。`open-design-v0.4.9` 已发布并标记 Latest，五平台构建全绿（[release run 42206328455](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42206328455)）；首次运行因 GitHub 未分配 `macos-15` arm64 runner 被取消两次（各排队 15 分钟），第三次重跑取得 runner 后完成。`open-design-v0.4.7` 已发布并标记 Latest，五平台构建全绿（[release run 42167937013](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42167937013)）；`open-design-v0.4.4` 已从 draft 转为正式 Release。`0.4.5` 与 `0.4.6` 的发布运行未产出可用资产，`0.4.6` 禁止使用；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release。分支与生产交付状态见验证记录。
 

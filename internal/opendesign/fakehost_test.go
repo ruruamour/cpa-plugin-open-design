@@ -35,6 +35,8 @@ type fakeHost struct {
 	authDir         string
 	authListErr     error
 	authList        []map[string]any
+	authRuntimeErr  error
+	authRuntime     map[string]map[string]any
 
 	// Operation bridge: every do/do_stream call is registered here so a cancel
 	// can release a blocked callback the way the real host does.
@@ -162,6 +164,19 @@ func (h *fakeHost) call(method string, in, out any) error {
 			return err
 		}
 		assign(out, map[string]any{"files": files})
+		return nil
+	case "host.auth.get_runtime":
+		h.mu.Lock()
+		err := h.authRuntimeErr
+		auth := h.authRuntime[stringField(in, "auth_index")]
+		h.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if auth == nil {
+			return errors.New("fakeHost: unknown auth index")
+		}
+		assign(out, map[string]any{"auth": auth})
 		return nil
 
 	case "host.stream.emit":

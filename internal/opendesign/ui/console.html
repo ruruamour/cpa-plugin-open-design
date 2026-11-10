@@ -78,6 +78,8 @@
     .badge.good, .badge.on { background: color-mix(in srgb, var(--good) 16%, var(--surface)); color: var(--good); }
     .badge.off, .badge.danger { background: color-mix(in srgb, var(--danger) 14%, var(--surface)); color: var(--danger); }
     .badge.danger { border: 1px solid color-mix(in srgb, var(--danger) 32%, transparent); font-weight: 600; }
+    .badge.warn { background: color-mix(in srgb, #b54708 14%, var(--surface)); color: #b54708; }
+    :root[data-theme="dark"] .badge.warn, :root[data-theme="system"] .badge.warn { color: #fdb022; }
     .badge.danger-soft { background: transparent; color: var(--danger); padding-left: 2px; }
     .lead { color: var(--muted); margin: 0 0 20px; max-width: 760px; }
     .lead code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
@@ -121,6 +123,9 @@
     .account-editor[open] > summary { margin-bottom: 10px; }
     .account-row { align-items: flex-start; }
     .account-row.paused { border-color: color-mix(in srgb, var(--danger) 42%, var(--line)); background: color-mix(in srgb, var(--danger) 6%, var(--surface)); }
+    .account-row.restricted { border-color: color-mix(in srgb, #b54708 36%, var(--line)); }
+    .schedule-detail { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 12px; }
+    .schedule-detail .mono { color: var(--ink); }
     .account-group-head { margin-top: 4px; padding: 2px 2px 0; color: var(--danger); font-size: 12.5px; font-weight: 700; }
     .account-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; }
     .account-tools .search { flex: 1 1 240px; width: auto; }
@@ -361,7 +366,7 @@
       <div class="panel-head">
         <div>
           <h2 id="accountsTitle">账户</h2>
-          <p class="hint">账户列表只显示标签、启用状态和操作；API key 不会回显，编辑时也不能读取原 key。打开本标签页会按账户顺序逐个查询一次额度（不并发），离开即停止。</p>
+          <p class="hint">账户列表显示标签、启用状态、额度暂停和 CPA 当前冷却；API key 不会回显。冷却只读，清除仍在 CPA 自己的凭据页。打开本标签页会按账户顺序逐个查询一次额度（不并发），离开即停止。</p>
         </div>
         <div class="panel-actions">
           <button class="button compact" id="refreshAccountStatus" type="button" title="重新读取账户状态，不发起上游额度查询">刷新状态</button>

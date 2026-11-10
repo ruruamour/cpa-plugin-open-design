@@ -202,6 +202,65 @@
     return countdown ? `${title} · ${countdown}` : title;
   }
 
+  const SCHEDULING_STATES = {
+    available: true,
+    credential_cooldown: true,
+    model_cooldown: true,
+    restricted: true,
+    host_disabled: true,
+    manual_disabled: true,
+    quota_paused: true,
+    unknown: true,
+  };
+
+  function normalizeScheduling(value) {
+    const data = value && typeof value === 'object' ? value : {};
+    const host = data.host && typeof data.host === 'object' ? data.host : {};
+    const accounts = [];
+    if (Array.isArray(data.accounts)) {
+      for (const item of data.accounts) {
+        if (!item || typeof item !== 'object') continue;
+        const id = text(item.id);
+        if (!id) continue;
+        const cooldowns = [];
+        if (Array.isArray(item.cooldowns)) {
+          for (const row of item.cooldowns) {
+            if (!row || typeof row !== 'object') continue;
+            const scope = row.scope === 'credential' || row.scope === 'model' ? row.scope : '';
+            const retryAt = safeTimestamp(row.retry_at);
+            if (!scope || !retryAt) continue;
+            cooldowns.push({
+              scope,
+              model: scope === 'model' ? safeIdentity(row.model, 128) : '',
+              reason: safeCode(row.reason, 40),
+              retry_at: retryAt,
+            });
+          }
+        }
+        const state = SCHEDULING_STATES[item.state] ? item.state : 'unknown';
+        accounts.push({
+          id,
+          state,
+          quota_paused: item.quota_paused === true,
+          cooldowns,
+          host: item.host && typeof item.host === 'object' ? {
+            disabled: item.host.disabled === true,
+            unavailable: item.host.unavailable === true,
+            status: safeCode(item.host.status, 64),
+            message: shortText(item.host.message, 200),
+            next_retry_after: safeTimestamp(item.host.next_retry_after),
+          } : null,
+        });
+      }
+    }
+    return {
+      observed_at: safeTimestamp(data.observed_at),
+      host_available: host.available === true,
+      host_note: shortText(host.note, 200),
+      accounts,
+    };
+  }
+
   function normalizeStatus(value) {
     const data = value && typeof value === 'object' ? value : {};
     const credentials = [];
@@ -1341,6 +1400,7 @@
     DEFAULT_BASE_URL,
     parseAPIError,
     normalizeStatus,
+    normalizeScheduling,
     normalizeQuotaPause,
     quotaPauseRemaining,
     quotaPauseEstimateRemaining,

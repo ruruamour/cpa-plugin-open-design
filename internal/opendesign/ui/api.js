@@ -175,6 +175,9 @@
       updateConfig: (logs, pause) => request('/config', { method: 'POST', body: pause ? { logs, pause } : { logs } }),
       updatePauseConfig: pause => request('/config', { method: 'POST', body: { pause } }),
       runtime: () => request('/runtime'),
+      // Read-only host scheduling projection for the account cards. The page
+      // asks for it only while the credentials tab is open, alongside status.
+      scheduling: () => request('/scheduling'),
       modelTest: input => request('/model-test', {
         method: 'POST',
         body: {

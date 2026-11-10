@@ -61,6 +61,7 @@ func managementRoutes() []managementRoute {
 		{Method: http.MethodGet, Path: apiBase + "/config"},
 		{Method: http.MethodPost, Path: apiBase + "/config"},
 		{Method: http.MethodGet, Path: apiBase + "/runtime"},
+		{Method: http.MethodGet, Path: apiBase + "/scheduling"},
 		{Method: http.MethodGet, Path: apiBase + "/error-rules"},
 		{Method: http.MethodPut, Path: apiBase + "/error-rules"},
 		{Method: http.MethodPost, Path: apiBase + "/error-rules/sync"},
@@ -156,6 +157,8 @@ func (s *Service) management(raw json.RawMessage) (any, error) {
 		return s.updateConfigRequest(r)
 	case r.Method == http.MethodGet && path == apiBase+"/runtime":
 		return s.runtimeRequest()
+	case r.Method == http.MethodGet && path == apiBase+"/scheduling":
+		return s.schedulingResponse()
 	case (r.Method == http.MethodGet || r.Method == http.MethodPut) && path == apiBase+"/error-rules":
 		return s.withActive(func() (any, error) { return s.errorRulesRequest(r) })
 	case r.Method == http.MethodPost && (path == apiBase+"/error-rules/sync" || path == apiBase+"/error-rules/reset"):

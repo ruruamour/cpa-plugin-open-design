@@ -40,6 +40,11 @@
     // minute-by-minute countdown re-render.
     accountPage: 1,
     accountSearch: '',
+    // Host scheduling is a read-only projection refreshed with account status.
+    // A failed read keeps the previous snapshot and says so, instead of turning
+    // every card into "unknown".
+    scheduling: null,
+    schedulingState: '',
     accountExpanded: {},
     selectedCredential: '',
     upstream: [],
@@ -755,7 +760,10 @@
     // Leaving the tab cancels the walk before anything else can run, so a slow
     // response cannot start the next account after the operator moved on.
     if (target.name !== 'credentials') cancelQuotaAutoLoad();
-    if (target.name === 'credentials') void autoLoadQuotaForAccounts();
+    if (target.name === 'credentials') {
+      void autoLoadQuotaForAccounts();
+      void loadScheduling();
+    }
     if (target.name === 'logs') void autoLoadRequestLogs();
     return target.name;
   }
@@ -961,6 +969,8 @@
     state.accountPage = 1;
     state.accountSearch = '';
     state.accountExpanded = {};
+    state.scheduling = null;
+    state.schedulingState = '';
     const accountSearch = $('accountSearch');
     if (accountSearch) accountSearch.value = '';
     state.selectedCredential = '';
@@ -1153,8 +1163,83 @@
     if (!state.verified || state.busy) return;
     const sessionGeneration = state.sessionGeneration;
     if (await loadStatus({ preserveOnError: true }) && sessionGeneration === state.sessionGeneration) {
-      message('accountRefreshState', '账户状态已更新；未重新查询额度。', 'ok');
+      await loadScheduling();
+      const note = state.schedulingState ? `账户状态已更新；${state.schedulingState}` : '账户状态已更新；未重新查询额度。';
+      message('accountRefreshState', note, state.scheduling && state.scheduling.host_available ? 'ok' : '');
     }
+  }
+
+  async function loadScheduling() {
+    if (!state.verified || !api() || typeof api().scheduling !== 'function') return;
+    try {
+      const raw = await api().scheduling();
+      state.scheduling = Core.normalizeScheduling(raw);
+      state.schedulingState = state.scheduling.host_available ? '' : (state.scheduling.host_note || '宿主调度状态暂时不可读。');
+    } catch (error) {
+      state.schedulingState = `调度状态读取失败：${formatError(error)}`;
+    }
+    renderAccounts();
+  }
+
+  function accountSchedule(id) {
+    const accounts = state.scheduling && state.scheduling.accounts;
+    if (!Array.isArray(accounts)) return null;
+    return accounts.find(item => item.id === id) || null;
+  }
+
+  const SCHEDULE_BADGE = {
+    available: ['参与调度', 'badge good'],
+    credential_cooldown: ['账号冷却', 'badge warn'],
+    model_cooldown: ['模型冷却', 'badge warn'],
+    restricted: ['调度受限', 'badge warn'],
+    host_disabled: ['宿主停用', 'badge warn'],
+    unknown: ['调度状态待查询', 'badge'],
+  };
+
+  const SCHEDULE_REASON = {
+    quota: '额度或频率限制',
+    credential_quota: '账号额度限制',
+    unauthorized: '鉴权失败',
+    payment_required: '额度或套餐受限',
+    not_found: '模型不可用',
+    model_not_supported: '模型不支持',
+    transient_error: '瞬时上游故障',
+    cloudflare_challenge: '出口校验',
+    unknown: '原因未分类',
+  };
+
+  function scheduleBadge(item) {
+    if (item.disabled) return null;
+    if (item.quota_pause) return null;
+    const schedule = accountSchedule(item.id);
+    const stateName = schedule ? schedule.state : 'unknown';
+    const preset = SCHEDULE_BADGE[stateName] || SCHEDULE_BADGE.unknown;
+    const title = stateName === 'restricted'
+      ? '宿主没有提供可区分的模型范围，不能判断具体哪个模型在冷却'
+      : (stateName === 'model_cooldown' ? '只影响列出的模型，其他模型仍按原有资格调度' : '');
+    return el('span', { className: preset[1], text: preset[0], attrs: title ? { title } : {} });
+  }
+
+  function scheduleDetail(item) {
+    const schedule = accountSchedule(item.id);
+    if (!schedule) return null;
+    const now = Date.now();
+    const lines = [];
+    const message = schedule.host && schedule.host.message;
+    if (message && schedule.state !== 'model_cooldown') lines.push(message);
+    for (const row of schedule.cooldowns) {
+      const at = Date.parse(row.retry_at);
+      if (!Number.isFinite(at) || at <= now) continue;
+      const reason = SCHEDULE_REASON[row.reason] || '原因未分类';
+      const who = row.scope === 'model' && row.model ? row.model : '账号';
+      lines.push(`${who} · ${reason} · 冷却至 ${Core.formatTime(row.retry_at)}`);
+    }
+    if (!lines.length && schedule.state === 'restricted') {
+      const retry = schedule.host && schedule.host.next_retry_after;
+      lines.push(retry && Date.parse(retry) > now ? `冷却至 ${Core.formatTime(retry)}` : '当前状态未提供模型范围');
+    }
+    if (!lines.length) return null;
+    return el('div', { className: 'schedule-detail' }, lines.map(line => el('span', { text: line })));
   }
 
   // Quota snapshots belong to one credential configuration. When the billing
@@ -1536,6 +1621,7 @@
       // changes `disabled`, so it gets its own badges and its own controls.
       pause ? el('span', { className: 'badge danger', text: Core.quotaPauseTitle(pause) }) : null,
       pause ? el('span', { className: 'badge danger-soft', text: Core.quotaPauseCountdown(pause) }) : null,
+      scheduleBadge(item),
       pause && pause.multiple_models ? el('span', { className: 'badge', text: '多个模型' }) : null,
       pause && pause.error ? el('span', { className: 'badge off', text: '同步待重试' }) : null,
       editing ? el('span', { className: 'badge', text: '正在编辑' }) : null,
@@ -1567,12 +1653,15 @@
         on: () => deleteAccount(item),
       }),
     ]);
+    const schedule = accountSchedule(item.id);
+    const restricted = !pause && schedule && (schedule.state === 'credential_cooldown' || schedule.state === 'restricted' || schedule.state === 'host_disabled');
     return el('div', {
-      className: `row account-row${pause ? ' paused' : ''}`,
+      className: `row account-row${pause ? ' paused' : ''}${restricted ? ' restricted' : ''}`,
       attrs: { 'data-credential-id': item.id, 'data-account-paused': pause ? 'true' : 'false' },
     }, [
       detail,
       actions,
+      scheduleDetail(item),
       renderQuota(item),
     ]);
   }
@@ -4840,6 +4929,7 @@
     }
     state.verified = { headers: resolved.headers, source: resolved.source };
     const ok = await loadStatus({ source: resolved.source });
+    if (ok && state.activeTab === 'credentials') void loadScheduling();
     // Reclaim vertical space once the reused login worked; the panel stays
     // one click away and reopening never changes authentication behaviour.
     if (ok) setAuthCollapsed(true);

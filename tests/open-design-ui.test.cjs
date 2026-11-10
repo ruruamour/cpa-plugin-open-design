@@ -6895,6 +6895,33 @@ test('额度读取失败或未配置时，暂停卡片仍给出明确状态', as
   assert.match(byId('paused-fail').textContent, /查询失败/, '查询失败的暂停账户显示失败而不是空白');
 });
 
+test('凭据卡片只读显示宿主冷却，不清除也不改额度暂停', async () => {
+  const until = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  const { view, consoleApi, calls } = quotaPage(async url => {
+    if (url.endsWith('/scheduling')) return respond(200, {
+      observed_at: new Date().toISOString(),
+      host: { available: true },
+      accounts: [{
+        id: 'cred-1',
+        state: 'model_cooldown',
+        quota_paused: false,
+        host: { disabled: false, unavailable: false, status: 'active', message: '', next_retry_after: '' },
+        cooldowns: [{ scope: 'model', model: 'flash', reason: 'quota', retry_at: until }],
+      }],
+    });
+    return respond(404, { error: 'not found' });
+  }, [activeCredential('cred-1', '主账户')]);
+
+  consoleApi.handlers.activateTab('credentials');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(calls.filter(call => call.url.endsWith('/scheduling')).length, 1);
+  const row = quotaRow(view).textContent;
+  assert.match(row, /模型冷却/);
+  assert.match(row, /flash · 额度或频率限制 · 冷却至/);
+  assert.doesNotMatch(row, /清除冷却/);
+  assert.equal(calls.filter(call => call.method !== 'GET').length, 0, '展示调度状态不得发起写请求');
+});
+
 test('刷新账户状态能看到后台恢复，不发起上游额度查询', async () => {
   const active = activeCredential('cred-1');
   const { view, consoleApi, calls } = quotaPage(async url => {

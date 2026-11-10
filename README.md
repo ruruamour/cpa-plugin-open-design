@@ -2,7 +2,7 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前版本为 `0.4.13`（未识别的上游故障不再误冷却或终止换号；规则命中与凭据类故障仍按原状态交给宿主），生产仍为已发布的 `0.4.12`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前版本为 `0.4.14`（凭据卡片只读显示 CPA 冷却与调度状态；`0.4.13` 让未识别的上游故障不再误冷却或终止换号），生产仍为已发布的 `0.4.12`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
@@ -12,7 +12,7 @@
 
 ## 功能
 
-`0.4.13` 修正交给宿主的错误：命中的请求级规则原样转发，凭据类故障保留真实状态以便冷却，其余未识别故障（裸 403、裸 402、524、未分类的 5xx 与传输错误）不再带状态码，并标成宿主认识的瞬时传输故障，从而换号而不冷却。请求日志仍记录真实上游状态。本版本尚未发布，生产仍是 `0.4.12`。
+`0.4.14` 在凭据卡片上只读显示 CPA 的冷却与调度状态，与插件自己的额度暂停分开；清除冷却仍在 CPA 自己的凭据页。`0.4.13` 修正交给宿主的错误：命中的请求级规则原样转发，凭据类故障保留真实状态以便冷却，其余未识别故障（裸 403、裸 402、524、未分类的 5xx 与传输错误）不再带状态码，并标成宿主认识的瞬时传输故障，从而换号而不冷却。请求日志仍记录真实上游状态。两个版本都尚未发布，生产仍是 `0.4.12`。
 
 `0.4.12` 已于 2026-11-08 发布并热加载上线：后台首次复查不再被历史上游重置提示推迟超过暂停后 30 分钟；复查需要排队且仍必须通过模型级官方新鲜证明，截图上的共享剩余额度不会直接解除暂停。界面将旧错误提示标为历史信息，不再断言它是恢复时间。
 
@@ -247,7 +247,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 产物是 `dist/open-design.so`（Linux amd64，C shared ABI v1）。
 
-发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。源码 `Version`、`marketplace/registry.json` 与发布 tag 保持同步；当前源码为 `0.4.13`，尚未发布，已发布的最新 tag 仍是 `open-design-v0.4.12`。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动"取最新"不适用于本 fork。
+发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。源码 `Version`、`marketplace/registry.json` 与发布 tag 保持同步；当前源码为 `0.4.14`，尚未发布，已发布的最新 tag 仍是 `open-design-v0.4.12`。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动"取最新"不适用于本 fork。
 
 ## 当前验证边界
 
