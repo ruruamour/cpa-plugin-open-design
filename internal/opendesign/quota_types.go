@@ -32,6 +32,10 @@ type quotaPart[T any] struct {
 type quotaError struct {
 	Kind    string `json:"kind"`
 	Message string `json:"message"`
+	// Reason narrows a "malformed" failure to the check that rejected it. It
+	// is always one of a few fixed plugin codes and never carries any part of
+	// the upstream body or of a credential.
+	Reason string `json:"reason,omitempty"`
 }
 
 type quotaWalletData struct {

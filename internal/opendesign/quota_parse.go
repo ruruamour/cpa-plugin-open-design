@@ -35,19 +35,39 @@ func creditsPerUSDValue(value string) string {
 // vela-billing.ts parseBillingPreflight at 5a0c477. Unknown fields are ignored;
 // only explicitly validated fields are copied into management responses.
 func parseQuotaWallet(body []byte) (*quotaWalletData, bool) {
+	data, reason := parseQuotaWalletReason(body)
+	return data, reason == ""
+}
+
+// parseQuotaWalletReason also names the check that failed. The balance is the
+// only field the official reader requires:
+//
+//	isValidUsdBalance(body.balanceUsd)                      -> reject otherwise
+//	updatedAt: typeof body.updatedAt === 'string' ? ... : null
+//
+// so updatedAt is display metadata. A value that is not a usable timestamp is
+// reported as unknown; it must not discard a balance the upstream did return.
+func parseQuotaWalletReason(body []byte) (*quotaWalletData, string) {
+	if len(body) > maxQuotaBody {
+		return nil, "body_too_large"
+	}
 	m, ok := quotaObject(body)
 	if !ok {
-		return nil, false
+		return nil, "not_json_object"
 	}
-	balance, ok := quotaString(m["balanceUsd"])
-	if !ok || len(balance) > 4096 || !quotaUnsignedDecimal.MatchString(balance) {
-		return nil, false
+	raw, present := m["balanceUsd"]
+	if !present {
+		return nil, "balance_missing"
 	}
-	updatedAt, ok := quotaNullableTime(m["updatedAt"], true)
+	balance, ok := quotaString(raw)
 	if !ok {
-		return nil, false
+		return nil, "balance_not_string"
 	}
-	return &quotaWalletData{BalanceUSD: balance, UpdatedAt: updatedAt}, true
+	if len(balance) > 4096 || !quotaUnsignedDecimal.MatchString(balance) {
+		return nil, "balance_format"
+	}
+	updatedAt, _ := quotaNullableTime(m["updatedAt"], true)
+	return &quotaWalletData{BalanceUSD: balance, UpdatedAt: updatedAt}, ""
 }
 
 func parseQuotaFunding(body []byte, workspaceID string) (*quotaFundingData, bool) {

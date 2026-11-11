@@ -1894,8 +1894,20 @@
       upstream: 'OpenDesign 额度服务暂时不可用',
       stopped: '额度查询已停止',
     };
-    const kind = error.kind ? `（${error.kind}）` : '';
-    const detail = messages[error.kind] || error.message;
+    // A malformed answer says which check rejected it, so the operator can
+    // tell a wrong credential setting from an upstream format change.
+    const reasons = {
+      credential_config: 'controlKey 或 Workspace ID 含有非法字符或过长',
+      body_too_large: '上游响应超过 1 MiB',
+      not_json_object: '上游返回的不是 JSON 对象',
+      balance_missing: '上游响应里没有 balanceUsd',
+      balance_not_string: 'balanceUsd 不是字符串',
+      balance_format: 'balanceUsd 不是非负十进制数',
+      funding_format: '套餐预检响应的字段不符合官方格式',
+    };
+    const reason = error.kind === 'malformed' && error.reason ? reasons[error.reason] || error.reason : '';
+    const kind = error.kind ? `（${error.kind}${error.reason ? ` · ${error.reason}` : ''}）` : '';
+    const detail = reason || messages[error.kind] || error.message;
     return `${prefix}${kind}${detail ? `：${detail}` : ''}`;
   }
 

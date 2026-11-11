@@ -8523,3 +8523,33 @@ test('the runtime list marks an account the plugin is holding back for quota', a
   assert.equal(text('paused'), '暂停账户已启用额度暂停中', 'the operator choice and the plugin pause are both shown');
   assert.equal(text('off'), '停用账户已停用');
 });
+
+// --- quota: a malformed answer names the check that rejected it ---------------
+
+test('a malformed wallet shows which check failed, and an unknown reason is shown verbatim but safely', async () => {
+  const answer = reason => quotaContract({
+    credential_id: 'cred-1', workspace_id: 'ws-1', state: 'partial',
+    wallet: { state: 'error', fetched_at: null, data: null, error: { kind: 'malformed', message: 'OpenDesign quota response or configuration was invalid.', ...(reason === undefined ? {} : { reason }) } },
+  });
+  const run = async reason => {
+    const { view, consoleApi } = quotaPage(async url => (url.includes('/quota') ? respond(200, answer(reason)) : respond(200, statusBody())));
+    await consoleApi.handlers.refreshQuota(consoleApi.state.status.credentials[0]);
+    return { text: quotaText(view), stored: consoleApi.state.quotas['cred-1'].wallet.error };
+  };
+  const missing = await run('balance_missing');
+  assert.equal(missing.stored.reason, 'balance_missing');
+  assert.match(missing.text, /malformed · balance_missing/);
+  assert.match(missing.text, /上游响应里没有 balanceUsd/);
+  assert.match((await run('credential_config')).text, /controlKey 或 Workspace ID 含有非法字符或过长/);
+  // A reason this console version does not know is still shown, as its code.
+  assert.match((await run('some_future_check')).text, /malformed · some_future_check/);
+  // An older backend sends no reason: the generic wording stays.
+  const legacy = await run(undefined);
+  assert.equal(legacy.stored.reason, '');
+  assert.match(legacy.text, /上游响应或额度配置不符合官方格式/);
+  assert.ok(!legacy.text.includes(' · undefined'));
+  // A reason is a short machine code; anything else is dropped, never rendered.
+  const hostile = await run('<img src=x onerror=alert(1)> balanceUsd=12.34');
+  assert.equal(hostile.stored.reason, '');
+  assert.ok(!hostile.text.includes('onerror') && !hostile.text.includes('12.34'));
+});

@@ -506,3 +506,48 @@ func TestQuotaQuiesceCancelsOperationAndWakesJoinedAndQueuedRequests(t *testing.
 		assertIdle(t, s)
 	}
 }
+
+// The production symptom: the wallet read reported "malformed" while the plan
+// read on the same account worked. The wallet body is display data and its
+// only required field is balanceUsd, so a timestamp the plugin cannot use must
+// not hide the balance, and a real rejection must say which check failed.
+func TestQuotaWalletUnusableTimestampStillShowsBalanceAndRejectionsNameTheirCheck(t *testing.T) {
+	s, host := newTestService(t)
+	id := addQuotaCredential(t, s, host, "")
+	host.doResponses = append(host.doResponses, fakeHTTPResponse{Status: http.StatusOK,
+		Body: []byte(`{"balanceUsd":"12.345","updatedAt":"2026-11-10 09:05:00","currency":"USD"}`)})
+	status, view, raw := quotaCall(t, s, id, true)
+	if status != http.StatusOK || view.State != "available" || view.Wallet.State != "available" || view.Wallet.Error != nil {
+		t.Fatalf("a wallet with an unusable updatedAt was not shown: %d %s", status, raw)
+	}
+	if view.Wallet.Data == nil || view.Wallet.Data.BalanceUSD != "12.345" || view.Wallet.Data.UpdatedAt != nil {
+		t.Fatalf("wallet data = %#v, want the balance with an unknown timestamp", view.Wallet.Data)
+	}
+	if strings.Contains(raw, "09:05:00") || strings.Contains(raw, "currency") {
+		t.Fatalf("unvalidated upstream text reached the management response: %s", raw)
+	}
+
+	for body, want := range map[string]string{
+		`{"data":{"balanceUsd":"12.345"}}`:      "balance_missing",
+		`{"balanceUsd":12.345}`:                 "balance_not_string",
+		`{"balanceUsd":"$12.34"}`:               "balance_format",
+		`<html><body>bad gateway</body></html>`: "not_json_object",
+	} {
+		other, otherHost := newTestService(t)
+		otherID := addQuotaCredential(t, other, otherHost, "")
+		otherHost.doResponses = append(otherHost.doResponses, fakeHTTPResponse{Status: http.StatusOK, Body: []byte(body)})
+		status, view, raw := quotaCall(t, other, otherID, true)
+		if status != http.StatusOK || view.Wallet.State != "error" || view.Wallet.Data != nil || view.Wallet.Error == nil {
+			t.Fatalf("%s: expected a wallet error: %d %s", body, status, raw)
+		}
+		if view.Wallet.Error.Kind != "malformed" || view.Wallet.Error.Reason != want {
+			t.Fatalf("%s: error = %+v, want malformed/%s", body, view.Wallet.Error, want)
+		}
+		// The reason is a fixed code: nothing from the body may be echoed.
+		for _, leak := range []string{"12.345", "12.34", "bad gateway", "html"} {
+			if strings.Contains(raw, leak) {
+				t.Fatalf("%s: management response echoed %q: %s", body, leak, raw)
+			}
+		}
+	}
+}

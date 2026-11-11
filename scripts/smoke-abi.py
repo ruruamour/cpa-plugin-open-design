@@ -99,6 +99,12 @@ def parse_rfc3339(value):
     return dt.datetime.fromisoformat(text)
 
 
+# Every reason a "malformed" quota failure may carry. The plugin builds it from
+# its own checks only; nothing from the upstream body is ever placed in it.
+MALFORMED_REASONS = {"credential_config", "body_too_large", "not_json_object", "balance_missing",
+                     "balance_not_string", "balance_format", "funding_format"}
+
+
 def assert_keys(value, expected, label):
     """Require an object to carry exactly the contract's keys.
 
@@ -2039,7 +2045,15 @@ def run_quota_live(request, origin, proxy, credential_id, client_models, auth_di
                 "%s invented data/fetched_at on a first failure: %s" % (name, part))
         require(part["error"] and part["error"]["kind"] == kind,
                 "%s error kind = %r, want %r" % (name, part["error"], kind))
-        assert_keys(part["error"], ["kind", "message"], "%s error" % name)
+        # The error shape stays closed. Since 0.5.0 a malformed failure also
+        # names the check that rejected it, as one of a fixed set of plugin
+        # codes; every other kind still carries exactly kind and message.
+        if kind == "malformed":
+            assert_keys(part["error"], ["kind", "message", "reason"], "%s error" % name)
+            require(part["error"]["reason"] in MALFORMED_REASONS,
+                    "%s malformed reason %r is not a known fixed code" % (name, part["error"]["reason"]))
+        else:
+            assert_keys(part["error"], ["kind", "message"], "%s error" % name)
         for secret in defects:
             require(secret not in json.dumps(body),
                     "%s quota leaked a control key" % name)

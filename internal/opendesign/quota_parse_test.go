@@ -21,12 +21,92 @@ func TestQuotaWalletValidation(t *testing.T) {
 	for _, raw := range []string{
 		`null`, `[]`, `{}`, `{"balanceUsd":0}`, `{"balanceUsd":null}`, `{"balanceUsd":"-1"}`, `{"balanceUsd":"+1"}`,
 		`{"balanceUsd":"1e2"}`, `{"balanceUsd":" 1"}`, `{"balanceUsd":".1"}`, `{"balanceUsd":"1."}`,
-		`{"balanceUsd":"1","updatedAt":"invalid"}`, `{"balanceUsd":"1","updatedAt":2}`, `{"balanceUsd":"1"} {}`,
+		`{"balanceUsd":"1"} {}`,
 		`{"BalanceUsd":"1"}`,
 	} {
 		if _, valid := parseQuotaWallet([]byte(raw)); valid {
 			t.Fatalf("invalid wallet accepted: %s", raw)
 		}
+	}
+}
+
+// The official reader (vela-wallet.ts at 5a0c477) requires only a valid
+// balanceUsd and reads updatedAt as `typeof v === 'string' ? v : null`. A
+// timestamp the plugin cannot use is therefore unknown metadata, not a reason
+// to discard a balance the upstream returned.
+func TestQuotaWalletKeepsBalanceWhenUpdatedAtIsUnusable(t *testing.T) {
+	for name, raw := range map[string]string{
+		"not a timestamp": `{"balanceUsd":"12.34","updatedAt":"invalid"}`,
+		"number":          `{"balanceUsd":"12.34","updatedAt":1762765500}`,
+		"empty string":    `{"balanceUsd":"12.34","updatedAt":""}`,
+		"space separated": `{"balanceUsd":"12.34","updatedAt":"2026-11-10 09:05:00"}`,
+		"no zone":         `{"balanceUsd":"12.34","updatedAt":"2026-11-10T09:05:00"}`,
+		"date only":       `{"balanceUsd":"12.34","updatedAt":"2026-11-10"}`,
+		"object":          `{"balanceUsd":"12.34","updatedAt":{"seconds":1}}`,
+		"boolean":         `{"balanceUsd":"12.34","updatedAt":false}`,
+	} {
+		data, reason := parseQuotaWalletReason([]byte(raw))
+		if reason != "" || data == nil {
+			t.Errorf("%s: balance rejected with reason %q: %s", name, reason, raw)
+			continue
+		}
+		if data.BalanceUSD != "12.34" {
+			t.Errorf("%s: balance = %q", name, data.BalanceUSD)
+		}
+		// Unusable metadata is unknown; it is never passed through as text.
+		if data.UpdatedAt != nil {
+			t.Errorf("%s: unusable updatedAt was kept as %q", name, *data.UpdatedAt)
+		}
+	}
+	// A usable timestamp is still reported.
+	data, reason := parseQuotaWalletReason([]byte(`{"balanceUsd":"1","updatedAt":"2026-11-03T00:00:00.123Z"}`))
+	if reason != "" || data.UpdatedAt == nil || *data.UpdatedAt != "2026-11-03T00:00:00.123Z" {
+		t.Fatalf("valid updatedAt lost: %#v reason %q", data, reason)
+	}
+}
+
+// Each rejection names the check that failed with a fixed code, so a
+// "malformed" wallet is diagnosable without ever exposing the upstream body.
+func TestQuotaWalletRejectionReasons(t *testing.T) {
+	for raw, want := range map[string]string{
+		`null`:                        "not_json_object",
+		`[]`:                          "not_json_object",
+		`"12.34"`:                     "not_json_object",
+		`<html>502</html>`:            "not_json_object",
+		``:                            "not_json_object",
+		`{"balanceUsd":"1"} {}`:       "not_json_object",
+		`{}`:                          "balance_missing",
+		`{"BalanceUsd":"1"}`:          "balance_missing",
+		`{"data":{"balanceUsd":"1"}}`: "balance_missing",
+		`{"balance":"1"}`:             "balance_missing",
+		`{"balanceUsd":0}`:            "balance_not_string",
+		`{"balanceUsd":12.34}`:        "balance_not_string",
+		`{"balanceUsd":null}`:         "balance_not_string",
+		`{"balanceUsd":"-1"}`:         "balance_format",
+		`{"balanceUsd":"+1"}`:         "balance_format",
+		`{"balanceUsd":"1e2"}`:        "balance_format",
+		`{"balanceUsd":" 1"}`:         "balance_format",
+		`{"balanceUsd":".1"}`:         "balance_format",
+		`{"balanceUsd":"1."}`:         "balance_format",
+		`{"balanceUsd":""}`:           "balance_format",
+		`{"balanceUsd":"$12.34"}`:     "balance_format",
+		`{"balanceUsd":"1,234.50"}`:   "balance_format",
+	} {
+		data, reason := parseQuotaWalletReason([]byte(raw))
+		if reason != want || data != nil {
+			t.Errorf("%q: reason = %q data = %v, want %q and no data", raw, reason, data, want)
+		}
+		if _, valid := parseQuotaWallet([]byte(raw)); valid {
+			t.Errorf("%q: parseQuotaWallet accepted a rejected body", raw)
+		}
+	}
+	oversized := []byte(`{"balanceUsd":"1","pad":"` + strings.Repeat("x", maxQuotaBody) + `"}`)
+	if _, reason := parseQuotaWalletReason(oversized); reason != "body_too_large" {
+		t.Fatalf("oversized body reason = %q", reason)
+	}
+	huge := []byte(`{"balanceUsd":"` + strings.Repeat("9", 4097) + `"}`)
+	if _, reason := parseQuotaWalletReason(huge); reason != "balance_format" {
+		t.Fatalf("overlong balance reason = %q", reason)
 	}
 }
 

@@ -583,7 +583,8 @@
     const kind = text(value.kind);
     const message = text(value.message);
     if (!kind && !message) return null;
-    return { kind, message };
+    // An optional fixed code naming the check that rejected the answer.
+    return { kind, message, reason: safeCode(value.reason, 40) || '' };
   }
 
   function quotaTimestamp(value) {

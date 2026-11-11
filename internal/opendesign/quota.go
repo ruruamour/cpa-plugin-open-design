@@ -158,20 +158,20 @@ func (s *Service) fetchQuota(callbackID string, c Credential, entry *quotaEntry,
 	// here too rather than assuming every credential passed through POST.
 	if len(c.ControlKey) > 8192 || strings.IndexFunc(c.ControlKey, unicode.IsControl) >= 0 ||
 		len(c.WorkspaceID) > 512 || strings.IndexFunc(c.WorkspaceID, unicode.IsControl) >= 0 {
-		view.Wallet = quotaFailed(view.Wallet, quotaFailure("malformed"))
+		view.Wallet = quotaFailed(view.Wallet, quotaMalformed("credential_config"))
 		if c.WorkspaceID != "" {
-			view.Funding = quotaFundingFailed(view.Funding, quotaFailure("malformed"))
+			view.Funding = quotaFundingFailed(view.Funding, quotaMalformed("credential_config"))
 		}
 		return completeQuotaView(view)
 	}
 	body, failure := s.quotaGET(ctx, callbackID, billingAPIURL+"/api/v1/wallet/balance", c.ControlKey)
 	if failure == nil {
-		data, valid := parseQuotaWallet(body)
-		if valid {
+		data, reason := parseQuotaWalletReason(body)
+		if reason == "" {
 			now := s.quotaNow()
 			view.Wallet = quotaPart[quotaWalletData]{State: "available", Data: data, FetchedAt: &now}
 		} else {
-			failure = quotaFailure("malformed")
+			failure = quotaMalformed(reason)
 		}
 	}
 	if failure != nil {
@@ -187,7 +187,7 @@ func (s *Service) fetchQuota(callbackID string, c Credential, entry *quotaEntry,
 				now := s.quotaNow()
 				view.Funding = quotaPart[quotaFundingData]{State: "available", Data: data, FetchedAt: &now}
 			} else {
-				failure = quotaFailure("malformed")
+				failure = quotaMalformed("funding_format")
 			}
 		}
 		if failure != nil {
@@ -268,9 +268,18 @@ func (s *Service) quotaGET(ctx context.Context, callbackID, address, controlKey 
 		return nil, quotaFailure("upstream")
 	}
 	if len(out.Body) > maxQuotaBody {
-		return nil, quotaFailure("malformed")
+		return nil, quotaMalformed("body_too_large")
 	}
 	return out.Body, nil
+}
+
+// quotaMalformed is a "malformed" failure that also says which check rejected
+// the answer. The reason is a fixed plugin code; nothing from the response or
+// the credential is ever placed in it.
+func quotaMalformed(reason string) *quotaError {
+	failure := quotaFailure("malformed")
+	failure.Reason = reason
+	return failure
 }
 
 func quotaFailure(kind string) *quotaError {
