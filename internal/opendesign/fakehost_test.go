@@ -28,6 +28,10 @@ type fakeHost struct {
 	// saveHook runs inside host.auth.save before the file on disk is replaced,
 	// which is exactly where CPA re-enters auth.parse.
 	saveHook func(name string, raw []byte)
+	// readHook runs before each host.http.stream_read is answered, with the
+	// zero-based index of that read. A test uses it to space frames in time.
+	readHook func(read int)
+	reads    int
 
 	emitPayloads    [][]byte
 	streamCloseErrs []string
@@ -246,6 +250,13 @@ func (h *fakeHost) handleDoStream(in any, out any) error {
 
 func (h *fakeHost) handleStreamRead(in, out any) error {
 	id := stringField(in, "stream_id")
+	h.mu.Lock()
+	hook, read := h.readHook, h.reads
+	h.reads++
+	h.mu.Unlock()
+	if hook != nil {
+		hook(read)
+	}
 	h.mu.Lock()
 	st, ok := h.streams[id]
 	if !ok {

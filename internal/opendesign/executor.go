@@ -429,7 +429,15 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 			// the last SSE frame is published before the fence disappears.
 			lease.release(s)
 		}()
-		streamErr = s.pumpSSE(r.HostCallbackID, stream, r.Model, emitter, requestChoiceCount(j), usage, keys)
+		streamErr = s.pumpSSE(r.HostCallbackID, stream, r.Model, emitter, requestChoiceCount(j), usage, func() {
+			// Measured from the same origin as the row's duration, when the frame
+			// arrived here: downstream send time is not part of it.
+			elapsed := time.Since(draft.started).Milliseconds()
+			if elapsed < 0 {
+				elapsed = 0
+			}
+			draft.firstTokenMS = &elapsed
+		}, keys)
 	}()
 	finished = true
 	return map[string]any{
@@ -439,10 +447,12 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 
 // pumpSSE decodes the upstream event stream and emits one JSON frame per event.
 // A `[DONE]` marker terminates the stream without being forwarded: the host
-// writes its own terminal marker.
-func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string, emit func([]byte) error, expectedChoices int64, usage *tokenUsage, keys []string) error {
+// writes its own terminal marker. onOutput, when set, is called once, before
+// the first frame that carries output is forwarded.
+func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string, emit func([]byte) error, expectedChoices int64, usage *tokenUsage, onOutput func(), keys []string) error {
 	decoder := &sseDecoder{maxBytes: maxSSEFrame}
 	var sawDone bool
+	outputSeen := onOutput == nil
 	// Per-choice completion: with n>1, one finished choice does not make the
 	// response complete, so an EOF must not be reported as success.
 	tracker := newChoiceTracker(expectedChoices)
@@ -473,6 +483,10 @@ func (s *Service) pumpSSE(callbackID string, stream upstreamStream, alias string
 				return upstreamErrorFromResponseObserved(status, stream.StatusCode, stream.Headers, event.Data, s.redactionKeys(keys...)...)
 			}
 			tracker.observe(root)
+			if !outputSeen && frameCarriesOutput(root) {
+				outputSeen = true
+				onOutput()
+			}
 			if usage != nil {
 				// Only values the upstream actually reported are kept; an absent
 				// usage object leaves every token count null.
@@ -569,6 +583,52 @@ func choiceIndex(choice map[string]any) int64 {
 		return int64(v)
 	}
 	return 0
+}
+
+// frameCarriesOutput reports whether a stream frame delivers something the
+// model produced: text, reasoning, a refusal or a tool call. A role-only
+// delta, an empty delta, a bare finish_reason and a usage-only frame do not
+// count, so the time to first output is not satisfied by a heartbeat.
+func frameCarriesOutput(root map[string]any) bool {
+	choices, ok := root["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if outputValue(choice["text"]) {
+			return true
+		}
+		for _, key := range []string{"delta", "message"} {
+			part, ok := choice[key].(map[string]any)
+			if !ok {
+				continue
+			}
+			for _, field := range []string{"content", "reasoning_content", "reasoning", "reasoning_details", "refusal", "tool_calls", "function_call"} {
+				if outputValue(part[field]) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// outputValue is true for a non-empty string, array or object.
+func outputValue(value any) bool {
+	switch v := value.(type) {
+	case string:
+		return v != ""
+	case []any:
+		return len(v) > 0
+	case map[string]any:
+		return len(v) > 0
+	default:
+		return false
+	}
 }
 
 // successBodyError converts a 2xx body that actually carries an error into the

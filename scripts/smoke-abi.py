@@ -3320,10 +3320,26 @@ def run_management_v03(request, origin, credential_id, work=None):
     metadata_keys = {"id", "started_at", "finished_at", "duration_ms", "model", "upstream_model",
                      "credential_id", "stream", "status", "http_status", "error_kind", "input_tokens",
                      "output_tokens", "total_tokens", "request_id", "upstream_attempted",
-                     "reasoning_effort", "reasoning_mapping"}
+                     "reasoning_effort", "reasoning_mapping",
+                     # Optional numeric diagnostics: time to first output, the
+                     # upstream's usage details and the derived output rate.
+                     "first_token_ms", "cached_tokens", "reasoning_tokens",
+                     "output_tokens_per_second"}
+    numeric_diagnostics = ("first_token_ms", "cached_tokens", "reasoning_tokens", "output_tokens_per_second")
     reasoning_sources = {"unset", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
     for entry in page["logs"]:
         require(set(entry).issubset(metadata_keys), "request log grew non-metadata fields")
+        require("output_tokens_per_second" in entry, "request log row lost its derived output rate")
+        for field in numeric_diagnostics:
+            value = entry.get(field)
+            require(value is None or (isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0),
+                    "request log diagnostic %s is not a non-negative number: %r" % (field, value))
+        if entry.get("cached_tokens") is not None:
+            require(entry["input_tokens"] is not None and entry["cached_tokens"] <= entry["input_tokens"],
+                    "cached tokens exceed the input they are part of")
+        if entry.get("first_token_ms") is not None:
+            require(entry["stream"] and entry["first_token_ms"] <= entry["duration_ms"],
+                    "time to first output is inconsistent with the row")
         if entry.get("reasoning_effort"):
             require(entry["reasoning_effort"] in reasoning_sources, "unsafe reasoning effort in request log")
         if entry.get("reasoning_mapping"):
@@ -3339,6 +3355,15 @@ def run_management_v03(request, origin, credential_id, work=None):
     stats = call("/request-stats")
     require(stats["total"] == page["total"] and stats["tokens"]["input"] >= 12 and
             stats["tokens"]["output"] >= 7 and stats["models"], stats)
+    require(stats["range"] == {"since": None, "until": None}, "unbounded statistics echoed a range")
+    for field in ("output_tokens_per_second", "output_rate_samples", "first_token_ms", "first_token_samples"):
+        require(field in stats, "statistics lost %s" % field)
+    for field in ("cached", "reasoning", "cache_rate", "cache_samples"):
+        require(field in stats["tokens"], "statistics tokens lost %s" % field)
+    future = call("/request-stats?since=2999-01-01T00:00:00Z")
+    require(future["total"] == 0 and future["retention"]["entries"] == stats["retention"]["entries"],
+            "a future statistics range still counted rows or changed the retention view")
+    call("/request-stats?since=not-a-time", expected=400)
     call("/request-logs", method="DELETE")
     require(call("/request-logs")["logs"] == [], "clear left visible entries")
     empty = call("/request-stats")

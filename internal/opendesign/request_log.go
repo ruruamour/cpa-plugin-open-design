@@ -69,6 +69,59 @@ type RequestLogEntry struct {
 	// ReasoningMapping records a rule that changed the strength. It is absent
 	// when no rule matched, so "unchanged" and "no rule" stay distinguishable.
 	ReasoningMapping *RequestLogReasoningMapping `json:"reasoning_mapping,omitempty"`
+	// FirstTokenMS is the time from the start of a streaming request to the
+	// first frame that carried output (text, reasoning or a tool call). It is
+	// absent for buffered requests, for streams that never produced output and
+	// for rows written before this field existed.
+	FirstTokenMS *int64 `json:"first_token_ms,omitempty"`
+	// CachedTokens and ReasoningTokens are the optional usage details an
+	// OpenAI-compatible upstream may report. They are subsets of the input and
+	// output counts respectively, never added on top of them, and stay absent
+	// when the upstream did not report them.
+	CachedTokens    *int64 `json:"cached_tokens,omitempty"`
+	ReasoningTokens *int64 `json:"reasoning_tokens,omitempty"`
+}
+
+// requestLogEntryView is one row of the management response. The output rate
+// is derived when the row is read rather than stored, so every row, including
+// those written by an earlier version, is computed by the same rule.
+type requestLogEntryView struct {
+	RequestLogEntry
+	OutputTokensPerSecond *float64 `json:"output_tokens_per_second"`
+}
+
+// requestLogMinRateWindowMS is the shortest generation window a rate is
+// computed from. A few tokens divided by a few milliseconds is noise.
+const requestLogMinRateWindowMS = 500
+
+// requestLogRateSample returns the output tokens and the window they were
+// produced in. The window excludes the time to first output when it is known,
+// so a slow start is reported as latency rather than as a slow generation.
+func requestLogRateSample(entry RequestLogEntry) (tokens, windowMS int64, ok bool) {
+	if entry.OutputTokens == nil || *entry.OutputTokens <= 0 {
+		return 0, 0, false
+	}
+	windowMS = entry.DurationMS
+	if entry.FirstTokenMS != nil && *entry.FirstTokenMS > 0 && *entry.FirstTokenMS <= entry.DurationMS {
+		windowMS -= *entry.FirstTokenMS
+	}
+	if windowMS < requestLogMinRateWindowMS {
+		return 0, 0, false
+	}
+	return *entry.OutputTokens, windowMS, true
+}
+
+func requestLogEntryViews(entries []RequestLogEntry) []requestLogEntryView {
+	views := make([]requestLogEntryView, 0, len(entries))
+	for _, entry := range entries {
+		view := requestLogEntryView{RequestLogEntry: entry}
+		if tokens, windowMS, ok := requestLogRateSample(entry); ok {
+			rate := float64(tokens) * 1000 / float64(windowMS)
+			view.OutputTokensPerSecond = &rate
+		}
+		views = append(views, view)
+	}
+	return views
 }
 
 // RequestLogReasoningMapping is the closed from→to pair of one applied rule.
@@ -1111,6 +1164,13 @@ func addToken(dst **int64, value *int64) {
 }
 
 func (s *requestLogStore) stats() map[string]any {
+	return s.statsFor(nil, nil)
+}
+
+// statsFor aggregates the retained rows, optionally limited to those that
+// started inside [since, until]. The range only narrows the retained set: rows
+// already pruned by the retention policy are not part of any answer.
+func (s *requestLogStore) statsFor(since, until *time.Time) map[string]any {
 	s.persistCommitMu.RLock()
 	s.mu.Lock()
 	changed := s.pruneLocked(s.now())
@@ -1120,10 +1180,20 @@ func (s *requestLogStore) stats() map[string]any {
 	}
 	success, failed, streams := 0, 0, 0
 	upstreamAttempted, localRejected := 0, 0
-	var input, output, total *int64
+	var input, output, total, cached, reasoning *int64
+	var cacheInput int64
+	cacheSamples := 0
+	var rateTokens, rateWindowMS int64
+	rateSamples := 0
+	var firstTokenSum int64
+	firstTokenSamples := 0
 	withUsage, withoutUsage := 0, 0
 	models := map[string]*requestLogModelStats{}
+	window := requestLogFilter{since: since, until: until}
 	for _, entry := range s.entries {
+		if !window.matches(entry) {
+			continue
+		}
 		if entry.Status == "success" {
 			success++
 		} else {
@@ -1146,6 +1216,23 @@ func (s *requestLogStore) stats() map[string]any {
 		addToken(&input, entry.InputTokens)
 		addToken(&output, entry.OutputTokens)
 		addToken(&total, entry.TotalTokens)
+		addToken(&cached, entry.CachedTokens)
+		addToken(&reasoning, entry.ReasoningTokens)
+		// The hit rate is taken over the rows that actually reported a cached
+		// count. A row that says nothing about caching is unknown, not a miss.
+		if entry.CachedTokens != nil && entry.InputTokens != nil && *entry.InputTokens > 0 {
+			cacheInput += *entry.InputTokens
+			cacheSamples++
+		}
+		if tokens, windowMS, ok := requestLogRateSample(entry); ok {
+			rateTokens += tokens
+			rateWindowMS += windowMS
+			rateSamples++
+		}
+		if entry.FirstTokenMS != nil {
+			firstTokenSum += *entry.FirstTokenMS
+			firstTokenSamples++
+		}
 
 		model := entry.Model
 		if model == "" {
@@ -1188,6 +1275,23 @@ func (s *requestLogStore) stats() map[string]any {
 		rate := float64(success) / float64(totalRequests)
 		successRate = &rate
 	}
+	var cacheRate *float64
+	if cacheSamples > 0 && cacheInput > 0 && cached != nil {
+		rate := float64(*cached) / float64(cacheInput)
+		cacheRate = &rate
+	}
+	// Total output over total generation time, not the mean of per-row rates:
+	// a long generation weighs more than a three-token reply.
+	var outputRate *float64
+	if rateSamples > 0 && rateWindowMS > 0 {
+		rate := float64(rateTokens) * 1000 / float64(rateWindowMS)
+		outputRate = &rate
+	}
+	var firstTokenAverage *int64
+	if firstTokenSamples > 0 {
+		average := firstTokenSum / int64(firstTokenSamples)
+		firstTokenAverage = &average
+	}
 	result := map[string]any{
 		"total":              totalRequests,
 		"success":            success,
@@ -1200,11 +1304,20 @@ func (s *requestLogStore) stats() map[string]any {
 			"input":                  input,
 			"output":                 output,
 			"total":                  total,
+			"cached":                 cached,
+			"reasoning":              reasoning,
+			"cache_rate":             cacheRate,
+			"cache_samples":          cacheSamples,
 			"requests_with_usage":    withUsage,
 			"requests_without_usage": withoutUsage,
 		},
-		"models":    perModel,
-		"retention": s.retentionViewLocked(),
+		"output_tokens_per_second": outputRate,
+		"output_rate_samples":      rateSamples,
+		"first_token_ms":           firstTokenAverage,
+		"first_token_samples":      firstTokenSamples,
+		"range":                    map[string]any{"since": since, "until": until},
+		"models":                   perModel,
+		"retention":                s.retentionViewLocked(),
 	}
 	s.mu.Unlock()
 	s.persistCommitMu.RUnlock()
@@ -1231,6 +1344,9 @@ type requestLogDraft struct {
 	reasoningFrom     string
 	reasoningTo       string
 	reasoningMapped   bool
+	// firstTokenMS is set by the stream pump when the first frame carrying
+	// output arrives. It stays nil for buffered requests.
+	firstTokenMS *int64
 }
 
 func (s *Service) recordRequestLog(draft *requestLogDraft, requestErr error) {
@@ -1245,17 +1361,20 @@ func (s *Service) recordRequestLog(draft *requestLogDraft, requestErr error) {
 	keys := append(s.metadataSecrets(), draft.secrets...)
 	entry := RequestLogEntry{
 		ID: newID(), StartedAt: draft.started.UTC(),
-		FinishedAt:    finished.UTC(),
-		DurationMS:    finished.Sub(draft.started).Milliseconds(),
-		Model:         requestLogText(draft.model, 512, keys...),
-		UpstreamModel: requestLogText(draft.upstreamModel, 512, keys...),
-		CredentialID:  requestLogText(draft.credentialID, 128, keys...),
-		Stream:        draft.stream,
-		Status:        "success",
-		RequestID:     s.safeRequestIDWithKeys(draft.requestID, keys...),
-		InputTokens:   sanitizeToken(draft.usage.Input),
-		OutputTokens:  sanitizeToken(draft.usage.Output),
-		TotalTokens:   sanitizeToken(draft.usage.Total),
+		FinishedAt:      finished.UTC(),
+		DurationMS:      finished.Sub(draft.started).Milliseconds(),
+		Model:           requestLogText(draft.model, 512, keys...),
+		UpstreamModel:   requestLogText(draft.upstreamModel, 512, keys...),
+		CredentialID:    requestLogText(draft.credentialID, 128, keys...),
+		Stream:          draft.stream,
+		Status:          "success",
+		RequestID:       s.safeRequestIDWithKeys(draft.requestID, keys...),
+		InputTokens:     sanitizeToken(draft.usage.Input),
+		OutputTokens:    sanitizeToken(draft.usage.Output),
+		TotalTokens:     sanitizeToken(draft.usage.Total),
+		FirstTokenMS:    draft.firstTokenMS,
+		CachedTokens:    draft.usage.Cached,
+		ReasoningTokens: draft.usage.Reasoning,
 	}
 	// Both values come from closed strength sets the plugin itself operates on,
 	// never from upstream text, so they are safe to store as-is.
@@ -1399,7 +1518,28 @@ func sanitizeRequestLogEntry(entry RequestLogEntry, keys ...string) (RequestLogE
 	entry.InputTokens = sanitizeToken(entry.InputTokens)
 	entry.OutputTokens = sanitizeToken(entry.OutputTokens)
 	entry.TotalTokens = sanitizeToken(entry.TotalTokens)
+	// A detail is a part of its total. One that is missing its total, or is
+	// larger than it, cannot be shown as a share and is dropped rather than
+	// clamped: an invented number is worse than an unknown one.
+	entry.CachedTokens = sanitizeTokenDetail(entry.CachedTokens, entry.InputTokens)
+	entry.ReasoningTokens = sanitizeTokenDetail(entry.ReasoningTokens, entry.OutputTokens)
+	if entry.FirstTokenMS != nil {
+		first := *entry.FirstTokenMS
+		if first < 0 || first > entry.DurationMS {
+			entry.FirstTokenMS = nil
+		} else {
+			entry.FirstTokenMS = &first
+		}
+	}
 	return entry, true
+}
+
+func sanitizeTokenDetail(detail, total *int64) *int64 {
+	detail = sanitizeToken(detail)
+	if detail == nil || total == nil || *detail > *total {
+		return nil
+	}
+	return detail
 }
 
 func sanitizeRequestLogEntries(entries []RequestLogEntry, keys ...string) []RequestLogEntry {
@@ -1460,6 +1600,9 @@ type tokenUsage struct {
 	Input  *int64
 	Output *int64
 	Total  *int64
+	// Cached and Reasoning are optional details of Input and Output.
+	Cached    *int64
+	Reasoning *int64
 }
 
 func tokenUsageFromMap(root map[string]any) tokenUsage {
@@ -1468,9 +1611,11 @@ func tokenUsageFromMap(root map[string]any) tokenUsage {
 		return tokenUsage{}
 	}
 	return tokenUsage{
-		Input:  tokenFromValue(usage["prompt_tokens"]),
-		Output: tokenFromValue(usage["completion_tokens"]),
-		Total:  tokenFromValue(usage["total_tokens"]),
+		Input:     tokenFromValue(usage["prompt_tokens"]),
+		Output:    tokenFromValue(usage["completion_tokens"]),
+		Total:     tokenFromValue(usage["total_tokens"]),
+		Cached:    cachedTokensFrom(usage),
+		Reasoning: tokenDetailFrom(usage, "completion_tokens_details", "reasoning_tokens"),
 	}
 }
 
@@ -1488,6 +1633,31 @@ func (u *tokenUsage) observe(root map[string]any) {
 	if value := tokenFromValue(usage["total_tokens"]); value != nil {
 		u.Total = value
 	}
+	if value := cachedTokensFrom(usage); value != nil {
+		u.Cached = value
+	}
+	if value := tokenDetailFrom(usage, "completion_tokens_details", "reasoning_tokens"); value != nil {
+		u.Reasoning = value
+	}
+}
+
+// tokenDetailFrom reads one count from an OpenAI usage detail object, e.g.
+// usage.prompt_tokens_details.cached_tokens.
+func tokenDetailFrom(usage map[string]any, object, field string) *int64 {
+	details, ok := usage[object].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return tokenFromValue(details[field])
+}
+
+// cachedTokensFrom prefers the OpenAI detail object and falls back to the flat
+// prompt_cache_hit_tokens field DeepSeek-style upstreams report.
+func cachedTokensFrom(usage map[string]any) *int64 {
+	if value := tokenDetailFrom(usage, "prompt_tokens_details", "cached_tokens"); value != nil {
+		return value
+	}
+	return tokenFromValue(usage["prompt_cache_hit_tokens"])
 }
 
 func tokenFromValue(value any) *int64 {
@@ -1603,6 +1773,36 @@ func parseRequestLogTime(raw string) (time.Time, error) {
 	return time.Time{}, errors.New("invalid time")
 }
 
+// parseRequestLogRange reads the optional since/until pair for the statistics
+// route. The validation is the same as the list filter's.
+func parseRequestLogRange(query url.Values) (since, until *time.Time, err error) {
+	read := func(key string) (*time.Time, error) {
+		if query == nil {
+			return nil, nil
+		}
+		raw := strings.TrimSpace(query.Get(key))
+		if raw == "" {
+			return nil, nil
+		}
+		parsed, parseErr := parseRequestLogTime(raw)
+		if parseErr != nil {
+			return nil, fail(http.StatusBadRequest, key+" must be RFC3339 or unix seconds")
+		}
+		parsed = parsed.UTC()
+		return &parsed, nil
+	}
+	if since, err = read("since"); err != nil {
+		return nil, nil, err
+	}
+	if until, err = read("until"); err != nil {
+		return nil, nil, err
+	}
+	if since != nil && until != nil && since.After(*until) {
+		return nil, nil, fail(http.StatusBadRequest, "since must not be after until")
+	}
+	return since, until, nil
+}
+
 func (s *Service) requestLogsRequest(r ManagementRequest) (any, error) {
 	if err := s.begin(); err != nil {
 		return managementError(statusOf(err), err.Error())
@@ -1620,7 +1820,7 @@ func (s *Service) requestLogsRequest(r ManagementRequest) (any, error) {
 		nextOffset = next
 	}
 	return managementJSON(http.StatusOK, map[string]any{
-		"logs":        logs,
+		"logs":        requestLogEntryViews(logs),
 		"total":       total,
 		"limit":       filter.limit,
 		"offset":      filter.offset,
@@ -1635,7 +1835,11 @@ func (s *Service) requestLogStatsRequest(r ManagementRequest) (any, error) {
 		return managementError(statusOf(err), err.Error())
 	}
 	defer s.done()
-	return managementJSON(http.StatusOK, s.requestLogs.stats())
+	since, until, err := parseRequestLogRange(r.Query)
+	if err != nil {
+		return managementError(statusOf(err), err.Error())
+	}
+	return managementJSON(http.StatusOK, s.requestLogs.statsFor(since, until))
 }
 
 func (s *Service) requestLogClearRequest(r ManagementRequest) (any, error) {
