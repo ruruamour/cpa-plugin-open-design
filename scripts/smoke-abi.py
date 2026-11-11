@@ -695,9 +695,15 @@ def run_cpa(artifact, binary, version):
             {"id": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash"}]})
         require(status == 200, "real host models POST returned %s: %s" % (status, raw))
         status, raw, _ = request(API + "/status")
-        require(json.loads(raw)["models"] == [
-            {"id": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash"}], raw)
-        evidence["host_models"] = json.loads(raw)["models"]
+        # Compare the mapping identity, not the whole row: since 0.4.5 a row
+        # also carries the opaque reasoning_revision used for optimistic
+        # locking, which made the original exact comparison fail on any host.
+        host_models = json.loads(raw)["models"]
+        require([(m.get("id"), m.get("upstream_id")) for m in host_models] ==
+                [("deepseek-flash", "deepseek-v4.1-flash")], raw)
+        require(all(isinstance(m.get("reasoning_revision"), str) and m["reasoning_revision"]
+                    for m in host_models), "a saved mapping lost its reasoning revision: %s" % raw)
+        evidence["host_models"] = [{"id": m["id"], "upstream_id": m["upstream_id"]} for m in host_models]
 
         status, raw, _ = request(API + "/credentials?id=" + credential_id, method="DELETE")
         require(status == 200, "real host credential delete returned %s: %s" % (status, raw))
@@ -1362,9 +1368,23 @@ def run_cpa_live(artifact, binary, version):
             require(frames[-1]["usage"]["total_tokens"] == 26, frames[-1])
             require(all(f["model"] == "deepseek-flash" for f in frames),
                     "stream lost the alias")
+            # The row the real host just produced: a stream records when its
+            # first output arrived and yields an output rate, read back through
+            # the host's own management route.
+            status, raw, _ = request(API + "/request-logs?limit=5")
+            require(status == 200, "request-logs after the stream returned %s" % status)
+            stream_rows = [row for row in json.loads(raw)["logs"] if row.get("stream") and row.get("status") == "success"]
+            require(stream_rows, "the stream produced no successful log row: %s" % raw[:300])
+            newest = stream_rows[0]
+            require(isinstance(newest.get("first_token_ms"), int) and
+                    0 <= newest["first_token_ms"] <= newest["duration_ms"],
+                    "stream row has no consistent first_token_ms: %s" % newest)
+            require("output_tokens_per_second" in newest, "stream row lost its derived rate: %s" % newest)
+            require(newest["output_tokens"] == 5 and newest["total_tokens"] == 26, newest)
             evidence["host_chat_stream"] = {"status": "PASS", "frames": len(frames),
                                             "alias_restored": True,
-                                            "usage": frames[-1]["usage"]}
+                                            "usage": frames[-1]["usage"],
+                                            "log_first_token_recorded": True}
         except (urllib.error.HTTPError, AssertionError) as exc:
             detail = exc.read().decode(errors="replace") if isinstance(
                 exc, urllib.error.HTTPError) else str(exc)
@@ -2525,6 +2545,32 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
                 time.sleep(0.2)
             require(restored, "quota pause was not restored after host restart")
             result["restart_keeps_pause"] = True
+            # A client request while the only account is paused. Whether the
+            # host still routes it to the plugin is the host's decision and is
+            # recorded, not required. What must hold either way: the upstream
+            # is not contacted, and a row the plugin does write for the refusal
+            # names it quota_blocked instead of blaming the upstream.
+            paused_before = len(origin.requests)
+            try:
+                paused_status, paused_raw, _ = request("/v1/chat/completions", {
+                    "model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}], "stream": False})
+            except urllib.error.HTTPError as exc:
+                paused_status, paused_raw = exc.code, exc.read()
+            require(len(origin.requests) == paused_before, "a paused account reached the upstream")
+            require(FIXTURE_KEY.encode() not in paused_raw, "paused response leaked a key")
+            status, raw, _ = request(API + "/request-logs?attempted=no&limit=20")
+            require(status == 200, "request-logs for the paused request returned %s" % status)
+            local_rows = json.loads(raw)["logs"]
+            require(all(row.get("error_kind") == "quota_blocked" for row in local_rows),
+                    "a local refusal of a paused account was logged as %r" % [row.get("error_kind") for row in local_rows])
+            require(all(row.get("http_status") is None and row.get("upstream_attempted") is False for row in local_rows),
+                    "a local refusal carried upstream data: %s" % local_rows)
+            result["paused_request"] = {
+                "surfaced_status": paused_status,
+                "reached_upstream": False,
+                "host_routed_to_plugin": bool(local_rows),
+                "logged_kinds": sorted({row.get("error_kind") for row in local_rows}),
+            }
             status, _, _ = request(API + "/credentials", {"id": credential_id, "disabled": True})
             require(status == 200, "plugin manual disable failed")
             status, _, _ = request(API + "/quota-pause/resume", {"credential_id": credential_id})
