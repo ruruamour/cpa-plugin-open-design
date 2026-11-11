@@ -77,6 +77,8 @@
 - **可用**：显示 `model_covered`、`funding`、`funding_check` 与查询时间。
 - **上次数据**：刷新失败后保留最后一次成功值并标记 stale。
 - **查询失败**：`error.kind` 为 `unauthorized`、`forbidden`、`rate_limited`、`timeout`、`malformed`、`network`、`upstream` 或 `stopped`。
+- `0.5.0` 起，`malformed` 还带一个 `error.reason`，说明是哪一项检查没通过：`credential_config`（controlKey 或 Workspace ID 含非法字符或过长）、`body_too_large`（响应超过 1 MiB）、`not_json_object`、`balance_missing`、`balance_not_string`、`balance_format`（钱包的 `balanceUsd`）、`funding_format`（套餐预检字段）。取值是固定的插件代码，不含上游正文或密钥；其他 `kind` 不带 `reason`。
+- 钱包只要求 `balanceUsd` 是非负十进制字符串，与官方读取器一致；`updatedAt` 不是可用的时间戳时记为未知，不影响余额显示。
 
 ## 预测的含义与计算
 

@@ -2,7 +2,7 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前源码版本为 `0.5.0`（控制台改为 ClinePassBridge 的设计，请求日志增加首字时间、缓存与输出速率，并修复两个已复现的缺陷）。`0.5.0` 只在本地提交并通过验证，**尚未部署，也未发布 Release**；生产运行的仍是本地构建热加载的 `0.4.16`，GitHub 最新 Release 仍是 `open-design-v0.4.12`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前源码版本为 `0.5.0`（控制台改为 ClinePassBridge 的设计，请求日志增加首字时间、缓存与输出速率，并修复两个已复现的缺陷）。`0.5.0` 只在本地提交，通过了本地验证和原版 CPA v8.0.67 的隔离宿主验证，**尚未部署，也未发布 Release**；生产运行的仍是本地构建热加载的 `0.4.16`，GitHub 最新 Release 仍是 `open-design-v0.4.12`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
@@ -19,6 +19,7 @@
 - **凭据管理**：启停改为开关（表示管理员自己的选择，与额度暂停无关）；展开详情里钱包与套餐窗口并排。账号卡片仍然默认折叠，额度条直接可见。
 - **模型映射**：已保存的映射行可以一键发起显式模型测试（仍需确认、只发一次）。
 - **修复**：清空 `credits_per_usd` 或使用 `clear_billing` 后，凭据文件里仍保留旧值，下次加载又恢复（`0.4.11`～`0.4.16` 均受影响）；额度暂停账号被本地拒绝的请求，在请求日志和模型测试里被记成 `upstream_error`，现在记为 `quota_blocked`。
+- **钱包读取**：与官方读取器对齐，只有 `balanceUsd` 决定钱包是否可读；原先 `updatedAt` 不是 RFC3339 就会把整个钱包判为 `malformed`。`malformed` 现在带一个固定的原因代码，控制台直接显示是哪一项检查没通过。
 
 没有从上游搬过来的部分：代理池（插件自带 HTTP 传输、限速与排队，与本插件「不做并发限制、不做排队」的边界相反）、会话重分配、钉上游与能力过滤、Cline 用量估算。
 
