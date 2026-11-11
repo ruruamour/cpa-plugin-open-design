@@ -79,6 +79,7 @@
 - **查询失败**：`error.kind` 为 `unauthorized`、`forbidden`、`rate_limited`、`timeout`、`malformed`、`network`、`upstream` 或 `stopped`。
 - `0.5.0` 起，`malformed` 还带一个 `error.reason`，说明是哪一项检查没通过：`credential_config`（controlKey 或 Workspace ID 含非法字符或过长）、`body_too_large`（响应超过 1 MiB）、`not_json_object`、`balance_missing`、`balance_not_string`、`balance_format`（钱包的 `balanceUsd`）、`funding_format`（套餐预检字段）。取值是固定的插件代码，不含上游正文或密钥；其他 `kind` 不带 `reason`。
 - 钱包只要求 `balanceUsd` 是非负十进制字符串，与官方读取器一致；`updatedAt` 不是可用的时间戳时记为未知，不影响余额显示。
+- 余额为负时钱包会报 `malformed`、原因 `balance_format`：套餐接口的 `balanceUsd` 允许负号，钱包规则不允许，官方读取器同样拒绝。线上已观察到套餐接口返回负余额的账号，其钱包正是这个原因代码。
 
 ## 预测的含义与计算
 
