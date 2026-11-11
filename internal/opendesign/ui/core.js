@@ -992,9 +992,67 @@
       upstream_attempted: value.upstream_attempted === undefined ? null : value.upstream_attempted === true,
       reasoning_effort: safeCode(value.reasoning_effort, 32),
       reasoning_mapping: reasoningConversion(value.reasoning_mapping),
+      first_token_ms: safeCounter(value.first_token_ms),
+      cached_tokens: safeCounter(value.cached_tokens),
+      reasoning_tokens: safeCounter(value.reasoning_tokens),
+      output_tokens_per_second: safeRate(value.output_tokens_per_second),
     };
+    // A detail is part of its total; one that contradicts it is unknown, not
+    // something to display. The backend applies the same rule before storing.
+    if (record.cached_tokens !== null && (record.input_tokens === null || record.cached_tokens > record.input_tokens)) record.cached_tokens = null;
+    if (record.reasoning_tokens !== null && (record.output_tokens === null || record.reasoning_tokens > record.output_tokens)) record.reasoning_tokens = null;
+    if (record.first_token_ms !== null && (record.duration_ms === null || record.first_token_ms > record.duration_ms)) record.first_token_ms = null;
     if (!record.id && !record.started_at && !record.model && !record.status) return null;
     return record;
+  }
+
+  // A non-negative finite number, for derived rates.
+  function safeRate(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+  }
+
+  function formatTokenRate(value) {
+    const rate = safeRate(value);
+    return rate === null ? '' : `${Math.round(rate).toLocaleString('en-US')} t/s`;
+  }
+
+  // Tone of a latency figure. The first output is judged on its own; a total
+  // is judged by throughput once the reply is long enough for that to mean
+  // something, otherwise by wall time.
+  function latencyTone(ms, kind, outputTokens) {
+    if (!Number.isSafeInteger(ms) || ms <= 0) return '';
+    const seconds = ms / 1000;
+    if (kind === 'first') return seconds < 5 ? 'good' : seconds < 10 ? 'warn' : 'bad';
+    if (Number.isSafeInteger(outputTokens) && outputTokens >= 100) {
+      const throughput = outputTokens / seconds;
+      return throughput >= 30 ? 'good' : throughput >= 15 ? 'warn' : 'bad';
+    }
+    return seconds < 10 ? 'good' : seconds < 30 ? 'warn' : 'bad';
+  }
+
+  const STATS_RANGES = ['all', 'today', '24h', '7d', '30d'];
+  const STATS_RANGE_LABELS = { all: '全部', today: '今天', '24h': '近 24 小时', '7d': '近 7 天', '30d': '近 30 天' };
+
+  function normalizeStatsRange(value) {
+    return STATS_RANGES.includes(value) ? value : 'all';
+  }
+
+  function statsRangeLabel(value) {
+    return STATS_RANGE_LABELS[normalizeStatsRange(value)];
+  }
+
+  // The lower bound a statistics range asks the backend for, or '' for all
+  // retained rows. "Today" starts at local midnight.
+  function statsRangeSince(value, now = Date.now()) {
+    const range = normalizeStatsRange(value);
+    if (range === 'all') return '';
+    if (range === 'today') {
+      const start = new Date(now);
+      start.setHours(0, 0, 0, 0);
+      return start.toISOString();
+    }
+    const hours = { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }[range];
+    return new Date(now - hours * 3600 * 1000).toISOString();
   }
 
   function normalizeRequestLogsPage(value) {
@@ -1022,9 +1080,9 @@
   function normalizeRequestStats(value) {
     const data = value && typeof value === 'object' ? value : {};
     const tokens = data.tokens && typeof data.tokens === 'object' ? data.tokens : {};
-    const rate = typeof data.success_rate === 'number' && Number.isFinite(data.success_rate) && data.success_rate >= 0 && data.success_rate <= 1
-      ? data.success_rate
-      : null;
+    const ratio = value => (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1 ? value : null);
+    const rate = ratio(data.success_rate);
+    const range = data.range && typeof data.range === 'object' ? data.range : {};
     const models = (Array.isArray(data.models) ? data.models : []).map(item => {
       const row = item && typeof item === 'object' ? item : {};
       return {
@@ -1051,9 +1109,18 @@
         input: safeInteger(tokens.input),
         output: safeInteger(tokens.output),
         total: safeInteger(tokens.total),
+        cached: safeInteger(tokens.cached),
+        reasoning: safeInteger(tokens.reasoning),
+        cache_rate: ratio(tokens.cache_rate),
+        cache_samples: safeInteger(tokens.cache_samples) ?? 0,
         requests_with_usage: safeInteger(tokens.requests_with_usage) ?? 0,
         requests_without_usage: safeInteger(tokens.requests_without_usage) ?? 0,
       },
+      output_tokens_per_second: safeRate(data.output_tokens_per_second),
+      output_rate_samples: safeInteger(data.output_rate_samples) ?? 0,
+      first_token_ms: safeInteger(data.first_token_ms),
+      first_token_samples: safeInteger(data.first_token_samples) ?? 0,
+      range: { since: safeTimestamp(range.since), until: safeTimestamp(range.until) },
       models,
       retention: normalizeRetention(data.retention),
     };
@@ -1474,6 +1541,12 @@
     errorRulesSyncText,
     normalizeRetention,
     formatRatio,
+    formatTokenRate,
+    latencyTone,
+    normalizeStatsRange,
+    statsRangeLabel,
+    statsRangeSince,
+    STATS_RANGES,
     safeInteger,
     safeIdentifier,
     safeIdentity,

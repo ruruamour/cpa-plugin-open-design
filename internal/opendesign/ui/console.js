@@ -130,6 +130,9 @@
     // other optional panels still need an explicit operator action.
     activeTab: 'logs',
     logQuery: { offset: 0, limit: 50, status: '', search: '', credentialID: '', attempted: '' },
+    // Time range of the summary cards. It narrows the retained rows only and is
+    // independent of the list filters above.
+    statsRange: 'all',
     logExpanded: {},
     logAutoLoaded: false,
     requestLogs: [],
@@ -1074,6 +1077,7 @@
     state.logAutoLoaded = false;
     state.logPage = { loaded: false, total: 0, offset: 0, limit: 50, has_more: false, next_offset: null, retention: null };
     state.requestStats = null;
+    state.statsRange = 'all';
     state.config = null;
     state.runtime = null;
     state.errorRules = null;
@@ -1095,6 +1099,7 @@
     renderOverview();
     renderRequestLogs();
     renderRequestStats();
+    renderStatsRange();
     renderConfig();
     renderRuntime();
     renderErrorRules();
@@ -3118,6 +3123,30 @@
   // None of these functions is called by rendering, status loading, tab
   // switching or a timer. Each one is reachable only from its own button.
 
+  const STATS_RANGE_BUTTONS = [
+    { id: 'statsRangeAll', value: 'all' },
+    { id: 'statsRangeToday', value: 'today' },
+    { id: 'statsRange24h', value: '24h' },
+    { id: 'statsRange7d', value: '7d' },
+    { id: 'statsRange30d', value: '30d' },
+  ];
+
+  function renderStatsRange() {
+    for (const item of STATS_RANGE_BUTTONS) {
+      const node = $(item.id);
+      if (node) node.setAttribute('aria-pressed', item.value === state.statsRange ? 'true' : 'false');
+    }
+  }
+
+  // Choosing a range re-reads the summary only; the list keeps its own filters.
+  async function setStatsRange(value) {
+    const range = Core.normalizeStatsRange(value);
+    if (optionalLogBusy() || range === state.statsRange) return;
+    state.statsRange = range;
+    renderStatsRange();
+    if (state.verified) await loadRequestStats();
+  }
+
   function optionalBusy(name) {
     return Boolean(state.optionalBusy[name]);
   }
@@ -3127,6 +3156,9 @@
     for (const id of ['refreshLogs', 'clearLogs', 'logsFilterSearch', 'logsFilterStatus', 'logsFilterCredential', 'logsFilterLimit']) {
       setDisabled(id, logBusy);
     }
+    // A range cannot change while a read is in flight, so the cards always
+    // describe the range that is shown as selected.
+    for (const item of STATS_RANGE_BUTTONS) setDisabled(item.id, logBusy);
     setDisabled('logsPrev', logBusy || state.logPage.offset <= 0);
     setDisabled('logsNext', logBusy || !state.logPage.has_more);
     for (const id of ['loadConfig']) setDisabled(id, optionalBusy('config'));
@@ -3180,6 +3212,18 @@
     model_not_enabled: '模型未启用',
     request_canceled: '客户端取消',
     count_tokens_unavailable: '不支持计数',
+    quota_blocked: '额度暂停',
+    credential_unavailable: '账户不可用',
+    credential_changed: '账户已变更',
+    invalid_request: '请求无效',
+    invalid_json: '请求无效',
+    insufficient_quota: '额度不足',
+    tier_limit_exceeded: '并发上限',
+    model_not_found: '上游无此模型',
+    context_length_exceeded: '上下文超长',
+    server_error: '上游服务错误',
+    server_overloaded: '上游过载',
+    upstream_error: '上游错误',
   };
 
   function logErrorKindLabel(kind) {
@@ -3190,7 +3234,11 @@
   // A local rejection never reached the upstream, so it gets its own label and
   // tone; an error kind the console knows is promoted to the headline.
   function logStatusInfo(record) {
-    if (record.upstream_attempted === false) return { label: '本地拒绝', tone: 'warn', error: false };
+    if (record.upstream_attempted === false) {
+      // Say why the plugin refused it, when the reason is one it names itself.
+      const reason = LOG_ERROR_KIND_LABELS[record.error_kind] || '';
+      return { label: reason ? `本地拒绝 · ${reason}` : '本地拒绝', tone: 'warn', error: false };
+    }
     const failed = record.status === 'error' || (record.http_status !== null && record.http_status >= 400);
     if (failed) return { label: logErrorKindLabel(record.error_kind) || '失败', tone: 'bad', error: true };
     if (record.status === 'success') return { label: '成功', tone: 'good', error: false };
@@ -3220,16 +3268,33 @@
     ]);
   }
 
+  // One latency figure with its tone. The label and value are separate text
+  // nodes so the summary still reads "首字 0.61 s" to a screen reader.
+  function latencyLine(label, ms, kind, outputTokens) {
+    const text = Core.formatLogDuration(ms);
+    const hint = kind === 'first'
+      ? '首字：小于 5 秒为绿，小于 10 秒为黄，其余为红'
+      : '耗时：输出不足 100 token 时按总时长（10 / 30 秒）着色，否则按输出 ÷ 总耗时（30 / 15 t/s）着色';
+    return el('div', { className: `latency-line ${text ? Core.latencyTone(ms, kind, outputTokens) : ''}`.trim(), attrs: { title: hint } }, [
+      el('span', { text: `${label} ` }),
+      el('span', { text: text || '—' }),
+    ]);
+  }
+
   function logRow(record) {
     const info = logStatusInfo(record);
     const local = record.upstream_attempted === false;
     const reasoning = logReasoningText(record);
     const duration = Core.formatLogDuration(record.duration_ms);
-    const tokens = record.total_tokens !== null
-      ? Core.formatCount(record.total_tokens)
-      : (record.input_tokens !== null || record.output_tokens !== null
-        ? `${Core.formatCount(record.input_tokens) || '?'} / ${Core.formatCount(record.output_tokens) || '?'}`
-        : '');
+    const firstToken = Core.formatLogDuration(record.first_token_ms);
+    const rate = Core.formatTokenRate(record.output_tokens_per_second);
+    const split = record.input_tokens !== null || record.output_tokens !== null
+      ? `${Core.formatCount(record.input_tokens) || '?'} / ${Core.formatCount(record.output_tokens) || '?'}`
+      : '';
+    const tokens = record.total_tokens !== null ? Core.formatCount(record.total_tokens) : split;
+    const cacheShare = record.cached_tokens !== null && record.input_tokens
+      ? Core.formatRatio(record.cached_tokens / record.input_tokens)
+      : '';
     const http = record.http_status !== null && !local ? `HTTP ${record.http_status}` : '';
     const cell = (label, content, sub) => el('div', { className: 'log-cell' }, [
       el('span', { className: 'log-cell-label', text: `${label} ` }),
@@ -3243,20 +3308,30 @@
     }), options.sub || '');
     const upstreamModel = record.upstream_model && record.upstream_model !== record.model ? record.upstream_model : '';
     const key = record.id || `${record.started_at}|${record.model}`;
+    // Total on top; the split, then cache and speed, each on a line of its own
+    // so a number is never broken across a wrap.
+    const usageLines = [
+      record.total_tokens !== null && split ? `输入 / 输出 ${split}` : '',
+      [record.cached_tokens !== null ? `缓存 ${Core.formatCount(record.cached_tokens)}${cacheShare ? `（${cacheShare}）` : ''}` : '', rate].filter(Boolean).join(' · '),
+    ].filter(Boolean);
     const summary = el('summary', { className: 'log-main' }, [
       textCell('时间', Core.formatLogTime(record.started_at) || record.started_at || '', { mono: true }),
       textCell('模型 / 上游', record.model || '未知模型', {
         mono: true,
         title: upstreamModel || record.model,
-        sub: upstreamModel || '',
+        sub: upstreamModel ? `→ ${upstreamModel}` : '',
       }),
       reasoning ? textCell('思考强度', reasoning) : el('div', { className: 'log-cell' }),
-      cell('结果', el('span', { className: `badge ${info.tone}`, text: info.label }), [http, local ? '本地退避' : (record.stream ? '流式' : '非流式')].filter(Boolean).join(' · ')),
+      cell('结果', el('span', { className: `badge ${info.tone}`, text: info.label }), [http, local ? '未请求上游' : (record.stream ? '流式' : '非流式')].filter(Boolean).join(' · ')),
       textCell('账户', credentialLabel(record.credential_id), { title: record.credential_id }),
-      textCell('耗时', duration || '', { mono: true }),
-      textCell('用量', tokens || '', { mono: true, sub: tokens && record.total_tokens !== null && (record.input_tokens !== null || record.output_tokens !== null)
-        ? `${Core.formatCount(record.input_tokens) || '?'} / ${Core.formatCount(record.output_tokens) || '?'}`
-        : '' }),
+      cell('首字 / 耗时', el('div', { className: 'log-latency' }, [
+        latencyLine('首字', local ? null : record.first_token_ms, 'first', record.output_tokens),
+        latencyLine('耗时', record.duration_ms, 'total', record.output_tokens),
+      ])),
+      cell('用量', el('div', { className: 'log-usage' }, [
+        el('span', { className: 'log-primary mono', text: tokens || '—' }),
+        ...usageLines.map(line => el('span', { className: 'log-sub', text: line })),
+      ])),
       el('span', { className: 'log-chevron', text: '›' }),
     ]);
     const detail = el('div', { className: 'log-detail' }, [
@@ -3264,13 +3339,19 @@
         logDatum('请求 ID', record.request_id, { mono: true }),
         logDatum('开始时间', Core.formatTime(record.started_at)),
         logDatum('结束时间', Core.formatTime(record.finished_at)),
+        logDatum('首字时间', firstToken || (record.stream && !local ? '未记录' : '')),
         logDatum('耗时', duration),
+        logDatum('输出速率', rate),
         logDatum('HTTP 状态', record.http_status !== null ? String(record.http_status) : ''),
         logDatum('上游已尝试', record.upstream_attempted === null ? '未记录' : (record.upstream_attempted ? '是' : '否（本地拒绝）')),
         logDatum('错误类型', record.error_kind, { mono: true, error: Boolean(record.error_kind) }),
         reasoning ? logDatum('思考强度', reasoning) : null,
         logDatum('输入 Token', Core.formatCount(record.input_tokens), { mono: true }),
         logDatum('输出 Token', Core.formatCount(record.output_tokens), { mono: true }),
+        record.cached_tokens !== null
+          ? logDatum('缓存 Token', `${Core.formatCount(record.cached_tokens)}${cacheShare ? `（占输入 ${cacheShare}）` : ''}`, { mono: true })
+          : null,
+        record.reasoning_tokens !== null ? logDatum('思考 Token', Core.formatCount(record.reasoning_tokens), { mono: true }) : null,
         logDatum('账户 ID', record.credential_id, { mono: true }),
       ]),
     ]);
@@ -3341,23 +3422,36 @@
     const totalTokens = Core.formatCount(stats.tokens.total);
     const inputTokens = Core.formatCount(stats.tokens.input) || '—';
     const outputTokens = Core.formatCount(stats.tokens.output) || '—';
+    const cacheRate = Core.formatRatio(stats.tokens.cache_rate);
+    const outputRate = Core.formatTokenRate(stats.output_tokens_per_second);
+    const firstToken = Core.formatLogDuration(stats.first_token_ms);
     const cards = [
       statCard('总请求', String(stats.total), [
-        el('span', { text: `成功 ${stats.success} · 失败 ${stats.failed}` }),
+        el('span', { text: `成功 ${stats.success} · 失败 ${stats.failed} · 本地拒绝 ${stats.local_rejected}` }),
       ]),
       statCard('成功率', rate || '—', [
-        el('span', { text: `流式 ${stats.streams} 次` }),
+        el('span', { text: `上游已尝试 ${stats.upstream_attempted} · 流式 ${stats.streams} 次` }),
       ]),
       statCard('Token 总量', totalTokens || '—', [
         el('span', { text: `输入 Token ${inputTokens} · 输出 Token ${outputTokens}` }),
       ]),
-      statCard('上游已尝试', String(stats.upstream_attempted), [
-        el('span', { text: `本地拒绝 ${stats.local_rejected}` }),
+      // Unknown stays unknown: a row that reported no cache figure is not a miss.
+      statCard('缓存命中率', cacheRate || '—', [
+        el('span', { text: stats.tokens.cache_samples
+          ? `缓存 Token ${Core.formatCount(stats.tokens.cached) || '0'} · ${stats.tokens.cache_samples} 条上报`
+          : '上游未上报缓存用量' }),
+      ]),
+      statCard('平均输出速率', outputRate || '—', [
+        el('span', { text: [
+          stats.output_rate_samples ? `${stats.output_rate_samples} 条样本` : '暂无可计算的样本',
+          firstToken ? `平均首字 ${firstToken}` : '',
+        ].filter(Boolean).join(' · '), attrs: { title: '总输出 token ÷ 总生成时间（耗时减去首字时间）；生成时间不足 0.5 秒的请求不计入。' } }),
       ]),
     ];
     const scope = retentionScopeText(stats.retention);
-    if (scope) {
-      cards.push(el('div', { className: 'stats-scope', text: `有 usage 的请求 ${stats.tokens.requests_with_usage} · 无 usage 的请求 ${stats.tokens.requests_without_usage} · ${scope}` }));
+    const range = state.statsRange === 'all' ? '' : `时段：${Core.statsRangeLabel(state.statsRange)}（只含已保留的日志）`;
+    if (scope || range) {
+      cards.push(el('div', { className: 'stats-scope', text: [range, `有 usage 的请求 ${stats.tokens.requests_with_usage} · 无 usage 的请求 ${stats.tokens.requests_without_usage}`, scope].filter(Boolean).join(' · ') }));
     }
     container.replaceChildren(...cards);
     if (models) {
@@ -3492,7 +3586,8 @@
     if (!silent) message('logsState', '正在读取请求统计…');
     const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
-      const raw = await api().requestStats();
+      const since = Core.statsRangeSince(state.statsRange);
+      const raw = await api().requestStats(since ? { since } : {});
       if (!stillCurrent()) return;
       state.requestStats = Core.normalizeRequestStats(raw);
       renderRequestStats();
@@ -4958,6 +5053,10 @@
     }
     const refreshLogs = $('refreshLogs');
     if (refreshLogs) refreshLogs.addEventListener('click', refreshRequestLogs);
+    for (const item of STATS_RANGE_BUTTONS) {
+      const node = $(item.id);
+      if (node) node.addEventListener('click', () => setStatsRange(item.value));
+    }
     const clearLogs = $('clearLogs');
     if (clearLogs) clearLogs.addEventListener('click', clearRequestLogs);
     const themeToggle = $('themeToggle');
@@ -5128,6 +5227,7 @@
     renderOverview();
     renderRequestLogs();
     renderRequestStats();
+    renderStatsRange();
     renderConfig();
     renderRuntime();
     renderErrorRules();
@@ -5193,6 +5293,7 @@
       handleTabKey,
       loadRequestLogs,
       loadRequestStats,
+      setStatsRange,
       refreshRequestLogs,
       autoLoadRequestLogs,
       clearRequestLogs,

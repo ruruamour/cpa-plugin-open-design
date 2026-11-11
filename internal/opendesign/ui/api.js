@@ -159,7 +159,7 @@
           q: options.search,
         },
       }),
-      requestStats: () => request('/request-stats'),
+      requestStats: (options = {}) => request('/request-stats', { query: { since: options.since, until: options.until } }),
       clearRequestLogs: () => request('/request-logs', { method: 'DELETE' }),
       config: () => request('/config'),
       // Request-scoped retry-scheduling policy. Reading it happens only when the

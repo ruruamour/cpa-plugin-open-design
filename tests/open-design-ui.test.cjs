@@ -8122,3 +8122,202 @@ test('the shell exposes the key dialog, icon tabs and a pre-paint scheme without
   assert.match(page, /root\.setAttribute\('data-scheme', scheme\)/, 'the scheme is resolved before the first paint');
   assert.ok(!page.includes('开发中，请勿在生产启用'), 'the stale pause warning is gone');
 });
+
+// --- request logs: latency, usage details and the statistics range -----------
+
+const logsSession = async (logs, statsImpl) => {
+  const view = fakePage({
+    fetchImpl: async url => {
+      if (url.includes('/request-stats')) return statsImpl ? statsImpl(url) : respond(200, { total: 0, tokens: {}, models: [] });
+      if (url.includes('/request-logs')) return respond(200, { logs, total: logs.length });
+      return respond(200, statusBody());
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  return { view, api };
+};
+
+test('a log row shows first-token latency, cache share and output rate, and hides what is unknown', async () => {
+  const { view, api } = await logsSession([
+    {
+      id: 'full', started_at: '2026-11-05T01:00:00Z', status: 'success', http_status: 200, model: 'od-flash', upstream_model: 'open-design/flash',
+      credential_id: 'cred-1', stream: true, upstream_attempted: true, duration_ms: 8421, first_token_ms: 612,
+      input_tokens: 18230, output_tokens: 1422, total_tokens: 19652, cached_tokens: 15104, reasoning_tokens: 310,
+      output_tokens_per_second: 182.0976,
+    },
+    // Written by an older version: none of the new fields exist.
+    { id: 'legacy', started_at: '2026-11-05T01:01:00Z', status: 'success', http_status: 200, model: 'od-flash', credential_id: 'cred-1',
+      stream: true, upstream_attempted: true, duration_ms: 4000, input_tokens: 100, output_tokens: 40, total_tokens: 140 },
+    // Details that contradict their totals must not be displayed.
+    { id: 'bogus', started_at: '2026-11-05T01:02:00Z', status: 'success', model: 'od-flash', credential_id: 'cred-1', stream: true,
+      duration_ms: 1000, first_token_ms: 5000, input_tokens: 10, output_tokens: 5, total_tokens: 15, cached_tokens: 11, reasoning_tokens: 6,
+      output_tokens_per_second: -3 },
+  ]);
+  await api.handlers.loadRequestLogs({ reset: true });
+  const rows = view.document.getElementById('requestLogList').children;
+  const [summary, detail] = [rows[0].children[0], rows[0].children[1]];
+  assert.match(summary.textContent, /首字 612 ms/);
+  assert.match(summary.textContent, /耗时 8\.42 s/);
+  assert.match(summary.textContent, /19,652/);
+  assert.match(summary.textContent, /18,230 \/ 1,422/);
+  assert.match(summary.textContent, /缓存 15,104（82\.85%）/);
+  assert.match(summary.textContent, /182 t\/s/);
+  assert.match(summary.textContent, /→ open-design\/flash/);
+  assert.match(detail.textContent, /首字时间 612 ms/);
+  assert.match(detail.textContent, /输出速率 182 t\/s/);
+  assert.match(detail.textContent, /缓存 Token 15,104（占输入 82\.85%）/);
+  assert.match(detail.textContent, /思考 Token 310/);
+  const lines = byClass(summary, 'log-latency').children;
+  assert.match(lines[0].className, /good/, 'a sub-5s first token is green');
+  assert.match(lines[1].className, /good/, '1422 tokens in 8.4s is above 30 t/s');
+
+  const legacy = rows[1];
+  assert.match(legacy.children[0].textContent, /首字 —/, 'an unknown first token is a dash, not zero');
+  assert.match(legacy.children[0].textContent, /耗时 4\.00 s/);
+  for (const text of ['缓存', 't/s']) assert.ok(!legacy.children[0].textContent.includes(text), `legacy row invents no ${text}`);
+  assert.match(legacy.children[1].textContent, /首字时间 未记录/);
+  for (const text of ['缓存 Token', '思考 Token']) assert.ok(!legacy.children[1].textContent.includes(text));
+  assert.equal(byClass(legacy.children[0], 'log-latency').children[0].className, 'latency-line', 'no tone without a value');
+
+  const bogus = api.state.requestLogs[2];
+  assert.deepEqual([bogus.first_token_ms, bogus.cached_tokens, bogus.reasoning_tokens, bogus.output_tokens_per_second], [null, null, null, null],
+    'inconsistent details are dropped by the normalizer');
+  for (const text of ['缓存', '思考 Token', 't/s']) assert.ok(!rows[2].textContent.includes(text));
+});
+
+test('latency tone follows first-token thresholds, then throughput for long replies', () => {
+  const core = fakePage().context.OpenDesignCore;
+  assert.equal(core.latencyTone(4999, 'first'), 'good');
+  assert.equal(core.latencyTone(5000, 'first'), 'warn');
+  assert.equal(core.latencyTone(10000, 'first'), 'bad');
+  // Fewer than 100 output tokens: judged by wall time.
+  assert.equal(core.latencyTone(9000, 'total', 99), 'good');
+  assert.equal(core.latencyTone(20000, 'total', 99), 'warn');
+  assert.equal(core.latencyTone(31000, 'total', 99), 'bad');
+  assert.equal(core.latencyTone(20000, 'total', null), 'warn', 'unknown usage is judged by wall time');
+  // A long reply is judged by throughput, so 40s can still be green.
+  assert.equal(core.latencyTone(40000, 'total', 1300), 'good');
+  assert.equal(core.latencyTone(40000, 'total', 700), 'warn');
+  assert.equal(core.latencyTone(40000, 'total', 500), 'bad');
+  for (const value of [0, -1, null, undefined, NaN, 1.5]) assert.equal(core.latencyTone(value, 'total', 500), '');
+  assert.equal(core.formatTokenRate(182.6), '183 t/s');
+  assert.equal(core.formatTokenRate(1234.4), '1,234 t/s');
+  for (const value of [null, undefined, -1, NaN, Infinity, '12']) assert.equal(core.formatTokenRate(value), '');
+});
+
+test('a local rejection names its reason and never shows a first-token figure', async () => {
+  const { view, api } = await logsSession([
+    { id: 'paused', started_at: '2026-11-05T01:00:00Z', status: 'error', model: 'od-flash', credential_id: 'cred-1', error_kind: 'quota_blocked', upstream_attempted: false, duration_ms: 2 },
+    { id: 'unknown-kind', started_at: '2026-11-05T01:01:00Z', status: 'error', model: 'od-flash', credential_id: 'cred-1', error_kind: 'something_new', upstream_attempted: false },
+    { id: 'no-kind', started_at: '2026-11-05T01:02:00Z', status: 'error', model: 'od-flash', credential_id: 'cred-1', upstream_attempted: false },
+    { id: 'remote', started_at: '2026-11-05T01:03:00Z', status: 'error', http_status: 429, model: 'od-flash', credential_id: 'cred-1', error_kind: 'rate_limit_exceeded', upstream_attempted: true, stream: true },
+  ]);
+  await api.handlers.loadRequestLogs({ reset: true });
+  const rows = view.document.getElementById('requestLogList').children;
+  const badge = row => byClass(row.children[0], 'badge');
+  assert.equal(badge(rows[0]).textContent, '本地拒绝 · 额度暂停');
+  assert.match(badge(rows[0]).className, /warn/);
+  assert.ok(!/failed/.test(rows[0].className), 'a local rejection is not toned as an upstream failure');
+  assert.match(rows[0].children[0].textContent, /未请求上游/);
+  assert.ok(!rows[0].children[0].textContent.includes('HTTP'), 'no upstream status exists for a local rejection');
+  assert.match(rows[0].children[0].textContent, /首字 —/);
+  assert.equal(badge(rows[1]).textContent, '本地拒绝', 'an unrecognised reason is not turned into a headline');
+  assert.match(rows[1].children[1].textContent, /something_new/, 'the raw kind stays available in the detail');
+  assert.equal(badge(rows[2]).textContent, '本地拒绝');
+  assert.equal(badge(rows[3]).textContent, '上游限流');
+  assert.match(rows[3].className, /failed/);
+  assert.match(rows[3].children[0].textContent, /HTTP 429 · 流式/);
+});
+
+test('statistics cards show cache hit rate and output rate, and say so when unknown', async () => {
+  const stats = {
+    total: 32, success: 16, failed: 16, streams: 24, success_rate: 0.5, upstream_attempted: 24, local_rejected: 8,
+    tokens: { input: 635404, output: 25208, total: 660612, cached: 67616, reasoning: 2848, cache_rate: 0.27067621, cache_samples: 12,
+      requests_with_usage: 16, requests_without_usage: 16 },
+    output_tokens_per_second: 94.6317, output_rate_samples: 16, first_token_ms: 5381, first_token_samples: 16,
+    range: { since: null, until: null }, models: [],
+    retention: { enabled: true, retention_days: 7, max_entries: 500, entries: 32 },
+  };
+  const { view, api } = await logsSession([], () => respond(200, stats));
+  await api.handlers.loadRequestStats();
+  const cards = [...view.document.getElementById('requestStats').children].map(node => node.textContent);
+  assert.equal(cards.length, 6, 'five cards plus the scope line');
+  assert.match(cards[0], /总请求32成功 16 · 失败 16 · 本地拒绝 8/);
+  assert.match(cards[1], /成功率50\.00%上游已尝试 24 · 流式 24 次/);
+  assert.match(cards[2], /Token 总量660,612输入 Token 635,404 · 输出 Token 25,208/);
+  assert.match(cards[3], /缓存命中率27\.07%缓存 Token 67,616 · 12 条上报/);
+  assert.match(cards[4], /平均输出速率95 t\/s16 条样本 · 平均首字 5\.38 s/);
+  assert.ok(!cards[5].includes('时段'), 'the unbounded range adds no range note');
+
+  // An upstream that reports nothing about caching or speed.
+  const bare = await logsSession([], () => respond(200, { total: 3, success: 3, failed: 0, tokens: { input: 9, output: 3, total: 12 }, models: [] }));
+  await bare.api.handlers.loadRequestStats();
+  const bareCards = [...bare.view.document.getElementById('requestStats').children].map(node => node.textContent);
+  assert.match(bareCards[3], /缓存命中率—上游未上报缓存用量/);
+  assert.match(bareCards[4], /平均输出速率—暂无可计算的样本/);
+  assert.ok(!bareCards[3].includes('0%') && !bareCards[4].includes('0 t/s'), 'unknown is never shown as zero');
+});
+
+test('choosing a statistics range re-reads only the summary with a since bound', async () => {
+  const calls = [];
+  const { view, api } = await logsSession([], url => { calls.push(url); return respond(200, { total: 1, tokens: {}, models: [], retention: { retention_days: 7, max_entries: 500, entries: 1 } }); });
+  const before = view.calls.length;
+  const start = Date.now();
+  await api.handlers.setStatsRange('24h');
+  assert.equal(calls.length, 1);
+  const since = new URL(calls[0], 'https://cpa.example').searchParams.get('since');
+  const delta = start - Date.parse(since);
+  assert.ok(delta >= 24 * 3600 * 1000 - 5000 && delta <= 24 * 3600 * 1000 + 5000, `since is 24h back, got ${delta}ms`);
+  assert.equal(view.calls.length - before, 1, 'the log list is not re-read');
+  assert.ok(!view.calls.slice(before).some(call => call.url.includes('/request-logs')));
+  assert.equal(view.document.getElementById('statsRange24h').getAttribute('aria-pressed'), 'true');
+  assert.equal(view.document.getElementById('statsRangeAll').getAttribute('aria-pressed'), 'false');
+  assert.match(view.document.getElementById('requestStats').textContent, /时段：近 24 小时（只含已保留的日志）/);
+
+  await api.handlers.setStatsRange('24h');
+  assert.equal(calls.length, 1, 'selecting the current range requests nothing');
+  await api.handlers.setStatsRange('all');
+  assert.equal(calls.length, 2);
+  assert.equal(new URL(calls[1], 'https://cpa.example').searchParams.get('since'), null, 'all retained rows sends no bound');
+  await api.handlers.setStatsRange('bogus');
+  assert.equal(calls.length, 2, 'an unknown range falls back to the current "all"');
+
+  // The refresh button keeps the selected range.
+  await api.handlers.setStatsRange('7d');
+  await api.handlers.refreshRequestLogs();
+  assert.ok(new URL(calls.at(-1), 'https://cpa.example').searchParams.get('since'), 'refresh keeps the range');
+  // A different key starts from all retained rows again.
+  api.handlers.clearAuth();
+  assert.equal(api.state.statsRange, 'all');
+  assert.equal(view.document.getElementById('statsRangeAll').getAttribute('aria-pressed'), 'true');
+});
+
+test('statistics range bounds are computed from the local clock', () => {
+  const core = fakePage().context.OpenDesignCore;
+  const now = Date.parse('2026-11-05T10:30:00Z');
+  assert.equal(core.statsRangeSince('all', now), '');
+  assert.equal(core.statsRangeSince('24h', now), '2026-11-04T10:30:00.000Z');
+  assert.equal(core.statsRangeSince('7d', now), '2026-10-29T10:30:00.000Z');
+  assert.equal(core.statsRangeSince('30d', now), '2026-10-06T10:30:00.000Z');
+  const midnight = new Date(now); midnight.setHours(0, 0, 0, 0);
+  assert.equal(core.statsRangeSince('today', now), midnight.toISOString());
+  assert.equal(core.statsRangeSince('nonsense', now), '', 'an unknown range means all');
+  assert.deepEqual([...core.STATS_RANGES], ['all', 'today', '24h', '7d', '30d']);
+});
+
+test('the range buttons are locked while a log read is in flight', async () => {
+  const gate = deferred();
+  const { view, api } = await logsSession([], () => gate.promise);
+  const pending = api.handlers.loadRequestStats();
+  await tick();
+  for (const id of ['statsRangeAll', 'statsRangeToday', 'statsRange24h', 'statsRange7d', 'statsRange30d']) {
+    assert.equal(view.document.getElementById(id).disabled, true, `${id} is locked during a read`);
+  }
+  await api.handlers.setStatsRange('7d');
+  assert.equal(api.state.statsRange, 'all', 'a range cannot change under an in-flight read');
+  gate.resolve(respond(200, { total: 0, tokens: {}, models: [] }));
+  await pending;
+  assert.equal(view.document.getElementById('statsRange7d').disabled, false);
+});
