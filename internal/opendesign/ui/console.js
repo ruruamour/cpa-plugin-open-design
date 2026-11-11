@@ -2479,9 +2479,11 @@
         className: 'control mono',
         value: model.id,
         placeholder: '对外模型名',
-        attrs: { 'aria-label': `第 ${index + 1} 行对外模型名`, autocomplete: 'off' },
+        // The full value is one hover away when a long name does not fit.
+        attrs: { 'aria-label': `第 ${index + 1} 行对外模型名`, autocomplete: 'off', title: model.id },
       });
       alias.addEventListener('input', () => {
+        alias.setAttribute('title', alias.value);
         state.mappings[index].id = alias.value;
         noteMappingsEdited();
         updateDirtyBadge();
@@ -2490,9 +2492,10 @@
         className: 'control mono',
         value: model.upstream_id,
         placeholder: '上游模型 ID',
-        attrs: { 'aria-label': `第 ${index + 1} 行上游模型 ID`, autocomplete: 'off' },
+        attrs: { 'aria-label': `第 ${index + 1} 行上游模型 ID`, autocomplete: 'off', title: model.upstream_id },
       });
       upstream.addEventListener('input', () => {
+        upstream.setAttribute('title', upstream.value);
         state.mappings[index].upstream_id = upstream.value;
         noteMappingsEdited();
         updateDirtyBadge();

@@ -318,11 +318,12 @@
     .upstream-coverage { grid-column: 2 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
     .upstream-coverage .small { overflow-wrap: anywhere; }
     #mappingList { gap: 10px; }
-    .mapping-row { display: grid; grid-template-columns: minmax(0, 1fr) 18px minmax(0, 1fr) auto auto; align-items: end; gap: 8px; padding: 12px 14px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--inset-bg); }
+    .mapping-row { display: grid; grid-template-columns: minmax(0, 1.5fr) 14px minmax(0, 1fr) auto auto; align-items: end; gap: 6px; padding: 12px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--inset-bg); }
     .mapping-row > .button { min-height: 38px; }
     .mapping-row > .button[data-action="remove-mapping"], .mapping-row > .button[data-action="test-mapping"] { width: 38px; padding: 0; gap: 0; font-size: 0; }
     .mapping-row > .button:nth-of-type(n+3) { grid-column: 1 / -1; justify-self: start; }
     .mapping-row .field { flex: none; }
+    .mapping-row .control { padding-inline: 8px; }
     .mapping-row .arrow { align-self: end; padding-bottom: 10px; color: var(--muted); text-align: center; }
     .mapping-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
     .effort-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }

@@ -41,7 +41,37 @@ def main():
                                    'estimate_at': stamp(4 * 86400), 'model_id': 'example-model',
                                    'awaiting_recheck': True, 'recheck_status': 'unproven'}
         credentials.append(item)
-    status = {'version': 'browser-fixture', 'credentials': credentials, 'models': []}
+    status = {'version': 'browser-fixture', 'credentials': credentials,
+              'models': [{'id': 'open-design-deepseek-v4.1-flash', 'upstream_id': 'deepseek-v4.1-flash'},
+                         {'id': 'open-design-minimax-m3.1', 'upstream_id': 'minimax-m3.1'}]}
+    # Synthetic log rows covering every cell: latency tones, usage details, a
+    # failure, a local rejection and a row an older version would have written.
+    logs = [
+        {'id': 'log-1', 'started_at': stamp(-120), 'finished_at': stamp(-112), 'duration_ms': 8421, 'first_token_ms': 612,
+         'model': 'open-design-deepseek-v4.1-flash', 'upstream_model': 'deepseek-v4.1-flash', 'credential_id': 'fixture-01',
+         'stream': True, 'status': 'success', 'http_status': 200, 'error_kind': None, 'upstream_attempted': True,
+         'input_tokens': 18230, 'output_tokens': 1422, 'total_tokens': 19652, 'cached_tokens': 15104, 'reasoning_tokens': 310,
+         'output_tokens_per_second': 182.1, 'reasoning_effort': 'high', 'request_id': 'req-fixture-1'},
+        {'id': 'log-2', 'started_at': stamp(-240), 'finished_at': stamp(-188), 'duration_ms': 52800, 'first_token_ms': 11800,
+         'model': 'open-design-minimax-m3.1', 'upstream_model': 'minimax-m3.1', 'credential_id': 'fixture-01',
+         'stream': True, 'status': 'error', 'http_status': 200, 'error_kind': 'upstream_protocol_error', 'upstream_attempted': True,
+         'input_tokens': None, 'output_tokens': None, 'total_tokens': None, 'output_tokens_per_second': None},
+        {'id': 'log-3', 'started_at': stamp(-360), 'finished_at': stamp(-360), 'duration_ms': 2,
+         'model': 'open-design-deepseek-v4.1-flash', 'upstream_model': 'deepseek-v4.1-flash', 'credential_id': 'fixture-02',
+         'stream': False, 'status': 'error', 'http_status': None, 'error_kind': 'quota_blocked', 'upstream_attempted': False,
+         'input_tokens': None, 'output_tokens': None, 'total_tokens': None, 'output_tokens_per_second': None},
+        {'id': 'log-4', 'started_at': stamp(-480), 'finished_at': stamp(-476), 'duration_ms': 4000,
+         'model': 'open-design-minimax-m3.1', 'upstream_model': 'minimax-m3.1', 'credential_id': 'fixture-01',
+         'stream': True, 'status': 'success', 'http_status': 200, 'error_kind': None, 'upstream_attempted': True,
+         'input_tokens': 100, 'output_tokens': 40, 'total_tokens': 140, 'output_tokens_per_second': 10.0},
+    ]
+    stats = {'total': 4, 'success': 2, 'failed': 2, 'streams': 3, 'success_rate': 0.5, 'upstream_attempted': 3, 'local_rejected': 1,
+             'tokens': {'input': 18330, 'output': 1462, 'total': 19792, 'cached': 15104, 'reasoning': 310,
+                        'cache_rate': 0.8285, 'cache_samples': 1, 'requests_with_usage': 2, 'requests_without_usage': 2},
+             'output_tokens_per_second': 123.4, 'output_rate_samples': 2, 'first_token_ms': 6206, 'first_token_samples': 2,
+             'range': {'since': None, 'until': None}, 'models': [],
+             'retention': {'enabled': True, 'retention_days': 7, 'max_entries': 500, 'entries': 4}}
+    stats_queries = []
     failed = set()
     held = []
     hold = [True]
@@ -79,10 +109,22 @@ def main():
                 for c in credentials]})
         elif parsed.path == base + '/request-logs':
             # The console lands on the logs tab and reads it once.
-            fulfill(route, {'logs': [], 'total': 0, 'limit': 50, 'offset': 0, 'has_more': False,
-                            'next_offset': None, 'retention': None})
+            fulfill(route, {'logs': logs, 'total': len(logs), 'limit': 50, 'offset': 0, 'has_more': False,
+                            'next_offset': None, 'retention': stats['retention']})
         elif parsed.path == base + '/request-stats':
-            fulfill(route, {'total': 0, 'success': 0, 'failed': 0, 'tokens': {}, 'models': []})
+            stats_queries.append(parse_qs(parsed.query))
+            fulfill(route, stats)
+        elif parsed.path == base + '/config':
+            fulfill(route, {'logs': {'enabled': True, 'retention_days': 7, 'max_entries': 500, 'entries': 4},
+                            'pause': {'enabled': True, 'max_seconds': 86400, 'owner': 'plugin'},
+                            'proxy': {'mode': 'host_managed', 'owner': 'CPA', 'read_only': True},
+                            'routing': {'mode': 'host_managed', 'owner': 'CPA', 'read_only': True},
+                            'upstream': {'fixed': True, 'origin': 'https://amr-link.open-design.ai/v1'}})
+        elif parsed.path == base + '/runtime':
+            fulfill(route, {'loaded': True, 'stopped': False, 'active_requests': 0, 'pending_operations': 0, 'model_count': 2,
+                            'host': {'available': True}, 'observed_at': stamp(0),
+                            'credentials': [{'id': c['id'], 'label': c['label'], 'disabled': False, 'model_count': 2,
+                                             'models_scope': 'shared', 'host': {'status': 'active'}} for c in credentials[:3]]})
         elif parsed.path == base + '/quota':
             cid = parse_qs(parsed.query)['credential_id'][0]
             if hold[0]:
@@ -109,6 +151,70 @@ def main():
         page.wait_for_function('OpenDesignConsole.state.logAutoLoaded === true')
         assert page.locator('#tabLogs').get_attribute('aria-selected') == 'true', 'the console lands on the logs tab'
         assert not page.locator('#authDialog').evaluate('node => node.open'), 'a reused login keeps the key dialog closed'
+
+        # ---- request logs -------------------------------------------------
+        page.locator('#requestLogList details').nth(3).wait_for()
+        overflow = 'document.documentElement.scrollWidth <= innerWidth'
+        rows = page.locator('#requestLogList details')
+        assert rows.count() == 4
+        first_row = rows.nth(0).locator('summary')
+        assert '首字 612 ms' in first_row.inner_text().replace('\n', ' ')
+        assert '182 t/s' in first_row.inner_text() and '82.85%' in first_row.inner_text()
+        tones = first_row.locator('.latency-line')
+        assert tones.count() == 2 and 'good' in tones.nth(0).get_attribute('class')
+        assert rows.nth(1).locator('.latency-line.bad').count() == 2, 'an 11.8s first token and a 52.8s reply are both red'
+        assert rows.nth(2).locator('.badge').inner_text() == '本地拒绝 · 额度暂停'
+        assert '未请求上游' in rows.nth(2).inner_text() and 'HTTP' not in rows.nth(2).locator('summary').inner_text()
+        assert '缓存' not in rows.nth(3).inner_text(), 'a row without cache data invents none'
+        cards = page.locator('#requestStats .fact.stat')
+        assert cards.count() == 5
+        widths = [cards.nth(i).bounding_box()['width'] for i in range(5)]
+        assert max(widths) - min(widths) < 2 and min(widths) > 200, f'statistics cards must share the row evenly: {widths}'
+        badge_box = rows.nth(0).locator('.badge').bounding_box()
+        assert badge_box['width'] < 80, f'a status badge must not stretch across its column: {badge_box}'
+        assert page.evaluate(overflow), 'logs: desktop horizontal overflow'
+        page.screenshot(path=str(args.out / 'logs-desktop.png'))
+        page.locator('#statsRange24h').click()
+        page.wait_for_function('OpenDesignConsole.state.statsRange === "24h" && !OpenDesignConsole.state.optionalBusy.stats')
+        assert stats_queries[-1].get('since'), 'a statistics range sends a since bound'
+        assert requests.count(base + '/request-logs') == 1, 'changing the range does not re-read the list'
+        assert page.locator('#statsRange24h').get_attribute('aria-pressed') == 'true'
+        rows.nth(0).locator('summary').click()
+        assert rows.nth(0).locator('.log-detail').is_visible()
+        assert 'req-fixture-1' in rows.nth(0).locator('.log-detail').inner_text()
+
+        # ---- models and config ---------------------------------------------
+        page.locator('#tabModels').click()
+        mapping = page.locator('#mappingList .mapping-row').first
+        alias = mapping.locator('input').first
+        assert alias.evaluate('node => node.scrollWidth <= node.clientWidth'), 'a default-prefixed alias must fit at 1440px'
+        assert alias.get_attribute('title') == 'open-design-deepseek-v4.1-flash', 'the full alias stays available on hover'
+        assert mapping.locator('[data-action="test-mapping"]').is_enabled()
+        left = page.locator('#modelsPanel').bounding_box()
+        right = page.locator('#reasoningPanel').bounding_box()
+        assert right['x'] > left['x'] + left['width'] - 1, 'models and reasoning panels sit side by side on desktop'
+        assert page.evaluate(overflow), 'models: desktop horizontal overflow'
+        page.screenshot(path=str(args.out / 'models-desktop.png'))
+        page.locator('#tabConfig').click()
+        page.locator('#loadConfig').click()
+        page.wait_for_function('OpenDesignConsole.state.config !== null')
+        page.locator('#loadRuntime').click()
+        page.locator('[data-runtime-credential="fixture-02"]').wait_for()
+        assert '额度暂停中' in page.locator('[data-runtime-credential="fixture-02"]').inner_text()
+        assert '额度暂停中' not in page.locator('[data-runtime-credential="fixture-01"]').inner_text()
+        assert page.locator('#configPauseEnabled').is_checked()
+        assert page.evaluate(overflow), 'config: desktop horizontal overflow'
+        page.screenshot(path=str(args.out / 'config-desktop.png'))
+
+        # ---- dialogs --------------------------------------------------------
+        page.locator('#openAuth').click()
+        assert page.locator('#authDialog').evaluate('node => node.open')
+        assert page.locator('#managementKey').evaluate('node => node === document.activeElement'), 'the key field takes focus'
+        page.keyboard.press('Escape')
+        assert not page.locator('#authDialog').evaluate('node => node.open')
+        assert page.evaluate('Boolean(OpenDesignConsole.state.verified)'), 'dismissing the key dialog keeps the session'
+        page.locator('#tabLogs').click()
+        assert base + '/quota' not in requests, 'no tab other than credentials queries quota'
         page.locator('#tabCredentials').click()
         page.locator('[data-credential-id="fixture-01"] [data-quota-status="loading"]').wait_for()
         page.locator('[data-credential-id="fixture-02"] [data-quota-status="pending"]').wait_for()
@@ -119,6 +225,7 @@ def main():
             fulfill(route, quota(cid))
         page.wait_for_function('!OpenDesignConsole.state.quotaBusy["fixture-01"]')
         assert requests.count(base + '/quota') == 1, 'tab exit must stop remaining queries'
+        page.wait_for_function('!OpenDesignConsole.state.optionalBusy.config')
         page.locator('#tabCredentials').click()
         page.wait_for_function('!OpenDesignConsole.state.quotaAutoRunning')
         assert requests.count(base + '/quota') == 13, 'repeat tab entry skips the already-fresh first row'
@@ -143,6 +250,16 @@ def main():
           OpenDesignConsole.render.renderAccounts();
         }''')
         assert '上游原提示' in page.locator('[data-credential-id="fixture-02"] > summary.account-summary').inner_text()
+        # The account form is a dialog; Esc cancels it and clears what was typed.
+        page.locator('#openAccountDialog').click()
+        assert page.locator('#accountDialog').evaluate('node => node.open')
+        assert page.locator('#accountLabel').evaluate('node => node === document.activeElement')
+        page.locator('#accountKey').fill('typed-then-escaped')
+        page.keyboard.press('Escape')
+        assert not page.locator('#accountDialog').evaluate('node => node.open')
+        assert page.locator('#accountKey').input_value() == '', 'Esc must not leave a typed key in the form'
+        toggle = first.locator('[data-action="toggle-account"]')
+        assert toggle.get_attribute('role') == 'switch' and toggle.get_attribute('aria-checked') == 'true'
         desktop_height = first.bounding_box()['height']
         assert desktop_height < 150, f'collapsed desktop card too tall: {desktop_height}'
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'desktop horizontal overflow'
@@ -186,12 +303,23 @@ def main():
         # Use the same actual page in a narrow, dark viewport too.
         page.evaluate('OpenDesignConsole.render.applyThemePreference("dark")')
         page.screenshot(path=str(args.out / 'mobile-dark.png'))
+        page.evaluate('OpenDesignConsole.render.applyThemePreference("light")')
+        for tab, name in [('tabLogs', 'logs'), ('tabModels', 'models'), ('tabConfig', 'config')]:
+            page.locator('#' + tab).click()
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), f'{name}: mobile horizontal overflow'
+            page.screenshot(path=str(args.out / f'{name}-mobile.png'))
+        latency = page.locator('#requestLogList details').nth(0).locator('.log-latency')
+        page.locator('#tabLogs').click()
+        assert latency.bounding_box()['width'] > 100, 'the latency cell must not collapse into the chevron column'
         assert not errors, errors
         result = {'browser': Path(args.browser).name, 'fixture_credentials': len(credentials),
                   'windows_per_card': 3, 'desktop_card_height': desktop_height,
                   'checks': ['no quota on bootstrap', 'serial pending/loading', 'cancel on tab exit',
                              'fresh-snapshot skip', '0/100 percent', 'real reset timestamps', 'native keyboard disclosure',
-                             'repaint and page retention', 'stale failure keeps values', 'desktop/mobile no overflow', 'no JS errors'],
+                             'repaint and page retention', 'stale failure keeps values', 'desktop/mobile no overflow', 'no JS errors',
+                             'logs landing read', 'latency tones and usage details', 'local rejection reason',
+                             'statistics cards and range', 'models side by side', 'runtime pause badge',
+                             'key dialog and account dialog dismissal'],
                   'screenshots': str(args.out), 'production_requests': 0}
         (args.out / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
         print(json.dumps(result, ensure_ascii=False))
