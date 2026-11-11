@@ -492,6 +492,8 @@ func modelTestErrorMessage(kind string) string {
 		return "OpenDesign credential changed while the model test was starting"
 	case "credential_unavailable":
 		return "OpenDesign credential is unavailable"
+	case "quota_blocked":
+		return "OpenDesign credential is paused for quota; nothing was sent upstream"
 	case "plugin_unavailable":
 		return "OpenDesign plugin is shutting down"
 	case "host_contract_error":

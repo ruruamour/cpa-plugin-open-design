@@ -682,7 +682,11 @@ func safeDiagnosticKind(kind string, keys []string) bool {
 	switch kind {
 	case "upstream_error", "upstream_protocol_error", "upstream_transport_error", "response_limit_exceeded",
 		"invalid_request", "invalid_json", "model_not_enabled", "credential_unavailable", "credential_changed",
-		"plugin_unavailable", "host_contract_error", "request_canceled", "count_tokens_unavailable":
+		"plugin_unavailable", "host_contract_error", "request_canceled", "count_tokens_unavailable",
+		// A fixed plugin code for a request refused locally because its account
+		// is quota-paused. Without it the log and the model test relabelled that
+		// refusal "upstream_error" although nothing was sent upstream.
+		"quota_blocked":
 		return true
 	default:
 		return false
