@@ -1776,15 +1776,15 @@ test('acknowledged account changes remain visible when the following status read
   }
 });
 
-test('five tabs switch with hidden and aria state only, including keyboard navigation', () => {
+test('four tabs switch with hidden and aria state only, including keyboard navigation', () => {
   const view = fakePage();
   const consoleApi = view.context.OpenDesignConsole;
   const before = view.calls.length;
+  // The overview is a panel of the config tab now, not a tab of its own.
   const tabs = [
-    ['overview', 'tabOverview', 'overviewPanel'],
+    ['logs', 'tabLogs', 'logsPanel'],
     ['credentials', 'tabCredentials', 'credentialsPanel'],
     ['models', 'tabModels', 'modelsTab'],
-    ['logs', 'tabLogs', 'logsPanel'],
     ['config', 'tabConfig', 'configPanel'],
   ];
   for (const [name, button, panel] of tabs) {
@@ -1801,7 +1801,9 @@ test('five tabs switch with hidden and aria state only, including keyboard navig
   }
   let prevented = false;
   consoleApi.handlers.handleTabKey({ key: 'ArrowRight', preventDefault() { prevented = true; } });
-  assert.equal(consoleApi.state.activeTab, 'overview', 'End-to-start keyboard navigation wraps across the tablist');
+  assert.equal(consoleApi.state.activeTab, 'logs', 'End-to-start keyboard navigation wraps across the tablist');
+  // An unknown name falls back to the first tab instead of leaving none selected.
+  assert.equal(consoleApi.handlers.activateTab('overview'), 'logs');
   assert.equal(prevented, true);
   assert.equal(view.calls.length, before, 'tab changes and rendering never fetch optional data');
 });
@@ -2392,8 +2394,15 @@ test('theme preference cycles system -> light -> dark, persists, and is applied 
   assert.equal(view.document.documentElement.getAttribute('data-theme-resolved'), 'dark');
   assert.equal(consoleApi.handlers.cycleThemePreference(), 'system');
   assert.equal(view.localStorage.getItem('open-design-theme'), null, 'following the system clears the pin');
-  const label = view.document.getElementById('themeToggle').textContent;
-  assert.match(label, /^主题：/);
+  const toggle = view.document.getElementById('themeToggle');
+  assert.match(toggle.textContent, /^跟随系统（(浅色|深色)）$/, 'the visible label names the preference');
+  assert.match(toggle.getAttribute('aria-label'), /^切换颜色主题，当前：跟随系统/);
+  assert.equal(toggle.getAttribute('data-icon'), 'monitor', 'the icon follows the preference');
+  consoleApi.handlers.applyThemePreference('dark');
+  assert.equal(toggle.textContent, '深色');
+  assert.equal(toggle.getAttribute('data-icon'), 'moon');
+  assert.equal(view.document.documentElement.getAttribute('data-scheme'), 'dark', 'the stylesheet keys on the resolved scheme');
+  consoleApi.handlers.applyThemePreference('system');
   const core = view.context.OpenDesignCore;
   assert.equal(core.nextThemePreference('bogus'), 'light', 'an unknown preference falls back to system first');
   assert.equal(core.resolvedTheme('system', true), 'dark');
@@ -2651,7 +2660,7 @@ test('the error-rules dialog is present in the console page and adds no tab', ()
     assert.ok(page.includes(`id="${id}"`), `missing #${id}`);
   }
   const tabs = [...page.matchAll(/<button class="tab" id="([^"]+)"/g)].map(match => match[1]);
-  assert.deepEqual(tabs, ['tabOverview', 'tabCredentials', 'tabModels', 'tabLogs', 'tabConfig']);
+  assert.deepEqual(tabs, ['tabLogs', 'tabCredentials', 'tabModels', 'tabConfig']);
   assert.ok(page.includes('role="dialog"') || page.includes('<dialog'), 'the rules editor is a dialog');
   for (const action of ['停止并冷却', '继续并冷却', '包含文本', '正则表达式']) assert.ok(page.includes(action), `help/editor mentions ${action}`);
 });
@@ -2741,9 +2750,9 @@ test('the reasoning panel exists with real controls and does not add a tab', () 
     assert.ok(page.includes(`id="${id}"`), `${id} must be present`);
   }
   assert.ok(page.includes('思考强度映射'));
-  // The panel lives inside the models tab: the console keeps its five tabs.
+  // The panel lives inside the models tab: the console keeps its four tabs.
   const tabs = [...page.matchAll(/data-tab="([^"]+)"/g)].map(match => match[1]);
-  assert.deepEqual(tabs, ['overview', 'credentials', 'models', 'logs', 'config']);
+  assert.deepEqual(tabs, ['logs', 'credentials', 'models', 'config']);
   // A disabled mapping never rewrites a request, so the copy has to say so.
   assert.ok(/默认关闭/.test(page));
 });
@@ -7944,4 +7953,172 @@ test('同一会话内较早的调度请求迟到也不覆盖较新的结果', as
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.doesNotMatch(accountRow(view, 'cred-1').textContent, /过期的旧结果/,
     'an out-of-order older response must be discarded by the request sequence');
+});
+
+// --- console shell: landing tab, key dialog, host theme ----------------------
+
+const sessionLogin = { 'opendesign:management-auth:https://cpa.example': JSON.stringify({ key: managementKey, type: 'bearer' }) };
+const pathOf = call => new URL(call.url, 'https://cpa.example').pathname.replace('/v0/management/open-design', '');
+
+function shellBackend(overrides = {}) {
+  return url => {
+    if (url.includes('/request-logs')) return respond(200, { logs: [], total: 0, limit: 50, offset: 0, has_more: false, next_offset: null, retention: null });
+    if (url.includes('/request-stats')) return respond(200, { total: 0, success: 0, failed: 0, tokens: {}, models: [] });
+    if (url.endsWith('/status')) return respond(overrides.status || 200, overrides.status ? { error: 'rejected' } : statusBody());
+    return respond(404, { error: 'unexpected request' });
+  };
+}
+
+test('a reused login lands on the logs tab and reads it exactly once', async () => {
+  const view = fakePage({ bootstrap: true, session: sessionLogin, fetchImpl: shellBackend() });
+  const api = view.context.OpenDesignConsole;
+  await waitFor(() => view.calls.some(call => pathOf(call) === '/request-stats'), 'the landing read');
+  assert.equal(api.state.activeTab, 'logs');
+  assert.equal(view.document.getElementById('tabLogs').getAttribute('aria-selected'), 'true');
+  assert.equal(view.document.getElementById('logsPanel').hidden, false);
+  assert.deepEqual(view.calls.map(pathOf), ['/status', '/request-logs', '/request-stats'],
+    'status first, then one page of logs and one summary');
+  assert.ok(view.calls.every(call => call.init.headers.Authorization === `Bearer ${managementKey}`));
+  // Returning to the tab is not a second read.
+  api.handlers.activateTab('config');
+  api.handlers.activateTab('logs');
+  await tick();
+  assert.equal(view.calls.length, 3, 're-entering the logs tab requests nothing');
+});
+
+test('without a key the page requests nothing and opens the key dialog', async () => {
+  const view = fakePage({ bootstrap: true, fetchImpl: shellBackend() });
+  const dialog = view.document.getElementById('authDialog');
+  let opened = 0;
+  dialog.showModal = () => { opened += 1; dialog.open = true; };
+  dialog.close = () => { dialog.open = false; };
+  // The bound page already ran its bootstrap once; run it again with a dialog
+  // that can actually open, as a browser provides.
+  await view.context.OpenDesignConsole.bootstrap();
+  assert.equal(view.calls.length, 0, 'nothing is requested before a key exists');
+  assert.equal(opened, 1, 'the key dialog opens by itself');
+  assert.equal(view.context.OpenDesignConsole.state.authCollapsed, false);
+  assert.match(view.document.getElementById('authState').textContent, /需要管理密钥/);
+  assert.equal(view.document.getElementById('accountsPanel').hidden, true);
+});
+
+test('submitting the key form verifies with one request, closes the dialog and then reads the visible tab', async () => {
+  const view = fakePage({ bootstrap: true, fetchImpl: shellBackend() });
+  const api = view.context.OpenDesignConsole;
+  const dialog = view.document.getElementById('authDialog');
+  dialog.showModal = () => { dialog.open = true; };
+  dialog.close = () => { dialog.open = false; };
+  await api.bootstrap();
+  assert.equal(dialog.open, true);
+  view.document.getElementById('managementKey').value = managementKey;
+  await view.document.getElementById('authForm').emit('submit', { preventDefault() {} });
+  await waitFor(() => view.calls.some(call => pathOf(call) === '/request-stats'), 'the read after login');
+  assert.deepEqual(view.calls.map(pathOf), ['/status', '/request-logs', '/request-stats']);
+  assert.equal(dialog.open, false, 'a verified key closes the dialog');
+  assert.equal(view.document.getElementById('managementKey').value, '', 'the key never stays in the form');
+  assert.equal(view.document.getElementById('authBadge').textContent, '已验证');
+  // The topbar button reopens the dialog without ending the session.
+  await view.document.getElementById('openAuth').emit('click');
+  assert.equal(dialog.open, true);
+  assert.ok(api.state.verified, 'reopening the dialog keeps the verified session');
+  await view.document.getElementById('closeAuth').emit('click');
+  assert.equal(dialog.open, false);
+});
+
+test('a rejected key keeps the dialog open and reads no tab data', async () => {
+  const view = fakePage({ bootstrap: true, fetchImpl: shellBackend({ status: 401 }) });
+  const dialog = view.document.getElementById('authDialog');
+  dialog.showModal = () => { dialog.open = true; };
+  dialog.close = () => { dialog.open = false; };
+  await view.context.OpenDesignConsole.bootstrap();
+  view.document.getElementById('managementKey').value = 'wrong-key';
+  await view.document.getElementById('authForm').emit('submit', { preventDefault() {} });
+  await tick();
+  assert.deepEqual(view.calls.map(pathOf), ['/status'], 'a rejected key triggers no further read');
+  assert.equal(dialog.open, true);
+  assert.match(view.document.getElementById('authState').textContent, /401/);
+  assert.ok(!view.document.getElementById('authState').textContent.includes('wrong-key'));
+});
+
+test('the handler itself still verifies with a single request', async () => {
+  const view = fakePage({ fetchImpl: shellBackend() });
+  const api = view.context.OpenDesignConsole;
+  view.document.getElementById('managementKey').value = managementKey;
+  assert.equal(await api.handlers.submitAuth({ preventDefault() {} }), true, 'a verified key reports success');
+  await tick();
+  assert.deepEqual(view.calls.map(pathOf), ['/status'], 'submitAuth never reads tab data on its own');
+  view.document.getElementById('managementKey').value = '';
+  assert.notEqual(await api.handlers.submitAuth({ preventDefault() {} }), true, 'an empty key is not a success');
+});
+
+test('following the system means following the CPA theme when one is readable', async () => {
+  // The management centre stored a dark theme while the OS prefers light.
+  const stored = fakePage({ persistent: { 'cli-proxy-theme': JSON.stringify({ state: { theme: 'dark' } }) } });
+  stored.context.matchMedia = () => ({ matches: false, addEventListener() {} });
+  await stored.context.OpenDesignConsole.bootstrap();
+  const root = stored.document.documentElement;
+  assert.equal(root.getAttribute('data-theme'), 'system', 'the preference itself is unchanged');
+  assert.equal(root.getAttribute('data-theme-resolved'), 'dark');
+  assert.equal(root.getAttribute('data-scheme'), 'dark');
+  assert.match(stored.document.getElementById('themeToggle').textContent, /跟随系统（深色）/);
+  // An explicit choice on this page still wins over the host.
+  stored.context.OpenDesignConsole.handlers.applyThemePreference('light');
+  assert.equal(root.getAttribute('data-scheme'), 'light');
+
+  // CPA's "white" is a light theme; "auto" and garbage fall back to the OS.
+  for (const [value, osDark, want] of [['white', true, 'light'], ['light', true, 'light'], ['auto', true, 'dark'], ['auto', false, 'light'], ['neon', false, 'light']]) {
+    const view = fakePage({ persistent: { 'cli-proxy-theme': JSON.stringify({ state: { theme: value } }) } });
+    view.context.matchMedia = () => ({ matches: osDark, addEventListener() {} });
+    await view.context.OpenDesignConsole.bootstrap();
+    assert.equal(view.document.documentElement.getAttribute('data-scheme'), want, `host ${value}, os dark ${osDark}`);
+  }
+  // Unreadable storage content must not break the page.
+  const broken = fakePage({ persistent: { 'cli-proxy-theme': '{not json' } });
+  broken.context.matchMedia = () => ({ matches: true, addEventListener() {} });
+  await broken.context.OpenDesignConsole.bootstrap();
+  assert.equal(broken.document.documentElement.getAttribute('data-scheme'), 'dark');
+  assert.equal(stored.calls.length + broken.calls.length, 0, 'theme resolution never requests anything');
+});
+
+test('an embedding CPA page decides the scheme and a later change is followed', async () => {
+  const view = fakePage();
+  const hostRoot = { value: 'dark', getAttribute(name) { return name === 'data-theme' ? this.value : null; } };
+  let observer = null;
+  view.context.parent = { document: { documentElement: hostRoot } };
+  view.context.MutationObserver = class { constructor(callback) { observer = callback; } observe(node, options) { assert.equal(node, hostRoot); assert.deepEqual(options.attributeFilter, ['data-theme']); } };
+  view.context.matchMedia = () => ({ matches: false, addEventListener() {} });
+  await view.context.OpenDesignConsole.bootstrap();
+  const root = view.document.documentElement;
+  assert.equal(root.getAttribute('data-scheme'), 'dark', 'the embedding page wins over a light OS');
+  assert.equal(typeof observer, 'function', 'the host theme is observed');
+  hostRoot.value = 'white';
+  observer();
+  assert.equal(root.getAttribute('data-scheme'), 'light', 'a host theme switch is applied live');
+  view.context.OpenDesignConsole.handlers.applyThemePreference('dark');
+  hostRoot.value = 'light';
+  observer();
+  assert.equal(root.getAttribute('data-scheme'), 'dark', 'a pinned preference ignores host changes');
+});
+
+test('the shell exposes the key dialog, icon tabs and a pre-paint scheme without external resources', () => {
+  const page = pageHTML();
+  for (const id of ['authDialog', 'authForm', 'openAuth', 'closeAuth', 'authSubmit', 'authClear', 'topbarSummary', 'overviewFacts']) {
+    assert.ok(page.includes(`id="${id}"`), `missing #${id}`);
+  }
+  assert.match(page, /<dialog id="authDialog"/);
+  assert.ok(!page.includes('id="authToggle"') && !page.includes('id="tabOverview"'), 'the collapsible panel and the overview tab are gone');
+  for (const [tab, icon] of [['tabLogs', 'logs'], ['tabCredentials', 'users'], ['tabModels', 'models'], ['tabConfig', 'sliders']]) {
+    assert.match(page, new RegExp(`id="${tab}"[^>]*data-icon="${icon}"`), `${tab} carries its icon`);
+    assert.ok(page.includes(`[data-icon="${icon}"] { --icon: url("data:image/svg+xml,`), `icon ${icon} is defined inline`);
+  }
+  // Every icon the markup or the scripts name is defined, and only as an inline data URL.
+  const defined = new Set([...page.matchAll(/\[data-icon="([a-z]+)"\] \{ --icon:/g)].map(match => match[1]));
+  const used = new Set([...page.matchAll(/data-icon="([a-z]+)"/g)].map(match => match[1]));
+  for (const name of [...page.matchAll(/icon: '([a-z]+)'/g)].map(match => match[1])) used.add(name);
+  for (const name of ['monitor', 'sun', 'moon']) used.add(name);
+  for (const name of used) assert.ok(defined.has(name), `icon ${name} is used but not defined`);
+  assert.ok(!/url\((?!"data:)/.test(page.split('</style>')[0]), 'the stylesheet loads nothing from the network');
+  assert.ok(!/<(script|link|img)[^>]+(src|href)=/.test(page), 'no external script, stylesheet or image');
+  assert.match(page, /root\.setAttribute\('data-scheme', scheme\)/, 'the scheme is resolved before the first paint');
+  assert.ok(!page.includes('开发中，请勿在生产启用'), 'the stale pause warning is gone');
 });

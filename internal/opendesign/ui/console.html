@@ -1,7 +1,35 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="system">
 <head>
   <meta charset="utf-8">
+  <script>
+    // Resolve the colour scheme before the first paint. console.js applies the
+    // same rule again once it loads; this only avoids a light flash.
+    (() => {
+      const root = document.documentElement;
+      let preference = 'system';
+      try {
+        const stored = localStorage.getItem('open-design-theme');
+        if (stored === 'light' || stored === 'dark') preference = stored;
+      } catch { /* Storage can be blocked; follow the surroundings. */ }
+      let scheme = preference;
+      if (preference === 'system') {
+        let host = '';
+        try {
+          if (window.parent !== window) host = window.parent.document.documentElement.getAttribute('data-theme') || '';
+        } catch { /* A cross-origin parent says nothing about its theme. */ }
+        if (!host) {
+          try { host = JSON.parse(localStorage.getItem('cli-proxy-theme') || '{}').state.theme || ''; } catch { host = ''; }
+        }
+        if (host === 'dark') scheme = 'dark';
+        else if (host === 'light' || host === 'white') scheme = 'light';
+        else scheme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+      root.setAttribute('data-theme', preference);
+      root.setAttribute('data-theme-resolved', scheme);
+      root.setAttribute('data-scheme', scheme);
+    })();
+  </script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <meta name="cpa-api-base" content="/v0/management/open-design">
@@ -9,303 +37,372 @@
   <style>
     :root {
       color-scheme: light;
-      --bg: #f5f6f8;
-      --surface: #ffffff;
-      --surface-2: #f0f2f5;
-      --ink: #1d2430;
-      --muted: #667085;
-      --line: #d8dde5;
-      --accent: #1f6feb;
-      --accent-ink: #ffffff;
-      --danger: #b42318;
-      --good: #087443;
-      --radius: 10px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Microsoft YaHei", sans-serif;
       font-size: 14px;
-      line-height: 1.55;
+      line-height: 1.5;
+      --bg: #fff; --surface: #fff; --surface-2: #f6f6f6; --ink: #2d2a26;
+      --muted: #6d6760; --line: #d9d9d9; --accent: #8b8680; --accent-hover: #7f7a74; --accent-ink: #fff;
+      --success: #087c54; --good: #087c54; --warn: #985d0a; --danger: #b8493a; --focus: #726d67;
+      --danger-fill: #c65746; --danger-fill-hover: #ae4738; --meter-warn: #d8b45c;
+      --inset-bg: color-mix(in srgb, var(--surface-2) 35%, var(--surface));
+      --inset-line: color-mix(in srgb, var(--line) 75%, var(--surface));
+      --code-bg: #f6f6f6; --shadow: 0 1px 2px rgba(0, 0, 0, .08);
     }
-    :root[data-theme="dark"] {
+    :root[data-theme="dark"], :root[data-scheme="dark"] {
       color-scheme: dark;
-      --bg: #151a21;
-      --surface: #1c232c;
-      --surface-2: #232b35;
-      --ink: #e8edf3;
-      --muted: #a8b3c2;
-      --line: #37414e;
-      --accent: #6ea8ff;
-      --accent-ink: #0e1520;
-      --danger: #ff9b8f;
-      --good: #6ee7b7;
+      --bg: #1d1b18; --surface: #1d1b18; --surface-2: #262320; --ink: #f6f4f1; --muted: #c9c3bb; --line: #4a453f;
+      --accent: #8b8680; --accent-hover: #9a948e; --accent-ink: #fff; --success: #6ee7b7; --good: #6ee7b7;
+      --warn: #f2c77c; --danger: #f1a399; --focus: #a6a099; --code-bg: #262320; --shadow: 0 1px 3px rgba(0, 0, 0, .3);
     }
-    :root[data-theme="light"] { color-scheme: light; }
-    :root[data-theme="dark"] { color-scheme: dark; }
-    /* system preference: no explicit light/dark choice stored by the page */
+    /* Without script the page still follows the operating system. */
     @media (prefers-color-scheme: dark) {
-      :root[data-theme="system"] {
+      :root[data-theme="system"]:not([data-scheme]) {
         color-scheme: dark;
-        --bg: #151a21;
-        --surface: #1c232c;
-        --surface-2: #232b35;
-        --ink: #e8edf3;
-        --muted: #a8b3c2;
-        --line: #37414e;
-        --accent: #6ea8ff;
-        --accent-ink: #0e1520;
-        --danger: #ff9b8f;
-        --good: #6ee7b7;
+        --bg: #1d1b18; --surface: #1d1b18; --surface-2: #262320; --ink: #f6f4f1; --muted: #c9c3bb; --line: #4a453f;
+        --accent: #8b8680; --accent-hover: #9a948e; --accent-ink: #fff; --success: #6ee7b7; --good: #6ee7b7;
+        --warn: #f2c77c; --danger: #f1a399; --focus: #a6a099; --code-bg: #262320; --shadow: 0 1px 3px rgba(0, 0, 0, .3);
       }
-    }
-    @media (prefers-color-scheme: light) {
-      :root[data-theme="system"] { color-scheme: light; }
     }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--ink); }
-    h1, h2, h3, p { margin: 0; }
-    h1 { font-size: 21px; }
-    h2 { font-size: 16px; }
-    h3 { font-size: 14px; }
-    button, input, select { font: inherit; }
+    h1, h2, h3, h4, p { margin: 0; }
+    h1 { font-size: 15px; line-height: 1.3; }
+    h2 { font-size: 16px; line-height: 1.3; }
+    h3 { font-size: 13px; line-height: 1.4; }
+    button, input, select, textarea { font: inherit; }
     button { cursor: pointer; }
     button:disabled { cursor: not-allowed; opacity: .55; }
-    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
     [hidden] { display: none !important; }
-    .shell { max-width: 1440px; margin: 0 auto; padding: 22px clamp(14px, 3vw, 32px) 48px; }
-    .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-bottom: 8px; }
-    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-    .mark { width: 30px; height: 30px; flex: none; border-radius: 8px; background: linear-gradient(135deg, var(--accent), #7c5cff); }
-    .version { color: var(--muted); font-size: 12px; }
-    .badge { display: inline-flex; align-items: center; min-height: 22px; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 12px; white-space: nowrap; }
-    .badge.good, .badge.on { background: color-mix(in srgb, var(--good) 16%, var(--surface)); color: var(--good); }
-    .badge.off, .badge.danger { background: color-mix(in srgb, var(--danger) 14%, var(--surface)); color: var(--danger); }
-    .badge.danger { border: 1px solid color-mix(in srgb, var(--danger) 32%, transparent); font-weight: 600; }
-    .badge.warn { background: color-mix(in srgb, #b54708 14%, var(--surface)); color: #b54708; }
-    :root[data-theme="dark"] .badge.warn, :root[data-theme="system"] .badge.warn { color: #fdb022; }
+    code, .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .mono { font-size: 12px; }
+    code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px; overflow-wrap: anywhere; }
+    .muted { color: var(--muted); }
+
+    /* --- shell ---------------------------------------------------------- */
+    .shell { max-width: 1580px; margin: 0 auto; padding: 16px clamp(16px, 3vw, 40px) 40px; }
+    .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; min-height: 40px; }
+    .brand { display: flex; align-items: center; gap: 11px; min-width: 0; }
+    .brandmark { display: grid; place-items: center; width: 32px; height: 32px; flex: none; border-radius: 8px; background: var(--ink); color: var(--surface); font-size: 12px; font-weight: 800; letter-spacing: .02em; }
+    .brand-text { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 9px; min-width: 0; }
+    .version { color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .topbar-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-left: auto; }
+    .topbar-summary { color: var(--muted); font-size: 12px; white-space: nowrap; }
+
+    /* --- controls ------------------------------------------------------- */
+    .button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 38px; padding: 7px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); font-weight: 600; white-space: nowrap; transition: border-color .16s, background .16s; }
+    .button:hover:not(:disabled) { border-color: var(--accent); background: var(--code-bg); }
+    .button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+    .button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+    .button.danger { background: var(--danger-fill); border-color: var(--danger-fill); color: #fff; }
+    .button.danger:hover:not(:disabled) { background: var(--danger-fill-hover); border-color: var(--danger-fill-hover); }
+    .button.compact { min-height: 32px; padding: 4px 9px; font-size: 12px; }
+    .button.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+    .button.ghost:hover:not(:disabled) { color: var(--ink); background: var(--surface-2); border-color: transparent; }
+    .badge { display: inline-flex; align-items: center; gap: 5px; min-height: 22px; padding: 2px 7px; border: 0; border-radius: 4px; background: var(--code-bg); color: var(--muted); font-size: 11px; font-weight: 600; white-space: nowrap; }
+    .badge.good, .badge.on { background: color-mix(in srgb, var(--success) 12%, var(--surface)); color: var(--success); }
+    .badge.warn { background: color-mix(in srgb, var(--warn) 14%, var(--surface)); color: var(--warn); }
+    .badge.bad, .badge.off, .badge.danger { background: color-mix(in srgb, var(--danger) 12%, var(--surface)); color: var(--danger); }
     .badge.danger-soft { background: transparent; color: var(--danger); padding-left: 2px; }
-    .lead { color: var(--muted); margin: 0 0 20px; max-width: 760px; }
-    .lead code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
-    .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 18px; }
-    .panel-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 14px; margin-bottom: 14px; }
+    button.badge { cursor: pointer; }
+    button.badge:hover { background: color-mix(in srgb, var(--danger) 20%, var(--surface)); }
+    .control { width: 100%; min-height: 38px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); min-width: 0; }
+    .control::placeholder { color: var(--muted); }
+    textarea.control { resize: vertical; }
+    .search { flex: 1 1 220px; width: auto; }
+    .count { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .field { display: grid; gap: 5px; min-width: 0; flex: 1 1 210px; }
+    .field > span, .field > label { color: var(--muted); font-size: 12px; font-weight: 600; }
+    .field.narrow { flex: 0 1 150px; }
+    .inline { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
+    .stack { display: grid; gap: 12px; }
+    .form-stack { display: grid; gap: 14px; }
+    .form-foot { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+    .hint { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .panel-hint { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+    .state { margin-top: 8px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .state.error { color: var(--danger); }
+    .state.ok { color: var(--success); }
+    .empty { padding: 36px 20px; text-align: center; color: var(--muted); }
+    .facts > .empty { grid-column: 1 / -1; padding: 14px 12px; font-size: 12px; }
+    .check { display: flex; align-items: center; gap: 9px; font-size: 13px; cursor: pointer; }
+    .check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); flex: none; }
+    .switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; font-size: 14px; }
+    .switch input { appearance: none; -webkit-appearance: none; position: relative; width: 30px; height: 18px; margin: 0; flex: none; border: 1px solid var(--line); border-radius: 20px; background: var(--inset-bg); cursor: pointer; }
+    .switch input::before { content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--muted); transition: transform 120ms ease; }
+    .switch input:checked { background: var(--accent); border-color: var(--accent); }
+    .switch input:checked::before { background: #fff; transform: translateX(12px); }
+    @media (prefers-reduced-motion: reduce) { .switch input::before { transition: none; } }
+    /* Line icons are CSS masks keyed by data-icon, so the label stays a plain text node. */
+    [data-icon]::before { content: ""; flex: none; width: 15px; height: 15px; background: currentColor; -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat; }
+    .tab[data-icon]::before { width: 16px; height: 16px; }
+    [data-icon][data-icon-only]::before { width: 18px; height: 18px; }
+    [data-icon="gear"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9.2 3-.6 2.3-2 .9-2.1-.7-2 3.5 1.6 1.6v2.8L2.5 15l2 3.5 2.1-.7 2 .9.6 2.3h4l.6-2.3 2-.9 2.1.7 2-3.5-1.6-1.6v-2.8l1.6-1.6-2-3.5-2.1.7-2-.9-.6-2.3Z'/%3E%3Ccircle cx='11.2' cy='12' r='3'/%3E%3C/svg%3E"); }
+    [data-icon="refresh"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 5v5h-5M4 19v-5h5'/%3E%3Cpath d='M5 12a7 7 0 0 1 11.95-4.95L20 10M19 12a7 7 0 0 1-11.95 4.95L4 14'/%3E%3C/svg%3E"); }
+    [data-icon="plus"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 5v14M5 12h14'/%3E%3C/svg%3E"); }
+    [data-icon="edit"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m16 3 5 5-13 13H3v-5ZM14 5l5 5'/%3E%3C/svg%3E"); }
+    [data-icon="trash"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7'/%3E%3C/svg%3E"); }
+    [data-icon="test"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m8 4 12 8-12 8Z'/%3E%3C/svg%3E"); }
+    [data-icon="search"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='10.5' cy='10.5' r='6.5'/%3E%3Cpath d='m16 16 5 5'/%3E%3C/svg%3E"); }
+    [data-icon="book"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 5v16M3 3h4a5 5 0 0 1 5 2 5 5 0 0 1 5-2h4v16h-4a5 5 0 0 0-5 2 5 5 0 0 0-5-2H3Z'/%3E%3C/svg%3E"); }
+    [data-icon="key"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='8' cy='15' r='5'/%3E%3Cpath d='m11.5 11.5 9-9M16 7l3 3M19 4l3 3'/%3E%3C/svg%3E"); }
+    [data-icon="save"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 3h12l4 4v14H3V3ZM7 3v6h10V3M7 21v-8h10v8'/%3E%3C/svg%3E"); }
+    [data-icon="close"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 6 12 12M6 18 18 6'/%3E%3C/svg%3E"); }
+    [data-icon="check"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 12 4 4L19 6'/%3E%3C/svg%3E"); }
+    [data-icon="select"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='4' y='4' width='16' height='16' rx='2'/%3E%3Cpath d='m8 12 3 3 5-6'/%3E%3C/svg%3E"); }
+    [data-icon="clear"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='4' y='4' width='16' height='16' rx='2'/%3E%3Cpath d='M8 12h8'/%3E%3C/svg%3E"); }
+    [data-icon="undo"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 4v6h6M4 10a8 8 0 1 1 0 6'/%3E%3C/svg%3E"); }
+    [data-icon="prev"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m15 5-7 7 7 7'/%3E%3C/svg%3E"); }
+    [data-icon="next"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 5 7 7-7 7'/%3E%3C/svg%3E"); }
+    [data-icon="up"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 12 7-7 7 7M12 5v14'/%3E%3C/svg%3E"); }
+    [data-icon="down"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 12 7 7 7-7M12 5v14'/%3E%3C/svg%3E"); }
+    [data-icon="info"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 11v6M12 7h.01'/%3E%3C/svg%3E"); }
+    [data-icon="logs"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 3h8l4 4v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h3Z'/%3E%3Cpath d='M8 11h8M8 15h8M8 7h4'/%3E%3C/svg%3E"); }
+    [data-icon="users"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2'/%3E%3Ccircle cx='9' cy='7' r='4'/%3E%3Cpath d='M19 8v6M22 11h-6'/%3E%3C/svg%3E"); }
+    [data-icon="models"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 5h7v6H3zM14 13h7v6h-7zM10 8h7v5M7 11v5h7'/%3E%3C/svg%3E"); }
+    [data-icon="sliders"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h7M15 7h5M4 17h3M11 17h9'/%3E%3Ccircle cx='13' cy='7' r='2'/%3E%3Ccircle cx='9' cy='17' r='2'/%3E%3C/svg%3E"); }
+    [data-icon="sun"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='4'/%3E%3Cpath d='M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4'/%3E%3C/svg%3E"); }
+    [data-icon="moon"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z'/%3E%3C/svg%3E"); }
+    [data-icon="monitor"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='12' rx='2'/%3E%3Cpath d='M8 20h8M12 16v4'/%3E%3C/svg%3E"); }
+    [data-icon="pause"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 5v14M16 5v14'/%3E%3C/svg%3E"); }
+    [data-icon="play"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m8 5 11 7-11 7Z'/%3E%3C/svg%3E"); }
+    [data-icon="stop"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='6' y='6' width='12' height='12' rx='1.5'/%3E%3C/svg%3E"); }
+    [data-icon="shield"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3 4 6v6c0 5 3.4 8 8 9 4.6-1 8-4 8-9V6Z'/%3E%3Cpath d='m9 12 2 2 4-4'/%3E%3C/svg%3E"); }
+    [data-icon="clock"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v5l3 2'/%3E%3C/svg%3E"); }
+    [data-icon="chevron"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 6 6 6-6 6'/%3E%3C/svg%3E"); }
+    [data-icon="warn"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 4 2.5 20h19Z'/%3E%3Cpath d='M12 10v4M12 17h.01'/%3E%3C/svg%3E"); }
+    [data-icon="download"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 4v11M7 11l5 5 5-5M5 20h14'/%3E%3C/svg%3E"); }
+    [data-icon="list"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01'/%3E%3C/svg%3E"); }
+
+    /* --- notices, tabs, panels ----------------------------------------- */
+    .notice { margin: 14px 0 0; padding: 10px 13px; border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--line)); border-left: 3px solid var(--warn); border-radius: 4px; background: color-mix(in srgb, var(--warn) 7%, var(--surface)); }
+    .tabs { display: flex; gap: 8px; margin: 6px 0 24px; overflow-x: auto; overflow-y: hidden; border-bottom: 1px solid color-mix(in srgb, var(--line) 65%, var(--bg)); }
+    .tab { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 8px; flex-shrink: 0; min-height: 44px; padding: 11px 16px; border: 0; border-radius: 10px 10px 0 0; background: transparent; color: var(--muted); font-weight: 600; transition: background .16s, color .16s; }
+    .tab:focus-visible { outline-offset: -4px; }
+    .tab:hover { color: var(--ink); background: color-mix(in srgb, var(--ink) 3%, var(--bg)); }
+    .tab[aria-selected="true"] { color: var(--ink); }
+    .tab[aria-selected="true"]::after { content: ""; position: absolute; bottom: 0; left: 12px; right: 12px; height: 2px; background: var(--ink); }
+    .panel { min-width: 0; padding: 22px; border: 1px solid color-mix(in srgb, var(--line) 70%, var(--surface)); border-radius: 12px; background: var(--surface); }
+    .panel + .panel { margin-top: 24px; }
+    .panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 12px; margin-bottom: 18px; }
     .panel-head h2, .panel-head h3 { min-width: 0; overflow-wrap: anywhere; }
     .panel-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
     .subhead { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; }
-    .subhead h3 { margin: 0; }
-    .hint { color: var(--muted); font-size: 12px; }
-    .form-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 12px; }
-    .form-head h3 { margin: 0; }
-    .stack { display: grid; gap: 12px; }
-    .inline { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
-    .field { display: grid; gap: 5px; min-width: 0; flex: 1 1 210px; }
-    .field > span { color: var(--muted); font-size: 12px; }
-    .control { width: 100%; min-height: 38px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); }
-    .control::placeholder { color: var(--muted); }
-    .button { min-height: 38px; padding: 7px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); font-weight: 600; white-space: nowrap; }
-    .button:hover:not(:disabled) { border-color: var(--accent); }
-    .button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
-    .button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); background: transparent; }
-    .button.compact { min-height: 34px; padding: 4px 10px; font-size: 12px; }
-    .check { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
-    .check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); flex: none; }
-    .effort-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    .effort-table th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 500; }
-    .effort-table th, .effort-table td { padding: 7px 0; border-bottom: 1px solid var(--line); }
-    .effort-table th:last-child, .effort-table td:last-child { width: 96px; text-align: right; }
-    .effort-table td:first-child { padding-right: 18px; }
-    .effort-table select { width: 100%; }
-    .effort-table .effort-empty { color: var(--muted); text-align: center; padding: 18px 0; border-bottom: none; }
-    .rows { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 8px; }
-    .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
-    .row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; min-width: 0; }
-    .row-main .name { font-weight: 600; overflow-wrap: anywhere; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+    .config-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; align-items: start; }
+    .config-grid > .wide { grid-column: 1 / -1; }
+    .config-side { display: grid; gap: 24px; min-width: 0; }
+    .config-side > .panel + .panel { margin-top: 0; }
+    .pagination, .pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 12px; margin-top: 14px; color: var(--muted); font-size: 12px; }
+    .pager-actions { display: flex; gap: 6px; }
+
+    /* --- dialogs -------------------------------------------------------- */
+    dialog { width: 100%; max-width: min(460px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; padding: 24px; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 20px 60px rgba(0, 0, 0, .22); background: var(--surface); color: var(--ink); }
+    dialog::backdrop { background: rgba(18, 29, 35, .52); }
+    dialog h2 { margin-bottom: 6px; }
+    dialog.dialog-wide { max-width: min(760px, calc(100vw - 32px)); }
+    .dialog-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px 12px; margin-bottom: 14px; }
+    .dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+    #errorRulesDialog .dialog-actions { position: sticky; bottom: -24px; margin: 14px 0 -10px; padding: 14px 0; border-top: 1px solid var(--line); background: var(--surface); }
+    #errorRulesState { white-space: pre-wrap; }
+    .guide { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .guide section { padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
+    .guide h3 { margin-bottom: 8px; }
+    .guide p { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+
+    /* --- shared rows and metrics --------------------------------------- */
+    .rows { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; min-width: 0; }
+    .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; padding: 12px 14px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--inset-bg); }
+    .row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+    .row-main .name { font-weight: 650; overflow-wrap: anywhere; }
     .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-    .row-detail { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; }
-    .account-editor { border: 1px solid var(--line); border-radius: 9px; padding: 9px 12px; background: var(--surface); }
-    .account-editor > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
-    .account-editor[open] > summary { margin-bottom: 10px; }
-    .account-row { display: block; padding: 0; overflow: hidden; }
-    .account-row.paused { border-color: color-mix(in srgb, var(--danger) 42%, var(--line)); background: color-mix(in srgb, var(--danger) 6%, var(--surface)); }
-    .account-row.restricted { border-color: color-mix(in srgb, #b54708 36%, var(--line)); }
-    .account-summary { display: grid; grid-template-columns: minmax(220px, .95fr) minmax(0, 2fr) 18px; gap: 12px 24px; align-items: center; padding: 14px 18px; cursor: pointer; list-style: none; }
-    .account-summary::-webkit-details-marker { display: none; }
-    .account-summary:hover { background: color-mix(in srgb, var(--accent) 3%, transparent); }
-    .account-identity { display: grid; gap: 5px; min-width: 0; }
-    .account-title { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px; min-width: 0; }
-    .account-title .name { font-size: 14px; font-weight: 700; overflow-wrap: anywhere; }
-    .account-identity .badge { border-radius: 4px; min-height: 20px; padding: 0 5px; font-size: 11px; }
-    .account-id { color: var(--muted); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .account-timing, .account-quota-meta { color: var(--muted); font-size: 11.5px; line-height: 1.5; overflow-wrap: anywhere; }
-    .account-timing { display: flex; flex-wrap: wrap; gap: 2px 10px; }
-    .account-pause-time { color: var(--danger); font-weight: 600; }
-    .account-quota-meta.error { color: var(--danger); }
-    .account-quota-meta[data-quota-status="partial"], .account-quota-meta[data-quota-status="stale"] { color: #a87816; }
-    .account-usage { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); gap: 10px 20px; align-items: start; min-width: 0; }
-    .account-usage .usage-value { font-size: 12px; font-weight: 500; }
-    .account-usage .usage-sub { font-size: 11px; }
-    .account-chevron { color: var(--muted); font-size: 20px; text-align: right; transition: transform .16s; }
-    .account-row[open] > summary .account-chevron { transform: rotate(90deg); }
-    .account-body { padding: 0 18px 14px; border-top: 1px solid var(--line); }
-    .account-body .row-actions { padding: 10px 0; justify-content: flex-end; }
-    .account-body .quota { padding-top: 10px; }
-    .account-load-state { margin: 8px 0; font-size: 12px; color: var(--muted); min-height: 18px; }
-    .schedule-detail { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 12px; padding-bottom: 8px; overflow-wrap: anywhere; }
-    .schedule-detail .mono { color: var(--ink); }
-    .account-group-head { margin-top: 4px; padding: 2px 2px 0; color: var(--danger); font-size: 12.5px; font-weight: 700; }
-    .account-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; }
-    .account-tools .search { flex: 1 1 240px; width: auto; }
-    .account-total { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 20px; margin-top: 12px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
-    .account-total .hint { margin: 0; }
-    .account-total .usage { min-width: 130px; }
+    .row-detail { flex: 1 1 100%; min-width: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 12px; }
+    .fact { display: grid; gap: 3px; min-width: 0; padding: 14px 16px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--inset-bg); }
+    .fact-label { color: var(--muted); font-size: 11px; }
+    .fact-value { font-weight: 700; overflow-wrap: anywhere; }
+    .fact.stat .fact-value { font-size: 17px; font-variant-numeric: tabular-nums; }
+    .fact-note { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .meter { display: block; width: 100%; height: 6px; border-radius: 4px; background: color-mix(in srgb, var(--line) 65%, var(--surface)); overflow: hidden; }
+    .meter > span { display: block; height: 100%; border-radius: inherit; background: var(--success); }
+    .meter.warn > span { background: var(--meter-warn); }
+    .meter.exhausted > span { background: var(--danger); }
     .usage { display: grid; gap: 5px; min-width: 0; align-content: start; }
     .usage-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 12px; }
     .usage-label { color: var(--muted); overflow-wrap: anywhere; }
-    .usage-percent { font-weight: 700; color: var(--ink); }
-    .usage-value { font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }
-    .usage-sub { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
-    .pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; }
-    .pager-actions { display: flex; gap: 6px; }
-    .toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
-    .toolbar .field { flex: 1 1 180px; }
-    .search { flex: 1 1 220px; width: auto; }
-    .upstream-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-    .upstream-tools .search { flex: 1 1 180px; }
-    #upstreamList { grid-template-columns: repeat(auto-fill, minmax(min(100%, 270px), 1fr)); }
-    .mapping-list { display: grid; gap: 8px; }
-    .mapping-row { display: grid; grid-template-columns: minmax(0, 1fr) 18px minmax(0, 1fr) auto; align-items: end; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
-    .mapping-row .field { flex: none; }
-    .mapping-row .arrow { align-self: end; color: var(--muted); padding-bottom: 10px; text-align: center; }
-    .mapping-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-    .mapping-status .badge.warn { background: color-mix(in srgb, #b54708 16%, var(--surface)); color: #b54708; }
-    :root[data-theme="dark"] .mapping-status .badge.warn { color: #fec84b; }
-    @media (prefers-color-scheme: dark) {
-      :root[data-theme="system"] .mapping-status .badge.warn { color: #fec84b; }
-    }
-    .upstream { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 6px 10px; }
-    .upstream-detail { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 9px; }
-    .upstream-detail .muted { font-size: 12px; }
-    .upstream-coverage { grid-column: 2 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
-    .upstream-coverage .small { overflow-wrap: anywhere; }
-    .billing { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--surface-2); }
+    .usage-percent { font-weight: 700; font-variant-numeric: tabular-nums; }
+    .usage.good .usage-percent { color: var(--success); }
+    .usage.warn .usage-percent { color: var(--warn); }
+    .usage.exhausted .usage-percent { color: var(--danger); }
+    .usage-value { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .usage-sub { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .usage-reset.expired { color: var(--warn); }
+
+    /* --- credentials ---------------------------------------------------- */
+    .account-editor { margin-bottom: 14px; padding: 12px 14px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--inset-bg); }
+    .account-editor > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+    .account-editor[open] > summary { margin-bottom: 12px; }
+    .form-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 12px; }
+    .billing { padding: 10px 12px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--surface); }
     .billing > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
     .billing[open] > summary { margin-bottom: 6px; }
-    .billing .inline { margin-top: 8px; }
-    .billing .check { margin-top: 8px; background: var(--surface); }
-    .quota { flex: 1 1 100%; min-width: 0; display: grid; gap: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+    .billing .inline, .billing .check { margin-top: 10px; }
+    .account-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 14px; }
+    .account-total { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 28px; margin-bottom: 14px; padding: 12px 16px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--inset-bg); }
+    .account-total .usage { min-width: 150px; }
+    .account-total .usage-head { justify-content: flex-start; gap: 10px; }
+    .account-load-state { min-height: 18px; margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+    #accountList { gap: 14px; }
+    .account-row { display: block; padding: 0; overflow: hidden; border-radius: 9px; }
+    .account-row.paused { border-color: color-mix(in srgb, #dc5252 45%, var(--line)); background: color-mix(in srgb, #dc5252 9%, var(--surface)); }
+    .account-row.restricted { border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
+    .account-summary { display: grid; grid-template-columns: minmax(200px, .9fr) minmax(0, 2fr) 18px; gap: 10px 24px; align-items: center; padding: 14px 18px; cursor: pointer; list-style: none; }
+    .account-summary::-webkit-details-marker { display: none; }
+    .account-summary:hover { background: color-mix(in srgb, var(--ink) 3%, transparent); }
+    .account-identity { display: grid; gap: 5px; min-width: 0; }
+    .account-title { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px; min-width: 0; }
+    .account-title .name { font-weight: 650; overflow-wrap: anywhere; }
+    .account-id { color: var(--muted); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .account-timing, .account-quota-meta { color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+    .account-timing { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+    .account-pause-time { color: var(--warn); font-weight: 600; }
+    .account-quota-meta.error { color: var(--danger); }
+    .account-quota-meta[data-quota-status="partial"], .account-quota-meta[data-quota-status="stale"] { color: var(--warn); }
+    .account-usage { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); gap: 10px 20px; align-items: start; min-width: 0; }
+    .account-usage .usage-value { font-size: 12px; font-weight: 500; }
+    .account-usage .usage-sub { font-size: 10px; }
+    .account-chevron { color: var(--muted); font-size: 18px; line-height: 1; text-align: right; transition: transform .16s; }
+    .account-row[open] > summary .account-chevron { transform: rotate(90deg); }
+    .account-body { padding: 0 18px 14px; border-top: 1px solid var(--inset-line); }
+    .account-body .row-actions { justify-content: flex-end; padding: 12px 0; }
+    .account-body .row-actions .button { min-height: 28px; font-size: 11px; }
+    .schedule-detail { display: flex; flex-wrap: wrap; gap: 4px 14px; padding-bottom: 8px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .schedule-detail .mono { color: var(--ink); }
+    .account-group-head { margin-top: 4px; padding: 2px 2px 0; color: var(--danger); font-size: 12px; font-weight: 700; }
+    .quota { display: grid; gap: 8px; min-width: 0; padding-top: 12px; border-top: 1px solid var(--inset-line); }
     .quota-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
     .quota-head .hint { margin-left: auto; }
-    .quota-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 8px; align-items: start; }
-    .quota-card { border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; background: var(--surface-2); min-width: 0; display: grid; gap: 6px; justify-items: start; align-content: start; }
-    .quota-card h4 { margin: 0; font-size: 12.5px; color: var(--muted); font-weight: 600; }
-    .quota-value { font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
-    .quota-meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .quota-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 10px; align-items: start; }
+    .quota-card { display: grid; gap: 6px; justify-items: start; align-content: start; min-width: 0; padding: 12px 14px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--surface); }
+    .quota-card h4 { font-size: 12px; color: var(--muted); font-weight: 600; }
+    .quota-value { font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .quota-meta, .quota-note, .quota-forecast { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .quota-forecast.warn { color: var(--warn); }
     .quota-window { display: grid; gap: 4px; width: 100%; justify-items: start; }
-    .quota-window + .quota-window { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+    .quota-window + .quota-window { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--inset-line); }
     .quota-window-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 10px; }
-    .quota-window-title { font-weight: 600; font-size: 12.5px; }
-    .meter { display: block; width: 100%; height: 6px; border-radius: 999px; background: color-mix(in srgb, var(--ink) 12%, var(--surface)); overflow: hidden; }
-    .meter > span { display: block; height: 100%; background: var(--good); }
-    .meter.warn > span { background: #c79528; }
-    .meter.exhausted > span { background: var(--danger); }
-    .usage.exhausted .usage-percent { color: var(--danger); }
-    .usage.warn .usage-percent { color: #a87816; }
-    .usage.good .usage-percent { color: var(--good); }
-    .usage-reset.expired { color: #a87816; }
-    .quota-forecast { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+    .quota-window-title { font-weight: 600; font-size: 12px; }
     .quota-trend { margin-top: 8px; }
     .quota-trend > summary { cursor: pointer; font-size: 12px; color: var(--muted); }
-    .quota-forecast.warn { color: #b54708; }
-    :root[data-theme="dark"] .quota-forecast.warn { color: #fec84b; }
-    @media (prefers-color-scheme: dark) {
-      :root[data-theme="system"] .quota-forecast.warn { color: #fec84b; }
-    }
-    .quota-note { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
+    /* --- models --------------------------------------------------------- */
+    .upstream-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    #upstreamList { gap: 0; max-height: min(46vh, 380px); overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; }
+    #upstreamList > .empty { padding: 22px 12px; }
+    .upstream { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 6px 12px; padding: 10px 12px; border: 0; border-radius: 0; background: transparent; }
+    .upstream + .upstream { border-top: 1px solid var(--line); }
+    .upstream:hover { background: var(--surface-2); }
+    .upstream input[type="checkbox"] { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+    .upstream-detail { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 9px; min-width: 0; }
     .upstream .mono { overflow-wrap: anywhere; }
-    .upstream .muted { font-size: 12px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12.5px; }
-    .muted { color: var(--muted); }
-    .empty { padding: 18px 12px; text-align: center; color: var(--muted); }
-    .state { margin-top: 10px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
-    .state.error { color: var(--danger); }
-    .state.ok { color: var(--good); }
-    .url { overflow-wrap: anywhere; }
-    .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
-    .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 16px; padding: 4px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; }
-    .tab { flex: 1 1 130px; min-height: 36px; padding: 6px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); font-weight: 600; }
-    .tab:hover { color: var(--ink); }
-    .tab[aria-selected="true"] { background: var(--surface); border-color: var(--line); color: var(--ink); }
-    .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 8px; }
-    .fact { display: grid; gap: 2px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); min-width: 0; }
-    .fact-label { color: var(--muted); font-size: 12px; }
-    .fact-value { font-weight: 600; overflow-wrap: anywhere; }
-    #logsPanel { --log-columns: minmax(94px, .85fr) minmax(132px, 1.55fr) minmax(80px, .75fr) minmax(100px, .9fr) minmax(92px, 1fr) minmax(68px, .6fr) minmax(92px, .85fr) 16px; }
-    .count { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
-    .fact.stat .fact-value { font-size: 17px; font-variant-numeric: tabular-nums; }
-    .fact-note { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+    .upstream .muted, .upstream-detail .muted { font-size: 12px; }
+    .upstream-coverage { grid-column: 2 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
+    .upstream-coverage .small { overflow-wrap: anywhere; }
+    #mappingList { gap: 10px; }
+    .mapping-row { display: grid; grid-template-columns: minmax(0, 1fr) 18px minmax(0, 1fr) auto; align-items: end; gap: 8px; padding: 12px 14px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--inset-bg); }
+    .mapping-row .field { flex: none; }
+    .mapping-row .arrow { align-self: end; padding-bottom: 10px; color: var(--muted); text-align: center; }
+    .mapping-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+    .effort-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }
+    .effort-table th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 500; }
+    .effort-table th, .effort-table td { padding: 7px 0; border-bottom: 1px solid var(--line); }
+    .effort-table th:last-child { width: 62px; }
+    .effort-table td:first-child { position: relative; padding-right: 26px; }
+    .effort-table td:first-child:not([colspan])::after { content: "→"; position: absolute; right: 7px; top: 50%; transform: translateY(-50%); color: var(--muted); }
+    .effort-table td:last-child:not([colspan]) { text-align: right; }
+    .effort-table select { width: 100%; }
+    .effort-table .button { min-height: 32px; padding: 4px 9px; font-size: 12px; }
+    .effort-table .effort-empty { padding: 20px 0; border-bottom: 0; color: var(--muted); text-align: center; }
+
+    /* --- request logs --------------------------------------------------- */
+    #logsPanel { --log-columns: minmax(94px, .8fr) minmax(150px, 1.55fr) minmax(84px, .75fr) minmax(104px, .9fr) minmax(92px, .95fr) minmax(70px, .6fr) minmax(96px, .9fr) 16px; }
+    .log-controls { padding: 16px; margin-bottom: 16px; }
+    .log-controls .toolbar { margin-bottom: 12px; }
+    .log-controls .toolbar select.control { width: auto; flex: 0 1 150px; }
+    #requestStats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     .stats-scope { grid-column: 1 / -1; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .stats-models { margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; background: var(--surface); }
-    .stats-models > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
-    .stats-models[open] > summary { margin-bottom: 8px; }
-    .log-head { display: grid; grid-template-columns: var(--log-columns); gap: 6px; padding: 0 12px 6px; color: var(--muted); font-size: 11px; font-weight: 700; }
-    .log-list { display: grid; gap: 6px; margin-top: 12px; }
-    .log-entry { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); overflow: hidden; }
-    .log-entry.failed { border-color: color-mix(in srgb, var(--danger) 38%, var(--line)); background: color-mix(in srgb, var(--danger) 5%, var(--surface)); }
+    .stats-models { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--inset-bg); }
+    .stats-models > summary { cursor: pointer; font-weight: 600; font-size: 12px; }
+    .stats-models[open] > summary { margin-bottom: 10px; }
+    .log-head { display: grid; grid-template-columns: var(--log-columns); gap: 6px; padding: 0 13px 7px; color: var(--muted); font-size: 11px; font-weight: 700; }
+    .log-list { display: grid; gap: 6px; }
+    .log-entry { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); overflow: hidden; }
+    .log-entry.failed { border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); }
+    .log-entry[open] { background: var(--inset-bg); box-shadow: inset 3px 0 var(--accent); }
     .log-entry > summary { list-style: none; cursor: pointer; }
     .log-entry > summary::-webkit-details-marker { display: none; }
-    .log-entry[open] > summary { background: color-mix(in srgb, var(--accent) 5%, var(--surface)); }
-    .log-main { display: grid; grid-template-columns: var(--log-columns); gap: 6px; padding: 10px 12px; align-items: center; font-size: 12.5px; }
-    .log-main:hover { background: color-mix(in srgb, var(--accent) 4%, var(--surface)); }
-    .log-cell { display: grid; gap: 2px; min-width: 0; }
-    .log-primary { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .log-sub { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+    .log-main { display: grid; grid-template-columns: var(--log-columns); gap: 6px; min-height: 64px; padding: 10px 12px; align-items: center; font-size: 12px; line-height: 1.4; }
+    .log-main:hover { background: color-mix(in srgb, var(--accent) 3%, var(--surface)); }
+    .log-cell { display: grid; gap: 3px; justify-items: start; min-width: 0; }
+    .log-primary { max-width: 100%; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .log-sub { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
     .log-cell-label { display: none; color: var(--muted); font-size: 11px; }
-    .log-chevron { color: var(--muted); font-size: 17px; line-height: 1; text-align: right; transition: transform .16s; }
+    .log-chevron { color: var(--muted); font-size: 18px; line-height: 1; text-align: right; transition: transform .16s; }
     details[open] > summary .log-chevron { transform: rotate(90deg); }
-    .log-detail { border-top: 1px solid var(--line); padding: 10px 12px; }
-    .log-detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 168px), 1fr)); gap: 8px 14px; }
-    .log-datum-label { color: var(--muted); font-size: 11px; }
-    .log-datum-value { font-size: 12.5px; overflow-wrap: anywhere; }
+    .log-detail { padding: 15px 18px; border-top: 1px solid var(--line); }
+    .log-detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 12px 20px; }
+    .log-datum-label { color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+    .log-datum-value { font-size: 12px; overflow-wrap: anywhere; }
     .log-datum-value.error { color: var(--danger); }
-    .toolbar .field.narrow { flex: 0 1 150px; }
-    .read-only { min-width: 0; border: 1px dashed var(--line); border-radius: 8px; padding: 10px 12px; background: var(--surface-2); }
-    dialog { width: min(920px, 94vw); max-height: 88vh; overflow: auto; border: 1px solid var(--line); border-radius: 12px; padding: 16px; background: var(--surface); color: var(--text); }
-    dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
-    .dialog-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; justify-content: space-between; }
-    .dialog-head h2 { margin: 0; }
-    .error-rule-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-width: 0; }
-    .error-rule-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
-    .error-rule-fields { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
-    .error-rule-condition { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-top: 8px; min-width: 0; }
-    .error-rule-condition-text { min-width: 0; width: 100%; font-family: var(--mono, monospace); overflow-wrap: anywhere; }
-    .error-rule-description { margin: 6px 0 0; overflow-wrap: anywhere; }
+
+    /* --- error rules ---------------------------------------------------- */
+    #errorRulesList { gap: 12px; }
+    .error-rule-card { display: grid; gap: 10px; min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 8px; }
+    .error-rule-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
     .error-rule-name { overflow-wrap: anywhere; }
-    #errorRulesState { white-space: pre-wrap; }
-    @media (max-width: 760px) {
-      .account-summary { grid-template-columns: minmax(0, 1fr) 18px; gap: 10px; padding: 12px; }
+    .error-rule-description { color: var(--muted); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+    .error-rule-fields { display: flex; flex-wrap: wrap; gap: 10px; }
+    .error-rule-condition { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; min-width: 0; }
+    .error-rule-condition-text { width: 100%; min-width: 0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+
+    @media (max-width: 1080px) {
+      .log-head { display: none; }
+      .log-main { grid-template-columns: repeat(4, minmax(0, 1fr)) 18px; gap: 8px; }
+      .log-cell-label { display: block; }
+      .log-primary { white-space: normal; }
+      .log-main .log-cell:nth-child(n+5) { grid-row: 2; }
+      .log-main .log-cell:nth-child(5) { grid-column: 1; }
+      .log-main .log-cell:nth-child(6) { grid-column: 2; }
+      .log-main .log-cell:nth-child(7) { grid-column: 3 / 5; }
+      .log-main .log-chevron { grid-column: 5; grid-row: 1; }
+    }
+    @media (max-width: 860px) {
+      .config-grid { grid-template-columns: minmax(0, 1fr); }
+      .account-summary { grid-template-columns: minmax(0, 1fr) 18px; gap: 12px; }
       .account-identity { grid-column: 1; }
-      .account-usage { grid-column: 1 / -1; grid-row: 2; grid-template-columns: repeat(auto-fit, minmax(min(100%, 135px), 1fr)); gap: 10px 14px; }
-      .account-total .usage { flex: 1 1 42%; min-width: 0; }
+      .account-usage { grid-column: 1 / -1; grid-row: 2; }
       .account-chevron { grid-column: 2; grid-row: 1; }
-      .account-body { padding: 0 12px 12px; }
+      #requestStats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .guide { grid-template-columns: minmax(0, 1fr); }
+    }
+    @media (max-width: 640px) {
+      .panel { padding: 16px; }
+      .tab { padding: 8px 12px; }
+      .count { margin-left: 0; }
+      .account-summary { padding: 14px; }
+      .account-body { padding: 0 14px 12px; }
       .account-body .row-actions { justify-content: flex-start; }
-      .split { grid-template-columns: minmax(0, 1fr); }
+      .account-total .usage { flex: 1 1 42%; min-width: 0; }
       .mapping-row { grid-template-columns: minmax(0, 1fr); }
       .mapping-row .arrow { display: none; }
       .mapping-row .button { justify-self: start; }
-      .panel { padding: 14px; }
-      .shell { padding: 16px 12px 36px; }
-      .tabs { gap: 4px; padding: 3px; }
-      .tab { flex: 1 1 120px; padding: 6px 8px; }
-      .log-head { display: none; }
-      .log-main { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 18px; gap: 8px; }
-      .log-cell-label { display: block; }
-      .log-primary { white-space: normal; overflow: visible; }
-      .log-main .log-cell:nth-child(1) { grid-column: 1; grid-row: 1; }
-      .log-main .log-cell:nth-child(4) { grid-column: 2; grid-row: 1; }
-      .log-main .log-cell:nth-child(2) { grid-column: 1 / 3; grid-row: 2; }
-      .log-main .log-cell:nth-child(3) { grid-column: 1; grid-row: 3; }
-      .log-main .log-cell:nth-child(5) { grid-column: 2; grid-row: 3; }
-      .log-main .log-cell:nth-child(6) { grid-column: 1; grid-row: 4; }
-      .log-main .log-cell:nth-child(7) { grid-column: 2; grid-row: 4; }
+      .log-main { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 18px; gap: 10px; padding: 13px; }
+      .log-main .log-cell:nth-child(n) { grid-row: auto; grid-column: auto; }
+      .log-main .log-cell:nth-child(2) { grid-column: 1 / 3; }
+      .log-main .log-cell:nth-child(7) { grid-column: 1 / 3; }
       .log-main .log-chevron { grid-column: 3; grid-row: 1; }
-      .count { margin-left: 0; }
+      .pagination, .pager { justify-content: space-between; }
+      .topbar-summary { display: none; }
     }
   </style>
 </head>
@@ -313,454 +410,432 @@
   <main class="shell">
     <div class="topbar">
       <div class="brand">
-        <span class="mark" aria-hidden="true"></span>
-        <div>
+        <span class="brandmark" aria-hidden="true">OD</span>
+        <div class="brand-text">
           <h1>OpenDesign Bridge</h1>
-          <div class="version" id="version">版本 --</div>
+          <span class="version" id="version">版本 --</span>
         </div>
       </div>
-      <span class="badge" id="authBadge">未验证</span>
-      <div class="panel-actions" style="margin-left: auto;">
-        <button class="button compact" id="themeToggle" type="button" aria-label="切换颜色主题：跟随系统" title="颜色主题：跟随系统、浅色、深色">主题：跟随系统</button>
+      <div class="topbar-tools">
+        <span class="topbar-summary" id="topbarSummary"></span>
+        <span class="badge" id="authBadge">未验证</span>
+        <button class="button compact ghost" id="themeToggle" type="button" aria-label="切换颜色主题：跟随系统" title="颜色主题：跟随系统、浅色、深色" data-icon="monitor">跟随系统</button>
+        <button class="button compact" id="openAuth" type="button" aria-haspopup="dialog" aria-controls="authDialog" data-icon="key">管理密钥</button>
       </div>
     </div>
-    <p class="lead">
-      通过 CPA 接入 OpenDesign Cloud 模型 API。默认上游地址为
-      <code class="url" id="baseUrl">https://amr-link.open-design.ai/v1</code>。
-      账户密钥只保存在 CPA 的凭据目录，本页不会持久化 OpenDesign API key。
-    </p>
 
-    <section class="panel" id="authPanel" aria-labelledby="authTitle">
-      <div class="panel-head">
-        <div>
-          <h2 id="authTitle">管理密钥</h2>
-          <p class="hint">用于访问 CPA 的 resource console 管理接口。可复用同源 CPA 已保存的登录，也可在下方输入当前入口的管理密钥；验证通过后才会保存。</p>
-        </div>
-        <div class="panel-actions">
-          <button class="button compact" id="authToggle" type="button" aria-expanded="true" aria-controls="authBody">收起</button>
-        </div>
-      </div>
-      <div class="stack" id="authBody">
-        <form class="stack" id="authForm" autocomplete="off">
-          <div class="inline">
-            <label class="field">
-              <span>请求头</span>
-              <select class="control" id="authType">
-                <option value="bearer">Authorization: Bearer</option>
-                <option value="x-management-key">X-Management-Key</option>
-              </select>
-            </label>
-            <label class="field">
-              <span>管理密钥</span>
-              <input class="control" id="managementKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="当前 CPA 入口的管理密钥">
-            </label>
-            <button class="button primary" id="authSubmit" type="submit">验证并进入</button>
-            <button class="button" id="authClear" type="button">清除本页密钥</button>
-          </div>
-          <label class="check" style="max-width: 360px;">
-            <input id="rememberAuth" type="checkbox">
-            在此浏览器记住管理密钥
-          </label>
-          <p class="state" id="authState" role="status" aria-live="polite" hidden></p>
-        </form>
-      </div>
-    </section>
-
-    <!-- Reserved extension slot: future per-account status can render inside each row without moving the action buttons. -->
     <nav class="tabs" role="tablist" aria-label="OpenDesign 管理分区">
-      <button class="tab" id="tabOverview" type="button" role="tab" aria-selected="true" aria-controls="overviewPanel" data-tab="overview">概览</button>
-      <button class="tab" id="tabCredentials" type="button" role="tab" aria-selected="false" aria-controls="credentialsPanel" data-tab="credentials" tabindex="-1">凭据 · 额度</button>
-      <button class="tab" id="tabModels" type="button" role="tab" aria-selected="false" aria-controls="modelsTab" data-tab="models" tabindex="-1">模型映射 · 覆盖</button>
-      <button class="tab" id="tabLogs" type="button" role="tab" aria-selected="false" aria-controls="logsPanel" data-tab="logs" tabindex="-1">请求日志</button>
-      <button class="tab" id="tabConfig" type="button" role="tab" aria-selected="false" aria-controls="configPanel" data-tab="config" tabindex="-1">代理池 · 配置</button>
+      <button class="tab" id="tabLogs" type="button" role="tab" aria-selected="true" aria-controls="logsPanel" data-tab="logs" data-icon="logs">请求日志</button>
+      <button class="tab" id="tabCredentials" type="button" role="tab" aria-selected="false" aria-controls="credentialsPanel" data-tab="credentials" tabindex="-1" data-icon="users">凭据管理</button>
+      <button class="tab" id="tabModels" type="button" role="tab" aria-selected="false" aria-controls="modelsTab" data-tab="models" tabindex="-1" data-icon="models">模型映射</button>
+      <button class="tab" id="tabConfig" type="button" role="tab" aria-selected="false" aria-controls="configPanel" data-tab="config" tabindex="-1" data-icon="sliders">配置概览</button>
     </nav>
 
-    <section class="tabpanel" id="overviewPanel" role="tabpanel" aria-labelledby="tabOverview">
-      <section class="panel" aria-labelledby="overviewTitle">
-        <div class="panel-head">
-          <div>
-            <h2 id="overviewTitle">运行概览</h2>
-            <p class="hint">只汇总管理接口已经返回的账户与已保存映射数量。切换标签页、打开日志或配置都不会自动发起请求。</p>
-          </div>
-          <span class="badge" id="overviewBadge">未验证</span>
-        </div>
-        <div class="facts" id="overviewFacts" aria-live="polite"></div>
-        <p class="hint" style="margin-top: 12px;">账户密钥只保存在 CPA 凭据目录，本页不回显。请求日志、配置、runtime 与模型测试都由你手动触发。</p>
-      </section>
-    </section>
-
-    <section class="tabpanel" id="credentialsPanel" role="tabpanel" aria-labelledby="tabCredentials" hidden>
-      <p class="empty" id="credentialsLocked">需要先验证管理密钥，才能查看账户和额度。</p>
-    <section class="panel" id="accountsPanel" aria-labelledby="accountsTitle" hidden>
-      <div class="panel-head">
-        <div>
-          <h2 id="accountsTitle">账户</h2>
-          <p class="hint">点击卡片展开操作与详情。额度按顺序查询；重置时间来自官方数据，不代表保证恢复。CPA 冷却只读，清除请到 CPA 凭据页。</p>
-        </div>
-        <div class="panel-actions">
-          <button class="button compact" id="refreshAccountQuotas" type="button" title="按列表顺序逐个刷新额度，不并发；60 秒内不重复查询上游">刷新额度</button>
-          <button class="button compact" id="refreshAccountStatus" type="button" title="重新读取账户状态，不发起上游额度查询">刷新状态</button>
-          <button class="button compact" id="openErrorRules" type="button" title="配置 CPA 的重试调度：命中规则后是停止还是继续换号，以及是否冷却失败的账号">错误规则</button>
-          <span class="badge" id="accountCount">0 个账户</span>
-          <button class="badge danger" id="accountPausedCount" type="button" title="跳到额度暂停账户" hidden>0 个额度暂停</button>
-        </div>
-      </div>
-      <p class="state" id="accountRefreshState" role="status" aria-live="polite" hidden></p>
-      <details class="account-editor" id="accountEditor">
-        <summary id="accountEditorSummary">添加账户</summary>
-      <form class="stack" id="accountForm" autocomplete="off">
-        <div class="form-head">
-          <h3 id="accountFormTitle">添加账户</h3>
-          <span class="hint" id="accountFormHint">填写标签和 API key 后添加。</span>
-        </div>
-        <div class="inline">
-          <label class="field">
-            <span>标签</span>
-            <input class="control" id="accountLabel" maxlength="100" placeholder="例如：主账户" autocomplete="off">
-          </label>
-          <label class="field">
-            <span>OpenDesign API key</span>
-            <input class="control" id="accountKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign Cloud API key">
-          </label>
-          <button class="button primary" id="accountSubmit" type="submit">添加账户</button>
-          <button class="button" id="accountCancel" type="button" hidden>取消编辑</button>
-        </div>
-        <details class="billing" id="billingFields">
-          <summary>可选：额度查询（官方 control key）</summary>
-          <p class="hint">
-            填写同一 OpenDesign 账号的额度授权。只填 controlKey 可查钱包；再填 Workspace ID 可查套餐窗口。
-            新增账户时两项均可留空；已保存的 controlKey 不会回显。
-          </p>
-          <div class="inline">
-            <label class="field">
-              <span>官方 controlKey（可选，仅查询额度）</span>
-              <input class="control" id="accountControlKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign 官方 control key">
-            </label>
-            <label class="field">
-              <span>Workspace ID（可选，查询套餐时填写）</span>
-              <input class="control mono" id="accountWorkspaceID" autocomplete="off" spellcheck="false" placeholder="用于查询套餐额度">
-            </label>
-            <label class="field">
-              <span>套餐额度换算（可选，credits / $1）</span>
-              <input class="control mono" id="accountCreditsPerUSD" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="例如 5000；留空则只显示 credits">
-            </label>
-          </div>
-          <label class="check" id="accountClearBillingRow" hidden>
-            <input id="accountClearBilling" type="checkbox">
-            清除已保存的额度授权（保留推理 Key）
-          </label>
-          <p class="hint">编辑时留空表示保留原值；勾选后保存可清除额度授权，推理 Key 保留。</p>
-        </details>
-        <p class="state" id="accountState" role="status" aria-live="polite" hidden></p>
-      </form>
-      </details>
-      <div class="account-tools">
-        <input class="control search" id="accountSearch" type="search" autocomplete="off" spellcheck="false" placeholder="搜索账户名称或 ID">
-        <span class="hint" id="accountFilterInfo"></span>
-      </div>
-      <div class="account-total" id="accountQuotaTotal" role="status" aria-live="polite"></div>
-      <p class="account-load-state" id="quotaLoadState" role="status" aria-live="polite" hidden></p>
-      <div class="rows" id="accountList" aria-live="polite"></div>
-      <div class="pager" id="accountPager" hidden>
-        <span class="hint" id="accountPageInfo"></span>
-        <div class="pager-actions">
-          <button class="button compact" id="accountsPrev" type="button" disabled>上一页</button>
-          <button class="button compact" id="accountsNext" type="button" disabled>下一页</button>
-        </div>
-      </div>
-    </section>
-    </section>
-
-    <section class="tabpanel" id="modelsTab" role="tabpanel" aria-labelledby="tabModels" hidden>
-      <p class="empty" id="modelsLocked">需要先验证管理密钥，才能读取上游模型并维护映射。</p>
-    <section class="panel" id="modelsPanel" aria-labelledby="modelsTitle" hidden>
-      <div class="panel-head">
-        <div>
-          <h2 id="modelsTitle">模型映射</h2>
-          <p class="hint">选择一个账户读取 OpenDesign 模型列表，勾选要暴露的模型，设置对外别名和上游 ID 后保存。</p>
-        </div>
-      </div>
-      <div class="stack">
-        <div class="subhead">
-          <h3>上游模型</h3>
-          <span class="hint">来自 OpenDesign <span class="mono">GET /models</span></span>
-        </div>
+    <section class="tabpanel" id="logsPanel" role="tabpanel" aria-labelledby="tabLogs">
+      <div class="panel log-controls">
         <div class="toolbar">
-          <label class="field">
-            <span>账户</span>
-            <select class="control" id="modelCredential">
-              <option value="" disabled selected>请选择账户</option>
-            </select>
-          </label>
-          <button class="button compact" id="fetchModels" type="button">获取模型列表</button>
-        </div>
-        <p class="state" id="modelState" role="status" aria-live="polite" hidden></p>
-        <div class="upstream-tools">
-          <input class="control search" id="upstreamSearch" type="search" placeholder="搜索上游模型或供应商" aria-label="搜索上游模型" autocomplete="off">
-          <button class="button compact" id="selectVisible" type="button">全选当前可见</button>
-          <button class="button compact" id="clearVisible" type="button">取消当前可见</button>
-          <span class="hint" id="upstreamCount">0 个上游模型</span>
-        </div>
-        <div class="rows" id="upstreamList" aria-live="polite">
-          <p class="empty">选择账户后点击「获取模型列表」。已停用账户不能拉取。</p>
-        </div>
-
-        <div class="subhead" style="margin-top: 6px;">
-          <h3>对外模型</h3>
-          <div class="panel-actions">
-            <span class="badge warn" id="mappingDirty" hidden>未保存</span>
-            <button class="button compact" id="revertMappings" type="button" hidden>还原为已保存</button>
-            <button class="button compact" id="addMapping" type="button">手动添加一行</button>
-          </div>
-        </div>
-        <div class="rows" id="mappingList" aria-live="polite">
-          <p class="empty">还没有模型映射。</p>
-        </div>
-        <div class="mapping-status">
-          <button class="button primary" id="saveModels" type="button">保存模型映射</button>
-          <span class="hint" id="mappingHint">勾选上游模型会自动生成 <span class="mono">open-design-</span> 前缀别名，可再手动修改。</span>
-        </div>
-        <!-- Reserved extension slot: future status blocks can sit beside the save action. -->
-      </div>
-    </section>
-
-    <section class="panel" id="reasoningPanel" aria-labelledby="reasoningTitle">
-      <div class="panel-head">
-        <div>
-          <h2 id="reasoningTitle">思考强度映射</h2>
-          <p class="hint">请求传入 → 发往上游。只改写顶层 <span class="mono">reasoning_effort</span>；未添加规则的强度直接透传，目标选「未设置」会移除该字段。已有 <span class="mono">thinking</span> / <span class="mono">reasoning</span> 且未传强度时保留原策略。每个模型独立配置，默认关闭。</p>
-        </div>
-      </div>
-      <div class="stack">
-        <div class="toolbar">
-          <label class="field">
-            <span>模型</span>
-            <select class="control" id="reasoningModel"><option value="" disabled selected>暂无模型</option></select>
-          </label>
-          <span class="badge warn" id="reasoningDirty" hidden>未保存</span>
-        </div>
-        <label class="check" style="max-width: 340px;">
-          <input id="reasoningEnabled" type="checkbox">
-          启用此模型的映射
-        </label>
-        <table class="effort-table">
-          <thead>
-            <tr>
-              <th scope="col">请求传入</th>
-              <th scope="col" title="选择「未设置」会移除 reasoning_effort 字段；模型默认强度由上游决定。">映射为</th>
-              <th scope="col">操作</th>
-            </tr>
-          </thead>
-          <tbody id="reasoningRows"></tbody>
-        </table>
-        <div class="panel-actions">
-          <button class="button compact" id="addReasoningRule" type="button">添加规则</button>
-          <button class="button compact" id="resetReasoningTable" type="button">恢复默认表</button>
-          <button class="button primary" id="saveReasoning" type="button">保存映射</button>
-        </div>
-        <p class="state" id="reasoningState" role="status" aria-live="polite" hidden></p>
-        <p class="state" id="reasoningOrphans" role="status" aria-live="polite" hidden></p>
-      </div>
-    </section>
-
-      <section class="panel" aria-labelledby="modelTestTitle">
-        <div class="panel-head">
-          <div>
-            <h2 id="modelTestTitle">模型测试（可选）</h2>
-            <p class="hint">只有点击「发送测试」并确认后才会调用 <span class="mono">POST /model-test</span>，一次操作只发一次请求，不自动重试。结果只显示状态、耗时和 token 计数，不显示 completion 或任何密钥。</p>
-          </div>
-        </div>
-        <div class="toolbar">
-          <label class="field narrow">
-            <span>账户</span>
-            <select class="control" id="modelTestCredential">
-              <option value="" disabled selected>请选择账户</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>客户端模型名</span>
-            <input class="control mono" id="modelTestModel" autocomplete="off" spellcheck="false" placeholder="例如 open-design-flash">
-          </label>
-          <label class="field">
-            <span>提示词（可选）</span>
-            <input class="control" id="modelTestPrompt" maxlength="512" autocomplete="off" placeholder="默认使用极小的探测提示">
-          </label>
-          <label class="field narrow">
-            <span>思考强度（可选）</span>
-            <select class="control" id="modelTestReasoning">
-              <option value="" selected>未指定</option>
-            </select>
-          </label>
-          <button class="button primary" id="runModelTest" type="button">发送测试</button>
-        </div>
-        <p class="state" id="modelTestState" role="status" aria-live="polite" hidden></p>
-        <div class="facts" id="modelTestFacts" aria-live="polite"></div>
-      </section>
-    </section>
-
-    <section class="tabpanel" id="logsPanel" role="tabpanel" aria-labelledby="tabLogs" hidden>
-      <section class="panel" aria-labelledby="logsTitle">
-        <div class="panel-head">
-          <div>
-            <h2 id="logsTitle">请求日志</h2>
-            <p class="hint">打开本页会读取一次日志与统计；之后只在点击按钮或切换筛选时请求。列表只展示请求元数据，不展示请求/响应正文、密钥、query 或工作区标识。</p>
-          </div>
-          <div class="panel-actions">
-            <button class="button compact" id="refreshLogs" type="button">刷新</button>
-            <button class="button compact danger" id="clearLogs" type="button">清空日志</button>
-          </div>
-        </div>
-        <div class="toolbar">
-          <label class="field">
-            <span>搜索</span>
-            <input class="control" id="logsFilterSearch" type="search" autocomplete="off" spellcheck="false" placeholder="模型、上游模型、错误类型或请求 ID">
-          </label>
-          <label class="field narrow">
-            <span>结果</span>
-            <select class="control" id="logsFilterStatus">
-              <option value="">全部</option>
-              <option value="success">成功</option>
-              <option value="error">失败</option>
-              <option value="local">本地拒绝</option>
-            </select>
-          </label>
-          <label class="field narrow">
-            <span>账户</span>
-            <select class="control" id="logsFilterCredential">
-              <option value="">全部账户</option>
-            </select>
-          </label>
-          <label class="field narrow">
-            <span>每页</span>
-            <select class="control" id="logsFilterLimit">
-              <option value="25">25</option>
-              <option value="50" selected>50</option>
-              <option value="100">100</option>
-            </select>
-          </label>
+          <input class="control search" id="logsFilterSearch" type="search" autocomplete="off" spellcheck="false" placeholder="搜索模型、上游模型、错误类型或请求 ID" aria-label="搜索请求日志">
+          <select class="control" id="logsFilterStatus" aria-label="按结果筛选">
+            <option value="">全部结果</option>
+            <option value="success">成功</option>
+            <option value="error">失败</option>
+            <option value="local">本地拒绝</option>
+          </select>
+          <select class="control" id="logsFilterCredential" aria-label="按账户筛选">
+            <option value="">全部账户</option>
+          </select>
+          <select class="control" id="logsFilterLimit" aria-label="每页条数">
+            <option value="25">每页 25</option>
+            <option value="50" selected>每页 50</option>
+            <option value="100">每页 100</option>
+          </select>
+          <button class="button compact" id="refreshLogs" type="button" title="重新读取日志和统计" data-icon="refresh">刷新</button>
+          <button class="button compact" id="clearLogs" type="button" title="持久化清空全部请求日志" data-icon="trash">清空</button>
           <span class="count" id="logsCount">尚未读取</span>
         </div>
-        <p class="state" id="logsState" role="status" aria-live="polite" hidden></p>
         <div class="facts" id="requestStats" aria-live="polite"></div>
         <details class="stats-models" id="requestStatsModelsPanel" hidden>
           <summary id="requestStatsModelsSummary">按模型分布</summary>
           <div class="rows" id="requestStatsModels" aria-live="polite"></div>
         </details>
-        <div class="log-head" aria-hidden="true">
-          <span>时间</span><span>模型 / 上游</span><span>思考强度</span><span>结果</span><span>账户</span><span>耗时</span><span>用量</span><span></span>
-        </div>
-        <div class="log-list" id="requestLogList" aria-live="polite">
-          <p class="empty">尚未读取。打开本页或点「刷新」后读取。</p>
-        </div>
-        <div class="pager">
-          <span class="hint" id="logsPageInfo">尚未读取日志。</span>
-          <div class="pager-actions">
-            <button class="button compact" id="logsPrev" type="button" disabled>上一页</button>
-            <button class="button compact" id="logsNext" type="button" disabled>下一页</button>
+        <p class="state" id="logsState" role="status" aria-live="polite" hidden></p>
+      </div>
+      <div class="log-head" aria-hidden="true">
+        <span>时间</span><span>模型 / 上游</span><span>思考强度</span><span>结果</span><span>账户</span><span>耗时</span><span>用量</span><span></span>
+      </div>
+      <div class="log-list" id="requestLogList" aria-live="polite">
+        <p class="empty">尚未读取。打开本页或点「刷新」后读取。</p>
+      </div>
+      <div class="pagination">
+        <span id="logsPageInfo">尚未读取日志。</span>
+        <button class="button compact" id="logsPrev" type="button" disabled data-icon="prev">上一页</button>
+        <button class="button compact" id="logsNext" type="button" disabled data-icon="next">下一页</button>
+      </div>
+      <p class="hint" style="margin-top: 14px;">只记录请求元数据：不含请求或响应正文、headers、query、密钥和工作区标识。</p>
+    </section>
+
+    <section class="tabpanel" id="credentialsPanel" role="tabpanel" aria-labelledby="tabCredentials" hidden>
+      <p class="empty" id="credentialsLocked">需要先验证管理密钥，才能查看账户和额度。</p>
+      <section class="panel" id="accountsPanel" aria-labelledby="accountsTitle" hidden>
+        <div class="panel-head">
+          <div>
+            <h2 id="accountsTitle" title="活动账户在前；额度暂停的账户置后，按复查时间从早到晚排列。">凭据管理</h2>
+            <p class="panel-hint">各窗口的官方已用比例与重置时间 · 点击卡片展开操作与详情</p>
+          </div>
+          <div class="panel-actions">
+            <button class="button compact" id="refreshAccountQuotas" type="button" title="按列表顺序逐个刷新额度，不并发；60 秒内不重复查询上游" data-icon="refresh">刷新额度</button>
+            <button class="button compact" id="refreshAccountStatus" type="button" title="重新读取账户状态，不发起上游额度查询" data-icon="undo">刷新状态</button>
+            <button class="button compact" id="openErrorRules" type="button" title="配置 CPA 的重试调度：命中规则后是停止还是继续换号，以及是否冷却失败的账号" data-icon="gear">错误规则</button>
           </div>
         </div>
+        <p class="state" id="accountRefreshState" role="status" aria-live="polite" hidden></p>
+        <details class="account-editor" id="accountEditor">
+          <summary id="accountEditorSummary">添加账户</summary>
+          <form class="stack" id="accountForm" autocomplete="off">
+            <div class="form-head">
+              <h3 id="accountFormTitle">添加账户</h3>
+              <span class="hint" id="accountFormHint">填写标签和 API key 后添加。</span>
+            </div>
+            <div class="inline">
+              <label class="field">
+                <span>标签</span>
+                <input class="control" id="accountLabel" maxlength="100" placeholder="例如：主账户" autocomplete="off">
+              </label>
+              <label class="field">
+                <span>OpenDesign API key</span>
+                <input class="control" id="accountKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign Cloud API key">
+              </label>
+              <button class="button primary" id="accountSubmit" type="submit" data-icon="plus">添加账户</button>
+              <button class="button" id="accountCancel" type="button" hidden>取消编辑</button>
+            </div>
+            <details class="billing" id="billingFields">
+              <summary>可选：额度查询（官方 control key）</summary>
+              <p class="hint">
+                填写同一 OpenDesign 账号的额度授权。只填 controlKey 可查钱包；再填 Workspace ID 可查套餐窗口。
+                新增账户时两项均可留空；已保存的 controlKey 不会回显。
+              </p>
+              <div class="inline">
+                <label class="field">
+                  <span>官方 controlKey（可选，仅查询额度）</span>
+                  <input class="control" id="accountControlKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign 官方 control key">
+                </label>
+                <label class="field">
+                  <span>Workspace ID（可选，查询套餐时填写）</span>
+                  <input class="control mono" id="accountWorkspaceID" autocomplete="off" spellcheck="false" placeholder="用于查询套餐额度">
+                </label>
+                <label class="field">
+                  <span>套餐额度换算（可选，credits / $1）</span>
+                  <input class="control mono" id="accountCreditsPerUSD" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="例如 5000；留空则只显示 credits">
+                </label>
+              </div>
+              <label class="check" id="accountClearBillingRow" hidden>
+                <input id="accountClearBilling" type="checkbox">
+                清除已保存的额度授权（保留推理 Key）
+              </label>
+              <p class="hint" style="margin-top: 8px;">编辑时留空表示保留原值；勾选后保存可清除额度授权，推理 Key 保留。</p>
+            </details>
+            <p class="state" id="accountState" role="status" aria-live="polite" hidden></p>
+          </form>
+        </details>
+        <div class="account-tools">
+          <input class="control search" id="accountSearch" type="search" autocomplete="off" spellcheck="false" placeholder="搜索账户名称或 ID" aria-label="搜索账户">
+          <span class="hint" id="accountFilterInfo"></span>
+          <button class="badge danger" id="accountPausedCount" type="button" title="跳到额度暂停账户" hidden>0 个额度暂停</button>
+          <span class="count" id="accountCount">0 个账户</span>
+        </div>
+        <div class="account-total" id="accountQuotaTotal" role="status" aria-live="polite"></div>
+        <p class="account-load-state" id="quotaLoadState" role="status" aria-live="polite" hidden></p>
+        <div class="rows" id="accountList" aria-live="polite"></div>
+        <div class="pagination" id="accountPager" hidden>
+          <span id="accountPageInfo"></span>
+          <button class="button compact" id="accountsPrev" type="button" disabled data-icon="prev">上一页</button>
+          <button class="button compact" id="accountsNext" type="button" disabled data-icon="next">下一页</button>
+        </div>
       </section>
+    </section>
+
+    <section class="tabpanel" id="modelsTab" role="tabpanel" aria-labelledby="tabModels" hidden>
+      <p class="empty" id="modelsLocked">需要先验证管理密钥，才能读取上游模型并维护映射。</p>
+      <div class="config-grid">
+        <section class="panel" id="modelsPanel" aria-labelledby="modelsTitle" hidden>
+          <div class="panel-head">
+            <div>
+              <h2 id="modelsTitle">模型映射</h2>
+              <p class="panel-hint">客户端名称与 OpenDesign 上游模型</p>
+            </div>
+            <div class="panel-actions">
+              <span class="badge warn" id="mappingDirty" hidden>未保存</span>
+              <button class="button compact" id="revertMappings" type="button" hidden data-icon="undo">还原为已保存</button>
+              <button class="button compact" id="addMapping" type="button" data-icon="plus">手动添加一行</button>
+            </div>
+          </div>
+          <div class="stack">
+            <div class="rows" id="mappingList" aria-live="polite">
+              <p class="empty">还没有模型映射。</p>
+            </div>
+            <div class="mapping-status">
+              <button class="button primary" id="saveModels" type="button" data-icon="save">保存模型映射</button>
+              <span class="hint" id="mappingHint">勾选上游模型会自动生成 <span class="mono">open-design-</span> 前缀别名，可再手动修改。</span>
+            </div>
+            <p class="state" id="modelState" role="status" aria-live="polite" hidden></p>
+            <div class="subhead" style="margin-top: 6px;">
+              <h3>上游模型</h3>
+              <span class="hint">来自 OpenDesign <span class="mono">GET /models</span></span>
+            </div>
+            <div class="inline">
+              <label class="field">
+                <span>账户</span>
+                <select class="control" id="modelCredential">
+                  <option value="" disabled selected>请选择账户</option>
+                </select>
+              </label>
+              <button class="button" id="fetchModels" type="button" data-icon="download">获取模型列表</button>
+            </div>
+            <div class="upstream-tools">
+              <input class="control search" id="upstreamSearch" type="search" placeholder="搜索上游模型或供应商" aria-label="搜索上游模型" autocomplete="off">
+              <button class="button compact" id="selectVisible" type="button" data-icon="select">全选当前可见</button>
+              <button class="button compact" id="clearVisible" type="button" data-icon="clear">取消当前可见</button>
+              <span class="hint" id="upstreamCount">0 个上游模型</span>
+            </div>
+            <div class="rows" id="upstreamList" aria-live="polite">
+              <p class="empty">选择账户后点击「获取模型列表」。已停用账户不能拉取。</p>
+            </div>
+          </div>
+        </section>
+
+        <div class="config-side">
+          <section class="panel" id="reasoningPanel" aria-labelledby="reasoningTitle">
+            <div class="panel-head">
+              <div>
+                <h2 id="reasoningTitle">思考强度映射</h2>
+                <p class="panel-hint" title="只改写顶层 reasoning_effort；未添加规则的强度直接透传，目标选「未设置」会移除该字段。已有 thinking / reasoning 且未传强度时保留原策略。每个模型独立配置，默认关闭。">请求传入 → 发往上游 · 只改写顶层 <span class="mono">reasoning_effort</span> · 每个模型默认关闭</p>
+              </div>
+              <span class="badge warn" id="reasoningDirty" hidden>未保存</span>
+            </div>
+            <div class="form-stack">
+              <label class="field">
+                <span>模型</span>
+                <select class="control" id="reasoningModel"><option value="" disabled selected>暂无模型</option></select>
+              </label>
+              <label class="check">
+                <input id="reasoningEnabled" type="checkbox">
+                启用此模型的映射
+              </label>
+              <table class="effort-table">
+                <thead>
+                  <tr>
+                    <th scope="col">请求传入</th>
+                    <th scope="col" title="选择「未设置」会移除 reasoning_effort 字段；模型默认强度由上游决定。">映射为</th>
+                    <th scope="col">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="reasoningRows"></tbody>
+              </table>
+              <div class="form-foot">
+                <button class="button compact" id="addReasoningRule" type="button" data-icon="plus">添加规则</button>
+                <button class="button compact" id="resetReasoningTable" type="button" data-icon="undo">恢复默认表</button>
+                <button class="button primary" id="saveReasoning" type="button" data-icon="save">保存映射</button>
+              </div>
+            </div>
+            <p class="state" id="reasoningState" role="status" aria-live="polite" hidden></p>
+            <p class="state" id="reasoningOrphans" role="status" aria-live="polite" hidden></p>
+          </section>
+
+          <section class="panel" aria-labelledby="modelTestTitle">
+            <div class="panel-head">
+              <div>
+                <h2 id="modelTestTitle">模型测试</h2>
+                <p class="panel-hint" title="只有点击「发送测试」并确认后才会调用 POST /model-test。结果只显示状态、耗时和 token 计数，不显示 completion 或任何密钥。">确认后发送一次真实的非流式请求，不自动重试</p>
+              </div>
+            </div>
+            <div class="form-stack">
+              <div class="inline">
+                <label class="field">
+                  <span>账户</span>
+                  <select class="control" id="modelTestCredential">
+                    <option value="" disabled selected>请选择账户</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>思考强度（可选）</span>
+                  <select class="control" id="modelTestReasoning">
+                    <option value="" selected>未指定</option>
+                  </select>
+                </label>
+              </div>
+              <label class="field">
+                <span>客户端模型名</span>
+                <input class="control mono" id="modelTestModel" autocomplete="off" spellcheck="false" placeholder="例如 open-design-flash">
+              </label>
+              <label class="field">
+                <span>提示词（可选）</span>
+                <input class="control" id="modelTestPrompt" maxlength="512" autocomplete="off" placeholder="默认使用极小的探测提示">
+              </label>
+              <div class="form-foot">
+                <button class="button primary" id="runModelTest" type="button" data-icon="test">发送测试</button>
+              </div>
+            </div>
+            <p class="state" id="modelTestState" role="status" aria-live="polite" hidden></p>
+            <div class="facts" id="modelTestFacts" aria-live="polite" style="margin-top: 12px;"></div>
+          </section>
+        </div>
+      </div>
     </section>
 
     <section class="tabpanel" id="configPanel" role="tabpanel" aria-labelledby="tabConfig" hidden>
-      <section class="panel" aria-labelledby="configTitle">
-        <div class="panel-head">
-          <div>
-            <h2 id="configTitle">插件配置</h2>
-            <p class="hint">插件可配置请求日志与额度暂停。额度暂停默认开启；CPA 原生界面的停用无法可靠归因，请优先通过本控制台启停。上游地址固定，代理池、路由和全局冷却由 CPA 宿主拥有。读取和保存都只在点击按钮时发生。</p>
-          </div>
-          <div class="panel-actions">
-            <button class="button compact" id="loadConfig" type="button">读取配置</button>
-          </div>
-        </div>
-        <p class="state" id="configState" role="status" aria-live="polite" hidden></p>
-        <div class="stack">
-          <div class="read-only">
-            <h3>请求日志</h3>
-            <form class="inline" id="logSettingsForm" autocomplete="off">
-              <label class="check" style="flex: 1 1 180px;">
-                <input id="configLogsEnabled" type="checkbox">
-                记录请求元数据
+      <div class="toolbar" style="margin-bottom: 16px;">
+        <button class="button compact" id="loadConfig" type="button" data-icon="refresh">读取配置</button>
+        <button class="button compact" id="loadRuntime" type="button" data-icon="refresh">读取运行时</button>
+        <p class="state" id="configState" role="status" aria-live="polite" style="margin-top: 0;" hidden></p>
+      </div>
+      <div class="config-grid">
+        <div class="config-side">
+          <section class="panel" aria-labelledby="logSettingsTitle">
+            <div class="panel-head">
+              <div>
+                <h2 id="logSettingsTitle">请求日志</h2>
+                <p class="panel-hint">仅影响本插件；只记录元数据</p>
+              </div>
+            </div>
+            <form class="form-stack" id="logSettingsForm" autocomplete="off">
+              <label class="switch">
+                <span>记录请求元数据</span>
+                <input id="configLogsEnabled" type="checkbox" role="switch">
               </label>
-              <label class="field narrow">
+              <label class="field">
                 <span>保留天数（1-90）</span>
                 <input class="control" id="configRetentionDays" type="number" min="1" max="90" step="1" inputmode="numeric">
               </label>
-              <label class="field narrow">
+              <label class="field">
                 <span>最多条数（1-500）</span>
                 <input class="control" id="configMaxEntries" type="number" min="1" max="500" step="1" inputmode="numeric">
               </label>
-              <button class="button primary" id="saveConfig" type="submit">保存日志设置</button>
+              <div class="form-foot">
+                <button class="button primary" id="saveConfig" type="submit" data-icon="save">保存日志设置</button>
+              </div>
             </form>
-            <p class="hint" style="margin-top: 8px;">未读取配置前这些控件不会发送请求；保存只提交日志相关字段。</p>
-          </div>
-          <div class="read-only">
-            <h3>额度暂停</h3>
-            <form class="inline" id="pauseSettingsForm" autocomplete="off">
-              <label class="check" style="flex: 1 1 220px;">
-                <input id="configPauseEnabled" type="checkbox">
-                识别到额度耗尽时自动暂停该账户
+          </section>
+
+          <section class="panel" aria-labelledby="pauseSettingsTitle">
+            <div class="panel-head">
+              <div>
+                <h2 id="pauseSettingsTitle">额度暂停</h2>
+                <p class="panel-hint">默认开启；上游明确报告额度耗尽时临时停用该账户</p>
+              </div>
+            </div>
+            <form class="form-stack" id="pauseSettingsForm" autocomplete="off">
+              <label class="switch">
+                <span>识别到额度耗尽时自动暂停该账户</span>
+                <input id="configPauseEnabled" type="checkbox" role="switch">
               </label>
-              <label class="field narrow">
+              <label class="field">
                 <span>上游提示复查上限（秒，60-604800）</span>
                 <input class="control" id="configPauseMaxSeconds" type="number" min="60" max="604800" step="60" inputmode="numeric">
               </label>
-              <button class="button primary" id="savePauseConfig" type="submit">保存额度暂停设置</button>
+              <div class="form-foot">
+                <button class="button primary" id="savePauseConfig" type="submit" data-icon="save">保存额度暂停设置</button>
+              </div>
             </form>
-            <p class="hint" style="margin-top: 8px;">
-              开发中，请勿在生产启用。插件会将暂停状态投影到 CPA，并在本地拦截；首次复查按上游提示与暂停后 30 分钟中较早者安排，账号逐个检查，实际执行可能排队。只有新鲜官方结果确认有余量才解除，查询失败继续暂停；上游原提示不代表恢复时间。请确认 controlKey 与推理 key 属于同一账号，插件无法自动验证两者归属。
+            <p class="hint" style="margin-top: 14px;">
+              首次复查取上游提示与暂停后 30 分钟中较早者，账号逐个排队检查；只有新鲜的官方结果确认有余量才解除，查询失败继续暂停。上游原提示不代表恢复时间。请确认 controlKey 与推理 key 属于同一账号，插件无法自动验证。
             </p>
             <p class="hint" style="margin-top: 8px;">
-              暂停期间请在本控制台启用/停用账户，不要使用 CPA 原生界面：原生入口和并发文件改写会直接写入同一份凭据文件，插件无法可靠区分一次停用是插件引发、宿主引发还是人工操作，两边同时改动可能让暂停与启用状态互相覆盖。未配置官方 controlKey（或缺少 Workspace ID）时无法自动复查额度，仍须人工处理。
+              暂停期间请在本控制台启用或停用账户：CPA 原生界面写的是同一个停用字段，插件无法区分来源。未配置 controlKey 或缺少 Workspace ID 时不能自动复查，需要人工解除。CPA 自身的 402 / 403 冷却属于宿主，不会因插件解除暂停而提前结束。
             </p>
-            <p class="hint" style="margin-top: 8px;">
-              CPA 自身的 402/403 冷却属于宿主，不会因插件解除暂停而提前结束；额度恢复后仍以 CPA 的实际调度结果为准。
-            </p>
-          </div>
-          <div class="read-only">
-            <h3>宿主代理 / 路由（只读）</h3>
-            <p class="hint">本插件没有私有代理池，也不提供代理、路由或全局冷却的增删改查。以下状态只用于说明边界。</p>
-            <div class="facts" id="hostOwnedFacts" aria-live="polite"></div>
-          </div>
-          <div class="read-only">
-            <h3>插件可见状态</h3>
-            <p class="hint">来自 <span class="mono">GET /runtime</span>；只显示插件可见状态，宿主拥有的调度、冷却和代理以 CPA 实际结果为准。</p>
-            <div class="facts" id="runtimeFacts" aria-live="polite"></div>
-            <div class="rows" id="runtimeCredentials" aria-live="polite"></div>
-            <div class="panel-actions" style="margin-top: 10px;">
-              <button class="button compact" id="loadRuntime" type="button">读取运行时</button>
-            </div>
-          </div>
+          </section>
         </div>
-      </section>
+
+        <div class="config-side">
+          <section class="panel" aria-labelledby="overviewTitle">
+            <div class="panel-head">
+              <div>
+                <h2 id="overviewTitle">运行概览</h2>
+                <p class="panel-hint">通过 CPA 接入 OpenDesign Cloud 模型 API；账户密钥只保存在 CPA 的凭据目录</p>
+              </div>
+              <span class="badge" id="overviewBadge">未验证</span>
+            </div>
+            <div class="facts" id="overviewFacts" aria-live="polite"></div>
+            <p class="hint" style="margin-top: 12px;">上游地址固定为 <code class="url" id="baseUrl">https://amr-link.open-design.ai/v1</code>，不可修改。</p>
+          </section>
+
+          <section class="panel" aria-labelledby="hostOwnedTitle">
+            <div class="panel-head">
+              <div>
+                <h2 id="hostOwnedTitle">宿主代理与路由</h2>
+                <p class="panel-hint">只读；代理、路由和全局冷却由 CPA 拥有，本插件没有私有代理池</p>
+              </div>
+            </div>
+            <div class="facts" id="hostOwnedFacts" aria-live="polite"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="runtimeTitle">
+            <div class="panel-head">
+              <div>
+                <h2 id="runtimeTitle">插件可见状态</h2>
+                <p class="panel-hint">来自 <span class="mono">GET /runtime</span>；调度、冷却和代理以 CPA 实际结果为准</p>
+              </div>
+            </div>
+            <div class="facts" id="runtimeFacts" aria-live="polite"></div>
+            <div class="rows" id="runtimeCredentials" aria-live="polite" style="margin-top: 12px;"></div>
+          </section>
+        </div>
+      </div>
     </section>
   </main>
 
-  <dialog id="errorRulesDialog" aria-labelledby="errorRulesTitle">
+  <dialog id="authDialog" aria-labelledby="authTitle">
+    <h2 id="authTitle">管理密钥</h2>
+    <p class="hint">用于访问 CPA 的管理接口。优先复用同源 CPA 已保存的登录；也可以在此输入当前入口的管理密钥，验证通过后才会保存。</p>
+    <form class="form-stack" id="authForm" autocomplete="off" style="margin-top: 16px;">
+      <label class="field">
+        <span>请求头</span>
+        <select class="control" id="authType">
+          <option value="bearer">Authorization: Bearer</option>
+          <option value="x-management-key">X-Management-Key</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>管理密钥</span>
+        <input class="control" id="managementKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="当前 CPA 入口的管理密钥" autofocus>
+      </label>
+      <label class="check">
+        <input id="rememberAuth" type="checkbox">
+        在此浏览器记住管理密钥
+      </label>
+      <p class="state" id="authState" role="status" aria-live="polite" style="margin-top: 0;" hidden></p>
+      <div class="dialog-actions" style="margin-top: 4px;">
+        <button class="button" id="authClear" type="button" data-icon="trash">清除本页密钥</button>
+        <button class="button" id="closeAuth" type="button" data-icon="close">关闭</button>
+        <button class="button primary" id="authSubmit" type="submit" data-icon="check">验证并进入</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog-wide" id="errorRulesDialog" aria-labelledby="errorRulesTitle">
     <div class="dialog-head">
       <div>
         <h2 id="errorRulesTitle">错误规则</h2>
         <p class="hint">作用范围：<span class="mono">全部 OpenDesign 凭据</span>。规则保存在插件中，并随每个账号的凭据同步给 CPA；实际的换号与冷却决定由 CPA 做出。</p>
       </div>
-      <button class="button compact" id="openErrorRuleHelp" type="button">动作说明</button>
+      <button class="button compact" id="openErrorRuleHelp" type="button" data-icon="info">动作说明</button>
     </div>
     <p class="state" id="errorRulesState" role="status" aria-live="polite" hidden></p>
     <div class="rows" id="errorRulesList" aria-live="polite"></div>
-    <div class="panel-actions" style="margin-top: 10px;">
-      <button class="button compact" id="addErrorRule" type="button">新增规则</button>
-      <button class="button compact" id="resetErrorRules" type="button">恢复默认</button>
-      <button class="button compact" id="retryErrorRules" type="button">重新同步</button>
-      <button class="button primary" id="saveErrorRules" type="button">保存并同步所有账号</button>
-      <button class="button" id="closeErrorRules" type="button">关闭</button>
+    <div class="dialog-actions">
+      <button class="button compact" id="addErrorRule" type="button" data-icon="plus">新增规则</button>
+      <button class="button compact" id="resetErrorRules" type="button" data-icon="undo">恢复默认</button>
+      <button class="button compact" id="retryErrorRules" type="button" data-icon="refresh">重新同步</button>
+      <button class="button" id="closeErrorRules" type="button" data-icon="close">关闭</button>
+      <button class="button primary" id="saveErrorRules" type="button" data-icon="save">保存并同步所有账号</button>
     </div>
   </dialog>
 
-  <dialog id="errorRuleHelpDialog" aria-labelledby="errorRuleHelpTitle">
+  <dialog class="dialog-wide" id="errorRuleHelpDialog" aria-labelledby="errorRuleHelpTitle">
     <div class="dialog-head">
       <h2 id="errorRuleHelpTitle">动作说明</h2>
-      <button class="button compact" id="closeErrorRuleHelp" type="button">关闭</button>
+      <button class="button compact" id="closeErrorRuleHelp" type="button" data-icon="close">关闭</button>
     </div>
-    <div class="read-only">
+    <div class="guide">
       <section><h3>停止</h3><p><b>当前请求：</b>停止重试和切换凭据，把错误返回客户端。</p><p><b>后续调度：</b>不影响凭据的冷却状态。</p></section>
       <section><h3>停止并冷却</h3><p><b>当前请求：</b>停止重试和切换凭据，把错误返回客户端。</p><p><b>后续调度：</b>把失败的凭据或模型暂时排除出调度。</p></section>
       <section><h3>继续</h3><p><b>当前请求：</b>继续尝试其他可用候选账号。</p><p><b>后续调度：</b>不冷却失败的凭据。</p></section>

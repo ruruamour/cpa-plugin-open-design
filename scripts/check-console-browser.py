@@ -77,6 +77,12 @@ def main():
             fulfill(route, {'host': {'available': True}, 'accounts': [
                 {'id': c['id'], 'state': 'quota_paused' if c['quota_paused'] else 'available', 'host': {}}
                 for c in credentials]})
+        elif parsed.path == base + '/request-logs':
+            # The console lands on the logs tab and reads it once.
+            fulfill(route, {'logs': [], 'total': 0, 'limit': 50, 'offset': 0, 'has_more': False,
+                            'next_offset': None, 'retention': None})
+        elif parsed.path == base + '/request-stats':
+            fulfill(route, {'total': 0, 'success': 0, 'failed': 0, 'tokens': {}, 'models': []})
         elif parsed.path == base + '/quota':
             cid = parse_qs(parsed.query)['credential_id'][0]
             if hold[0]:
@@ -100,11 +106,14 @@ def main():
         page.locator('#accountsPanel').wait_for(state='attached')
         page.wait_for_function('OpenDesignConsole.state.status.credentials.length === 13')
         assert base + '/quota' not in requests, 'bootstrap must not query quota'
+        page.wait_for_function('OpenDesignConsole.state.logAutoLoaded === true')
+        assert page.locator('#tabLogs').get_attribute('aria-selected') == 'true', 'the console lands on the logs tab'
+        assert not page.locator('#authDialog').evaluate('node => node.open'), 'a reused login keeps the key dialog closed'
         page.locator('#tabCredentials').click()
         page.locator('[data-credential-id="fixture-01"] [data-quota-status="loading"]').wait_for()
         page.locator('[data-credential-id="fixture-02"] [data-quota-status="pending"]').wait_for()
         assert len(held) == 1, 'serial walk must have exactly one in-flight request'
-        page.locator('#tabOverview').click()
+        page.locator('#tabConfig').click()
         hold[0] = False
         for route, cid in held:
             fulfill(route, quota(cid))

@@ -128,7 +128,7 @@
     busy: false,
     // Credentials tab starts read-only scheduling and serial quota reads;
     // other optional panels still need an explicit operator action.
-    activeTab: 'overview',
+    activeTab: 'logs',
     logQuery: { offset: 0, limit: 50, status: '', search: '', credentialID: '', attempted: '' },
     logExpanded: {},
     logAutoLoaded: false,
@@ -734,10 +734,9 @@
   // behind their explicit buttons.
 
   const TABS = [
-    { name: 'overview', button: 'tabOverview', panel: 'overviewPanel' },
+    { name: 'logs', button: 'tabLogs', panel: 'logsPanel' },
     { name: 'credentials', button: 'tabCredentials', panel: 'credentialsPanel' },
     { name: 'models', button: 'tabModels', panel: 'modelsTab' },
-    { name: 'logs', button: 'tabLogs', panel: 'logsPanel' },
     { name: 'config', button: 'tabConfig', panel: 'configPanel' },
   ];
 
@@ -746,7 +745,10 @@
     return TABS.find(item => item.name === wanted) || TABS[0];
   }
 
-  function activateTab(name, options = {}) {
+  // selectTab only moves the selection. activateTab also runs the reads a tab
+  // owns; the bootstrap uses selectTab so the landing tab requests nothing
+  // before the management key is verified.
+  function selectTab(name) {
     const target = tabEntry(name);
     state.activeTab = target.name;
     for (const item of TABS) {
@@ -759,6 +761,11 @@
       }
       if (panelNode) panelNode.hidden = !selected;
     }
+    return target;
+  }
+
+  function activateTab(name, options = {}) {
+    const target = selectTab(name);
     if (options.focus) {
       const active = $(target.button);
       if (active && typeof active.focus === 'function') active.focus();
@@ -772,6 +779,18 @@
     }
     if (target.name === 'logs') void autoLoadRequestLogs();
     return target.name;
+  }
+
+  // Runs the reads the visible tab owns, for a session that became usable while
+  // that tab was already on screen. Each read keeps its own once-per-session or
+  // throttling guard, so calling this twice requests nothing extra.
+  function refreshVisibleTab() {
+    if (!state.verified) return;
+    if (state.activeTab === 'logs') void autoLoadRequestLogs();
+    if (state.activeTab === 'credentials') {
+      void autoLoadQuotaForAccounts();
+      void loadScheduling();
+    }
   }
 
   function tabFromEvent(event) {
@@ -810,9 +829,37 @@
   // toggle can pin light/dark without touching authentication or data state.
 
   const THEME_STORAGE_KEY = 'open-design-theme';
+  const HOST_THEME_STORAGE_KEY = 'cli-proxy-theme';
+  const THEME_ICONS = { system: 'monitor', light: 'sun', dark: 'moon' };
   let themeMedia = null;
+  let themeHostBound = false;
 
+  // The theme of the CPA page around this console: its <html data-theme> when
+  // the console is embedded same-origin, otherwise the preference the
+  // management centre stored for this origin. Empty when neither is readable.
+  function hostTheme() {
+    let value = '';
+    try {
+      if (globalThis.parent && globalThis.parent !== globalThis) {
+        value = globalThis.parent.document.documentElement.getAttribute('data-theme') || '';
+      }
+    } catch { value = ''; }
+    if (!value) {
+      try {
+        const saved = JSON.parse(localStorage.getItem(HOST_THEME_STORAGE_KEY) || '{}');
+        value = (saved && saved.state && saved.state.theme) || '';
+      } catch { value = ''; }
+    }
+    if (value === 'dark') return 'dark';
+    if (value === 'light' || value === 'white') return 'light';
+    return '';
+  }
+
+  // "Follow the system" means follow the surroundings: an explicit CPA theme
+  // wins over the operating system, which is the fallback.
   function themeSystemDark() {
+    const host = hostTheme();
+    if (host) return host === 'dark';
     try {
       return typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches === true;
     } catch { return false; }
@@ -835,8 +882,9 @@
     const preference = Core.normalizeThemePreference(state.themePreference);
     const resolved = Core.resolvedTheme(preference, themeSystemDark());
     const label = Core.themePreferenceLabel(preference, resolved);
-    button.textContent = `主题：${label}`;
+    button.textContent = label;
     button.setAttribute('aria-label', `切换颜色主题，当前：${label}`);
+    button.setAttribute('data-icon', THEME_ICONS[preference] || THEME_ICONS.system);
   }
 
   function applyThemePreference(value, options = {}) {
@@ -846,6 +894,9 @@
     if (root && root.setAttribute) {
       root.setAttribute('data-theme', state.themePreference);
       root.setAttribute('data-theme-resolved', resolved);
+      // The stylesheet keys its palette on the resolved scheme, so a CPA theme
+      // that differs from the operating system is honoured too.
+      root.setAttribute('data-scheme', resolved);
     }
     if (options.persist) persistTheme(state.themePreference);
     renderThemeToggle();
@@ -866,6 +917,23 @@
         if (themeMedia.addEventListener) themeMedia.addEventListener('change', changed);
         else if (themeMedia.addListener) themeMedia.addListener(changed);
       } catch { /* The CSS media query still follows the system. */ }
+    }
+    if (!themeHostBound) {
+      themeHostBound = true;
+      const followHost = () => {
+        if (state.themePreference === 'system') applyThemePreference('system');
+      };
+      try {
+        // CPA switching its own theme, in this tab or another one.
+        if (typeof addEventListener === 'function') {
+          addEventListener('storage', event => {
+            if (event && event.key === HOST_THEME_STORAGE_KEY) followHost();
+          });
+        }
+        if (typeof MutationObserver === 'function' && globalThis.parent && globalThis.parent !== globalThis) {
+          new MutationObserver(followHost).observe(globalThis.parent.document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+        }
+      } catch { /* A cross-origin parent cannot be observed; the OS scheme still applies. */ }
     }
     applyThemePreference(readStoredTheme() || 'system', { persist: false });
   }
@@ -1349,13 +1417,19 @@
     if (version) version.textContent = state.status.version ? `版本 ${state.status.version}` : '版本 --';
     const base = $('baseUrl');
     if (base) base.textContent = state.status.base_url || DEFAULT_BASE_URL;
+    const summary = $('topbarSummary');
+    if (summary) {
+      const credentials = Array.isArray(state.status.credentials) ? state.status.credentials : [];
+      const models = Array.isArray(state.status.models) ? state.status.models : [];
+      summary.textContent = state.verified ? `${credentials.length} 个账户 · ${models.length} 个映射` : '';
+    }
   }
 
   function button(label, action, options = {}) {
     return el('button', {
       text: label,
       className: options.className || 'button',
-      attrs: { type: 'button', 'data-action': action, ...options.attrs },
+      attrs: { type: 'button', 'data-action': action, 'data-icon': options.icon, ...options.attrs },
       disabled: options.disabled,
       on: options.on,
     });
@@ -4793,14 +4867,17 @@
     }
   }
 
+  // The key form is a dialog. It opens by itself whenever the session has no
+  // verified key and closes once one is accepted; the topbar button reopens it
+  // to switch or clear the key without disturbing unsaved drafts.
   function setAuthCollapsed(collapsed) {
     state.authCollapsed = Boolean(collapsed);
-    const body = $('authBody');
-    if (body) body.hidden = state.authCollapsed;
-    const toggle = $('authToggle');
-    if (toggle) {
-      toggle.textContent = state.authCollapsed ? '展开' : '收起';
-      toggle.setAttribute('aria-expanded', state.authCollapsed ? 'false' : 'true');
+    const dialog = $('authDialog');
+    if (!dialog) return;
+    if (state.authCollapsed) {
+      if (typeof dialog.close === 'function' && dialog.open) dialog.close();
+    } else if (typeof dialog.showModal === 'function' && !dialog.open) {
+      dialog.showModal();
     }
   }
 
@@ -4811,11 +4888,20 @@
   function bind() {
     populateReasoningInputs();
     const authForm = $('authForm');
-    if (authForm) authForm.addEventListener('submit', submitAuth);
+    // Verifying a key is one /status request. The page, not the handler, then
+    // gives the visible tab the one-time read it would get from being opened.
+    if (authForm) authForm.addEventListener('submit', async event => {
+      if (await submitAuth(event) === true) refreshVisibleTab();
+    });
     const clear = $('authClear');
     if (clear) clear.addEventListener('click', clearAuth);
-    const authToggle = $('authToggle');
-    if (authToggle) authToggle.addEventListener('click', toggleAuthPanel);
+    const openAuth = $('openAuth');
+    if (openAuth) openAuth.addEventListener('click', () => setAuthCollapsed(false));
+    const closeAuth = $('closeAuth');
+    if (closeAuth) closeAuth.addEventListener('click', () => setAuthCollapsed(true));
+    const authDialog = $('authDialog');
+    // Esc and the backdrop close the dialog natively; keep the flag in step.
+    if (authDialog) authDialog.addEventListener('close', () => { state.authCollapsed = true; });
     const accountForm = $('accountForm');
     if (accountForm) accountForm.addEventListener('submit', addAccount);
     const cancel = $('accountCancel');
@@ -4989,6 +5075,7 @@
         : '');
       if (!sameIdentity) message('accountState', '');
       message('authState', '管理密钥验证成功，已开始读取账户和模型。', 'ok');
+      return true;
     } catch (error) {
       if (activeAuthAttempt !== attempt || generation !== state.optionalGeneration || sessionGeneration !== state.sessionGeneration) return;
       // A rejected candidate proves nothing about the already verified identity:
@@ -5031,8 +5118,10 @@
   async function bootstrap() {
     initTheme();
     renderMeta();
-    activateTab('overview');
-    setAuthCollapsed(false);
+    // Select the landing tab without its implicit read: nothing is requested
+    // before the management key is known to work.
+    selectTab('logs');
+    setAuthCollapsed(true);
     resetAccountForm();
     renderAccounts();
     renderModels();
@@ -5054,10 +5143,12 @@
     }
     state.verified = { headers: resolved.headers, source: resolved.source };
     const ok = await loadStatus({ source: resolved.source });
-    if (ok && state.activeTab === 'credentials') void loadScheduling();
-    // Reclaim vertical space once the reused login worked; the panel stays
-    // one click away and reopening never changes authentication behaviour.
-    if (ok) setAuthCollapsed(true);
+    if (ok) {
+      setAuthCollapsed(true);
+      // The landing tab was selected before the key was verified; run its
+      // one-time read now that the session exists.
+      refreshVisibleTab();
+    }
   }
 
   const consoleAPI = {
