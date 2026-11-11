@@ -201,6 +201,7 @@
     dialog::backdrop { background: rgba(18, 29, 35, .52); }
     dialog h2 { margin-bottom: 6px; }
     dialog.dialog-wide { max-width: min(760px, calc(100vw - 32px)); }
+    dialog.dialog-form { max-width: min(520px, calc(100vw - 32px)); }
     .dialog-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px 12px; margin-bottom: 14px; }
     .dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 18px; }
     #errorRulesDialog .dialog-actions { position: sticky; bottom: -24px; margin: 14px 0 -10px; padding: 14px 0; border-top: 1px solid var(--line); background: var(--surface); }
@@ -239,10 +240,6 @@
     .usage-reset.expired { color: var(--warn); }
 
     /* --- credentials ---------------------------------------------------- */
-    .account-editor { margin-bottom: 14px; padding: 12px 14px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--inset-bg); }
-    .account-editor > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
-    .account-editor[open] > summary { margin-bottom: 12px; }
-    .form-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 12px; }
     .billing { padding: 10px 12px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--surface); }
     .billing > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
     .billing[open] > summary { margin-bottom: 6px; }
@@ -276,20 +273,32 @@
     .account-body { padding: 0 18px 14px; border-top: 1px solid var(--inset-line); }
     .account-body .row-actions { justify-content: flex-end; padding: 12px 0; }
     .account-body .row-actions .button { min-height: 28px; font-size: 11px; }
+    /* A real button (it submits a change), drawn as a switch for its state. */
+    .account-switch { gap: 8px; border-color: transparent; background: transparent; color: var(--muted); font-weight: 500; }
+    .account-switch:hover:not(:disabled) { border-color: transparent; background: color-mix(in srgb, var(--ink) 5%, transparent); color: var(--ink); }
+    .account-switch::after { content: ""; order: 2; flex: none; width: 34px; height: 20px; border-radius: 999px; background: radial-gradient(circle at 10px 10px, #fff 7px, transparent 7.5px), color-mix(in srgb, var(--muted) 30%, var(--surface)); transition: background .15s; }
+    .account-switch[aria-checked="true"]::after { background: radial-gradient(circle at 24px 10px, #fff 7px, transparent 7.5px), #8c8983; }
+    @media (prefers-reduced-motion: reduce) { .account-switch::after { transition: none; } }
     .schedule-detail { display: flex; flex-wrap: wrap; gap: 4px 14px; padding-bottom: 8px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .schedule-detail .mono { color: var(--ink); }
     .account-group-head { margin-top: 4px; padding: 2px 2px 0; color: var(--danger); font-size: 12px; font-weight: 700; }
     .quota { display: grid; gap: 8px; min-width: 0; padding-top: 12px; border-top: 1px solid var(--inset-line); }
     .quota-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
     .quota-head .hint { margin-left: auto; }
-    .quota-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 10px; align-items: start; }
-    .quota-card { display: grid; gap: 6px; justify-items: start; align-content: start; min-width: 0; padding: 12px 14px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--surface); }
+    /* Wallet on the left, plan on the right; the plan's windows share its width. */
+    .quota-grid { display: grid; grid-template-columns: minmax(200px, 260px) minmax(0, 1fr); gap: 10px; align-items: start; }
+    .quota-grid > :only-child { grid-column: 1 / -1; }
+    .quota-card { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 12px; min-width: 0; padding: 12px 14px; border: 1px solid var(--inset-line); border-radius: 8px; background: var(--surface); }
+    .quota-card > * { flex: 0 0 100%; min-width: 0; }
+    .quota-card > h4, .quota-card > .badge { flex: 0 0 auto; }
+    .quota-card > .quota-window { flex: 1 1 180px; }
     .quota-card h4 { font-size: 12px; color: var(--muted); font-weight: 600; }
     .quota-value { font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
     .quota-meta, .quota-note, .quota-forecast { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .quota-forecast.warn { color: var(--warn); }
-    .quota-window { display: grid; gap: 4px; width: 100%; justify-items: start; }
-    .quota-window + .quota-window { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--inset-line); }
+    .quota-window { display: grid; gap: 4px; justify-items: start; }
+    .quota-window { align-self: start; padding: 10px 12px; border: 1px solid var(--inset-line); border-radius: 6px; background: var(--inset-bg); }
+    .quota-window .quota-value { font-size: 15px; }
     .quota-window-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 10px; }
     .quota-window-title { font-weight: 600; font-size: 12px; }
     .quota-trend { margin-top: 8px; }
@@ -397,6 +406,7 @@
     }
     @media (max-width: 860px) {
       .config-grid { grid-template-columns: minmax(0, 1fr); }
+      .quota-grid { grid-template-columns: minmax(0, 1fr); }
       .account-summary { grid-template-columns: minmax(0, 1fr) 18px; gap: 12px; }
       .account-identity { grid-column: 1; }
       .account-usage { grid-column: 1 / -1; grid-row: 2; }
@@ -414,6 +424,7 @@
       .account-body { padding: 0 14px 12px; }
       .account-body .row-actions { justify-content: flex-start; }
       .account-total .usage { flex: 1 1 42%; min-width: 0; }
+      .account-total .usage-head { flex-direction: column; align-items: flex-start; gap: 2px; }
       .mapping-row { grid-template-columns: minmax(0, 1fr); }
       .mapping-row .arrow { display: none; }
       .mapping-row .button { justify-self: start; }
@@ -520,57 +531,10 @@
             <button class="button compact" id="refreshAccountQuotas" type="button" title="按列表顺序逐个刷新额度，不并发；60 秒内不重复查询上游" data-icon="refresh">刷新额度</button>
             <button class="button compact" id="refreshAccountStatus" type="button" title="重新读取账户状态，不发起上游额度查询" data-icon="undo">刷新状态</button>
             <button class="button compact" id="openErrorRules" type="button" title="配置 CPA 的重试调度：命中规则后是停止还是继续换号，以及是否冷却失败的账号" data-icon="gear">错误规则</button>
+            <button class="button compact primary" id="openAccountDialog" type="button" aria-haspopup="dialog" aria-controls="accountDialog" data-icon="plus">添加账户</button>
           </div>
         </div>
         <p class="state" id="accountRefreshState" role="status" aria-live="polite" hidden></p>
-        <details class="account-editor" id="accountEditor">
-          <summary id="accountEditorSummary">添加账户</summary>
-          <form class="stack" id="accountForm" autocomplete="off">
-            <div class="form-head">
-              <h3 id="accountFormTitle">添加账户</h3>
-              <span class="hint" id="accountFormHint">填写标签和 API key 后添加。</span>
-            </div>
-            <div class="inline">
-              <label class="field">
-                <span>标签</span>
-                <input class="control" id="accountLabel" maxlength="100" placeholder="例如：主账户" autocomplete="off">
-              </label>
-              <label class="field">
-                <span>OpenDesign API key</span>
-                <input class="control" id="accountKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign Cloud API key">
-              </label>
-              <button class="button primary" id="accountSubmit" type="submit" data-icon="plus">添加账户</button>
-              <button class="button" id="accountCancel" type="button" hidden>取消编辑</button>
-            </div>
-            <details class="billing" id="billingFields">
-              <summary>可选：额度查询（官方 control key）</summary>
-              <p class="hint">
-                填写同一 OpenDesign 账号的额度授权。只填 controlKey 可查钱包；再填 Workspace ID 可查套餐窗口。
-                新增账户时两项均可留空；已保存的 controlKey 不会回显。
-              </p>
-              <div class="inline">
-                <label class="field">
-                  <span>官方 controlKey（可选，仅查询额度）</span>
-                  <input class="control" id="accountControlKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign 官方 control key">
-                </label>
-                <label class="field">
-                  <span>Workspace ID（可选，查询套餐时填写）</span>
-                  <input class="control mono" id="accountWorkspaceID" autocomplete="off" spellcheck="false" placeholder="用于查询套餐额度">
-                </label>
-                <label class="field">
-                  <span>套餐额度换算（可选，credits / $1）</span>
-                  <input class="control mono" id="accountCreditsPerUSD" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="例如 5000；留空则只显示 credits">
-                </label>
-              </div>
-              <label class="check" id="accountClearBillingRow" hidden>
-                <input id="accountClearBilling" type="checkbox">
-                清除已保存的额度授权（保留推理 Key）
-              </label>
-              <p class="hint" style="margin-top: 8px;">编辑时留空表示保留原值；勾选后保存可清除额度授权，推理 Key 保留。</p>
-            </details>
-            <p class="state" id="accountState" role="status" aria-live="polite" hidden></p>
-          </form>
-        </details>
         <div class="account-tools">
           <input class="control search" id="accountSearch" type="search" autocomplete="off" spellcheck="false" placeholder="搜索账户名称或 ID" aria-label="搜索账户">
           <span class="hint" id="accountFilterInfo"></span>
@@ -841,6 +805,53 @@
         <button class="button" id="authClear" type="button" data-icon="trash">清除本页密钥</button>
         <button class="button" id="closeAuth" type="button" data-icon="close">关闭</button>
         <button class="button primary" id="authSubmit" type="submit" data-icon="check">验证并进入</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog-form" id="accountDialog" aria-labelledby="accountFormTitle">
+    <h2 id="accountFormTitle">添加账户</h2>
+    <p class="hint" id="accountFormHint">填写标签和 API key 后添加。</p>
+    <form class="form-stack" id="accountForm" autocomplete="off" style="margin-top: 16px;">
+      <label class="field">
+        <span>标签</span>
+        <input class="control" id="accountLabel" maxlength="100" placeholder="例如：主账户" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>OpenDesign API key</span>
+        <input class="control" id="accountKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign Cloud API key">
+      </label>
+      <details class="billing" id="billingFields">
+        <summary>可选：额度查询（官方 control key）</summary>
+        <p class="hint">
+          填写同一 OpenDesign 账号的额度授权。只填 controlKey 可查钱包；再填 Workspace ID 可查套餐窗口。
+          新增账户时两项均可留空；已保存的 controlKey 不会回显。
+        </p>
+        <div class="form-stack" style="margin-top: 10px;">
+          <label class="field">
+            <span>官方 controlKey（可选，仅查询额度）</span>
+            <input class="control" id="accountControlKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 OpenDesign 官方 control key">
+          </label>
+          <label class="field">
+            <span>Workspace ID（可选，查询套餐时填写）</span>
+            <input class="control mono" id="accountWorkspaceID" autocomplete="off" spellcheck="false" placeholder="用于查询套餐额度">
+          </label>
+          <label class="field">
+            <span>套餐额度换算（可选，credits / $1）</span>
+            <input class="control mono" id="accountCreditsPerUSD" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="例如 5000；留空则只显示 credits">
+          </label>
+        </div>
+        <label class="check" id="accountClearBillingRow" hidden>
+          <input id="accountClearBilling" type="checkbox">
+          清除已保存的额度授权（保留推理 Key）
+        </label>
+        <p class="hint" style="margin-top: 8px;">编辑时留空表示保留原值；勾选后保存可清除额度授权，推理 Key 保留。</p>
+      </details>
+      <p class="state" id="accountState" role="status" aria-live="polite" style="margin-top: 0;" hidden></p>
+      <div class="dialog-actions" style="margin-top: 4px;">
+        <button class="button" id="accountCancel" type="button" hidden data-icon="undo">取消编辑</button>
+        <button class="button" id="closeAccountDialog" type="button" data-icon="close">关闭</button>
+        <button class="button primary" id="accountSubmit" type="submit" data-icon="check">添加账户</button>
       </div>
     </form>
   </dialog>

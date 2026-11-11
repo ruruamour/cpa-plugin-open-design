@@ -8321,3 +8321,126 @@ test('the range buttons are locked while a log read is in flight', async () => {
   await pending;
   assert.equal(view.document.getElementById('statsRange7d').disabled, false);
 });
+
+// --- credentials: account dialog, switch control, progress wording -----------
+
+function dialogPage(options = {}) {
+  const view = fakePage({ bootstrap: true, ...options });
+  const dialog = view.document.getElementById('accountDialog');
+  dialog.showModal = () => { dialog.open = true; };
+  dialog.close = () => { dialog.open = false; void dialog.emit('close'); };
+  return { view, dialog, api: view.context.OpenDesignConsole };
+}
+
+test('the account form is a dialog: add opens it empty, edit opens it filled, both close on success', async () => {
+  const saved = [];
+  const { view, dialog, api } = dialogPage({
+    fetchImpl: async (url, init = {}) => {
+      if (url.includes('/credentials') && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        saved.push(body);
+        return respond(body.id ? 200 : 201, { id: body.id || 'cred-new', label: body.label, disabled: false });
+      }
+      return respond(200, statusBody());
+    },
+  });
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  assert.equal(Boolean(dialog.open), false, 'the dialog starts closed');
+
+  await view.document.getElementById('openAccountDialog').emit('click');
+  assert.equal(dialog.open, true);
+  assert.equal(view.document.getElementById('accountFormTitle').textContent, '添加账户');
+  view.document.getElementById('accountLabel').value = '新账户';
+  view.document.getElementById('accountKey').value = 'fixture-new-key-123';
+  await view.document.getElementById('accountForm').emit('submit', { preventDefault() {} });
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].api_key, 'fixture-new-key-123');
+  assert.equal(dialog.open, false, 'a successful add closes the dialog');
+  assert.equal(view.document.getElementById('accountKey').value, '', 'the key never stays in the form');
+
+  const row = accountRow(view, 'cred-1');
+  await actionOf(row, 'edit-account').emit('click');
+  assert.equal(dialog.open, true, 'editing opens the same dialog');
+  assert.equal(view.document.getElementById('accountFormTitle').textContent, '编辑账户「主账户」');
+  assert.equal(view.document.getElementById('accountLabel').value, '主账户');
+  assert.equal(view.document.getElementById('accountCancel').hidden, false);
+
+  // Opening "add" while an edit is in progress starts from a clean form.
+  await view.document.getElementById('openAccountDialog').emit('click');
+  assert.equal(api.state.accountEdit, null, 'the header button never inherits an edit');
+  assert.equal(view.document.getElementById('accountLabel').value, '');
+  assert.equal(view.document.getElementById('accountFormTitle').textContent, '添加账户');
+});
+
+test('dismissing the account dialog cancels the edit and clears typed secrets', async () => {
+  const { view, dialog, api } = dialogPage({ fetchImpl: async () => respond(200, statusBody()) });
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const before = view.calls.length;
+  await actionOf(accountRow(view, 'cred-1'), 'edit-account').emit('click');
+  view.document.getElementById('accountKey').value = 'typed-but-abandoned';
+  view.document.getElementById('accountControlKey').value = 'typed-control';
+  // Esc: the browser closes the dialog and fires close.
+  dialog.open = false;
+  await dialog.emit('close');
+  assert.equal(api.state.accountEdit, null, 'Esc cancels the edit');
+  assert.equal(view.document.getElementById('accountKey').value, '');
+  assert.equal(view.document.getElementById('accountControlKey').value, '');
+  assert.match(view.document.getElementById('accountState').textContent, /已取消编辑/);
+
+  await view.document.getElementById('openAccountDialog').emit('click');
+  view.document.getElementById('accountKey').value = 'typed-for-a-new-account';
+  await view.document.getElementById('closeAccountDialog').emit('click');
+  assert.equal(dialog.open, false);
+  assert.equal(view.document.getElementById('accountKey').value, '', 'closing an add clears the typed key');
+
+  // Esc on a new-account dialog: the browser closes it without any button.
+  await view.document.getElementById('openAccountDialog').emit('click');
+  view.document.getElementById('accountKey').value = 'typed-then-escaped';
+  view.document.getElementById('accountControlKey').value = 'typed-control-then-escaped';
+  dialog.open = false;
+  await dialog.emit('close');
+  assert.equal(view.document.getElementById('accountKey').value, '', 'Esc on an add clears the typed key');
+  assert.equal(view.document.getElementById('accountControlKey').value, '', 'Esc on an add clears the typed control key');
+  assert.equal(view.calls.length, before, 'opening and dismissing the dialog requests nothing');
+});
+
+test('the enable control is a switch whose state is the operator choice, not the quota pause', async () => {
+  const view = fakePage();
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  api.render.applyStatus(statusBody({ credentials: [
+    { id: 'on', label: '启用中', disabled: false },
+    { id: 'off', label: '人工停用', disabled: true },
+    pausedCredential('paused', '额度暂停'),
+  ] }));
+  api.render.renderAccounts();
+  const toggle = id => actionOf(accountRow(view, id), 'toggle-account');
+  assert.equal(toggle('on').getAttribute('role'), 'switch');
+  assert.equal(toggle('on').getAttribute('aria-checked'), 'true');
+  assert.equal(toggle('on').textContent, '停用', 'the label names the action');
+  assert.equal(toggle('off').getAttribute('aria-checked'), 'false');
+  assert.equal(toggle('off').textContent, '启用');
+  // A quota pause is a plugin restriction; the operator's own choice is still "enabled".
+  assert.equal(toggle('paused').getAttribute('aria-checked'), 'true');
+  for (const [action, icon] of [['fetch-account', 'download'], ['edit-account', 'edit'], ['delete-account', 'trash'], ['resume-quota-pause', 'play']]) {
+    assert.equal(actionOf(accountRow(view, 'paused'), action).getAttribute('data-icon'), icon);
+  }
+});
+
+test('entering the credentials tab with only fresh snapshots says so instead of "0 queried"', async () => {
+  const fresh = new Date(Date.now() + 45_000).toISOString();
+  const { view, consoleApi: api, calls } = quotaPage(async url => (url.includes('/quota')
+    ? respond(200, quotaContract({ credential_id: 'cred-1', workspace_id: 'ws-1' }))
+    : respond(200, { accounts: [], host: { available: true } })));
+  // Stored the way the console stores every answer: through the normalizer.
+  api.state.quotas['cred-1'] = view.context.OpenDesignCore.normalizeQuota(
+    quotaContract({ credential_id: 'cred-1', workspace_id: 'ws-1', next_refresh_at: fresh }));
+  api.handlers.activateTab('credentials');
+  await waitFor(() => !api.state.quotaAutoRunning && api.state.quotaProgress, 'the walk to finish');
+  const text = view.document.getElementById('quotaLoadState').textContent;
+  assert.match(text, /60 秒有效期内/);
+  assert.doesNotMatch(text, /0 个已查询/);
+  assert.equal(calls.filter(call => call.url.includes('/quota')).length, 0, 'a fresh snapshot is not re-queried');
+});

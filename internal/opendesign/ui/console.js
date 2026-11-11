@@ -1736,27 +1736,35 @@
     const actions = el('div', { className: 'row-actions', attrs: { 'data-account-actions': item.id } }, [
       button('获取模型', 'fetch-account', {
         className: 'button compact',
+        icon: 'download',
         disabled: item.disabled,
         on: () => selectAccount(item),
       }),
       button('编辑', 'edit-account', {
         className: 'button compact',
+        icon: 'edit',
         on: () => editAccount(item),
       }),
+      // The label names the action; the switch position shows the current
+      // state of the operator's own choice, independent of a quota pause.
       button(item.disabled ? '启用' : '停用', 'toggle-account', {
-        className: 'button compact',
+        className: 'button compact account-switch',
+        attrs: { role: 'switch', 'aria-checked': item.disabled ? 'false' : 'true', title: item.disabled ? '当前为人工停用，点击启用' : '当前为启用，点击停用' },
         on: () => toggleAccount(item),
       }),
       pause ? button('解除额度暂停', 'resume-quota-pause', {
         className: 'button compact',
+        icon: 'play',
         on: () => resumeQuotaPause(item),
       }) : null,
       canRecheckQuotaPause(item, pause) ? button('重查额度', 'recheck-quota-pause', {
         className: 'button compact',
+        icon: 'shield',
         on: () => recheckQuotaPause(item),
       }) : null,
       button('删除', 'delete-account', {
         className: 'button compact danger',
+        icon: 'trash',
         on: () => deleteAccount(item),
       }),
     ]);
@@ -2126,7 +2134,11 @@
     const text = state.quotaAutoRunning
       ? `额度查询 ${processed} / ${progress.total} · 待查 ${state.quotaPending.length}${current ? ` · 正在查询「${current.label}」` : ''}`
       : (processed < progress.total ? `额度查询已停止 · 已处理 ${processed} / ${progress.total}`
-        : `额度查询完成 · ${progress.completed} 个已查询${progress.skipped ? ` · ${progress.skipped} 个已跳过` : ''}`);
+        : (progress.total === 0
+          // Every snapshot is younger than the 60s throttle, or no account is
+          // eligible: say that instead of "0 queried".
+          ? '额度快照仍在 60 秒有效期内，本次没有需要查询的账户。'
+          : `额度查询完成 · ${progress.completed} 个已查询${progress.skipped ? ` · ${progress.skipped} 个已跳过` : ''}`));
     node.textContent = `${text}${progress.failed ? ` · ${progress.failed} 个失败` : ''}`;
   }
 
@@ -2610,12 +2622,37 @@
     if (nodes.billing) nodes.billing.open = false;
   }
 
+  // The add/edit form is a dialog. Opening it never touches the form's values;
+  // resetAccountForm and editAccount own those.
+  function setAccountDialog(open) {
+    const dialog = $('accountDialog');
+    if (!dialog) return;
+    if (open) {
+      if (typeof dialog.showModal === 'function' && !dialog.open) dialog.showModal();
+    } else if (typeof dialog.close === 'function' && dialog.open) {
+      dialog.close();
+    }
+  }
+
+  function openAccountDialog() {
+    if (state.busy) return;
+    // Starting a new account from the header never inherits an edit in progress.
+    if (state.accountEdit) resetAccountForm();
+    message('accountState', '');
+    setAccountDialog(true);
+    const label = $('accountLabel');
+    if (label && typeof label.focus === 'function') label.focus();
+  }
+
+  function closeAccountDialog() {
+    if (state.busy) return;
+    if (state.accountEdit) cancelAccountEdit();
+    else resetAccountForm();
+  }
+
   function resetAccountForm() {
     state.accountEdit = null;
-    const editor = $('accountEditor');
-    if (editor) editor.open = false;
-    const editorSummary = $('accountEditorSummary');
-    if (editorSummary) editorSummary.textContent = '添加账户';
+    setAccountDialog(false);
     const nodes = accountFormNodes();
     const clearRow = $('accountClearBillingRow');
     if (clearRow) clearRow.hidden = true;
@@ -2635,10 +2672,7 @@
   function editAccount(item) {
     if (state.busy) return;
     state.accountEdit = { id: item.id, label: item.label, billing_configured: item.billing_configured === true, credits_per_usd: item.credits_per_usd || '' };
-    const editor = $('accountEditor');
-    if (editor) editor.open = true;
-    const editorSummary = $('accountEditorSummary');
-    if (editorSummary) editorSummary.textContent = `编辑账户「${item.label}」`;
+    setAccountDialog(true);
     const nodes = accountFormNodes();
     if (nodes.title) nodes.title.textContent = `编辑账户「${item.label}」`;
     if (nodes.hint) nodes.hint.textContent = 'API key 不能回显；留空表示保留原 Key，保存后输入框会清空。';
@@ -5001,6 +5035,22 @@
     if (accountForm) accountForm.addEventListener('submit', addAccount);
     const cancel = $('accountCancel');
     if (cancel) cancel.addEventListener('click', cancelAccountEdit);
+    const openAccount = $('openAccountDialog');
+    if (openAccount) openAccount.addEventListener('click', openAccountDialog);
+    const closeAccount = $('closeAccountDialog');
+    if (closeAccount) closeAccount.addEventListener('click', closeAccountDialog);
+    const accountDialog = $('accountDialog');
+    // Esc closes the dialog natively. Treat it as a cancel so an abandoned edit
+    // cannot be saved later by an unrelated submit, and no key stays typed in.
+    if (accountDialog) accountDialog.addEventListener('close', () => {
+      if (state.busy) return;
+      if (state.accountEdit) cancelAccountEdit();
+      else {
+        const key = $('accountKey');
+        if (key) key.value = '';
+        clearBillingInputs();
+      }
+    });
     const accountsPrev = $('accountsPrev');
     if (accountsPrev) accountsPrev.addEventListener('click', previousAccountsPage);
     const accountsNext = $('accountsNext');
@@ -5303,6 +5353,8 @@
       saveConfig,
       savePauseConfig,
       loadRuntime,
+      openAccountDialog,
+      closeAccountDialog,
       openErrorRules,
       closeErrorRules,
       openErrorRuleHelp,
