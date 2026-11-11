@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// newQuotaPauseTestService opts in explicitly: the production zero-value policy
-// stays off until CPA-native manual-disable attribution is safe.
+// newQuotaPauseTestService sets the pause policy explicitly, so these tests do
+// not depend on the default an unset policy resolves to (which is on).
 func newQuotaPauseTestService(t *testing.T) (*Service, *fakeHost) {
 	t.Helper()
 	s, host := newTestService(t)

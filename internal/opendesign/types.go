@@ -121,9 +121,9 @@ type Config struct {
 	Models   []Model   `json:"models" yaml:"models"`
 	LogLevel string    `json:"log_level,omitempty" yaml:"log_level,omitempty"`
 	Logs     LogConfig `json:"logs,omitempty" yaml:"logs,omitempty"`
-	// Pause is the plugin-owned quota-exhaustion policy. A nil Enabled defaults
-	// to off while manual-disable attribution is under review, so upgrading an
-	// older settings.json cannot silently activate an unsafe pause.
+	// Pause is the plugin-owned quota-exhaustion policy. A nil Enabled means the
+	// operator made no explicit choice and resolves to on (see pauseSettings),
+	// so an older settings.json without this object gets the reviewed default.
 	Pause PauseConfig `json:"pause,omitempty" yaml:"pause,omitempty"`
 }
 
