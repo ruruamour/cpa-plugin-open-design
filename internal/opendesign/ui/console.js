@@ -4025,7 +4025,7 @@
       condition.text = textarea.value;
       markErrorRulesDirty();
     });
-    const remove = el('button', { className: 'button compact danger', type: 'button', text: '删除条件' });
+    const remove = el('button', { className: 'button compact danger', type: 'button', text: '删除条件', attrs: { 'data-icon': 'trash' } });
     remove.addEventListener('click', () => {
       const rule = errorRulesDraft()[ruleIndex];
       if (!rule) return;
@@ -4056,16 +4056,16 @@
       rule.action = action.value;
       markErrorRulesDirty();
     });
-    const up = el('button', { className: 'button compact', type: 'button', text: '上移', attrs: { 'aria-label': `规则 ${index + 1} 上移` } });
+    const up = el('button', { className: 'button compact', type: 'button', text: '上移', attrs: { 'aria-label': `规则 ${index + 1} 上移`, 'data-icon': 'up' } });
     up.addEventListener('click', () => moveErrorRule(index, -1));
-    const down = el('button', { className: 'button compact', type: 'button', text: '下移', attrs: { 'aria-label': `规则 ${index + 1} 下移` } });
+    const down = el('button', { className: 'button compact', type: 'button', text: '下移', attrs: { 'aria-label': `规则 ${index + 1} 下移`, 'data-icon': 'down' } });
     down.addEventListener('click', () => moveErrorRule(index, 1));
-    const remove = el('button', { className: 'button compact danger', type: 'button', text: '删除' });
+    const remove = el('button', { className: 'button compact danger', type: 'button', text: '删除', attrs: { 'data-icon': 'trash' } });
     remove.addEventListener('click', () => {
       errorRulesDraft().splice(index, 1);
       markErrorRulesDirty({ rerender: true });
     });
-    const addCondition = el('button', { className: 'button compact', type: 'button', text: '新增条件' });
+    const addCondition = el('button', { className: 'button compact', type: 'button', text: '新增条件', attrs: { 'data-icon': 'plus' } });
     addCondition.addEventListener('click', () => {
       rule.conditions.push({ type: 'contains', text: '' });
       markErrorRulesDirty({ rerender: true });

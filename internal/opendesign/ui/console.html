@@ -109,6 +109,9 @@
     .control { width: 100%; min-height: 38px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); min-width: 0; }
     .control::placeholder { color: var(--muted); }
     textarea.control { resize: vertical; }
+    /* One chevron for every select instead of the platform arrow; the mid-grey
+       stroke reads on both the light and the dark surface. */
+    select.control { appearance: none; -webkit-appearance: none; padding-right: 30px; text-overflow: ellipsis; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b8680' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 9px center; background-size: 14px 14px; }
     .search { flex: 1 1 220px; width: auto; }
     .count { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
     .field { display: grid; gap: 5px; min-width: 0; flex: 1 1 210px; }
@@ -202,7 +205,9 @@
     dialog h2 { margin-bottom: 6px; }
     dialog.dialog-wide { max-width: min(760px, calc(100vw - 32px)); }
     dialog.dialog-form { max-width: min(520px, calc(100vw - 32px)); }
-    .dialog-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px 12px; margin-bottom: 14px; }
+    .dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px 16px; margin-bottom: 14px; }
+    .dialog-head > div { flex: 1 1 0; min-width: 0; }
+    .dialog-head > .button { flex: none; }
     .dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 18px; }
     #errorRulesDialog .dialog-actions { position: sticky; bottom: -24px; margin: 14px 0 -10px; padding: 14px 0; border-top: 1px solid var(--line); background: var(--surface); }
     #errorRulesState { white-space: pre-wrap; }
@@ -387,9 +392,14 @@
     .error-rule-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
     .error-rule-name { overflow-wrap: anywhere; }
     .error-rule-description { color: var(--muted); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
-    .error-rule-fields { display: flex; flex-wrap: wrap; gap: 10px; }
-    .error-rule-condition { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; min-width: 0; }
-    .error-rule-condition-text { width: 100%; min-width: 0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+    /* Status and match type share one narrow column, so the action and the
+       match text line up underneath each other. */
+    .error-rule-fields { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 12px; }
+    .error-rule-condition { display: grid; grid-template-columns: 150px minmax(0, 1fr) auto; gap: 12px; align-items: start; min-width: 0; }
+    .error-rule-fields .field, .error-rule-condition .field { flex: none; }
+    .error-rule-condition .row-actions { padding-top: 22px; }
+    .error-rule-condition-text { width: 100%; min-width: 0; min-height: 38px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; }
+    .error-rule-card > .row-actions { justify-content: flex-start; }
 
     @media (max-width: 1080px) {
       #requestStats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -416,6 +426,9 @@
       .account-usage { grid-column: 1 / -1; grid-row: 2; }
       .account-chevron { grid-column: 2; grid-row: 1; }
       .guide { grid-template-columns: minmax(0, 1fr); }
+      .error-rule-fields { grid-template-columns: 110px minmax(0, 1fr); }
+      .error-rule-condition { grid-template-columns: minmax(0, 1fr); }
+      .error-rule-condition .row-actions { padding-top: 0; }
     }
     @media (max-width: 640px) {
       #requestStats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
