@@ -2,7 +2,7 @@
 
 把 OpenDesign 的 OpenAI 兼容接口接入 [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI)。
 
-> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前源码版本为 `0.4.16`（紧凑凭据卡片、直接可见的窗口额度与时间、准确的串行查询进度）。生产已本地构建热加载 `0.4.16`，GitHub 最新 Release 仍是 `open-design-v0.4.12`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
+> 本仓库是 [ClinePassBridge](https://github.com/xiao-qiu-qiu/ClinePassBridge) v0.4.3（commit `8ddb9eac5c0cc0c1485671d27373d2210ec2a0c9`）的独立 fork，保留 `upstream` 远程用于对照和同步。插件 ID 与 provider 为 `open-design`；当前源码版本为 `0.5.0`（控制台改为 ClinePassBridge 的设计，请求日志增加首字时间、缓存与输出速率，并修复两个已复现的缺陷）。`0.5.0` 只在本地提交并通过验证，**尚未部署，也未发布 Release**；生产运行的仍是本地构建热加载的 `0.4.16`，GitHub 最新 Release 仍是 `open-design-v0.4.12`。这不是 OpenDesign 官方发布，也不代表 ClinePassBridge 上游。
 >
 > `0.3.0` 已完成本地 Go／Node、Microsoft Edge、原版 CPA 隔离验收及 `nuoapi-net` 生产升级；精确提交、CI 和上线证据见[验证记录](docs/verification.md)。
 >
@@ -11,6 +11,16 @@
 > **`0.4.6` tag 不得使用。** 该版本的暂停恢复路径会覆盖旧文件与人工停用状态，发布工作流失败且未生成 Release。`0.4.7` 已修复旧文件回放、解除修订、插件控制台人工停用保护与 Windows 粗时钟复查误判，通过独立复核、两套隔离宿主验收和五平台 Release 构建，并已于 2026-11-06 完成生产升级。CPA 原生界面的停用仍无法可靠归因（已知限制）：暂停期间请在插件控制台启停账户。
 
 ## 功能
+
+`0.5.0` 把控制台改为 ClinePassBridge（上游 v0.4.7）的设计，后端只修缺陷并补日志字段，没有改变调度、暂停或恢复逻辑：
+
+- **外观与结构**：暖灰配色与深色主题、顶栏、带图标的下划线标签页、双栏面板。标签页为「请求日志／凭据管理／模型映射／配置概览」，原概览并入配置页，顶栏显示账户与映射数量。管理密钥、添加和编辑账户都改为对话框；没有可用密钥时密钥对话框自动打开。「跟随系统」在嵌入 CPA 或能读到 CPA 保存的主题时跟随 CPA，否则跟随操作系统。
+- **请求日志**：每行显示首字时间与耗时（带绿／黄／红色标）、输入／输出、缓存占比和输出速率；本地拒绝在徽标里写明原因。统计为五张卡片（总请求、成功率、Token 总量、缓存命中率、平均输出速率），可按「全部／今天／24 小时／7 天／30 天」查看。上游没有上报的数值显示为「—」，不显示成 0。
+- **凭据管理**：启停改为开关（表示管理员自己的选择，与额度暂停无关）；展开详情里钱包与套餐窗口并排。账号卡片仍然默认折叠，额度条直接可见。
+- **模型映射**：已保存的映射行可以一键发起显式模型测试（仍需确认、只发一次）。
+- **修复**：清空 `credits_per_usd` 或使用 `clear_billing` 后，凭据文件里仍保留旧值，下次加载又恢复（`0.4.11`～`0.4.16` 均受影响）；额度暂停账号被本地拒绝的请求，在请求日志和模型测试里被记成 `upstream_error`，现在记为 `quota_blocked`。
+
+没有从上游搬过来的部分：代理池（插件自带 HTTP 传输、限速与排队，与本插件「不做并发限制、不做排队」的边界相反）、会话重分配、钉上游与能力过滤、Cline 用量估算。
 
 `0.4.16` 将「凭据 · 额度」改为紧凑两列卡片：左侧账号、暂停与复查状态、上游历史提示、钱包余额及查询时间；右侧直接显示官方返回的各窗口进度条、剩余 credits／可选美元换算与重置时间。点击卡片展开编辑、启停、复查、刷新和完整说明，展开状态在重绘和翻页后保留。待查询、正在查询、部分失败和旧数据分别标明；顶部提供整批刷新／停止与进度。窗口种类以官方数据为准，缺失保留未知。
 
@@ -72,15 +82,14 @@ GitHub 最新 Release 为 [`open-design-v0.4.12`](https://github.com/ruruamour/c
 
 ## 控制台
 
-控制台分为 5 个标签页，除「凭据 · 额度」外切换标签页不会自动发请求。打开「凭据 · 额度」会按账户顺序自动查询一次额度（一个账号一个账号地查，不会并发），其余操作仍由按钮手动触发：
+控制台分为 4 个标签页，默认打开「请求日志」，密钥可用后读取一次日志与统计。打开「凭据管理」会按账户顺序自动查询一次额度（一个账号一个账号地查，不会并发），其余操作仍由按钮手动触发：
 
 | 标签页 | 内容 |
 | --- | --- |
-| 概览 | 汇总管理接口已返回的账户与映射数量 |
-| 凭据 · 额度 | 紧凑账号卡片、官方窗口额度条与重置时间、暂停复查／历史提示、查询进度与刷新／停止；点击展开账户操作和额度详情 |
-| 模型映射 · 覆盖 | 拉取上游模型、搜索与批量勾选、保存映射、按模型配置思考强度映射、按模型查询官方覆盖、显式模型测试 |
-| 请求日志 | 只读元数据列表、汇总统计、筛选与分页、清空日志 |
-| 代理池 · 配置 | 请求日志开关与保留设置、额度暂停开关与单次上限；宿主代理／路由／冷却只读展示，runtime 手动读取 |
+| 请求日志 | 元数据列表（首字／耗时色条、用量、缓存占比、输出速率）、五张统计卡片与统计时段、搜索与筛选、分页、清空日志 |
+| 凭据管理 | 紧凑账号卡片、官方窗口额度条与重置时间、暂停复查／历史提示、查询进度与刷新／停止；点击展开账户操作和额度详情；添加与编辑在对话框里完成 |
+| 模型映射 | 映射列表与行内测试、拉取上游模型并批量勾选、按模型配置思考强度映射、按模型查询官方覆盖、显式模型测试 |
+| 配置概览 | 请求日志开关与保留设置、额度暂停开关与单次上限、运行概览；宿主代理／路由／冷却只读展示，runtime 手动读取 |
 
 ### 重试调度／错误规则
 
@@ -115,9 +124,12 @@ GitHub 最新 Release 为 [`open-design-v0.4.12`](https://github.com/ruruamour/c
 
 ### 请求日志与统计
 
-日志条目只包含以下元数据 allowlist：请求 ID、开始／结束时间、耗时、客户端模型、上游模型、凭据 ID、是否流式、状态、HTTP 状态、错误类型、输入／输出／总 token、`upstream_attempted`。**不保存**请求/响应正文、headers、query 字符串、API key、control key 或 Workspace ID；保存前还会按已知 Key 再做一次脱敏。
+日志条目只包含以下元数据 allowlist：请求 ID、开始／结束时间、耗时、客户端模型、上游模型、凭据 ID、是否流式、状态、HTTP 状态、错误类型、输入／输出／总 token、`upstream_attempted`、思考强度及其映射，以及 `0.5.0` 新增的三个可选数值：首字时间 `first_token_ms`、缓存 token `cached_tokens`、思考 token `reasoning_tokens`。列表响应另带读取时计算的 `output_tokens_per_second`。**不保存**请求/响应正文、headers、query 字符串、API key、control key 或 Workspace ID；保存前还会按已知 Key 再做一次脱敏。
 
 - 默认开启，保留 7 天、最多 500 条；可通过配置调整为 1–90 天、1–500 条。
+- 首字时间只对流式请求记录：第一帧带输出（正文、思考或工具调用）的数据到达时计时，只带 role 或只带 usage 的帧不算。缓存与思考 token 取自上游 usage 明细（兼容 `prompt_cache_hit_tokens`）；明细大于其总量或缺少总量时丢弃。
+- 输出速率不落盘：读取时按「输出 token ÷（耗时 − 首字时间）」计算，窗口不足 0.5 秒不计。统计里的平均速率是总输出除以总生成时间，不是各行速率的平均。
+- 缓存命中率只统计上报了缓存数值的请求；没有上报的请求算未知，不算未命中。
 - 写入为异步：25ms 合并持久化，失败后 2 秒重试；`plugin.quiesce`／`plugin.shutdown` 会先取消延迟任务再同步 flush。
 - 清空日志是持久化操作：先写入 clear tombstone（含保留策略），再更新内存，因此崩溃恢复后旧日志不会复活。
 - usage 字段可为 `null`：响应没有出现对应 usage 时保持未知，不写成 0。
@@ -192,7 +204,7 @@ install -Dm755 dist/open-design.so plugins/linux/amd64/open-design.so
 | `POST /v0/management/open-design/quota-pause/recheck` | 对暂停账户立即发起官方复查，body 为 `{credential_id}` |
 | `GET` / `POST /v0/management/open-design/models/reasoning` | 读取或保存每个模型的思考强度映射 |
 | `GET /v0/management/open-design/request-logs` | 分页读取元数据日志，支持 `limit`、`offset`、`status`、`model`、`q`、`credential_id`、`attempted`、`since`、`until` |
-| `GET /v0/management/open-design/request-stats` | 读取汇总统计（含本地拒绝数） |
+| `GET /v0/management/open-design/request-stats` | 读取汇总统计（含本地拒绝数、缓存命中率、平均输出速率与平均首字时间）；可选 `since`／`until` 只在已保留的日志内收窄 |
 | `DELETE /v0/management/open-design/request-logs` | 持久化清空日志（也接受 `POST /request-logs/clear`） |
 | `GET` / `POST /v0/management/open-design/config` | 读取或修改请求日志开关、保留天数与条数上限，以及 `pause.enabled`／`pause.max_seconds` |
 | `GET /v0/management/open-design/runtime` | 插件可见运行时状态；宿主账户信息不可读时标记降级 |
@@ -249,7 +261,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 产物是 `dist/open-design.so`（Linux amd64，C shared ABI v1）。
 
-发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。源码 `Version`、`marketplace/registry.json` 与发布 tag 保持同步；当前源码为 `0.4.15`，尚未发布，已发布的最新 tag 仍是 `open-design-v0.4.12`。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动"取最新"不适用于本 fork。
+发布 tag 使用 `open-design-vX.Y.Z` 形式，避免与 fork 保留的上游 `v*` tag 冲突。`open-design-v0.4.6` 是不安全的失败 tag，不得使用或复用。源码 `Version`、`marketplace/registry.json` 与发布 tag 保持同步；当前源码为 `0.5.0`，尚未发布，已发布的最新 tag 仍是 `open-design-v0.4.12`。CPA 插件商店的 latest-release 解析要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本，`github-release` 的自动"取最新"不适用于本 fork。
 
 ## 当前验证边界
 

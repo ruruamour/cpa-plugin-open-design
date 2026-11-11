@@ -4,7 +4,7 @@
 
 `0.4.0` 的 ctypes 与原版 CPA 假上游冒烟同时覆盖日志／统计、`/config`、`/runtime`、`/model-test`、`/model-coverage` 和 `/error-rules`。`--cpa-live` 还包含一段双账号真实宿主轮换验证：假上游按凭据返回生产 400 `tier_limit_exceeded`，宿主必须按规则换到另一账号并返回 200，冷却后跳过失败账号，`stop` 规则下不换号。所有账户与请求均为本地 fixture，验收记录见 `docs/verification.md`。
 
-## `check-console-browser.py` — 紧凑凭据卡片的真实浏览器检查
+## `check-console-browser.py` — 控制台四个标签页的真实浏览器检查
 
 需要本机 Python `playwright` 与 Microsoft Edge／Chromium。默认优先使用 `microsoft-edge`，也可显式指定路径：
 
@@ -14,6 +14,8 @@ python3 scripts/check-console-browser.py --browser /usr/bin/google-chrome --out 
 ```
 
 脚本将 `ui.go` 同样拼接的控制台交给隔离浏览器，所有网络请求均拦截为本地合成 fixture，不读真实凭据、不请求生产或官方接口。覆盖 1440px／390px、明暗主题、默认折叠、键盘展开、重绘及翻页保留、串行 pending／loading、离开停止、60 秒快照跳过、真实零／100% 窗口、失败保留旧值、无横向溢出及 JS 错误。截图和 `result.json` 写到 `--out`，不属于插件发布包。
+
+`0.5.0` 起脚本覆盖全部四个标签页：请求日志（落地页只读一次、首字／耗时色条、缓存与速率、本地拒绝原因、五张统计卡片等宽、统计时段只重读统计）、模型映射（双栏并排、默认前缀别名完整显示）、配置概览（额度暂停中的账户有标记）、密钥与账户对话框（焦点、Esc 关闭、不残留已输入的密钥），以及手机宽度下四个页面均无横向溢出。
 
 ## `smoke-abi.py` — 原生 C ABI v1 冒烟
 
