@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -253,7 +254,36 @@ type Credential struct {
 	extraFields     map[string]json.RawMessage
 }
 
-var credentialJSONFields = []string{"type", "id", "label", "api_key", "control_key", "workspace_id", "disabled", "base_url", "model_revision", "request_scoped_errors", "quota_block", "quota_revision"}
+// credentialJSONFields is every key the Credential struct itself reads and
+// writes. It is derived from the struct tags rather than maintained by hand: a
+// key missing from this list is treated as a host- or operator-added field and
+// re-emitted verbatim by MarshalJSON, so a hand-kept list silently made a
+// newly added field impossible to clear (an omitempty zero value disappears
+// from the known encoding and the stale preserved copy takes its place).
+var credentialJSONFields = credentialKnownJSONFields()
+
+func credentialKnownJSONFields() []string {
+	typ := reflect.TypeOf(Credential{})
+	fields := make([]string, 0, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		// Same naming rule encoding/json applies: "-" is never written, an
+		// empty name falls back to the Go field name.
+		tag := field.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "" {
+			name = field.Name
+		}
+		fields = append(fields, name)
+	}
+	return fields
+}
 
 // UnmarshalJSON keeps host- or operator-added fields so a rewrite through
 // host.auth.save cannot silently drop them.
