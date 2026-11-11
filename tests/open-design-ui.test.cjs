@@ -8444,3 +8444,82 @@ test('entering the credentials tab with only fresh snapshots says so instead of 
   assert.doesNotMatch(text, /0 个已查询/);
   assert.equal(calls.filter(call => call.url.includes('/quota')).length, 0, 'a fresh snapshot is not re-queried');
 });
+
+// --- models and config: row test button, runtime pause badge -----------------
+
+test('a saved mapping row can start the explicit model test; an unsaved row cannot', async () => {
+  const sent = [];
+  const confirmations = [];
+  const view = fakePage({
+    confirmImpl: text => { confirmations.push(text); return true; },
+    fetchImpl: async (url, init = {}) => {
+      if (url.includes('/model-test')) {
+        sent.push(JSON.parse(init.body));
+        return respond(200, { credential_id: 'cred-1', model_id: 'od-flash', upstream_model: 'open-design/flash', status: 'success', http_status: 200, duration_ms: 12, upstream_attempted: true, real_inference: true });
+      }
+      return respond(200, statusBody());
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await api.render.loadStatus();
+  const rows = () => view.document.getElementById('mappingList').children;
+  const testButton = row => [...row.children].find(node => node.getAttribute && node.getAttribute('data-action') === 'test-mapping');
+  // The four leading children keep their order: alias, arrow, upstream, delete.
+  assert.equal(rows()[0].children[3].getAttribute('data-action'), 'remove-mapping');
+  assert.equal(rows()[0].children[4].getAttribute('data-action'), 'test-mapping');
+  assert.equal(testButton(rows()[0]).disabled, false, 'a saved row is testable');
+
+  view.document.getElementById('modelTestCredential').value = 'cred-1';
+  await testButton(rows()[0]).emit('click');
+  assert.equal(view.document.getElementById('modelTestModel').value, 'od-flash', 'the alias is filled in for the operator to see');
+  assert.equal(confirmations.length, 1, 'the row button still asks for confirmation');
+  assert.match(confirmations[0], /od-flash/);
+  assert.equal(sent.length, 1, 'exactly one test request');
+  assert.deepEqual([sent[0].credential_id, sent[0].model_id], ['cred-1', 'od-flash']);
+
+  // A declined confirmation sends nothing.
+  const declined = fakePage({ confirmImpl: () => false, fetchImpl: async url => (url.includes('/model-test') ? (sent.push('declined'), respond(200, {})) : respond(200, statusBody())) });
+  const other = declined.context.OpenDesignConsole;
+  other.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  await other.render.loadStatus();
+  declined.document.getElementById('modelTestCredential').value = 'cred-1';
+  await other.handlers.testMapping('od-flash');
+  assert.equal(sent.length, 1, 'declining the confirmation sends no request');
+
+  // An edited or new row is unknown to the backend, so it cannot be tested.
+  const alias = rows()[0].children[0].children[1];
+  alias.value = 'renamed-alias';
+  await alias.emit('input');
+  api.render.renderMappings();
+  assert.equal(testButton(rows()[0]).disabled, true, 'an unsaved rename is not testable');
+  assert.match(testButton(rows()[0]).getAttribute('title'), /保存映射后/);
+  api.handlers.addMapping();
+  assert.equal(testButton(rows()[1]).disabled, true, 'a new empty row is not testable');
+  await testButton(rows()[1]).emit('click');
+  assert.equal(sent.length, 1, 'a disabled row never starts a test');
+});
+
+test('the runtime list marks an account the plugin is holding back for quota', async () => {
+  const view = fakePage({
+    fetchImpl: async url => (url.includes('/runtime') ? respond(200, {
+      loaded: true, stopped: false, active_requests: 0, pending_operations: 0, model_count: 1, host: { available: true },
+      credentials: [
+        { id: 'active', label: '活动账户', disabled: false, model_count: 1, models_scope: 'shared', host: { status: 'active' } },
+        { id: 'paused', label: '暂停账户', disabled: false, model_count: 1, models_scope: 'shared', host: { status: 'active' } },
+        { id: 'off', label: '停用账户', disabled: true, model_count: 1, models_scope: 'shared', host: { status: 'active' } },
+      ],
+    }) : respond(404, { error: 'not found' })),
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  api.render.applyStatus(statusBody({ credentials: [
+    activeCredential('active', '活动账户'), pausedCredential('paused', '暂停账户'), { id: 'off', label: '停用账户', disabled: true },
+  ] }));
+  await api.handlers.loadRuntime();
+  const rows = [...view.document.getElementById('runtimeCredentials').children];
+  const text = id => rows.find(row => row.getAttribute('data-runtime-credential') === id).children[0].textContent;
+  assert.equal(text('active'), '活动账户已启用');
+  assert.equal(text('paused'), '暂停账户已启用额度暂停中', 'the operator choice and the plugin pause are both shown');
+  assert.equal(text('off'), '停用账户已停用');
+});

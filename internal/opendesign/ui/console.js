@@ -2499,6 +2499,8 @@
       });
       const remove = button('删除', 'remove-mapping', {
         className: 'button compact danger',
+        icon: 'trash',
+        attrs: { title: '删除这一行（保存后生效）', 'aria-label': `删除第 ${index + 1} 行映射` },
         on: () => {
           state.mappings.splice(index, 1);
           noteMappingsEdited();
@@ -2506,6 +2508,17 @@
         },
       });
       const actions = [remove];
+      // A saved row can be sent to the test panel in one click. It only fills
+      // in the alias and starts the same explicit, confirmed, single request;
+      // an unsaved row is not testable because the backend does not know it.
+      const savedAlias = state.savedMappings.some(saved => saved.id === model.id && saved.upstream_id === model.upstream_id);
+      actions.push(button('测试', 'test-mapping', {
+        className: 'button compact',
+        icon: 'test',
+        disabled: !savedAlias || !model.id,
+        attrs: { title: savedAlias ? '填入右侧「模型测试」并发送一次（仍需确认）' : '保存映射后才能测试这一行' },
+        on: () => testMapping(model.id),
+      }));
       // An unresolved pin and an unpinned row that collides with a server alias
       // are both never dropped or rebound automatically. This single-row
       // control is the only explicit way to say "use the server's current row
@@ -3864,10 +3877,15 @@
         list.replaceChildren(el('p', { className: 'empty', text: 'runtime 未返回账户。' }));
       } else {
         list.replaceChildren(...runtime.credentials.map(item => {
+          // /runtime reports the operator's own choice only. The quota pause is
+          // known from the status read, so say it here too: an account the
+          // plugin is holding back must not read as plainly "enabled".
+          const known = state.status.credentials.find(entry => entry.id === item.id);
           const head = [
             el('span', { className: 'name', text: item.label }),
             el('span', { className: `badge ${item.disabled ? 'off' : 'on'}`, text: item.disabled ? '已停用' : '已启用' }),
           ];
+          if (known && known.quota_paused) head.push(el('span', { className: 'badge danger', text: '额度暂停中' }));
           if (item.testing) head.push(el('span', { className: 'badge', text: '测试中' }));
           const details = [`映射模型 ${item.model_count} 个（${item.models_scope === 'shared' ? '全局共享' : '未知范围'}）`];
           details.push(`宿主账户：${hostBoundaryText(item.host)}`);
@@ -4276,6 +4294,19 @@
     state.modelTest = null;
     renderModelTest();
     if (text) message('modelTestState', text, 'error');
+  }
+
+  // Start the explicit model test for one saved alias. The request, its
+  // confirmation and its single-shot rule are runModelTest's; this only
+  // chooses the alias, so nothing about the test contract changes.
+  async function testMapping(alias) {
+    if (optionalBusy('modelTest') || !alias) return;
+    const model = $('modelTestModel');
+    if (model && model.value !== alias) {
+      model.value = alias;
+      invalidateModelTestResult('模型选择已变化，之前的模型测试结果已清除。');
+    }
+    await runModelTest();
   }
 
   async function runModelTest() {
@@ -5364,6 +5395,7 @@
       resetErrorRules,
       addErrorRule,
       runModelTest,
+      testMapping,
       cycleThemePreference,
       applyThemePreference,
     },
