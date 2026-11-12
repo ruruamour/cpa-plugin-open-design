@@ -47,6 +47,14 @@ func parseQuotaWallet(body []byte) (*quotaWalletData, bool) {
 //
 // so updatedAt is display metadata. A value that is not a usable timestamp is
 // reported as unknown; it must not discard a balance the upstream did return.
+//
+// One deliberate difference from the official reader: a negative balance is
+// accepted. The official rule (/^\d+(?:\.\d+)?$/) rejects it, which made the
+// console report "malformed" for an account that was simply overdrawn (the
+// funding check of the same account returned balanceUsd "-N.NNNN" in
+// production). The wallet is display-only here, so showing the amount the
+// upstream returned is more useful than hiding it; the funding parser, which
+// feeds the quota pause, already accepted a sign and is unchanged.
 func parseQuotaWalletReason(body []byte) (*quotaWalletData, string) {
 	if len(body) > maxQuotaBody {
 		return nil, "body_too_large"
@@ -63,7 +71,7 @@ func parseQuotaWalletReason(body []byte) (*quotaWalletData, string) {
 	if !ok {
 		return nil, "balance_not_string"
 	}
-	if len(balance) > 4096 || !quotaUnsignedDecimal.MatchString(balance) {
+	if len(balance) > 4096 || !quotaSignedDecimal.MatchString(balance) {
 		return nil, "balance_format"
 	}
 	updatedAt, _ := quotaNullableTime(m["updatedAt"], true)

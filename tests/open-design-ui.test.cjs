@@ -8553,3 +8553,325 @@ test('a malformed wallet shows which check failed, and an unknown reason is show
   assert.equal(hostile.stored.reason, '');
   assert.ok(!hostile.text.includes('onerror') && !hostile.text.includes('12.34'));
 });
+
+// --- 并发保护：配置面板、运行时状态 -------------------------------------------
+
+const concurrencyConfig = (overrides = {}) => ({
+  logs: {},
+  pause: { enabled: true, max_seconds: 86400, owner: 'plugin' },
+  concurrency: {
+    enabled: true, max_in_flight: 4, hold_seconds: 60, max_hold_seconds: 300, owner: 'plugin',
+    limits: { max_in_flight: [1, 64], hold_seconds: [0, 3600], max_hold_seconds: [0, 3600] },
+    stats: {
+      since: '2026-11-12T03:40:00Z', held_now: 2, rejected_at_limit: 120, rejected_while_held: 45,
+      upstream_rate_limited: 9, holds_started: 7,
+    },
+    ...overrides,
+  },
+  upstream: { fixed: true }, proxy: {}, routing: {},
+});
+
+function concurrencyPage(config, onPost) {
+  const calls = [];
+  const view = fakePage({
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, init });
+      if (url.endsWith('/config') && init.method === 'POST') return onPost ? onPost(JSON.parse(init.body)) : respond(200, config);
+      if (url.endsWith('/config')) return respond(200, config);
+      return respond(404, { error: 'not found' });
+    },
+  });
+  const api = view.context.OpenDesignConsole;
+  api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+  const node = id => view.document.getElementById(id);
+  const posts = () => calls.filter(call => call.init.method === 'POST');
+  return { view, api, node, posts };
+}
+
+const factPairs = container => [...container.children].map(fact => [fact.children[0].textContent, fact.children[1].textContent]);
+
+test('并发保护：归一化保留未知为未知，缺失整段时为 null', () => {
+  const core = fakePage().context.OpenDesignCore;
+  // An older backend has no such section: that is "not supported", never defaults.
+  assert.equal(core.normalizeConfig({ logs: {}, pause: {} }).concurrency, null);
+  assert.equal(core.normalizeConfig({ concurrency: 'yes' }).concurrency, null);
+  const full = core.normalizeConfig(concurrencyConfig()).concurrency;
+  assert.deepEqual(JSON.parse(JSON.stringify(full)), {
+    enabled: true, max_in_flight: 4, hold_seconds: 60, max_hold_seconds: 300, owner: 'plugin',
+    stats: { since: '2026-11-12T03:40:00Z', held_now: 2, rejected_at_limit: 120, rejected_while_held: 45, upstream_rate_limited: 9, holds_started: 7 },
+  });
+  // Out-of-range or missing numbers become null, never 0 and never a default.
+  const partial = core.normalizeConfig({ concurrency: { enabled: 'true', max_in_flight: 0, hold_seconds: -1, max_hold_seconds: 99999, stats: { held_now: '3' } } }).concurrency;
+  assert.equal(partial.enabled, false, 'only a literal true enables');
+  assert.equal(partial.max_in_flight, null);
+  assert.equal(partial.hold_seconds, null);
+  assert.equal(partial.max_hold_seconds, null);
+  assert.equal(partial.stats.held_now, null);
+  assert.equal(partial.stats.rejected_at_limit, null);
+  // hold_seconds 0 is a real value (holding off), not "missing".
+  assert.equal(core.normalizeConfig({ concurrency: { hold_seconds: 0, max_hold_seconds: 0 } }).concurrency.hold_seconds, 0);
+});
+
+test('并发保护：读取配置后显示设置与统计', async () => {
+  const { api, node } = concurrencyPage(concurrencyConfig());
+  // Before anything is read the form is locked and empty.
+  api.render.renderConfig();
+  assert.equal(node('configConcurrencyMaxInFlight').value, '');
+  assert.equal(node('saveConcurrencyConfig').disabled, true);
+  assert.match(node('concurrencyFacts').textContent, /读取配置/);
+  await api.handlers.loadConfig();
+  assert.equal(node('configConcurrencyEnabled').checked, true);
+  assert.equal(node('configConcurrencyMaxInFlight').value, '4');
+  assert.equal(node('configConcurrencyHoldSeconds').value, '60');
+  assert.equal(node('configConcurrencyMaxHoldSeconds').value, '300');
+  for (const id of ['configConcurrencyEnabled', 'configConcurrencyMaxInFlight', 'configConcurrencyHoldSeconds', 'configConcurrencyMaxHoldSeconds', 'saveConcurrencyConfig']) {
+    assert.equal(node(id).disabled, false, `${id} is usable once the config is read`);
+  }
+  const facts = factPairs(node('concurrencyFacts'));
+  assert.deepEqual(facts.slice(0, 5), [
+    ['当前挂起账号', '2'], ['达到上限被本地拒绝', '120'], ['挂起期间被本地拒绝', '45'], ['上游限流次数', '9'], ['触发挂起次数', '7'],
+  ]);
+  assert.equal(facts[5][0], '统计起始');
+  assert.notEqual(facts[5][1], '未知');
+});
+
+test('并发保护：统计里未知的数显示为「—」而不是 0', async () => {
+  const { api, node } = concurrencyPage(concurrencyConfig({ stats: { held_now: 0, rejected_at_limit: 'many' } }));
+  await api.handlers.loadConfig();
+  const facts = Object.fromEntries(factPairs(node('concurrencyFacts')));
+  assert.equal(facts['当前挂起账号'], '0', 'a real zero is shown as zero');
+  assert.equal(facts['达到上限被本地拒绝'], '—');
+  assert.equal(facts['上游限流次数'], '—');
+  assert.equal(facts['统计起始'], '未知');
+});
+
+test('并发保护：旧后端没有该配置时表单锁定并说明不支持', async () => {
+  const legacy = concurrencyConfig();
+  delete legacy.concurrency;
+  const { api, node, posts } = concurrencyPage(legacy);
+  await api.handlers.loadConfig();
+  assert.match(node('concurrencyFacts').textContent, /当前后端不支持并发保护/);
+  for (const id of ['configConcurrencyEnabled', 'configConcurrencyMaxInFlight', 'configConcurrencyHoldSeconds', 'configConcurrencyMaxHoldSeconds', 'saveConcurrencyConfig']) {
+    assert.equal(node(id).disabled, true, `${id} is locked without backend support`);
+  }
+  // No defaults are invented for a backend that never sent the section.
+  assert.equal(node('configConcurrencyMaxInFlight').value, '');
+  assert.equal(node('configConcurrencyEnabled').checked, false);
+  // The quota-pause form on the same page is unaffected.
+  assert.equal(node('savePauseConfig').disabled, false);
+  await api.handlers.saveConcurrencyConfig({ preventDefault() {} });
+  assert.equal(posts().length, 0, 'nothing is sent to a backend that cannot accept it');
+  assert.match(node('configState').textContent, /不支持并发保护/);
+});
+
+test('并发保护：保存前校验范围，只提交并发设置', async () => {
+  const saved = concurrencyConfig({ enabled: false, max_in_flight: 6, hold_seconds: 30, max_hold_seconds: 120 });
+  const { api, node, posts } = concurrencyPage(concurrencyConfig(), () => respond(200, saved));
+  await api.handlers.loadConfig();
+  const submit = () => api.handlers.saveConcurrencyConfig({ preventDefault() {} });
+  const set = (limit, hold, max) => {
+    node('configConcurrencyMaxInFlight').value = limit;
+    node('configConcurrencyHoldSeconds').value = hold;
+    node('configConcurrencyMaxHoldSeconds').value = max;
+  };
+  for (const [values, message] of [
+    [['0', '60', '300'], /并发上限必须是 1 到 64/],
+    [['65', '60', '300'], /并发上限必须是 1 到 64/],
+    [['', '60', '300'], /并发上限必须是 1 到 64/],
+    [['4.5', '60', '300'], /并发上限必须是 1 到 64/],
+    [['4', '-1', '300'], /挂起时间必须是 0 到 3600/],
+    [['4', '3601', '3601'], /挂起时间必须是 0 到 3600/],
+    [['4', '60', '3601'], /最长挂起必须是 0 到 3600/],
+    [['4', '60', ''], /最长挂起必须是 0 到 3600/],
+    [['4', '200', '100'], /最长挂起不能小于挂起时间/],
+  ]) {
+    set(...values);
+    await submit();
+    assert.match(node('configState').textContent, message, `values ${values.join('/')}`);
+  }
+  assert.equal(posts().length, 0, 'an invalid form is never submitted');
+  set('6', '30', '120');
+  node('configConcurrencyEnabled').checked = false;
+  await submit();
+  assert.equal(posts().length, 1);
+  assert.deepEqual(JSON.parse(posts()[0].init.body), { concurrency: { enabled: false, max_in_flight: 6, hold_seconds: 30, max_hold_seconds: 120 } });
+  assert.match(node('configState').textContent, /并发保护设置已保存/);
+  // The form shows what the backend answered, not what was typed.
+  assert.equal(node('configConcurrencyMaxInFlight').value, '6');
+  assert.equal(node('configConcurrencyEnabled').checked, false);
+  // hold 0 / max 0 (holding off) is a valid save.
+  set('4', '0', '0');
+  await submit();
+  assert.equal(posts().length, 2);
+  assert.deepEqual(JSON.parse(posts()[1].init.body).concurrency, { enabled: false, max_in_flight: 4, hold_seconds: 0, max_hold_seconds: 0 });
+});
+
+test('并发保护：保存失败时显示错误且不改动已显示的设置', async () => {
+  const { api, node } = concurrencyPage(concurrencyConfig(), () => respond(400, { error: 'concurrency.max_in_flight must be between 1 and 64' }));
+  await api.handlers.loadConfig();
+  node('configConcurrencyMaxInFlight').value = '8';
+  await api.handlers.saveConcurrencyConfig({ preventDefault() {} });
+  assert.equal(api.state.config.concurrency.max_in_flight, 4, 'a refused save leaves the known policy alone');
+  assert.equal(node('saveConcurrencyConfig').disabled, false, 'the form is usable again after a failure');
+  assert.ok(node('configState').textContent.length > 0);
+  assert.ok(!/已保存/.test(node('configState').textContent));
+});
+
+test('运行时列表显示每个账号的在途数、上限与限流挂起状态', async () => {
+  const future = new Date(Date.now() + 45_000).toISOString();
+  const past = new Date(Date.now() - 45_000).toISOString();
+  const row = (id, label, concurrency) => ({ id, label, disabled: false, model_count: 1, models_scope: 'shared', host: { status: 'active' }, ...(concurrency === undefined ? {} : { concurrency }) });
+  const runtimeBody = (gate, credentials) => ({
+    loaded: true, stopped: false, active_requests: 3, pending_operations: 0, model_count: 1, host: { available: true },
+    ...(gate === undefined ? {} : { concurrency: gate }), credentials,
+  });
+  const render = async body => {
+    const view = fakePage({ fetchImpl: async url => (url.includes('/runtime') ? respond(200, body) : respond(404, { error: 'not found' })) });
+    const api = view.context.OpenDesignConsole;
+    api.state.verified = { headers: { Authorization: `Bearer ${managementKey}` }, source: 'manual' };
+    api.render.applyStatus(statusBody({ credentials: body.credentials.map(item => activeCredential(item.id, item.label)) }));
+    await api.handlers.loadRuntime();
+    const rows = [...view.document.getElementById('runtimeCredentials').children];
+    const find = id => rows.find(node => node.getAttribute('data-runtime-credential') === id);
+    return {
+      head: id => find(id).children[0].textContent,
+      detail: id => find(id).children[1].textContent,
+      facts: Object.fromEntries(factPairs(view.document.getElementById('runtimeFacts'))),
+    };
+  };
+  const shown = await render(runtimeBody({ enabled: true, max_in_flight: 4 }, [
+    row('busy', '忙账号', { in_flight: 3, peak_in_flight: 4, held_until: null, probing: false, consecutive_rejections: 0 }),
+    row('held', '挂起账号', { in_flight: 0, peak_in_flight: 4, held_until: future, probing: false, consecutive_rejections: 2 }),
+    row('probe', '探测账号', { in_flight: 0, peak_in_flight: 2, held_until: null, probing: true, consecutive_rejections: 1 }),
+    row('expired', '到期账号', { in_flight: 1, peak_in_flight: 1, held_until: past, probing: false, consecutive_rejections: 0 }),
+  ]));
+  assert.equal(shown.facts['账号并发上限'], '4');
+  assert.equal(shown.head('busy'), '忙账号已启用');
+  assert.match(shown.detail('busy'), /在途 3 \/ 上限 4（峰值 4）/);
+  assert.equal(shown.head('held'), '挂起账号已启用限流挂起中');
+  assert.match(shown.detail('held'), /挂起到 /);
+  assert.equal(shown.head('probe'), '探测账号已启用等待探测');
+  assert.ok(!/挂起到/.test(shown.detail('probe')));
+  // A hold that is already over is not shown as a hold.
+  assert.equal(shown.head('expired'), '到期账号已启用');
+  assert.ok(!/挂起到/.test(shown.detail('expired')));
+
+  // The protection is off: the limit is not presented as a number.
+  const off = await render(runtimeBody({ enabled: false, max_in_flight: 4 }, [
+    row('a', '账号', { in_flight: 9, peak_in_flight: 9, held_until: null, probing: false, consecutive_rejections: 0 }),
+  ]));
+  assert.equal(off.facts['账号并发上限'], '未启用');
+  assert.match(off.detail('a'), /在途 9 \/ 上限 未启用（峰值 9）/);
+
+  // An older backend reports nothing: nothing is said, and nothing is zero.
+  const legacy = await render(runtimeBody(undefined, [row('a', '账号')]));
+  assert.equal(legacy.facts['账号并发上限'], '未知');
+  assert.ok(!/在途/.test(legacy.detail('a')));
+  assert.equal(legacy.head('a'), '账号已启用');
+
+  // Only a literal true means enabled: a missing or non-boolean flag is not
+  // presented as an active limit.
+  for (const flag of [undefined, 'true', 1, null]) {
+    const gate = flag === undefined ? { max_in_flight: 4 } : { enabled: flag, max_in_flight: 4 };
+    const vague = await render(runtimeBody(gate, [row('a', '账号', { in_flight: 1, peak_in_flight: 1, held_until: null, probing: false, consecutive_rejections: 0 })]));
+    assert.equal(vague.facts['账号并发上限'], '未启用', `enabled=${JSON.stringify(flag)}`);
+  }
+
+  // Numbers the backend did not send stay unknown.
+  const partial = await render(runtimeBody({ enabled: true }, [row('a', '账号', { held_until: 'not-a-date', probing: 'yes' })]));
+  assert.equal(partial.facts['账号并发上限'], '未知');
+  assert.match(partial.detail('a'), /在途 — \/ 上限 未知（峰值 —）/);
+  assert.equal(partial.head('a'), '账号已启用');
+});
+
+// --- 钱包负余额 ---------------------------------------------------------------
+
+test('钱包余额可以为负：解析、格式化与汇总', () => {
+  const core = fakePage().context.OpenDesignCore;
+  // The sign goes in front of the currency symbol and the digits are untouched.
+  assert.equal(core.formatUSD('-0.1234'), '-$0.1234');
+  assert.equal(core.formatUSD('12.345'), '$12.345');
+  assert.equal(core.formatUSD('0'), '$0');
+  for (const bad of ['--1', '-', '1-', '+1', '-1.', '-.5', '1e3', ' ', '', '-1,000', null, 5, -5]) {
+    assert.equal(core.formatUSD(bad), '', `${JSON.stringify(bad)} is not a balance`);
+    assert.equal(core.balanceCents(bad), null);
+  }
+  assert.equal(core.balanceIsNegative('-0.1234'), true);
+  assert.equal(core.balanceIsNegative('-0'), false, 'minus zero is not an overdraft');
+  assert.equal(core.balanceIsNegative('-0.000'), false);
+  assert.equal(core.balanceIsNegative('0.5'), false);
+  // Exact cents, rounded half away from zero, without floating point.
+  assert.equal(core.balanceCents('-0.1234'), -12n);
+  assert.equal(core.balanceCents('-0.125'), -13n);
+  assert.equal(core.balanceCents('0.125'), 13n);
+  assert.equal(core.balanceCents('3'), 300n);
+  assert.equal(core.balanceCents('-1'), -100n);
+  assert.equal(core.balanceCents('0.1'), 10n);
+  assert.equal(core.balanceCents('12345678901234567890.99'), 1234567890123456789099n);
+  assert.equal(core.formatCentsUSD(-12n), '-$0.12');
+  assert.equal(core.formatCentsUSD(200n), '$2.00');
+  assert.equal(core.formatCentsUSD(-123456789n), '-$1,234,567.89');
+  assert.equal(core.formatCentsUSD(0n), '$0.00');
+  // A credit count or a rate still cannot be negative.
+  assert.equal(core.formatCredits('-5'), '');
+  // The normalized quota keeps the negative amount instead of dropping it.
+  const quota = core.normalizeQuota(quotaContract({ wallet: { state: 'available', fetched_at: '2026-11-03T00:00:00Z', data: { balanceUsd: '-0.1234', updatedAt: null }, error: null } }));
+  assert.equal(quota.wallet.data.balanceUsd, '-0.1234');
+});
+
+test('负的钱包余额照实显示并用警示色，不显示成 0 或空', async () => {
+  const negative = quotaContract({ wallet: { state: 'available', fetched_at: '2026-11-03T00:00:00Z', data: { balanceUsd: '-0.1234', updatedAt: null }, error: null } });
+  const { view, consoleApi } = quotaPage(async url => (url.includes('/quota') ? respond(200, negative) : respond(200, statusBody())));
+  await consoleApi.handlers.refreshQuota(consoleApi.state.status.credentials[0]);
+  const detail = accountQuotaDetail(quotaRow(view));
+  const value = byClass(detail, 'quota-value');
+  assert.ok(value, 'the wallet card shows a value');
+  assert.equal(value.textContent, '-$0.1234');
+  assert.ok(hasClass(value, 'negative'), 'a negative balance carries the warning class');
+  assert.match(detail.textContent, /钱包余额为负/);
+  assert.ok(!/malformed|balance_format/.test(detail.textContent), 'a negative balance is not a format error');
+  // The collapsed summary shows it too.
+  assert.match(quotaRow(view).textContent, /-\$0\.1234/);
+
+  // A non-negative balance carries no warning.
+  const positive = quotaPage(async url => (url.includes('/quota') ? respond(200, quotaContract()) : respond(200, statusBody())));
+  await positive.consoleApi.handlers.refreshQuota(positive.consoleApi.state.status.credentials[0]);
+  const plain = byClass(accountQuotaDetail(quotaRow(positive.view)), 'quota-value');
+  assert.equal(plain.textContent, '$12.345');
+  assert.ok(!hasClass(plain, 'negative'));
+  assert.ok(!/钱包余额为负/.test(accountQuotaDetail(quotaRow(positive.view)).textContent));
+});
+
+test('多账户钱包汇总把负余额算进去', () => {
+  const credentials = [
+    { id: 'a', label: 'A', disabled: false, billing_configured: true },
+    { id: 'b', label: 'B', disabled: false, billing_configured: true },
+    { id: 'c', label: 'C', disabled: false, billing_configured: true },
+  ];
+  const view = fakePage();
+  const api = view.context.OpenDesignConsole;
+  const Core = view.context.OpenDesignCore;
+  const quota = (id, balance) => Core.normalizeQuota(quotaContract({
+    credential_id: id,
+    wallet: { state: 'available', data: { balanceUsd: balance } },
+    funding: { state: 'available', data: { codingPlan: { windows: [] } } },
+  }));
+  const total = view.document.getElementById('accountQuotaTotal');
+  const walletRow = () => [...total.children].filter(child => child.className === 'usage')
+    .map(node => ({ label: node.children[0].children[0].textContent, value: node.children[0].children[1], sub: node.children[1].textContent }))
+    .find(entry => entry.label === '钱包余额');
+  api.render.applyStatus(statusBody({ credentials }));
+  api.state.quotas.a = quota('a', '-1');
+  api.state.quotas.b = quota('b', '3');
+  api.render.renderAccounts();
+  // -1 and 3 total 2: the negative one is added, not skipped.
+  assert.equal(walletRow().value.textContent, '$2.00');
+  assert.equal(walletRow().sub, '2 个账户');
+  assert.ok(!hasClass(walletRow().value, 'negative'));
+  api.state.quotas.c = quota('c', '-2.505');
+  api.render.renderAccounts();
+  // 2.00 - 2.51 (half away from zero) = -0.51, sign before the symbol.
+  assert.equal(walletRow().value.textContent, '-$0.51');
+  assert.equal(walletRow().sub, '3 个账户');
+  assert.ok(hasClass(walletRow().value, 'negative'), 'an overdrawn total carries the warning class');
+});

@@ -573,6 +573,20 @@
     return /^[0-9]+(?:\.[0-9]+)?$/.test(raw) ? raw : '';
   }
 
+  // A balance, unlike a credit count or a rate, can be below zero: the upstream
+  // reports an overdrawn wallet as e.g. "-0.1234". Only one leading minus is
+  // accepted, and "-0" style values are kept as written.
+  function balanceText(value) {
+    if (typeof value !== 'string') return '';
+    const raw = value.trim();
+    return /^-?[0-9]+(?:\.[0-9]+)?$/.test(raw) ? raw : '';
+  }
+
+  function balanceIsNegative(value) {
+    const raw = balanceText(value);
+    return raw.startsWith('-') && /[1-9]/.test(raw);
+  }
+
   function creditText(value) {
     const raw = decimalText(value);
     return /^[0-9]+$/.test(raw) ? raw : '';
@@ -634,7 +648,7 @@
     const wallet = normalizeComponent(data.wallet);
     if (wallet.data) {
       wallet.data = {
-        balanceUsd: decimalText(wallet.data.balanceUsd),
+        balanceUsd: balanceText(wallet.data.balanceUsd),
         updatedAt: quotaTimestamp(wallet.data.updatedAt),
       };
     }
@@ -642,7 +656,7 @@
     if (funding.data) {
       const plan = funding.data.codingPlan && typeof funding.data.codingPlan === 'object' ? funding.data.codingPlan : null;
       funding.data = {
-        balanceUsd: decimalText(funding.data.balanceUsd),
+        balanceUsd: balanceText(funding.data.balanceUsd),
         funding: text(funding.data.funding),
         modelCovered: typeof funding.data.modelCovered === 'boolean' ? funding.data.modelCovered : null,
         fundingCheck: text(funding.data.fundingCheck),
@@ -756,8 +770,31 @@
   }
 
   function formatUSD(value) {
-    const raw = decimalText(value);
-    return raw ? `$${raw}` : '';
+    const raw = balanceText(value);
+    if (!raw) return '';
+    // The sign goes in front of the currency symbol: -$0.1234, not $-0.1234.
+    return raw.startsWith('-') ? `-$${raw.slice(1)}` : `$${raw}`;
+  }
+
+  // Exact cents of a balance string, rounded half away from zero, or null when
+  // it is not a balance. BigInt keeps a large or long-fraction value exact.
+  function balanceCents(value) {
+    const raw = balanceText(value);
+    if (!raw) return null;
+    const negative = raw.startsWith('-');
+    const [whole, fraction = ''] = (negative ? raw.slice(1) : raw).split('.');
+    let cents = BigInt(whole) * 100n + BigInt((fraction + '00').slice(0, 2));
+    if (fraction.length > 2 && fraction[2] >= '5') cents += 1n;
+    return negative ? -cents : cents;
+  }
+
+  // Formats summed cents as -$1,234.56 / $1,234.56.
+  function formatCentsUSD(cents) {
+    if (typeof cents !== 'bigint') return '';
+    const negative = cents < 0n;
+    const absolute = negative ? -cents : cents;
+    const whole = String(absolute / 100n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return `${negative ? '-' : ''}$${whole}.${String(absolute % 100n).padStart(2, '0')}`;
   }
 
   function formatDuration(seconds) {
@@ -1127,6 +1164,40 @@
     };
   }
 
+  // The per-account concurrency protection. A backend that predates it sends no
+  // such object: that is reported as null ("not supported"), never as defaults,
+  // and a number the backend did not send stays null instead of becoming 0.
+  function normalizeConcurrencyConfig(value) {
+    if (!value || typeof value !== 'object') return null;
+    const stats = value.stats && typeof value.stats === 'object' ? value.stats : {};
+    return {
+      enabled: value.enabled === true,
+      max_in_flight: safeInteger(value.max_in_flight, 1, 64),
+      hold_seconds: safeInteger(value.hold_seconds, 0, 3600),
+      max_hold_seconds: safeInteger(value.max_hold_seconds, 0, 3600),
+      owner: safeCode(value.owner, 20),
+      stats: {
+        since: safeTimestamp(stats.since),
+        held_now: safeCounter(stats.held_now),
+        rejected_at_limit: safeCounter(stats.rejected_at_limit),
+        rejected_while_held: safeCounter(stats.rejected_while_held),
+        upstream_rate_limited: safeCounter(stats.upstream_rate_limited),
+        holds_started: safeCounter(stats.holds_started),
+      },
+    };
+  }
+
+  function normalizeRuntimeConcurrency(value) {
+    if (!value || typeof value !== 'object') return null;
+    return {
+      in_flight: safeCounter(value.in_flight),
+      peak_in_flight: safeCounter(value.peak_in_flight),
+      held_until: safeTimestamp(value.held_until),
+      probing: value.probing === true,
+      consecutive_rejections: safeCounter(value.consecutive_rejections),
+    };
+  }
+
   function normalizeConfig(value) {
     const data = value && typeof value === 'object' ? value : {};
     const hostPart = part => {
@@ -1142,6 +1213,7 @@
     const pauseMax = safeInteger(pause.max_seconds, 60, 604800);
     return {
       logs: normalizeRetention(data.logs),
+      concurrency: normalizeConcurrencyConfig(data.concurrency),
       // Older servers may omit this section. The reviewed default is enabled,
       // matching the plugin's own pauseSettings; only an explicit false turns
       // automatic pauses off.
@@ -1196,8 +1268,10 @@
         testing: row.testing === true,
         last_test: normalizeRuntimeTest(row.last_test),
         host: normalizeRuntimeHost(row.host),
+        concurrency: normalizeRuntimeConcurrency(row.concurrency),
       };
     });
+    const gate = data.concurrency && typeof data.concurrency === 'object' ? data.concurrency : null;
     const host = data.host && typeof data.host === 'object' ? data.host : {};
     const capabilities = [];
     if (data.capabilities && typeof data.capabilities === 'object') {
@@ -1218,6 +1292,8 @@
       pending_operations: safeInteger(data.pending_operations) ?? 0,
       model_count: safeInteger(data.model_count) ?? 0,
       credentials,
+      // null when the backend does not report it (an older plugin).
+      concurrency: gate && { enabled: gate.enabled === true, max_in_flight: safeInteger(gate.max_in_flight, 1, 64) },
       host: { available: host.available === true, note: shortText(host.note, 300) },
       capabilities,
     };
@@ -1532,6 +1608,10 @@
     normalizeRequestStats,
     normalizeConfig,
     normalizeRuntime,
+    balanceText,
+    balanceIsNegative,
+    balanceCents,
+    formatCentsUSD,
     normalizeModelTest,
     normalizeErrorRules,
     explainErrorRule,

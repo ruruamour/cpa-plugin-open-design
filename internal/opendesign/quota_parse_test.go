@@ -19,7 +19,7 @@ func TestQuotaWalletValidation(t *testing.T) {
 		t.Fatal("optional updatedAt must remain null")
 	}
 	for _, raw := range []string{
-		`null`, `[]`, `{}`, `{"balanceUsd":0}`, `{"balanceUsd":null}`, `{"balanceUsd":"-1"}`, `{"balanceUsd":"+1"}`,
+		`null`, `[]`, `{}`, `{"balanceUsd":0}`, `{"balanceUsd":null}`, `{"balanceUsd":"--1"}`, `{"balanceUsd":"+1"}`,
 		`{"balanceUsd":"1e2"}`, `{"balanceUsd":" 1"}`, `{"balanceUsd":".1"}`, `{"balanceUsd":"1."}`,
 		`{"balanceUsd":"1"} {}`,
 		`{"BalanceUsd":"1"}`,
@@ -82,7 +82,13 @@ func TestQuotaWalletRejectionReasons(t *testing.T) {
 		`{"balanceUsd":0}`:            "balance_not_string",
 		`{"balanceUsd":12.34}`:        "balance_not_string",
 		`{"balanceUsd":null}`:         "balance_not_string",
-		`{"balanceUsd":"-1"}`:         "balance_format",
+		`{"balanceUsd":"--1"}`:        "balance_format",
+		`{"balanceUsd":"-"}`:          "balance_format",
+		`{"balanceUsd":"-.5"}`:        "balance_format",
+		`{"balanceUsd":"-1."}`:        "balance_format",
+		`{"balanceUsd":"1-"}`:         "balance_format",
+		`{"balanceUsd":"- 1"}`:        "balance_format",
+		`{"balanceUsd":"-1e2"}`:       "balance_format",
 		`{"balanceUsd":"+1"}`:         "balance_format",
 		`{"balanceUsd":"1e2"}`:        "balance_format",
 		`{"balanceUsd":" 1"}`:         "balance_format",
@@ -225,5 +231,27 @@ func TestQuotaFundingPreservesBigCreditStringsAndOfficialOverage(t *testing.T) {
 	window["remainingCredits"] = "2" + strings.Repeat("0", 120)
 	if _, valid := parseQuotaFunding(mustJSON(t, m), "ws-1"); valid {
 		t.Fatal("large remainingCredits above the limit was accepted")
+	}
+}
+
+// An overdrawn wallet is a balance, not a format error. The amount is returned
+// exactly as the upstream sent it; only one leading minus is accepted.
+func TestWalletAcceptsANegativeBalance(t *testing.T) {
+	for _, balance := range []string{"-0.1234", "-1", "-0", "-12.50", "-0.000000001", "-123456789012345678901234567890.12"} {
+		data, reason := parseQuotaWalletReason([]byte(`{"balanceUsd":"` + balance + `","updatedAt":null}`))
+		if reason != "" || data == nil {
+			t.Fatalf("negative balance %q rejected: %q", balance, reason)
+		}
+		if data.BalanceUSD != balance {
+			t.Fatalf("balance %q was rewritten to %q", balance, data.BalanceUSD)
+		}
+		if _, valid := parseQuotaWallet([]byte(`{"balanceUsd":"` + balance + `"}`)); !valid {
+			t.Fatalf("parseQuotaWallet rejected %q", balance)
+		}
+	}
+	// A credit count still cannot carry a sign: that is a different field with
+	// a different meaning, and the quota pause reads it.
+	if quotaCredits.MatchString("-1") || quotaUnsignedDecimal.MatchString("-1") {
+		t.Fatal("the unsigned patterns accept a sign")
 	}
 }

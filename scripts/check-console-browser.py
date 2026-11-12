@@ -84,9 +84,12 @@ def main():
             windows.append({'policyId': f'fixture-{duration}', 'durationSeconds': duration, 'resetMode': 'fixed',
                             'usedCredits': used, 'limitCredits': '1000', 'remainingCredits': str(1000 - int(used)),
                             'windowStart': stamp(-3600), 'resetsAt': stamp(duration), 'forecast': {'state': 'insufficient_samples'}})
+        # One account is overdrawn: the upstream reports that as a negative
+        # balance, which must be shown as the amount it is.
+        balance = '-0.1234' if credential_id == 'fixture-03' else '12.345'
         return {'credential_id': credential_id, 'billing_configured': True, 'workspace_id': 'fixture-workspace',
                 'state': 'available', 'fetched_at': stamp(0), 'next_refresh_at': stamp(60),
-                'wallet': {'state': 'available', 'fetched_at': stamp(0), 'data': {'balanceUsd': '12.345', 'updatedAt': stamp(0)}},
+                'wallet': {'state': 'available', 'fetched_at': stamp(0), 'data': {'balanceUsd': balance, 'updatedAt': stamp(0)}},
                 'funding': {'state': 'available', 'fetched_at': stamp(0), 'data': {'balanceUsd': '12.345', 'funding': 'coding_plan',
                             'modelCovered': None, 'codingPlan': {'tier': 'pro', 'windows': windows}}}}
 
@@ -117,14 +120,24 @@ def main():
         elif parsed.path == base + '/config':
             fulfill(route, {'logs': {'enabled': True, 'retention_days': 7, 'max_entries': 500, 'entries': 4},
                             'pause': {'enabled': True, 'max_seconds': 86400, 'owner': 'plugin'},
+                            'concurrency': {'enabled': True, 'max_in_flight': 4, 'hold_seconds': 60, 'max_hold_seconds': 300,
+                                            'owner': 'plugin',
+                                            'limits': {'max_in_flight': [1, 64], 'hold_seconds': [0, 3600], 'max_hold_seconds': [0, 3600]},
+                                            'stats': {'since': stamp(-7200), 'held_now': 1, 'rejected_at_limit': 1234,
+                                                      'rejected_while_held': 56, 'upstream_rate_limited': 9, 'holds_started': 7}},
                             'proxy': {'mode': 'host_managed', 'owner': 'CPA', 'read_only': True},
                             'routing': {'mode': 'host_managed', 'owner': 'CPA', 'read_only': True},
                             'upstream': {'fixed': True, 'origin': 'https://amr-link.open-design.ai/v1'}})
         elif parsed.path == base + '/runtime':
-            fulfill(route, {'loaded': True, 'stopped': False, 'active_requests': 0, 'pending_operations': 0, 'model_count': 2,
+            gate = {'fixture-01': {'in_flight': 3, 'peak_in_flight': 4, 'held_until': None, 'probing': False, 'consecutive_rejections': 0},
+                    'fixture-02': {'in_flight': 0, 'peak_in_flight': 0, 'held_until': None, 'probing': False, 'consecutive_rejections': 0},
+                    'fixture-03': {'in_flight': 0, 'peak_in_flight': 4, 'held_until': stamp(45), 'probing': False, 'consecutive_rejections': 2}}
+            fulfill(route, {'loaded': True, 'stopped': False, 'active_requests': 3, 'pending_operations': 0, 'model_count': 2,
                             'host': {'available': True}, 'observed_at': stamp(0),
+                            'concurrency': {'enabled': True, 'max_in_flight': 4},
                             'credentials': [{'id': c['id'], 'label': c['label'], 'disabled': False, 'model_count': 2,
-                                             'models_scope': 'shared', 'host': {'status': 'active'}} for c in credentials[:3]]})
+                                             'models_scope': 'shared', 'host': {'status': 'active'},
+                                             'concurrency': gate[c['id']]} for c in credentials[:3]]})
         elif parsed.path == base + '/quota':
             cid = parse_qs(parsed.query)['credential_id'][0]
             if hold[0]:
@@ -203,8 +216,44 @@ def main():
         assert '额度暂停中' in page.locator('[data-runtime-credential="fixture-02"]').inner_text()
         assert '额度暂停中' not in page.locator('[data-runtime-credential="fixture-01"]').inner_text()
         assert page.locator('#configPauseEnabled').is_checked()
+        # ---- concurrency protection: settings, counters, runtime state ----
+        assert page.locator('#configConcurrencyEnabled').is_checked()
+        assert page.locator('#configConcurrencyMaxInFlight').input_value() == '4'
+        assert page.locator('#configConcurrencyHoldSeconds').input_value() == '60'
+        assert page.locator('#configConcurrencyMaxHoldSeconds').input_value() == '300'
+        assert page.locator('#saveConcurrencyConfig').is_enabled()
+        gate_facts = page.locator('#concurrencyFacts').inner_text().replace('\n', ' ')
+        for expected in ('当前挂起账号 1', '达到上限被本地拒绝 1234', '挂起期间被本地拒绝 56', '上游限流次数 9', '触发挂起次数 7'):
+            assert expected in gate_facts, f'concurrency facts miss {expected!r}: {gate_facts}'
+        busy_row = page.locator('[data-runtime-credential="fixture-01"]').inner_text().replace('\n', ' ')
+        assert '在途 3 / 上限 4（峰值 4）' in busy_row and '限流挂起中' not in busy_row
+        held_row = page.locator('[data-runtime-credential="fixture-03"]').inner_text().replace('\n', ' ')
+        assert '限流挂起中' in held_row and '挂起到' in held_row
+        assert '账号并发上限 4' in page.locator('#runtimeFacts').inner_text().replace('\n', ' ')
+        panel = page.locator('#concurrencySettingsForm')
+        pause_panel = page.locator('#pauseSettingsForm')
+        assert panel.bounding_box()['y'] > pause_panel.bounding_box()['y'], 'the concurrency panel follows the quota-pause panel'
+        field_widths = [page.locator('#' + name).bounding_box()['width'] for name in
+                        ('configConcurrencyMaxInFlight', 'configConcurrencyHoldSeconds', 'configConcurrencyMaxHoldSeconds', 'configPauseMaxSeconds')]
+        assert max(field_widths) - min(field_widths) < 2, f'the new fields must line up with the existing ones: {field_widths}'
+        # An out-of-range number never reaches the handler: the browser's own
+        # constraint validation stops the submit first.
+        page.locator('#configConcurrencyMaxInFlight').fill('65')
+        assert not page.locator('#configConcurrencyMaxInFlight').evaluate('node => node.validity.valid')
+        assert not page.locator('#concurrencySettingsForm').evaluate('node => node.checkValidity()')
+        page.locator('#configConcurrencyMaxInFlight').fill('4')
+        # A maximum below the hold passes every per-field constraint, so a real
+        # click submits the form and only the handler can refuse it. That proves
+        # the submit event is bound; the fixture (GET only) proves nothing was sent.
+        page.locator('#configConcurrencyHoldSeconds').fill('200')
+        page.locator('#configConcurrencyMaxHoldSeconds').fill('100')
+        assert page.locator('#concurrencySettingsForm').evaluate('node => node.checkValidity()')
+        page.locator('#saveConcurrencyConfig').click()
+        page.wait_for_function("document.getElementById('configState').textContent.includes('最长挂起不能小于挂起时间')")
+        page.locator('#configConcurrencyHoldSeconds').fill('60')
+        page.locator('#configConcurrencyMaxHoldSeconds').fill('300')
         assert page.evaluate(overflow), 'config: desktop horizontal overflow'
-        page.screenshot(path=str(args.out / 'config-desktop.png'))
+        page.screenshot(path=str(args.out / 'config-desktop.png'), full_page=True)
 
         # ---- dialogs --------------------------------------------------------
         page.locator('#openAuth').click()
@@ -236,6 +285,20 @@ def main():
         assert first.locator('.account-usage [aria-valuenow="0"]').count() == 1
         assert '剩余 0' in first_summary.inner_text()
         assert '$12.345' in first_summary.inner_text()
+        # An overdrawn wallet is shown as it is, in the warning colour, and it
+        # is added to the total like any other balance.
+        third = page.locator('[data-credential-id="fixture-03"]')
+        assert '-$0.1234' in third.locator('summary.account-summary').inner_text()
+        third.locator('summary.account-summary').click()
+        negative = third.locator('[data-quota-part="wallet"] .quota-value')
+        assert negative.inner_text() == '-$0.1234'
+        assert 'negative' in negative.get_attribute('class')
+        danger = page.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--danger').trim()")
+        probe = page.evaluate('''(colour) => { const n = document.createElement('span'); n.style.color = colour;
+            document.body.append(n); const c = getComputedStyle(n).color; n.remove(); return c; }''', danger)
+        assert negative.evaluate('node => getComputedStyle(node).color') == probe, 'a negative balance uses the danger colour'
+        assert '钱包余额为负' in third.locator('[data-quota-part="wallet"]').inner_text()
+        third.locator('summary.account-summary').click()
         assert first_summary.locator('button').count() == 0
         assert not first.get_attribute('open')
         assert not first.locator('[data-account-actions]').is_visible(), 'closed details must hide actions'
@@ -319,7 +382,9 @@ def main():
                              'repaint and page retention', 'stale failure keeps values', 'desktop/mobile no overflow', 'no JS errors',
                              'logs landing read', 'latency tones and usage details', 'local rejection reason',
                              'statistics cards and range', 'models side by side', 'runtime pause badge',
-                             'key dialog and account dialog dismissal'],
+                             'key dialog and account dialog dismissal',
+                             'concurrency settings and counters', 'runtime in-flight and hold badge',
+                             'negative wallet balance shown with the danger colour'],
                   'screenshots': str(args.out), 'production_requests': 0}
         (args.out / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
         print(json.dumps(result, ensure_ascii=False))

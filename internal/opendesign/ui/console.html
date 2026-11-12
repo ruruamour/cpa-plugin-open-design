@@ -241,6 +241,7 @@
     .usage.warn .usage-percent { color: var(--warn); }
     .usage.exhausted .usage-percent { color: var(--danger); }
     .usage-value { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .usage-value.negative, .quota-value.negative { color: var(--danger); }
     .usage-sub { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
     .usage-reset.expired { color: var(--warn); }
 
@@ -759,6 +760,43 @@
             <p class="hint" style="margin-top: 8px;">
               暂停期间请在本控制台启用或停用账户：CPA 原生界面写的是同一个停用字段，插件无法区分来源。未配置 controlKey 或缺少 Workspace ID 时不能自动复查，需要人工解除。CPA 自身的 402 / 403 冷却属于宿主，不会因插件解除暂停而提前结束。
             </p>
+          </section>
+
+          <section class="panel" aria-labelledby="concurrencySettingsTitle">
+            <div class="panel-head">
+              <div>
+                <h2 id="concurrencySettingsTitle">并发保护</h2>
+                <p class="panel-hint">按账号限制同时进行的请求数；被上游限流后暂时不再使用该账号</p>
+              </div>
+            </div>
+            <form class="form-stack" id="concurrencySettingsForm" autocomplete="off">
+              <label class="switch">
+                <span>限制每个账号同时进行的请求数</span>
+                <input id="configConcurrencyEnabled" type="checkbox" role="switch">
+              </label>
+              <label class="field">
+                <span>每个账号的并发上限（1-64）</span>
+                <input class="control" id="configConcurrencyMaxInFlight" type="number" min="1" max="64" step="1" inputmode="numeric">
+              </label>
+              <label class="field">
+                <span>被上游限流后挂起（秒，0-3600，0 表示不挂起）</span>
+                <input class="control" id="configConcurrencyHoldSeconds" type="number" min="0" max="3600" step="1" inputmode="numeric">
+              </label>
+              <label class="field">
+                <span>连续被限流时的最长挂起（秒）</span>
+                <input class="control" id="configConcurrencyMaxHoldSeconds" type="number" min="0" max="3600" step="1" inputmode="numeric">
+              </label>
+              <div class="form-foot">
+                <button class="button primary" id="saveConcurrencyConfig" type="submit" data-icon="save">保存并发保护设置</button>
+              </div>
+            </form>
+            <p class="hint" style="margin-top: 14px;">
+              账号达到上限时，新请求在本地被拒绝、不发给上游，CPA 会改用其他账号且不冷却该账号。选哪个账号仍由 CPA 决定，插件只能放行或拒绝。
+            </p>
+            <p class="hint" style="margin-top: 8px;">
+              账号被上游限流后，在挂起时间内不再向它发请求；到期后先放行一个请求试探，成功才恢复。连续被限流时挂起时间翻倍，直到最长挂起。在途数是插件本次加载以来的统计，热加载后从 0 开始。
+            </p>
+            <div class="facts" id="concurrencyFacts" aria-live="polite" style="margin-top: 14px;"></div>
           </section>
         </div>
 

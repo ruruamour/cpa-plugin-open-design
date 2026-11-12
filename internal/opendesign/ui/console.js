@@ -1617,7 +1617,7 @@
     }
     const windows = new Map();
     let queried = 0;
-    let walletCents = 0;
+    let walletCents = 0n;
     let wallets = 0;
     for (const item of active) {
       const quota = state.quotas[item.id];
@@ -1625,9 +1625,11 @@
       queried += 1;
       const wallet = quota.wallet || {};
       if ((wallet.state === 'available' || wallet.state === 'stale') && wallet.data && wallet.data.balanceUsd) {
-        const balance = Number(wallet.data.balanceUsd);
-        if (Number.isFinite(balance)) {
-          walletCents += Math.round(balance * 100);
+        // An overdrawn wallet is a real amount: it is added like any other, so
+        // -1 and 3 total 2 instead of the negative one being skipped.
+        const cents = Core.balanceCents(wallet.data.balanceUsd);
+        if (cents !== null) {
+          walletCents += cents;
           wallets += 1;
         }
       }
@@ -1667,7 +1669,7 @@
       parts.push(el('span', { className: 'usage' }, [
         el('span', { className: 'usage-head' }, [
           el('span', { className: 'usage-label', text: '钱包余额' }),
-          el('span', { className: 'usage-value', text: `$${(walletCents / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` }),
+          el('span', { className: walletCents < 0n ? 'usage-value negative' : 'usage-value', text: Core.formatCentsUSD(walletCents) }),
         ]),
         el('span', { className: 'usage-sub', text: `${wallets} 个账户` }),
       ]));
@@ -1902,7 +1904,7 @@
       not_json_object: '上游返回的不是 JSON 对象',
       balance_missing: '上游响应里没有 balanceUsd',
       balance_not_string: 'balanceUsd 不是字符串',
-      balance_format: 'balanceUsd 不是非负十进制数',
+      balance_format: 'balanceUsd 不是十进制数',
       funding_format: '套餐预检响应的字段不符合官方格式',
     };
     const reason = error.kind === 'malformed' && error.reason ? reasons[error.reason] || error.reason : '';
@@ -1922,8 +1924,16 @@
       card.append(el('p', { className: 'quota-note', text: '未配置官方 controlKey，不查询余额。可在编辑账户中填写。' }));
       return card;
     }
+    // An overdrawn wallet is shown as the amount it is, in the warning colour.
+    const balanceNode = () => el('div', {
+      className: Core.balanceIsNegative(wallet.data.balanceUsd) ? 'quota-value negative' : 'quota-value',
+      text: Core.formatUSD(wallet.data.balanceUsd),
+    });
     if (wallet.state === 'available' && wallet.data && wallet.data.balanceUsd) {
-      card.append(el('div', { className: 'quota-value', text: Core.formatUSD(wallet.data.balanceUsd) }));
+      card.append(balanceNode());
+      if (Core.balanceIsNegative(wallet.data.balanceUsd)) {
+        card.append(el('p', { className: 'quota-note', text: '钱包余额为负。这是上游返回的数值，不影响套餐窗口内的额度。' }));
+      }
       card.append(el('p', { className: 'quota-meta', text: `查询时间：${Core.formatTime(wallet.fetched_at) || '未知'}` }));
       card.append(el('p', { className: 'quota-meta', text: wallet.data.updatedAt
         ? `上游更新时间：${Core.formatTime(wallet.data.updatedAt)}`
@@ -1937,7 +1947,7 @@
     }
     if (wallet.state === 'stale') {
       if (wallet.data && wallet.data.balanceUsd) {
-        card.append(el('div', { className: 'quota-value', text: Core.formatUSD(wallet.data.balanceUsd) }));
+        card.append(balanceNode());
         card.append(el('p', { className: 'quota-meta', text: `上次成功查询：${Core.formatTime(wallet.fetched_at) || '未知'}（当前可能已变化）` }));
       }
       card.append(el('p', { className: 'quota-note', text: quotaErrorText('刷新失败，保留上次数据', wallet.error) }));
@@ -3229,6 +3239,10 @@
       'configPauseEnabled', 'configPauseMaxSeconds', 'savePauseConfig']) {
       setDisabled(id, configLocked);
     }
+    // A backend without the concurrency section cannot accept these fields, so
+    // the form stays locked instead of offering a save that would fail.
+    const concurrencyLocked = configLocked || !state.config.concurrency;
+    for (const id of CONCURRENCY_CONTROLS) setDisabled(id, concurrencyLocked);
     setDisabled('loadRuntime', optionalBusy('runtime'));
     setDisabled('openErrorRules', optionalBusy('errorRules'));
     syncErrorRulesControls();
@@ -3738,8 +3752,110 @@
       if (days) days.value = '';
       if (max) max.value = '';
     }
+    renderConcurrencyConfig();
     renderHostOwnedFacts();
     syncOptionalBusyControls();
+  }
+
+  const CONCURRENCY_CONTROLS = ['configConcurrencyEnabled', 'configConcurrencyMaxInFlight',
+    'configConcurrencyHoldSeconds', 'configConcurrencyMaxHoldSeconds', 'saveConcurrencyConfig'];
+
+  // Unknown stays unknown: a counter the backend did not send is "—", never 0.
+  function countText(value) {
+    return value === null || value === undefined ? '—' : String(value);
+  }
+
+  function renderConcurrencyConfig() {
+    const enabled = $('configConcurrencyEnabled');
+    const fields = {
+      max_in_flight: $('configConcurrencyMaxInFlight'),
+      hold_seconds: $('configConcurrencyHoldSeconds'),
+      max_hold_seconds: $('configConcurrencyMaxHoldSeconds'),
+    };
+    const facts = $('concurrencyFacts');
+    const config = state.config;
+    const policy = config ? config.concurrency : null;
+    if (enabled) enabled.checked = Boolean(policy && policy.enabled);
+    for (const [key, node] of Object.entries(fields)) {
+      if (node) node.value = policy && policy[key] !== null ? String(policy[key]) : '';
+    }
+    if (!facts) return;
+    if (!config) {
+      renderFacts(facts, [], '点「读取配置」后显示并发保护的设置与统计。');
+      return;
+    }
+    if (!policy) {
+      renderFacts(facts, [], '当前后端不支持并发保护。');
+      return;
+    }
+    const stats = policy.stats;
+    renderFacts(facts, [
+      { label: '当前挂起账号', value: countText(stats.held_now) },
+      { label: '达到上限被本地拒绝', value: countText(stats.rejected_at_limit) },
+      { label: '挂起期间被本地拒绝', value: countText(stats.rejected_while_held) },
+      { label: '上游限流次数', value: countText(stats.upstream_rate_limited) },
+      { label: '触发挂起次数', value: countText(stats.holds_started) },
+      { label: '统计起始', value: Core.formatTime(stats.since) || '未知' },
+    ]);
+  }
+
+  // Saves only the plugin-owned concurrency protection. Which account a request
+  // goes to is still CPA's decision; this only decides what the plugin sends.
+  async function saveConcurrencyConfig(event) {
+    if (event) event.preventDefault();
+    if (optionalBusy('config')) return;
+    if (!state.config || !state.config.concurrency) {
+      message('configState', '当前后端不支持并发保护。', 'error');
+      return;
+    }
+    const read = id => {
+      const node = $(id);
+      const raw = node ? String(node.value).trim() : '';
+      return /^\d+$/.test(raw) ? Number(raw) : NaN;
+    };
+    const limit = read('configConcurrencyMaxInFlight');
+    const hold = read('configConcurrencyHoldSeconds');
+    const maxHold = read('configConcurrencyMaxHoldSeconds');
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) {
+      message('configState', '并发上限必须是 1 到 64 之间的整数。', 'error');
+      return;
+    }
+    if (!Number.isSafeInteger(hold) || hold < 0 || hold > 3600) {
+      message('configState', '挂起时间必须是 0 到 3600 之间的整数秒。', 'error');
+      return;
+    }
+    if (!Number.isSafeInteger(maxHold) || maxHold < 0 || maxHold > 3600) {
+      message('configState', '最长挂起必须是 0 到 3600 之间的整数秒。', 'error');
+      return;
+    }
+    if (maxHold < hold) {
+      message('configState', '最长挂起不能小于挂起时间。', 'error');
+      return;
+    }
+    const enabled = $('configConcurrencyEnabled');
+    const generation = state.optionalGeneration;
+    const sessionGeneration = state.sessionGeneration;
+    setOptionalBusy('config', true);
+    message('configState', '正在保存并发保护设置…');
+    const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
+    try {
+      const raw = await api().updateConcurrencyConfig({
+        enabled: Boolean(enabled && enabled.checked),
+        max_in_flight: limit,
+        hold_seconds: hold,
+        max_hold_seconds: maxHold,
+      });
+      if (!stillCurrent()) return;
+      state.config = Core.normalizeConfig(raw);
+      renderConfig();
+      message('configState', '并发保护设置已保存。', 'ok');
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (optionalAuthFailure(error)) return;
+      message('configState', optionalErrorText(error), 'error');
+    } finally {
+      if (stillCurrent()) setOptionalBusy('config', false);
+    }
   }
 
   function renderHostOwnedFacts() {
@@ -3884,6 +4000,7 @@
       { label: '在飞请求', value: String(runtime.active_requests) },
       { label: '待处理操作', value: String(runtime.pending_operations) },
       { label: '映射模型数', value: String(runtime.model_count) },
+      { label: '账号并发上限', value: runtimeLimitText(runtime.concurrency) },
       { label: '宿主账户状态', value: runtime.host.available ? '可读取' : '不可读取（仅插件侧状态）' },
       { label: '观测时间', value: Core.formatTime(runtime.observed_at) || '未知' },
     ]);
@@ -3903,6 +4020,21 @@
           if (known && known.quota_paused) head.push(el('span', { className: 'badge danger', text: '额度暂停中' }));
           if (item.testing) head.push(el('span', { className: 'badge', text: '测试中' }));
           const details = [`映射模型 ${item.model_count} 个（${item.models_scope === 'shared' ? '全局共享' : '未知范围'}）`];
+          // Absent on a backend without the protection: then nothing is said
+          // about concurrency at all.
+          const gate = item.concurrency;
+          if (gate) {
+            const limit = runtime.concurrency && runtime.concurrency.enabled && runtime.concurrency.max_in_flight !== null
+              ? String(runtime.concurrency.max_in_flight) : (runtime.concurrency && !runtime.concurrency.enabled ? '未启用' : '未知');
+            details.push(`在途 ${countText(gate.in_flight)} / 上限 ${limit}（峰值 ${countText(gate.peak_in_flight)}）`);
+            const heldUntil = gate.held_until ? Date.parse(gate.held_until) : NaN;
+            if (Number.isFinite(heldUntil) && heldUntil > Date.now()) {
+              head.push(el('span', { className: 'badge danger', text: '限流挂起中' }));
+              details.push(`挂起到 ${Core.formatTime(gate.held_until)}`);
+            } else if (gate.probing) {
+              head.push(el('span', { className: 'badge', text: '等待探测' }));
+            }
+          }
           details.push(`宿主账户：${hostBoundaryText(item.host)}`);
           if (item.last_test) {
             const when = Core.formatTime(item.last_test.tested_at);
@@ -3921,6 +4053,12 @@
         }));
       }
     }
+  }
+
+  function runtimeLimitText(gate) {
+    if (!gate) return '未知';
+    if (!gate.enabled) return '未启用';
+    return gate.max_in_flight === null ? '未知' : String(gate.max_in_flight);
   }
 
   async function loadRuntime() {
@@ -5182,6 +5320,8 @@
     if (logSettingsForm) logSettingsForm.addEventListener('submit', saveConfig);
     const pauseSettingsForm = $('pauseSettingsForm');
     if (pauseSettingsForm) pauseSettingsForm.addEventListener('submit', savePauseConfig);
+    const concurrencySettingsForm = $('concurrencySettingsForm');
+    if (concurrencySettingsForm) concurrencySettingsForm.addEventListener('submit', saveConcurrencyConfig);
     const loadRuntimeButton = $('loadRuntime');
     if (loadRuntimeButton) loadRuntimeButton.addEventListener('click', loadRuntime);
     const runTestButton = $('runModelTest');
@@ -5398,6 +5538,7 @@
       loadConfig,
       saveConfig,
       savePauseConfig,
+      saveConcurrencyConfig,
       loadRuntime,
       openAccountDialog,
       closeAccountDialog,
