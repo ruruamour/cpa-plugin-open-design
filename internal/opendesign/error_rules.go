@@ -131,6 +131,11 @@ func defaultErrorRules() []RequestErrorRule {
 		// (concurrency_gate.go). Nothing was sent upstream, so the host should
 		// simply use another account and must not cool this one down.
 		{Status: http.StatusTooManyRequests, Match: []string{concurrencyBusyMarker}, Action: "continue"},
+		// The same local refusal, but with a known wait (a held or resting
+		// account). It carries that wait as retry_after_seconds, and the cooldown
+		// makes the host skip the account for exactly that long instead of
+		// offering it to every request in turn.
+		{Status: http.StatusTooManyRequests, Match: []string{concurrencyWaitMarker}, Action: "continue-and-cooldown"},
 		{Status: http.StatusPaymentRequired, Match: []string{upstreamErrorMarkerFor("insufficient_quota")}, Action: "continue-and-cooldown"},
 		// OpenDesign reports a spent coding plan (with a reset time) or an
 		// uncovered wallet as 402 with its own insufficient_balance code. The
@@ -207,7 +212,7 @@ func hostSchedulingClass(rules []RequestErrorRule, status int, message, kind str
 	if matchedErrorRule(rules, status, message) {
 		return hostScheduleRule
 	}
-	if kind == concurrencyLimitKind || kind == concurrencyHeldKind {
+	if isConcurrencyKind(kind) {
 		// A local refusal whose "continue" rule an operator removed. Its real
 		// status is 429, which the host would answer with a quota cooldown on an
 		// account that did nothing wrong, so it falls back to the neutral form:

@@ -36,6 +36,7 @@ type configConcurrencyUpdate struct {
 	MaxInFlight    *int  `json:"max_in_flight"`
 	HoldSeconds    *int  `json:"hold_seconds"`
 	MaxHoldSeconds *int  `json:"max_hold_seconds"`
+	RestSeconds    *int  `json:"rest_seconds"`
 }
 
 type configUpdateInput struct {
@@ -171,6 +172,10 @@ func (s *Service) updateConfigRequest(r ManagementRequest) (any, error) {
 			value := *update.MaxHoldSeconds
 			policy.MaxHoldSeconds = &value
 		}
+		if update.RestSeconds != nil {
+			value := *update.RestSeconds
+			policy.RestSeconds = &value
+		}
 		// A partial update is checked against what it resolves to, so raising
 		// only the base hold above a previously stored maximum is refused
 		// instead of being silently widened.
@@ -215,8 +220,17 @@ func (s *Service) updateConfigRequest(r ManagementRequest) (any, error) {
 	s.cfg.Concurrency = cfg.Concurrency
 	if !cfg.concurrencySettings().enabled || cfg.concurrencySettings().hold <= 0 {
 		// Turning the protection or the hold off releases every held account at
-		// once; turning it back on starts from a clean slate.
-		s.concurrencyStates = map[string]*concurrencyState{}
+		// once; turning it back on starts the hold bookkeeping from a clean
+		// slate. When each account's last request ended is kept on purpose: the
+		// upstream counts from it whatever the plugin's setting was, so the rest
+		// must still be known when the protection is switched back on.
+		for keyHash, state := range s.concurrencyStates {
+			if state.lastEnded.IsZero() {
+				delete(s.concurrencyStates, keyHash)
+				continue
+			}
+			*state = concurrencyState{lastEnded: state.lastEnded}
+		}
 	}
 	s.mu.Unlock()
 	s.requestLogs.setSettings(cfg.logSettings())

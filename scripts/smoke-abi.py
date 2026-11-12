@@ -1636,7 +1636,7 @@ CONCURRENCY_OFF = {"concurrency": {"enabled": False}}
 def run_concurrency_protection(request, origin, primary_id):
     """The per-account concurrency protection, observed through the live host.
 
-    Two things only the real host can show:
+    Three things only the real host can show:
 
       1. An account at its limit refuses locally and the host just uses another
          account: the caller still gets 200, the busy account sees no further
@@ -1645,6 +1645,10 @@ def run_concurrency_protection(request, origin, primary_id):
          (retry_after_seconds). With the plugin's own hold switched off again,
          the host alone must still leave that account alone, well past the one
          second its own backoff would have used.
+      3. After a request completed, the account rests. Its refusal carries the
+         remaining rest as a cooldown, so the host skips it instead of offering
+         it to every following request; when every account rests the caller
+         gets a 429 with Retry-After, and after the rest the account serves.
     """
     result = {"status": "FAIL"}
 
@@ -1680,14 +1684,20 @@ def run_concurrency_protection(request, origin, primary_id):
         require(second_secret not in raw.decode(), "credential response leaked a key")
 
         defaults = config()
-        assert_keys(defaults, ["enabled", "max_in_flight", "hold_seconds", "max_hold_seconds",
+        assert_keys(defaults, ["enabled", "max_in_flight", "hold_seconds", "max_hold_seconds", "rest_seconds",
                                "owner", "limits", "stats"], "concurrency config")
         assert_keys(defaults["stats"], ["since", "held_now", "rejected_at_limit", "rejected_while_held",
-                                        "upstream_rate_limited", "holds_started"], "concurrency stats")
+                                        "rejected_at_rest", "upstream_rate_limited", "holds_started"],
+                    "concurrency stats")
         require(defaults["owner"] == "plugin", defaults)
-        policy = config({"concurrency": {"enabled": True, "max_in_flight": 1,
+        # Parts 1 and 2 are about the limit and the hold, and send requests to
+        # an account right after another one completed, so the rest is off.
+        policy = config({"concurrency": {"enabled": True, "max_in_flight": 1, "rest_seconds": 0,
                                          "hold_seconds": 60, "max_hold_seconds": 300}})
-        require(policy["enabled"] is True and policy["max_in_flight"] == 1 and policy["hold_seconds"] == 60, policy)
+        require(policy["enabled"] is True and policy["max_in_flight"] == 1 and policy["hold_seconds"] == 60
+                and policy["rest_seconds"] == 0, policy)
+        status, raw, _ = call(API + "/config", {"concurrency": {"rest_seconds": 3601}})
+        require(status == 400, "an out-of-range rest was accepted: %s %s" % (status, raw[:200]))
         status, raw, _ = call(API + "/config", {"concurrency": {"max_in_flight": 0}})
         require(status == 400, "a zero limit was accepted: %s %s" % (status, raw[:200]))
 
@@ -1745,11 +1755,12 @@ def run_concurrency_protection(request, origin, primary_id):
         status, raw, _ = call(API + "/runtime")
         require(status == 200, "runtime returned %s" % status)
         runtime = json.loads(raw)
-        require(runtime["concurrency"] == {"enabled": True, "max_in_flight": 1}, runtime["concurrency"])
+        require(runtime["concurrency"] == {"enabled": True, "max_in_flight": 1, "rest_seconds": 0},
+                runtime["concurrency"])
         rows = {row["id"]: row for row in runtime["credentials"]}
         for row in rows.values():
-            assert_keys(row["concurrency"], ["in_flight", "peak_in_flight", "held_until", "probing",
-                                             "consecutive_rejections"], "runtime concurrency row")
+            assert_keys(row["concurrency"], ["in_flight", "peak_in_flight", "held_until", "resting_until",
+                                             "probing", "consecutive_rejections"], "runtime concurrency row")
         busy_id = primary_id if busy_key == first_key else second_id
         require(rows[busy_id]["concurrency"]["in_flight"] == 1 and rows[busy_id]["concurrency"]["held_until"] is None,
                 rows[busy_id]["concurrency"])
@@ -1824,6 +1835,81 @@ def run_concurrency_protection(request, origin, primary_id):
                 "three seconds after the 429 the host used the limited account again (%s); "
                 "it did not apply the cooldown it was given" % later)
         result["host_honoured_retry_after"] = True
+
+        # ---- 3. the rest after a completed request ------------------------
+        # A third account that nothing above has touched, so neither the host
+        # nor the plugin holds any state for it. The two used so far are taken
+        # out of rotation by their operator switch.
+        for account in (primary_id, second_id):
+            status, raw, _ = call(API + "/credentials", {"id": account, "disabled": True})
+            require(status == 200, "disable returned %s: %s" % (status, raw[:200]))
+        third_secret = FIXTURE_KEY + "-rest"
+        third_key = "Bearer " + third_secret
+        status, raw, _ = call(API + "/credentials", {"label": "fixture-rest", "api_key": third_secret})
+        require(status == 201, "third credential create returned %s: %s" % (status, raw[:200]))
+        third_id = json.loads(raw)["id"]
+        rest_seconds = 14
+        policy = config({"concurrency": {"enabled": True, "max_in_flight": 4, "rest_seconds": rest_seconds,
+                                         "hold_seconds": 60, "max_hold_seconds": 300}})
+        require(policy["rest_seconds"] == rest_seconds and policy["stats"]["held_now"] == 0, policy)
+        # The first request to reach the new account completes and starts its rest.
+        deadline = time.monotonic() + 60
+        served = None
+        while time.monotonic() < deadline and served is None:
+            mark = len(origin.requests)
+            status, raw, _ = chat()
+            if status == 200 and attempts_since(mark) == [third_key]:
+                served = time.monotonic()
+            else:
+                time.sleep(0.5)
+        require(served is not None, "the third account never served a request")
+        before = config()["stats"]
+        mark = len(origin.requests)
+        statuses, retry_after = [], []
+        for _ in range(8):
+            status, raw, headers = chat()
+            statuses.append(status)
+            retry_after.append(next((v for k, v in headers.items() if k.lower() == "retry-after"), None))
+        after = config()["stats"]
+        require(attempts_since(mark) == [], "a resting account reached the upstream: %s" % attempts_since(mark))
+        require(statuses == [429] * 8, "requests to a resting account returned %s, want eight 429" % statuses)
+        refused = after["rejected_at_rest"] - before["rejected_at_rest"]
+        # The first refusal carries the remaining rest as a cooldown. If the host
+        # honours it, the other seven requests are answered by the host itself
+        # and never reach the plugin. Without it all eight would.
+        require(1 <= refused <= 2,
+                "eight requests to a resting account reached the plugin %d times; "
+                "the host did not apply the cooldown it was given" % refused)
+        waits = [int(v) for v in retry_after if v and v.isdigit()]
+        require(waits and all(1 <= w <= rest_seconds for w in waits),
+                "the 429s carry Retry-After %s, want values within the %d s rest" % (retry_after, rest_seconds))
+        status, raw, _ = call(API + "/runtime")
+        rows = {row["id"]: row for row in json.loads(raw)["credentials"]}
+        resting = rows[third_id]["concurrency"]
+        require(resting["resting_until"] and resting["held_until"] is None and resting["consecutive_rejections"] == 0,
+                "the account is not reported as resting: %s" % resting)
+        result["rest_refusals_for_eight_requests"] = refused
+        result["rest_retry_after"] = sorted(set(waits))
+        # After the rest the same account serves again, with no probe and no hold.
+        time.sleep(max(0.0, rest_seconds + 2 - (time.monotonic() - served)))
+        deadline = time.monotonic() + 30
+        status = None
+        while time.monotonic() < deadline:
+            mark = len(origin.requests)
+            status, raw, _ = chat()
+            if status == 200:
+                break
+            time.sleep(0.5)
+        require(status == 200 and attempts_since(mark) == [third_key],
+                "after the rest the account did not serve: %s %s" % (status, attempts_since(mark)))
+        final = config()["stats"]
+        require(final["holds_started"] == after["holds_started"] and final["upstream_rate_limited"] == after["upstream_rate_limited"],
+                "the rest scenario caused an upstream rejection: %s -> %s" % (after, final))
+        result["served_again_after_rest"] = True
+        call(API + "/credentials?id=" + third_id, method="DELETE")
+        for account in (primary_id, second_id):
+            status, raw, _ = call(API + "/credentials", {"id": account, "disabled": False})
+            require(status == 200, "re-enable returned %s: %s" % (status, raw[:200]))
         result["status"] = "PASS"
     except AssertionError as exc:
         result["failure"] = str(exc)[:400]
@@ -3121,7 +3207,12 @@ def _live_quota_recovery(boot, stop, request, origin, work, credential_id):
         return False
 
     try:
-        require(bool(disk_state().get("quota_block")), "recovery case started without a persisted quota block")
+        # The plugin pauses the account in memory at once; the host writes the
+        # auth file a few tens of milliseconds later. Reading the file right
+        # after the 402 returned raced that write (2 of 6 runs failed, on the
+        # 0.5.0 artifact and script as well), so wait for it, bounded.
+        require(wait_for(lambda: bool(disk_state().get("quota_block")), 10, "persisted quota block"),
+                "recovery case started without a persisted quota block")
         status, _, _ = request(API + "/credentials", {"id": credential_id, "disabled": True})
         require(status == 200, "plugin manual disable before recovery failed")
 
@@ -3535,7 +3626,7 @@ def run(artifact, version):
                 "StorageJSON": storage, "host_callback_id": "gate-cb"})
 
         status, raw, _ = plugin.management(API + "/config", method="POST", body={"concurrency": {
-            "enabled": True, "max_in_flight": 4, "hold_seconds": 60, "max_hold_seconds": 300}})
+            "enabled": True, "max_in_flight": 4, "hold_seconds": 60, "max_hold_seconds": 300, "rest_seconds": 0}})
         require(status == 200, "could not switch the concurrency protection on: %s" % status)
         upstream.fail["/chat/completions"] = (
             429, json.dumps({"error": {"code": "rate_limit_exceeded", "message": "slow down"}}))
@@ -3554,19 +3645,42 @@ def run(artifact, version):
         refused = envelope.get("error") or {}
         require(not envelope.get("ok") and refused.get("http_status") == 429
                 and refused.get("code") == "account_held"
-                and "[upstream:account_busy]" in refused.get("message", ""),
+                and "[upstream:account_wait]" in refused.get("message", ""),
                 "a held account was not refused locally: %s" % refused)
-        require("retry_after_seconds" not in refused, "a local refusal carries a cooldown: %s" % refused)
+        # The hold has about 60 s left, so the refusal carries it as the cooldown,
+        # under the wait marker (rule: continue-and-cooldown).
+        require(refused.get("retry_after_seconds") in (59, 60),
+                "a held account's refusal carries retry_after_seconds=%r, want what is left of the hold"
+                % refused.get("retry_after_seconds"))
         require(len(upstream.requests) == sent_before + 1,
                 "a held account reached the upstream: %d requests" % (len(upstream.requests) - sent_before))
         evidence["concurrency_wire"] = {"retry_after_seconds": wire["retry_after_seconds"],
-                                        "held_refusal_code": refused["code"]}
+                                        "held_refusal_code": refused["code"],
+                                        "held_refusal_retry_after_seconds": refused["retry_after_seconds"]}
         status, raw, _ = plugin.management(API + "/config", method="POST", body=CONCURRENCY_OFF)
         require(status == 200 and json.loads(raw)["concurrency"]["stats"]["held_now"] == 0,
                 "could not switch the concurrency protection off again: %s" % status)
         _, envelope = gate_execute()
         require(envelope.get("ok"), "the account stayed shut after the protection was switched off: %s"
                 % envelope.get("error"))
+        # The rest, on the wire: that request just completed, so with the rest
+        # on the next one is refused inside the library and carries the rest.
+        status, raw, _ = plugin.management(API + "/config", method="POST", body={"concurrency": {
+            "enabled": True, "rest_seconds": 65}})
+        require(status == 200, "could not switch the rest on: %s" % status)
+        sent_before = len(upstream.requests)
+        _, envelope = gate_execute()
+        resting = envelope.get("error") or {}
+        require(not envelope.get("ok") and resting.get("http_status") == 429
+                and resting.get("code") == "account_resting"
+                and "[upstream:account_wait]" in resting.get("message", "")
+                and resting.get("retry_after_seconds") in (64, 65),
+                "a resting account was not refused with its cooldown: %s" % resting)
+        require(len(upstream.requests) == sent_before, "a resting account reached the upstream")
+        evidence["concurrency_wire"]["resting_refusal"] = {"code": resting["code"],
+                                                           "retry_after_seconds": resting["retry_after_seconds"]}
+        status, raw, _ = plugin.management(API + "/config", method="POST", body=CONCURRENCY_OFF)
+        require(status == 200, "could not switch the concurrency protection off again: %s" % status)
 
         # ---- management quota through the fake ctypes host ----
         evidence["quota_host"] = run_quota_ctypes(plugin, host, upstream, credential_id)

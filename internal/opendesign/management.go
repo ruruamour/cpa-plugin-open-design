@@ -688,7 +688,7 @@ func safeDiagnosticKind(kind string, keys []string) bool {
 		// refusal "upstream_error" although nothing was sent upstream.
 		"quota_blocked",
 		// Fixed plugin codes for a request the concurrency protection refused.
-		concurrencyLimitKind, concurrencyHeldKind:
+		concurrencyLimitKind, concurrencyHeldKind, concurrencyRestingKind:
 		return true
 	default:
 		return false

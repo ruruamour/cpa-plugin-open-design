@@ -766,13 +766,17 @@
             <div class="panel-head">
               <div>
                 <h2 id="concurrencySettingsTitle">并发保护</h2>
-                <p class="panel-hint">按账号限制同时进行的请求数；被上游限流后暂时不再使用该账号</p>
+                <p class="panel-hint">按账号控制发给上游的请求：完成后休息、限制并发、被限流后挂起</p>
               </div>
             </div>
             <form class="form-stack" id="concurrencySettingsForm" autocomplete="off">
               <label class="switch">
                 <span>限制每个账号同时进行的请求数</span>
                 <input id="configConcurrencyEnabled" type="checkbox" role="switch">
+              </label>
+              <label class="field">
+                <span>请求完成后休息（秒，0-3600，0 表示不休息）</span>
+                <input class="control" id="configConcurrencyRestSeconds" type="number" min="0" max="3600" step="1" inputmode="numeric">
               </label>
               <label class="field">
                 <span>每个账号的并发上限（1-64）</span>
@@ -791,10 +795,13 @@
               </div>
             </form>
             <p class="hint" style="margin-top: 14px;">
-              账号达到上限时，新请求在本地被拒绝、不发给上游，CPA 会改用其他账号且不冷却该账号。选哪个账号仍由 CPA 决定，插件只能放行或拒绝。
+              上游的规则是：账号完成一个请求后约一分钟内不接受新请求，从最后一个完成的请求算起；同时发起的请求不受影响。所以账号有请求完成后，插件在休息时间内不再向它发请求。默认 65 秒是上游的一分钟加余量，设短了会被上游拒绝。
             </p>
             <p class="hint" style="margin-top: 8px;">
-              账号被上游限流后，在挂起时间内不再向它发请求；到期后先放行一个请求试探，成功才恢复。连续被限流时挂起时间翻倍，直到最长挂起。在途数是插件本次加载以来的统计，热加载后从 0 开始。
+              被拒绝的请求都不发给上游。休息或挂起的账号会连同剩余时间告诉 CPA，CPA 在这段时间内跳过它；达到并发上限的账号只是让 CPA 改用其他账号，不冷却。选哪个账号仍由 CPA 决定，插件只能放行或拒绝。
+            </p>
+            <p class="hint" style="margin-top: 8px;">
+              挂起用于插件看不到的情况（例如热加载后不知道账号何时完成过请求）：账号被上游限流后挂起，到期先放行一个请求试探，成功才恢复，连续被限流时挂起时间翻倍。热加载后各项统计从 0 开始。
             </p>
             <div class="facts" id="concurrencyFacts" aria-live="polite" style="margin-top: 14px;"></div>
           </section>

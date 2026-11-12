@@ -14,7 +14,7 @@ import (
 
 const (
 	// Version is the plugin version advertised at registration.
-	Version = "0.6.0"
+	Version = "0.6.1"
 	// PluginID is the CPA plugin identifier and management path segment.
 	PluginID = "open-design"
 	// Provider is the CPA provider key for this plugin.

@@ -8560,10 +8560,10 @@ const concurrencyConfig = (overrides = {}) => ({
   logs: {},
   pause: { enabled: true, max_seconds: 86400, owner: 'plugin' },
   concurrency: {
-    enabled: true, max_in_flight: 4, hold_seconds: 60, max_hold_seconds: 300, owner: 'plugin',
-    limits: { max_in_flight: [1, 64], hold_seconds: [0, 3600], max_hold_seconds: [0, 3600] },
+    enabled: true, max_in_flight: 4, hold_seconds: 60, max_hold_seconds: 300, rest_seconds: 65, owner: 'plugin',
+    limits: { max_in_flight: [1, 64], hold_seconds: [0, 3600], max_hold_seconds: [0, 3600], rest_seconds: [0, 3600] },
     stats: {
-      since: '2026-11-12T03:40:00Z', held_now: 2, rejected_at_limit: 120, rejected_while_held: 45,
+      since: '2026-11-12T03:40:00Z', held_now: 2, rejected_at_limit: 120, rejected_while_held: 45, rejected_at_rest: 3300,
       upstream_rate_limited: 9, holds_started: 7,
     },
     ...overrides,
@@ -8597,9 +8597,16 @@ test('并发保护：归一化保留未知为未知，缺失整段时为 null', 
   assert.equal(core.normalizeConfig({ concurrency: 'yes' }).concurrency, null);
   const full = core.normalizeConfig(concurrencyConfig()).concurrency;
   assert.deepEqual(JSON.parse(JSON.stringify(full)), {
-    enabled: true, max_in_flight: 4, hold_seconds: 60, max_hold_seconds: 300, owner: 'plugin',
-    stats: { since: '2026-11-12T03:40:00Z', held_now: 2, rejected_at_limit: 120, rejected_while_held: 45, upstream_rate_limited: 9, holds_started: 7 },
+    enabled: true, max_in_flight: 4, hold_seconds: 60, max_hold_seconds: 300, rest_seconds: 65, owner: 'plugin',
+    stats: { since: '2026-11-12T03:40:00Z', held_now: 2, rejected_at_limit: 120, rejected_while_held: 45, rejected_at_rest: 3300, upstream_rate_limited: 9, holds_started: 7 },
   });
+  // A 0.6.0 backend has the limit and the hold but no rest: null, not 65 and not 0.
+  const older = core.normalizeConfig({ concurrency: { enabled: true, max_in_flight: 4, hold_seconds: 60, max_hold_seconds: 300 } }).concurrency;
+  assert.equal(older.rest_seconds, null);
+  assert.equal(older.stats.rejected_at_rest, null);
+  // 0 is a real value (resting off), and out of range is unknown.
+  assert.equal(core.normalizeConfig({ concurrency: { rest_seconds: 0 } }).concurrency.rest_seconds, 0);
+  assert.equal(core.normalizeConfig({ concurrency: { rest_seconds: 3601 } }).concurrency.rest_seconds, null);
   // Out-of-range or missing numbers become null, never 0 and never a default.
   const partial = core.normalizeConfig({ concurrency: { enabled: 'true', max_in_flight: 0, hold_seconds: -1, max_hold_seconds: 99999, stats: { held_now: '3' } } }).concurrency;
   assert.equal(partial.enabled, false, 'only a literal true enables');
@@ -8621,18 +8628,19 @@ test('并发保护：读取配置后显示设置与统计', async () => {
   assert.match(node('concurrencyFacts').textContent, /读取配置/);
   await api.handlers.loadConfig();
   assert.equal(node('configConcurrencyEnabled').checked, true);
+  assert.equal(node('configConcurrencyRestSeconds').value, '65');
   assert.equal(node('configConcurrencyMaxInFlight').value, '4');
   assert.equal(node('configConcurrencyHoldSeconds').value, '60');
   assert.equal(node('configConcurrencyMaxHoldSeconds').value, '300');
-  for (const id of ['configConcurrencyEnabled', 'configConcurrencyMaxInFlight', 'configConcurrencyHoldSeconds', 'configConcurrencyMaxHoldSeconds', 'saveConcurrencyConfig']) {
+  for (const id of ['configConcurrencyEnabled', 'configConcurrencyRestSeconds', 'configConcurrencyMaxInFlight', 'configConcurrencyHoldSeconds', 'configConcurrencyMaxHoldSeconds', 'saveConcurrencyConfig']) {
     assert.equal(node(id).disabled, false, `${id} is usable once the config is read`);
   }
   const facts = factPairs(node('concurrencyFacts'));
-  assert.deepEqual(facts.slice(0, 5), [
-    ['当前挂起账号', '2'], ['达到上限被本地拒绝', '120'], ['挂起期间被本地拒绝', '45'], ['上游限流次数', '9'], ['触发挂起次数', '7'],
+  assert.deepEqual(facts.slice(0, 6), [
+    ['当前挂起账号', '2'], ['休息期间被本地拒绝', '3300'], ['达到上限被本地拒绝', '120'], ['挂起期间被本地拒绝', '45'], ['上游限流次数', '9'], ['触发挂起次数', '7'],
   ]);
-  assert.equal(facts[5][0], '统计起始');
-  assert.notEqual(facts[5][1], '未知');
+  assert.equal(facts[6][0], '统计起始');
+  assert.notEqual(facts[6][1], '未知');
 });
 
 test('并发保护：统计里未知的数显示为「—」而不是 0', async () => {
@@ -8651,7 +8659,7 @@ test('并发保护：旧后端没有该配置时表单锁定并说明不支持',
   const { api, node, posts } = concurrencyPage(legacy);
   await api.handlers.loadConfig();
   assert.match(node('concurrencyFacts').textContent, /当前后端不支持并发保护/);
-  for (const id of ['configConcurrencyEnabled', 'configConcurrencyMaxInFlight', 'configConcurrencyHoldSeconds', 'configConcurrencyMaxHoldSeconds', 'saveConcurrencyConfig']) {
+  for (const id of ['configConcurrencyEnabled', 'configConcurrencyRestSeconds', 'configConcurrencyMaxInFlight', 'configConcurrencyHoldSeconds', 'configConcurrencyMaxHoldSeconds', 'saveConcurrencyConfig']) {
     assert.equal(node(id).disabled, true, `${id} is locked without backend support`);
   }
   // No defaults are invented for a backend that never sent the section.
@@ -8669,10 +8677,11 @@ test('并发保护：保存前校验范围，只提交并发设置', async () =>
   const { api, node, posts } = concurrencyPage(concurrencyConfig(), () => respond(200, saved));
   await api.handlers.loadConfig();
   const submit = () => api.handlers.saveConcurrencyConfig({ preventDefault() {} });
-  const set = (limit, hold, max) => {
+  const set = (limit, hold, max, rest = '65') => {
     node('configConcurrencyMaxInFlight').value = limit;
     node('configConcurrencyHoldSeconds').value = hold;
     node('configConcurrencyMaxHoldSeconds').value = max;
+    node('configConcurrencyRestSeconds').value = rest;
   };
   for (const [values, message] of [
     [['0', '60', '300'], /并发上限必须是 1 到 64/],
@@ -8684,6 +8693,10 @@ test('并发保护：保存前校验范围，只提交并发设置', async () =>
     [['4', '60', '3601'], /最长挂起必须是 0 到 3600/],
     [['4', '60', ''], /最长挂起必须是 0 到 3600/],
     [['4', '200', '100'], /最长挂起不能小于挂起时间/],
+    [['4', '60', '300', '-1'], /休息时间必须是 0 到 3600/],
+    [['4', '60', '300', '3601'], /休息时间必须是 0 到 3600/],
+    [['4', '60', '300', ''], /休息时间必须是 0 到 3600/],
+    [['4', '60', '300', '6.5'], /休息时间必须是 0 到 3600/],
   ]) {
     set(...values);
     await submit();
@@ -8694,16 +8707,35 @@ test('并发保护：保存前校验范围，只提交并发设置', async () =>
   node('configConcurrencyEnabled').checked = false;
   await submit();
   assert.equal(posts().length, 1);
-  assert.deepEqual(JSON.parse(posts()[0].init.body), { concurrency: { enabled: false, max_in_flight: 6, hold_seconds: 30, max_hold_seconds: 120 } });
+  assert.deepEqual(JSON.parse(posts()[0].init.body), { concurrency: { enabled: false, max_in_flight: 6, hold_seconds: 30, max_hold_seconds: 120, rest_seconds: 65 } });
   assert.match(node('configState').textContent, /并发保护设置已保存/);
   // The form shows what the backend answered, not what was typed.
   assert.equal(node('configConcurrencyMaxInFlight').value, '6');
   assert.equal(node('configConcurrencyEnabled').checked, false);
   // hold 0 / max 0 (holding off) is a valid save.
-  set('4', '0', '0');
+  set('4', '0', '0', '0');
   await submit();
   assert.equal(posts().length, 2);
-  assert.deepEqual(JSON.parse(posts()[1].init.body).concurrency, { enabled: false, max_in_flight: 4, hold_seconds: 0, max_hold_seconds: 0 });
+  assert.deepEqual(JSON.parse(posts()[1].init.body).concurrency, { enabled: false, max_in_flight: 4, hold_seconds: 0, max_hold_seconds: 0, rest_seconds: 0 });
+});
+
+test('并发保护：0.6.0 后端没有休息设置时，该字段锁定且不提交', async () => {
+  const older = concurrencyConfig();
+  delete older.concurrency.rest_seconds;
+  delete older.concurrency.stats.rejected_at_rest;
+  const { api, node, posts } = concurrencyPage(older, () => respond(200, older));
+  await api.handlers.loadConfig();
+  // The rest of the form works; only the field the backend does not know is locked.
+  assert.equal(node('configConcurrencyRestSeconds').disabled, true);
+  assert.equal(node('configConcurrencyRestSeconds').value, '', 'no default is invented for it');
+  assert.equal(node('configConcurrencyMaxInFlight').disabled, false);
+  assert.equal(node('saveConcurrencyConfig').disabled, false);
+  assert.ok(!factPairs(node('concurrencyFacts')).some(([label]) => label === '休息期间被本地拒绝'), 'no counter for a feature the backend lacks');
+  node('configConcurrencyMaxInFlight').value = '5';
+  await api.handlers.saveConcurrencyConfig({ preventDefault() {} });
+  assert.equal(posts().length, 1);
+  // The unknown field is left out, so the older backend's strict decoder accepts the body.
+  assert.deepEqual(JSON.parse(posts()[0].init.body), { concurrency: { enabled: true, max_in_flight: 5, hold_seconds: 60, max_hold_seconds: 300 } });
 });
 
 test('并发保护：保存失败时显示错误且不改动已显示的设置', async () => {
@@ -8739,6 +8771,24 @@ test('运行时列表显示每个账号的在途数、上限与限流挂起状�
       facts: Object.fromEntries(factPairs(view.document.getElementById('runtimeFacts'))),
     };
   };
+  const resting = await render(runtimeBody({ enabled: true, max_in_flight: 4, rest_seconds: 65 }, [
+    row('rest', '休息账号', { in_flight: 2, peak_in_flight: 4, held_until: null, resting_until: future, probing: false, consecutive_rejections: 0 }),
+    row('done', '休息完账号', { in_flight: 0, peak_in_flight: 4, held_until: null, resting_until: past, probing: false, consecutive_rejections: 0 }),
+    row('both', '挂起并休息', { in_flight: 0, peak_in_flight: 4, held_until: future, resting_until: future, probing: false, consecutive_rejections: 1 }),
+  ]));
+  assert.equal(resting.facts['请求完成后休息'], '65 秒');
+  // Resting is the normal state after a request: a plain badge, with the time.
+  assert.equal(resting.head('rest'), '休息账号已启用休息中');
+  assert.match(resting.detail('rest'), /休息到 /);
+  assert.equal(resting.head('done'), '休息完账号已启用', 'a rest that is over is not shown');
+  assert.ok(!/休息到/.test(resting.detail('done')));
+  assert.equal(resting.head('both'), '挂起并休息已启用限流挂起中休息中');
+  assert.match(resting.detail('both'), /挂起到 .*休息到 /);
+  assert.equal((await render(runtimeBody({ enabled: true, max_in_flight: 4, rest_seconds: 0 }, [row('a', '账号', { in_flight: 0, peak_in_flight: 0 })]))).facts['请求完成后休息'], '未启用');
+  assert.equal((await render(runtimeBody({ enabled: false, max_in_flight: 4, rest_seconds: 65 }, [row('a', '账号', { in_flight: 0, peak_in_flight: 0 })]))).facts['请求完成后休息'], '未启用');
+  // A 0.6.0 backend does not report it: unknown, not a number.
+  assert.equal((await render(runtimeBody({ enabled: true, max_in_flight: 4 }, [row('a', '账号', { in_flight: 0, peak_in_flight: 0 })]))).facts['请求完成后休息'], '未知');
+
   const shown = await render(runtimeBody({ enabled: true, max_in_flight: 4 }, [
     row('busy', '忙账号', { in_flight: 3, peak_in_flight: 4, held_until: null, probing: false, consecutive_rejections: 0 }),
     row('held', '挂起账号', { in_flight: 0, peak_in_flight: 4, held_until: future, probing: false, consecutive_rejections: 2 }),

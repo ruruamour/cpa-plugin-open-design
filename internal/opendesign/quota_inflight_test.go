@@ -596,7 +596,12 @@ func TestQuotaInFlightStreamsReleaseAfterEveryTerminalCallback(t *testing.T) {
 func TestQuotaInFlightReleaseWakeIsScopedToBlockedKey(t *testing.T) {
 	s := NewService()
 	c := Credential{Type: Provider, ID: "fixture-inflight", Label: "fixture", APIKey: "fixture-inflight-key"}
+	// This test is about the recovery wake, and admits several requests for one
+	// key at the same instant. That is exactly what the concurrency protection
+	// refuses, so it is switched off here; concurrency_gate_test.go covers it.
+	off := false
 	s.mu.Lock()
+	s.cfg.Concurrency = &ConcurrencyConfig{Enabled: &off}
 	s.storeCredentialLocked(c)
 	s.mu.Unlock()
 	live, _ := liveCredential(s, c.ID)

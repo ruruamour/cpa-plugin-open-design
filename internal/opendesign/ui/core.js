@@ -1175,12 +1175,16 @@
       max_in_flight: safeInteger(value.max_in_flight, 1, 64),
       hold_seconds: safeInteger(value.hold_seconds, 0, 3600),
       max_hold_seconds: safeInteger(value.max_hold_seconds, 0, 3600),
+      // Absent on a 0.6.0 backend, which has the limit and the hold only: then
+      // it is null and the console neither shows nor sends it.
+      rest_seconds: safeInteger(value.rest_seconds, 0, 3600),
       owner: safeCode(value.owner, 20),
       stats: {
         since: safeTimestamp(stats.since),
         held_now: safeCounter(stats.held_now),
         rejected_at_limit: safeCounter(stats.rejected_at_limit),
         rejected_while_held: safeCounter(stats.rejected_while_held),
+        rejected_at_rest: safeCounter(stats.rejected_at_rest),
         upstream_rate_limited: safeCounter(stats.upstream_rate_limited),
         holds_started: safeCounter(stats.holds_started),
       },
@@ -1193,6 +1197,7 @@
       in_flight: safeCounter(value.in_flight),
       peak_in_flight: safeCounter(value.peak_in_flight),
       held_until: safeTimestamp(value.held_until),
+      resting_until: safeTimestamp(value.resting_until),
       probing: value.probing === true,
       consecutive_rejections: safeCounter(value.consecutive_rejections),
     };
@@ -1293,7 +1298,11 @@
       model_count: safeInteger(data.model_count) ?? 0,
       credentials,
       // null when the backend does not report it (an older plugin).
-      concurrency: gate && { enabled: gate.enabled === true, max_in_flight: safeInteger(gate.max_in_flight, 1, 64) },
+      concurrency: gate && {
+        enabled: gate.enabled === true,
+        max_in_flight: safeInteger(gate.max_in_flight, 1, 64),
+        rest_seconds: safeInteger(gate.rest_seconds, 0, 3600),
+      },
       host: { available: host.available === true, note: shortText(host.note, 300) },
       capabilities,
     };

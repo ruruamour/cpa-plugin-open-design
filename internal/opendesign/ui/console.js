@@ -3243,6 +3243,9 @@
     // the form stays locked instead of offering a save that would fail.
     const concurrencyLocked = configLocked || !state.config.concurrency;
     for (const id of CONCURRENCY_CONTROLS) setDisabled(id, concurrencyLocked);
+    // A 0.6.0 backend has the limit and the hold but no rest: that one field
+    // stays locked so nothing is sent that the backend would refuse.
+    if (!concurrencyLocked && state.config.concurrency.rest_seconds === null) setDisabled('configConcurrencyRestSeconds', true);
     setDisabled('loadRuntime', optionalBusy('runtime'));
     setDisabled('openErrorRules', optionalBusy('errorRules'));
     syncErrorRulesControls();
@@ -3757,7 +3760,7 @@
     syncOptionalBusyControls();
   }
 
-  const CONCURRENCY_CONTROLS = ['configConcurrencyEnabled', 'configConcurrencyMaxInFlight',
+  const CONCURRENCY_CONTROLS = ['configConcurrencyEnabled', 'configConcurrencyRestSeconds', 'configConcurrencyMaxInFlight',
     'configConcurrencyHoldSeconds', 'configConcurrencyMaxHoldSeconds', 'saveConcurrencyConfig'];
 
   // Unknown stays unknown: a counter the backend did not send is "—", never 0.
@@ -3768,6 +3771,7 @@
   function renderConcurrencyConfig() {
     const enabled = $('configConcurrencyEnabled');
     const fields = {
+      rest_seconds: $('configConcurrencyRestSeconds'),
       max_in_flight: $('configConcurrencyMaxInFlight'),
       hold_seconds: $('configConcurrencyHoldSeconds'),
       max_hold_seconds: $('configConcurrencyMaxHoldSeconds'),
@@ -3789,8 +3793,10 @@
       return;
     }
     const stats = policy.stats;
+    const restFacts = policy.rest_seconds === null ? [] : [{ label: '休息期间被本地拒绝', value: countText(stats.rejected_at_rest) }];
     renderFacts(facts, [
       { label: '当前挂起账号', value: countText(stats.held_now) },
+      ...restFacts,
       { label: '达到上限被本地拒绝', value: countText(stats.rejected_at_limit) },
       { label: '挂起期间被本地拒绝', value: countText(stats.rejected_while_held) },
       { label: '上游限流次数', value: countText(stats.upstream_rate_limited) },
@@ -3816,6 +3822,13 @@
     const limit = read('configConcurrencyMaxInFlight');
     const hold = read('configConcurrencyHoldSeconds');
     const maxHold = read('configConcurrencyMaxHoldSeconds');
+    // Only a backend that reports the rest is sent one.
+    const restSupported = state.config.concurrency.rest_seconds !== null;
+    const rest = restSupported ? read('configConcurrencyRestSeconds') : null;
+    if (restSupported && (!Number.isSafeInteger(rest) || rest < 0 || rest > 3600)) {
+      message('configState', '休息时间必须是 0 到 3600 之间的整数秒。', 'error');
+      return;
+    }
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) {
       message('configState', '并发上限必须是 1 到 64 之间的整数。', 'error');
       return;
@@ -3839,12 +3852,14 @@
     message('configState', '正在保存并发保护设置…');
     const stillCurrent = () => generation === state.optionalGeneration && sessionGeneration === state.sessionGeneration;
     try {
-      const raw = await api().updateConcurrencyConfig({
+      const policy = {
         enabled: Boolean(enabled && enabled.checked),
         max_in_flight: limit,
         hold_seconds: hold,
         max_hold_seconds: maxHold,
-      });
+      };
+      if (restSupported) policy.rest_seconds = rest;
+      const raw = await api().updateConcurrencyConfig(policy);
       if (!stillCurrent()) return;
       state.config = Core.normalizeConfig(raw);
       renderConfig();
@@ -4001,6 +4016,7 @@
       { label: '待处理操作', value: String(runtime.pending_operations) },
       { label: '映射模型数', value: String(runtime.model_count) },
       { label: '账号并发上限', value: runtimeLimitText(runtime.concurrency) },
+      { label: '请求完成后休息', value: runtimeRestText(runtime.concurrency) },
       { label: '宿主账户状态', value: runtime.host.available ? '可读取' : '不可读取（仅插件侧状态）' },
       { label: '观测时间', value: Core.formatTime(runtime.observed_at) || '未知' },
     ]);
@@ -4028,11 +4044,17 @@
               ? String(runtime.concurrency.max_in_flight) : (runtime.concurrency && !runtime.concurrency.enabled ? '未启用' : '未知');
             details.push(`在途 ${countText(gate.in_flight)} / 上限 ${limit}（峰值 ${countText(gate.peak_in_flight)}）`);
             const heldUntil = gate.held_until ? Date.parse(gate.held_until) : NaN;
+            const restingUntil = gate.resting_until ? Date.parse(gate.resting_until) : NaN;
             if (Number.isFinite(heldUntil) && heldUntil > Date.now()) {
               head.push(el('span', { className: 'badge danger', text: '限流挂起中' }));
               details.push(`挂起到 ${Core.formatTime(gate.held_until)}`);
             } else if (gate.probing) {
               head.push(el('span', { className: 'badge', text: '等待探测' }));
+            }
+            // Resting is the normal state after a request, not a fault: a plain badge.
+            if (Number.isFinite(restingUntil) && restingUntil > Date.now()) {
+              head.push(el('span', { className: 'badge', text: '休息中' }));
+              details.push(`休息到 ${Core.formatTime(gate.resting_until)}`);
             }
           }
           details.push(`宿主账户：${hostBoundaryText(item.host)}`);
@@ -4059,6 +4081,12 @@
     if (!gate) return '未知';
     if (!gate.enabled) return '未启用';
     return gate.max_in_flight === null ? '未知' : String(gate.max_in_flight);
+  }
+
+  function runtimeRestText(gate) {
+    if (!gate || gate.rest_seconds === null) return '未知';
+    if (!gate.enabled || gate.rest_seconds === 0) return '未启用';
+    return `${gate.rest_seconds} 秒`;
   }
 
   async function loadRuntime() {

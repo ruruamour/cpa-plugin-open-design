@@ -31,11 +31,21 @@ func (c *gateClock) advance(d time.Duration) {
 }
 
 // gateFixture returns a service with one account, one mapping and a fake gate
-// clock. The gate runs on its built-in defaults unless a test changes them.
+// clock. The rest after a finished request is switched off: these tests are
+// about the concurrency limit and the hold, and start a request right after
+// another one ended. restFixture leaves every default in place.
 func gateFixture(t *testing.T) (*Service, *fakeHost, string, *gateClock) {
 	t.Helper()
+	s, host, id, clock := restFixture(t)
+	setConcurrency(t, s, map[string]any{"rest_seconds": 0})
+	return s, host, id, clock
+}
+
+// restFixture is gateFixture with the built-in defaults untouched.
+func restFixture(t *testing.T) (*Service, *fakeHost, string, *gateClock) {
+	t.Helper()
 	s, host := newTestService(t)
-	id := seedModels(t, s, host)
+	id := seedGatedModels(t, s, host)
 	clock := &gateClock{now: time.Date(2026, 11, 12, 3, 0, 0, 0, time.UTC)}
 	s.concurrencyClock = clock.Now
 	return s, host, id, clock
@@ -208,8 +218,9 @@ func TestConcurrencyGateHoldsTheAccountAfterAnUpstreamRateLimit(t *testing.T) {
 		t.Fatalf("host retry-after = %d s, want 61 (60 s hold + 1 s slack)", seconds)
 	}
 	err := gateRefused(t, s, id)
-	if streamErrorCode(err) != concurrencyHeldKind || !strings.Contains(err.Error(), concurrencyBusyMarker) {
-		t.Fatalf("refusal while held = %v, want %s with the busy marker", err, concurrencyHeldKind)
+	// The hold is known, so the refusal tells the host how long to stay away.
+	if streamErrorCode(err) != concurrencyHeldKind || !strings.Contains(err.Error(), concurrencyWaitMarker) || HostRetryAfterSeconds(err) != 60 {
+		t.Fatalf("refusal while held = %v with cooldown %d, want %s with the wait marker and 60 s", err, HostRetryAfterSeconds(err), concurrencyHeldKind)
 	}
 	clock.advance(59 * time.Second)
 	_ = gateRefused(t, s, id)
@@ -223,13 +234,18 @@ func TestConcurrencyGateHoldsTheAccountAfterAnUpstreamRateLimit(t *testing.T) {
 		t.Fatalf("second request during the probe = %v, want %s", err, concurrencyHeldKind)
 	}
 	gateAccept(s, probe)
-	// The release itself drops the recovered entry; no management read has
-	// happened yet that could have swept it.
+	// The release itself clears the hold bookkeeping (no management read has
+	// happened yet that could have swept it). The entry stays only to remember
+	// when the account's last request ended.
 	s.mu.Lock()
+	var leftover concurrencyState
+	for _, state := range s.concurrencyStates {
+		leftover = *state
+	}
 	afterProbe := len(s.concurrencyStates)
 	s.mu.Unlock()
-	if afterProbe != 0 {
-		t.Fatalf("%d hold entries remain right after the probe was accepted", afterProbe)
+	if afterProbe != 1 || leftover.strikes != 0 || leftover.probe != 0 || leftover.holdUntil.After(clock.Now()) || leftover.lastEnded.IsZero() {
+		t.Fatalf("after the probe was accepted: %d entries, %+v; want one that only records when the request ended", afterProbe, leftover)
 	}
 	// Accepted: the account is back to its full limit.
 	leases := make([]*quotaInFlightLease, 0, 4)
@@ -246,11 +262,15 @@ func TestConcurrencyGateHoldsTheAccountAfterAnUpstreamRateLimit(t *testing.T) {
 	if stats["upstream_rate_limited"] != float64(1) || stats["holds_started"] != float64(1) || stats["rejected_while_held"] != float64(3) {
 		t.Fatalf("stats = %v, want 1 rate limit, 1 hold, 3 refusals while held", stats)
 	}
+	// Once the last request ended longer ago than any rest setting could still
+	// need, the next management read drops the entry.
+	clock.advance(time.Hour + time.Second)
+	gateStats(t, s)
 	s.mu.Lock()
 	left := len(s.concurrencyStates)
 	s.mu.Unlock()
 	if left != 0 {
-		t.Fatalf("%d hold entries survive a recovered account", left)
+		t.Fatalf("%d entries survive a recovered account an hour after its last request", left)
 	}
 }
 
@@ -402,6 +422,16 @@ func TestConcurrencyGateDisablingReleasesHeldAccounts(t *testing.T) {
 	gateAccept(s, gateAdmit(t, s, id))
 	setConcurrency(t, s, map[string]any{"enabled": true})
 	gateAccept(s, gateAdmit(t, s, id))
+	// The hold bookkeeping is gone for good: no strikes, no probe, no hold.
+	s.mu.Lock()
+	var left concurrencyState
+	for _, state := range s.concurrencyStates {
+		left = *state
+	}
+	s.mu.Unlock()
+	if left.strikes != 0 || left.probe != 0 || !left.holdUntil.IsZero() {
+		t.Fatalf("after switching the protection off and on: %+v, want no hold bookkeeping", left)
+	}
 }
 
 // A quota exhaustion belongs to the quota pause, not to the gate.
@@ -474,11 +504,13 @@ func TestBufferedExecutorHoldsTheAccountAndTellsTheHostHowLong(t *testing.T) {
 		t.Fatalf("second request = %v, want %s", err, concurrencyHeldKind)
 	}
 	message, status = s.HostErrorDetails(err)
-	if status != http.StatusTooManyRequests || !strings.Contains(message, concurrencyBusyMarker) {
-		t.Fatalf("host sees %d %q for a held account, want a 429 with the busy marker", status, message)
+	if status != http.StatusTooManyRequests || !strings.Contains(message, concurrencyWaitMarker) {
+		t.Fatalf("host sees %d %q for a held account, want a 429 with the wait marker", status, message)
 	}
-	if HostRetryAfterSeconds(err) != 0 {
-		t.Fatal("a local refusal carries a host retry-after")
+	// The refusal carries what is left of the hold, so the host stops offering
+	// the account instead of asking again for every request.
+	if got := HostRetryAfterFor(err, status); got < 59 || got > 60 {
+		t.Fatalf("a held account's refusal carries a cooldown of %d s, want what is left of the 60 s hold", got)
 	}
 	if n := host.countMethod("host.http.do"); n != 1 {
 		t.Fatalf("the upstream was called %d times, want 1", n)
@@ -698,7 +730,8 @@ func TestConcurrencyConfigRoundTripAndValidation(t *testing.T) {
 	if view == nil {
 		t.Fatalf("GET /config has no concurrency object: %s", raw)
 	}
-	for key, want := range map[string]any{"enabled": true, "max_in_flight": float64(4), "hold_seconds": float64(60), "max_hold_seconds": float64(300), "owner": "plugin"} {
+	for key, want := range map[string]any{"enabled": true, "max_in_flight": float64(4), "hold_seconds": float64(60), "max_hold_seconds": float64(300),
+		"rest_seconds": float64(65), "owner": "plugin"} {
 		if view[key] != want {
 			t.Errorf("default %s = %v, want %v", key, view[key], want)
 		}
@@ -771,12 +804,13 @@ func TestConcurrencySettingsResolveSafely(t *testing.T) {
 		policy *ConcurrencyConfig
 		want   concurrencySettings
 	}{
-		"absent":         {nil, concurrencySettings{true, 4, 60 * time.Second, 300 * time.Second}},
-		"empty":          {&ConcurrencyConfig{}, concurrencySettings{true, 4, 60 * time.Second, 300 * time.Second}},
-		"huge":           {&ConcurrencyConfig{Enabled: &on, MaxInFlight: 1 << 40, HoldSeconds: &huge, MaxHoldSeconds: &huge}, concurrencySettings{true, 64, time.Hour, time.Hour}},
-		"negative":       {&ConcurrencyConfig{MaxInFlight: -3, HoldSeconds: &negative, MaxHoldSeconds: &negative}, concurrencySettings{true, 4, 0, 0}},
-		"hold off":       {&ConcurrencyConfig{HoldSeconds: &zero}, concurrencySettings{true, 4, 0, 300 * time.Second}},
-		"max below hold": {&ConcurrencyConfig{MaxHoldSeconds: &zero}, concurrencySettings{true, 4, 60 * time.Second, 60 * time.Second}},
+		"absent":         {nil, concurrencySettings{true, 4, 60 * time.Second, 300 * time.Second, 65 * time.Second}},
+		"empty":          {&ConcurrencyConfig{}, concurrencySettings{true, 4, 60 * time.Second, 300 * time.Second, 65 * time.Second}},
+		"huge":           {&ConcurrencyConfig{Enabled: &on, MaxInFlight: 1 << 40, HoldSeconds: &huge, MaxHoldSeconds: &huge, RestSeconds: &huge}, concurrencySettings{true, 64, time.Hour, time.Hour, time.Hour}},
+		"negative":       {&ConcurrencyConfig{MaxInFlight: -3, HoldSeconds: &negative, MaxHoldSeconds: &negative, RestSeconds: &negative}, concurrencySettings{true, 4, 0, 0, 0}},
+		"hold off":       {&ConcurrencyConfig{HoldSeconds: &zero}, concurrencySettings{true, 4, 0, 300 * time.Second, 65 * time.Second}},
+		"max below hold": {&ConcurrencyConfig{MaxHoldSeconds: &zero}, concurrencySettings{true, 4, 60 * time.Second, 60 * time.Second, 65 * time.Second}},
+		"rest off":       {&ConcurrencyConfig{RestSeconds: &zero}, concurrencySettings{true, 4, 60 * time.Second, 300 * time.Second, 0}},
 	}
 	for name, tc := range cases {
 		if got := (Config{Concurrency: tc.policy}).concurrencySettings(); got != tc.want {
@@ -801,7 +835,7 @@ func TestConcurrencySettingsResolveSafely(t *testing.T) {
 			t.Errorf("%s failed validation: %v", name, err)
 		}
 	}
-	settings := concurrencySettings{true, 4, time.Hour, time.Hour}
+	settings := concurrencySettings{true, 4, time.Hour, time.Hour, time.Minute}
 	if got := settings.holdFor(1<<30, 1<<62); got != time.Hour {
 		t.Fatalf("holdFor with absurd inputs = %v, want the maximum", got)
 	}
@@ -871,9 +905,10 @@ func TestConcurrencyStateDoesNotOutliveAReplacedKey(t *testing.T) {
 	gateAccept(s, gateAdmit(t, s, id))
 	s.mu.Lock()
 	before := len(s.concurrencyStates)
+	_, oldHeld := s.concurrencyStates[quotaPauseKeyHash("sk-amr-exec-0001")]
 	s.mu.Unlock()
-	if before != 1 {
-		t.Fatalf("%d hold entries before the sweep, want the old key's one", before)
+	if before != 2 || !oldHeld {
+		t.Fatalf("%d entries before the sweep (old key present: %v), want the old key's hold and the new key's last request", before, oldHeld)
 	}
 	if status, _, raw := managementCall(t, s, http.MethodGet, apiBase+"/runtime", nil, nil); status != http.StatusOK {
 		t.Fatalf("runtime: %d %s", status, raw)
@@ -885,8 +920,11 @@ func TestConcurrencyStateDoesNotOutliveAReplacedKey(t *testing.T) {
 	if peaks != 1 || oldPeak {
 		t.Fatalf("peak entries = %d (old key present: %v), want only the live key", peaks, oldPeak)
 	}
-	if states != 0 {
-		t.Fatalf("%d hold entries survive for a key no account uses", states)
+	s.mu.Lock()
+	_, oldState := s.concurrencyStates[quotaPauseKeyHash("sk-amr-exec-0001")]
+	s.mu.Unlock()
+	if states != 1 || oldState {
+		t.Fatalf("%d entries after the sweep (old key present: %v), want only the live key's", states, oldState)
 	}
 }
 
@@ -1056,7 +1094,7 @@ func TestOutOfRangeConcurrencyInSettingsDoesNotBlockLoading(t *testing.T) {
 	registrar(t, s, dir)
 	t.Cleanup(func() { _, _ = s.quiesce() })
 	got := s.config().concurrencySettings()
-	if want := (concurrencySettings{true, concurrencyMaxInFlightLimit, 0, time.Hour}); got != want {
+	if want := (concurrencySettings{true, concurrencyMaxInFlightLimit, 0, time.Hour, 65 * time.Second}); got != want {
 		t.Fatalf("resolved policy = %+v, want %+v", got, want)
 	}
 	// Saving without correcting the stored value is refused, and names the field.
@@ -1238,4 +1276,685 @@ func errorsAs(err error, target **APIError) bool {
 		*target = typed
 	}
 	return ok
+}
+
+// ---- rest after a finished request ---------------------------------------------
+
+func refusalOf(t *testing.T, s *Service, id string) *APIError {
+	t.Helper()
+	err := gateRefused(t, s, id)
+	apiErr, ok := err.(*APIError)
+	if !ok {
+		t.Fatalf("refusal is %T, want *APIError", err)
+	}
+	return apiErr
+}
+
+// The rule the upstream enforces: once an accepted request has ended, the
+// account takes nothing new for about a minute. The plugin waits 65 s (the
+// minute plus a margin) and sends nothing in between.
+func TestRestAfterAFinishedRequest(t *testing.T) {
+	s, _, id, clock := restFixture(t)
+	if concurrencyDefaultRest != 65*time.Second {
+		t.Fatalf("default rest = %v, want 65s", concurrencyDefaultRest)
+	}
+	gateAccept(s, gateAdmit(t, s, id))
+	refusal := refusalOf(t, s, id)
+	if refusal.Kind != concurrencyRestingKind || refusal.Status != http.StatusTooManyRequests {
+		t.Fatalf("refusal = %s (%d), want %s with 429", refusal.Kind, refusal.Status, concurrencyRestingKind)
+	}
+	if upstreamErrorWasAttempted(refusal) {
+		t.Fatal("a resting refusal claims it reached the upstream")
+	}
+	if got := HostRetryAfterSeconds(refusal); got != 65 || !strings.Contains(refusal.Message, concurrencyWaitMarker) {
+		t.Fatalf("refusal %q with wait %d s, want the wait marker and 65", refusal.Message, got)
+	}
+	clock.advance(64 * time.Second)
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind {
+		t.Fatalf("after 64 s: %s, want still resting", got.Kind)
+	}
+	clock.advance(time.Second)
+	gateAccept(s, gateAdmit(t, s, id))
+	if got := gateStats(t, s)["rejected_at_rest"]; got != float64(2) {
+		t.Fatalf("rejected_at_rest = %v, want 2", got)
+	}
+	if n := inFlightTotal(s); n != 0 {
+		t.Fatalf("%d in-flight counters leaked", n)
+	}
+}
+
+// Requests started together are all sent: none of them has ended yet. This is
+// what makes a burst up to the concurrency limit possible at all.
+func TestRestDoesNotApplyBeforeAnyRequestEnded(t *testing.T) {
+	s, _, id, clock := restFixture(t)
+	leases := []*quotaInFlightLease{gateAdmit(t, s, id)}
+	for i := 0; i < 3; i++ {
+		clock.advance(2 * time.Second)
+		leases = append(leases, gateAdmit(t, s, id))
+	}
+	// Four running and none ended: the fifth meets the concurrency limit, not the rest.
+	if got := refusalOf(t, s, id); got.Kind != concurrencyLimitKind {
+		t.Fatalf("fifth concurrent request = %s, want the concurrency limit", got.Kind)
+	}
+	// The first one ends. From now on nothing new is started, although three
+	// slots are in use and one is free.
+	clock.advance(10 * time.Second)
+	gateAccept(s, leases[0])
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind {
+		t.Fatalf("after the first request ended with three still running: %s, want resting", got.Kind)
+	}
+	// The rest is counted from the LAST request to end, not the first.
+	clock.advance(20 * time.Second)
+	gateAccept(s, leases[1])
+	gateAccept(s, leases[2])
+	clock.advance(20 * time.Second)
+	gateAccept(s, leases[3]) // ends 40 s after the first one
+	clock.advance(26 * time.Second)
+	// 66 s after the first end, 26 s after the last one.
+	late := refusalOf(t, s, id)
+	if late.Kind != concurrencyRestingKind || HostRetryAfterSeconds(late) != 39 {
+		t.Fatalf("66 s after the first end: %s with wait %d s, want resting for another 39", late.Kind, HostRetryAfterSeconds(late))
+	}
+	clock.advance(39 * time.Second)
+	gateAccept(s, gateAdmit(t, s, id))
+}
+
+// Only a request the upstream took starts a rest. One it rejected does not, and
+// neither does one that never got an answer.
+func TestRestCountsOnlyAcceptedRequests(t *testing.T) {
+	s, _, id, clock := restFixture(t)
+	setConcurrency(t, s, map[string]any{"hold_seconds": 0, "max_hold_seconds": 0})
+	for name, failure := range map[string]error{
+		"upstream 429":      upstream429(""),
+		"transport failure": upstreamTransportError(os.ErrDeadlineExceeded),
+		"upstream 500":      upstreamErrorFromResponse(http.StatusInternalServerError, nil, []byte(`{"error":{"code":"server_error"}}`)),
+		"upstream 400":      upstreamErrorFromResponse(http.StatusBadRequest, nil, []byte(`{"error":{"message":"bad"}}`)),
+	} {
+		lease := gateAdmit(t, s, id)
+		s.settleConcurrency(lease, failure)
+		lease.release(s)
+		next, err := s.admitQuotaInFlight(mustLive(t, s, id), id)
+		if err != nil {
+			t.Fatalf("after %s the account is resting: %v", name, err)
+		}
+		// Released without an outcome at all (a panic path): no rest either.
+		next.release(s)
+	}
+	gateAccept(s, gateAdmit(t, s, id))
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind {
+		t.Fatalf("after an accepted request: %s, want resting", got.Kind)
+	}
+	clock.advance(65 * time.Second)
+	// A stream that was accepted and then broke was still served by the upstream.
+	broken := gateAdmit(t, s, id)
+	s.concurrencyAccepted(broken)
+	s.settleConcurrency(broken, upstreamTransportError(os.ErrDeadlineExceeded))
+	broken.release(s)
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind {
+		t.Fatalf("after an accepted stream broke: %s, want resting", got.Kind)
+	}
+}
+
+func mustLive(t *testing.T, s *Service, id string) Credential {
+	t.Helper()
+	c, ok := liveCredential(s, id)
+	if !ok {
+		t.Fatalf("credential %s is not live", id)
+	}
+	return c
+}
+
+// The rest is a setting, and 0 turns it off without touching the rest.
+func TestRestFollowsItsSettingAndCanBeTurnedOff(t *testing.T) {
+	for _, seconds := range []int{10, 30, 120} {
+		s, _, id, clock := restFixture(t)
+		setConcurrency(t, s, map[string]any{"rest_seconds": seconds})
+		gateAccept(s, gateAdmit(t, s, id))
+		clock.advance(time.Duration(seconds)*time.Second - time.Millisecond)
+		if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind {
+			t.Fatalf("rest %d s: just before it ends the account is %s", seconds, got.Kind)
+		}
+		clock.advance(time.Millisecond)
+		gateAccept(s, gateAdmit(t, s, id))
+	}
+	s, _, id, _ := restFixture(t)
+	setConcurrency(t, s, map[string]any{"rest_seconds": 0, "max_in_flight": 2})
+	for i := 0; i < 10; i++ {
+		gateAccept(s, gateAdmit(t, s, id))
+	}
+	a, b := gateAdmit(t, s, id), gateAdmit(t, s, id)
+	if got := refusalOf(t, s, id); got.Kind != concurrencyLimitKind {
+		t.Fatalf("with the rest off the third concurrent request is %s, want the limit", got.Kind)
+	}
+	gateAccept(s, a)
+	if got := gateReject(s, b); got != 61 {
+		t.Fatalf("with the rest off a rejection holds for %d s, want 61", got)
+	}
+	if got := gateStats(t, s)["rejected_at_rest"]; got != float64(0) {
+		t.Fatalf("rejected_at_rest = %v with the rest off", got)
+	}
+}
+
+// Changing the setting applies to rests already running: the upstream counts
+// from when the request ended whatever the plugin's setting was at the time.
+func TestRestSettingAppliesToARestAlreadyRunning(t *testing.T) {
+	s, _, id, clock := restFixture(t)
+	gateAccept(s, gateAdmit(t, s, id))
+	clock.advance(30 * time.Second)
+	setConcurrency(t, s, map[string]any{"rest_seconds": 120})
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind || HostRetryAfterSeconds(got) != 90 {
+		t.Fatalf("after lengthening the rest: %s wait %d s, want resting 90", got.Kind, HostRetryAfterSeconds(got))
+	}
+	setConcurrency(t, s, map[string]any{"rest_seconds": 20})
+	gateAccept(s, gateAdmit(t, s, id))
+	// Turning the rest off and on again does not forget when the last request ended.
+	setConcurrency(t, s, map[string]any{"rest_seconds": 0})
+	setConcurrency(t, s, map[string]any{"rest_seconds": 60})
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind {
+		t.Fatalf("after switching the rest back on: %s, want resting", got.Kind)
+	}
+}
+
+// A wait the host can honour (at least its 10 s minimum cooldown) goes out with
+// the wait marker and the cooldown; a shorter one goes out as plain "busy", so
+// the host never stays away longer than the plugin needs.
+func TestRefusalCarriesACooldownOnlyWhenTheHostCanHonourIt(t *testing.T) {
+	s, _, id, clock := restFixture(t)
+	setConcurrency(t, s, map[string]any{"rest_seconds": 30})
+	gateAccept(s, gateAdmit(t, s, id))
+	for _, tc := range []struct {
+		elapsed time.Duration
+		seconds int
+		marker  string
+	}{
+		{0, 30, concurrencyWaitMarker},
+		{19 * time.Second, 11, concurrencyWaitMarker},
+		{time.Second, 10, concurrencyWaitMarker},
+		{time.Second, 0, concurrencyBusyMarker},
+		{8 * time.Second, 0, concurrencyBusyMarker},
+	} {
+		clock.advance(tc.elapsed)
+		refusal := refusalOf(t, s, id)
+		if got := HostRetryAfterSeconds(refusal); got != tc.seconds {
+			t.Errorf("after %v: cooldown %d s, want %d", tc.elapsed, got, tc.seconds)
+		}
+		if !strings.Contains(refusal.Message, tc.marker) {
+			t.Errorf("after %v: message %q, want %s", tc.elapsed, refusal.Message, tc.marker)
+		}
+		other := concurrencyBusyMarker
+		if tc.marker == concurrencyBusyMarker {
+			other = concurrencyWaitMarker
+		}
+		if strings.Contains(refusal.Message, other) {
+			t.Errorf("after %v: message %q carries both markers", tc.elapsed, refusal.Message)
+		}
+	}
+	// The concurrency limit never carries a cooldown: a slot can free any moment.
+	s2, _, id2, _ := gateFixture(t)
+	setConcurrency(t, s2, map[string]any{"max_in_flight": 1})
+	parked := gateAdmit(t, s2, id2)
+	atLimit := refusalOf(t, s2, id2)
+	if atLimit.Kind != concurrencyLimitKind || HostRetryAfterSeconds(atLimit) != 0 || !strings.Contains(atLimit.Message, concurrencyBusyMarker) {
+		t.Fatalf("at the limit: %s %q with cooldown %d, want busy and none", atLimit.Kind, atLimit.Message, HostRetryAfterSeconds(atLimit))
+	}
+	gateAccept(s2, parked)
+}
+
+// A held account tells the host how long the hold still runs.
+func TestHeldRefusalCarriesTheRemainingHold(t *testing.T) {
+	s, _, id, clock := gateFixture(t)
+	gateReject(s, gateAdmit(t, s, id))
+	for _, tc := range []struct {
+		elapsed time.Duration
+		seconds int
+		marker  string
+	}{{0, 60, concurrencyWaitMarker}, {25 * time.Second, 35, concurrencyWaitMarker}, {25 * time.Second, 10, concurrencyWaitMarker}, {time.Second, 0, concurrencyBusyMarker}} {
+		clock.advance(tc.elapsed)
+		refusal := refusalOf(t, s, id)
+		if refusal.Kind != concurrencyHeldKind || HostRetryAfterSeconds(refusal) != tc.seconds || !strings.Contains(refusal.Message, tc.marker) {
+			t.Errorf("after %v: %s %q cooldown %d, want held, %s, %d", tc.elapsed, refusal.Kind, refusal.Message, HostRetryAfterSeconds(refusal), tc.marker, tc.seconds)
+		}
+	}
+	// While a probe is running the wait is unknown: no cooldown.
+	clock.advance(9 * time.Second)
+	probe := gateAdmit(t, s, id)
+	during := refusalOf(t, s, id)
+	if during.Kind != concurrencyHeldKind || HostRetryAfterSeconds(during) != 0 || !strings.Contains(during.Message, concurrencyBusyMarker) {
+		t.Fatalf("during the probe: %s %q cooldown %d, want held, busy, none", during.Kind, during.Message, HostRetryAfterSeconds(during))
+	}
+	gateAccept(s, probe)
+}
+
+// The hold is timed from the rejection, the rest from the last request to end.
+// A burst whose first request ended (and got the next one rejected) while the
+// others were still running must not be probed when the hold expires: the
+// account is still resting from the later ones. This was the reason a 60 s
+// probe was regularly rejected in production.
+func TestProbeWaitsForTheRest(t *testing.T) {
+	s, _, id, clock := restFixture(t)
+	first, second := gateAdmit(t, s, id), gateAdmit(t, s, id)
+	clock.advance(15 * time.Second)
+	gateAccept(s, first) // the account now rests; the plugin sends nothing
+	// Something the plugin could not see still got the account rejected (for
+	// example the state after a hot reload): the hold starts now.
+	forgotten := func() bool {
+		// Deferred unlock: a failed expectation must fail the test, never leave
+		// the service locked for the fixture's cleanup to wait on.
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		state := s.concurrencyStates[quotaPauseKeyHash("sk-amr-exec-0001")]
+		if state == nil || state.lastEnded.IsZero() {
+			return false
+		}
+		state.lastEnded = time.Time{}
+		return true
+	}()
+	if !forgotten {
+		t.Fatal("the request that ended left no record of when it ended")
+	}
+	gateReject(s, gateAdmit(t, s, id))
+	clock.advance(25 * time.Second)
+	gateAccept(s, second) // ends 25 s into the 60 s hold
+	clock.advance(36 * time.Second)
+	// The hold (60 s) is over, but the last request ended only 36 s ago.
+	waiting := refusalOf(t, s, id)
+	if waiting.Kind != concurrencyRestingKind || HostRetryAfterSeconds(waiting) != 29 {
+		t.Fatalf("after the hold with the rest still running: %s wait %d s, want resting 29", waiting.Kind, HostRetryAfterSeconds(waiting))
+	}
+	clock.advance(29 * time.Second)
+	probe := gateAdmit(t, s, id)
+	if probe.gate.probe == 0 {
+		t.Fatal("the first request after hold and rest is not the probe")
+	}
+	gateAccept(s, probe)
+}
+
+// Accounts rest independently, and several records sharing one upstream key
+// rest together.
+func TestRestIsPerUpstreamKey(t *testing.T) {
+	s, host, first, _ := restFixture(t)
+	second := addCredential(t, s, host, "secondary", "sk-amr-exec-0002")
+	twin := addCredential(t, s, host, "twin", "sk-amr-exec-0001")
+	gateAccept(s, gateAdmit(t, s, first))
+	if got := refusalOf(t, s, twin); got.Kind != concurrencyRestingKind {
+		t.Fatalf("a record sharing the key is %s, want resting", got.Kind)
+	}
+	gateAccept(s, gateAdmit(t, s, second))
+	if got := refusalOf(t, s, second); got.Kind != concurrencyRestingKind {
+		t.Fatalf("the second account after its own request is %s, want resting", got.Kind)
+	}
+}
+
+// The policy round-trips, validates and persists like the rest of it.
+func TestRestConfigRoundTripAndValidation(t *testing.T) {
+	s, _ := newTestService(t)
+	view := setConcurrency(t, s, map[string]any{"rest_seconds": 90})
+	if view["rest_seconds"] != float64(90) || view["max_in_flight"] != float64(4) || view["hold_seconds"] != float64(60) {
+		t.Fatalf("after update: %v", view)
+	}
+	limits, _ := view["limits"].(map[string]any)
+	if got, _ := limits["rest_seconds"].([]any); len(got) != 2 || got[0] != float64(0) || got[1] != float64(3600) {
+		t.Fatalf("limits.rest_seconds = %v", limits["rest_seconds"])
+	}
+	reloaded := NewService()
+	reloaded.SetHost(newFakeHost().call)
+	registrar(t, reloaded, s.config().DataDir)
+	t.Cleanup(func() { _, _ = reloaded.quiesce() })
+	if got := reloaded.config().concurrencySettings(); got.rest != 90*time.Second {
+		t.Fatalf("reloaded policy = %+v", got)
+	}
+	// 0 is a real choice and survives a reload.
+	setConcurrency(t, s, map[string]any{"rest_seconds": 0})
+	again := NewService()
+	again.SetHost(newFakeHost().call)
+	registrar(t, again, s.config().DataDir)
+	t.Cleanup(func() { _, _ = again.quiesce() })
+	if got := again.config().concurrencySettings(); got.rest != 0 || got.maxInFlight != 4 {
+		t.Fatalf("reloaded policy with the rest off = %+v", got)
+	}
+	for name, policy := range map[string]map[string]any{
+		"negative rest": {"rest_seconds": -1}, "rest too long": {"rest_seconds": 3601},
+		"retired pacing field": {"max_starts": 3},
+	} {
+		status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/config", nil, map[string]any{"concurrency": policy})
+		if status != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400: %s", name, status, raw)
+		}
+	}
+	if got := s.config().concurrencySettings(); got.rest != 0 {
+		t.Fatalf("a refused update changed the policy: %+v", got)
+	}
+	negative, huge := -1, 3601
+	for name, policy := range map[string]*ConcurrencyConfig{"negative": {RestSeconds: &negative}, "huge": {RestSeconds: &huge}} {
+		if validateConcurrencyConfig(policy) == nil {
+			t.Errorf("%s rest passed validation", name)
+		}
+	}
+}
+
+// /runtime says when a resting account can be used again.
+func TestRuntimeReportsTheRest(t *testing.T) {
+	s, _, id, clock := restFixture(t)
+	read := func() (map[string]any, map[string]any) {
+		_, body, raw := managementCall(t, s, http.MethodGet, apiBase+"/runtime", nil, nil)
+		top, _ := body["concurrency"].(map[string]any)
+		for _, item := range body["credentials"].([]any) {
+			row := item.(map[string]any)
+			if row["id"] == id {
+				view, _ := row["concurrency"].(map[string]any)
+				return top, view
+			}
+		}
+		t.Fatalf("account missing from runtime: %s", raw)
+		return nil, nil
+	}
+	top, row := read()
+	if top["rest_seconds"] != float64(65) || row["resting_until"] != nil {
+		t.Fatalf("fresh runtime = %v / %v", top, row)
+	}
+	running := gateAdmit(t, s, id)
+	if _, row = read(); row["resting_until"] != nil || row["in_flight"] != float64(1) {
+		t.Fatalf("with a request running and none ended: %v", row)
+	}
+	gateAccept(s, running)
+	_, row = read()
+	if want := clock.Now().Add(65 * time.Second).Format(time.RFC3339); row["resting_until"] != want {
+		t.Fatalf("resting_until = %v, want %s", row["resting_until"], want)
+	}
+	clock.advance(65 * time.Second)
+	if _, row = read(); row["resting_until"] != nil {
+		t.Fatalf("after the rest: resting_until = %v, want null", row["resting_until"])
+	}
+	// With the rest off nothing is reported as resting.
+	gateAccept(s, gateAdmit(t, s, id))
+	setConcurrency(t, s, map[string]any{"rest_seconds": 0})
+	if top, row = read(); top["rest_seconds"] != float64(0) || row["resting_until"] != nil {
+		t.Fatalf("with the rest off: %v / %v", top, row)
+	}
+	// With the whole protection off (and the rest setting left at 65 s) nothing
+	// is refused, so nothing may be reported as resting either.
+	setConcurrency(t, s, map[string]any{"rest_seconds": 65})
+	if _, row = read(); row["resting_until"] == nil {
+		t.Fatal("fixture: the account should be resting again with the rest back on")
+	}
+	setConcurrency(t, s, map[string]any{"enabled": false})
+	if top, row = read(); top["enabled"] != false || row["resting_until"] != nil {
+		t.Fatalf("with the protection off: %v / %v", top, row)
+	}
+	// Nothing is refused while it is off...
+	gateAccept(s, gateAdmit(t, s, id))
+	// ...and switching it back on still knows the account's last request just
+	// ended: the upstream is counting from it regardless.
+	setConcurrency(t, s, map[string]any{"enabled": true})
+	_, row = read()
+	if want := clock.Now().Add(65 * time.Second).Format(time.RFC3339); row["resting_until"] != want {
+		t.Fatalf("after switching the protection back on: resting_until = %v, want %s", row["resting_until"], want)
+	}
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind {
+		t.Fatalf("after switching the protection back on the account is %s, want resting", got.Kind)
+	}
+}
+
+// A rested, recovered account leaves nothing behind, and a replaced key takes
+// its rest with it.
+func TestRestStateIsDroppedWhenItCarriesNoInformation(t *testing.T) {
+	s, _, id, clock := restFixture(t)
+	gateAccept(s, gateAdmit(t, s, id))
+	count := func() int {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.concurrencyStates)
+	}
+	if count() != 1 {
+		t.Fatalf("%d entries right after a request ended, want 1 (the rest)", count())
+	}
+	// When the request ended stays known for as long as any rest setting (up
+	// to an hour) could still need it, then a management read drops it.
+	clock.advance(time.Hour - time.Second)
+	gateStats(t, s)
+	if count() != 1 {
+		t.Fatalf("%d entries just under an hour after the request ended, want it kept", count())
+	}
+	clock.advance(2 * time.Second)
+	gateStats(t, s)
+	if count() != 0 {
+		t.Fatalf("%d entries more than an hour after the request ended", count())
+	}
+	gateAccept(s, gateAdmit(t, s, id))
+	if status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/credentials", nil, map[string]any{"id": id, "api_key": "sk-amr-exec-9999"}); status != http.StatusOK {
+		t.Fatalf("replace key: %d %s", status, raw)
+	}
+	// The new key is a different upstream identity: it is not resting.
+	running := gateAdmit(t, s, id)
+	managementCall(t, s, http.MethodGet, apiBase+"/runtime", nil, nil)
+	if count() != 0 {
+		t.Fatalf("%d entries for a key no account uses", count())
+	}
+	gateAccept(s, running)
+}
+
+// The wait marker's built-in rule cools the account down for the given time;
+// the busy marker's rule does not cool at all. Without their rules both fall
+// back to the neutral form and never to a bare 429.
+func TestDefaultRulesForTheTwoRefusalMarkers(t *testing.T) {
+	rules := defaultErrorRules()
+	action := func(marker string) string {
+		for _, rule := range rules {
+			for _, match := range rule.Match {
+				if match == marker && rule.Status == http.StatusTooManyRequests {
+					return rule.Action
+				}
+			}
+		}
+		return ""
+	}
+	if got := action(concurrencyBusyMarker); got != "continue" {
+		t.Fatalf("busy marker rule = %q, want continue", got)
+	}
+	if got := action(concurrencyWaitMarker); got != "continue-and-cooldown" {
+		t.Fatalf("wait marker rule = %q, want continue-and-cooldown", got)
+	}
+	if strings.Contains(concurrencyWaitMarker, concurrencyBusyMarker) || strings.Contains(concurrencyBusyMarker, concurrencyWaitMarker) {
+		t.Fatal("one marker contains the other, so one rule would match both")
+	}
+	s, _, id, _ := restFixture(t)
+	gateAccept(s, gateAdmit(t, s, id))
+	waiting := gateRefused(t, s, id)
+	message, status := s.HostErrorDetails(waiting)
+	if status != http.StatusTooManyRequests || !strings.Contains(message, concurrencyWaitMarker) || HostRetryAfterFor(waiting, status) != 65 {
+		t.Fatalf("with the default rules the host sees %d %q cooldown %d, want 429, the wait marker, 65", status, message, HostRetryAfterFor(waiting, status))
+	}
+	for _, kind := range []string{concurrencyLimitKind, concurrencyHeldKind, concurrencyRestingKind} {
+		for _, marker := range []string{concurrencyBusyMarker, concurrencyWaitMarker} {
+			if class := hostSchedulingClass(nil, http.StatusTooManyRequests, marker+" x", kind); class != hostScheduleNeutral {
+				t.Errorf("%s with %s and no rules is class %d, want neutral", kind, marker, class)
+			}
+		}
+	}
+	// An operator who removed the rules gets no cooldown and no bare 429.
+	s.mu.Lock()
+	s.errorRules = nil
+	s.mu.Unlock()
+	message, status = s.HostErrorDetails(waiting)
+	if status != 0 || !strings.Contains(message, hostTransportHint) || HostRetryAfterFor(waiting, status) != 0 {
+		t.Fatalf("without rules the host sees %d %q cooldown %d, want the neutral form and none", status, message, HostRetryAfterFor(waiting, status))
+	}
+}
+
+// A resting refusal is counted, never listed, and names itself in a model test.
+// The cooldown reaches the host on both executor paths.
+func TestRestingRefusalIsCountedNotLoggedAndCarriesItsCooldown(t *testing.T) {
+	s, host, id, _ := restFixture(t)
+	gateAccept(s, gateAdmit(t, s, id))
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	for i := 0; i < 3; i++ {
+		_, err := execute(t, s, executorPayload{AuthID: id, Model: "od-large", Payload: body})
+		if _, status := s.HostErrorDetails(err); streamErrorCode(err) != concurrencyRestingKind || HostRetryAfterFor(err, status) != 65 {
+			t.Fatalf("buffered refusal = %v with cooldown %d", err, HostRetryAfterFor(err, status))
+		}
+		_, err = executeStream(t, s, executorPayload{AuthID: id, Model: "od-large", Payload: body, Stream: true, StreamID: "c"})
+		if _, status := s.HostErrorDetails(err); streamErrorCode(err) != concurrencyRestingKind || HostRetryAfterFor(err, status) != 65 {
+			t.Fatalf("stream refusal = %v with cooldown %d", err, HostRetryAfterFor(err, status))
+		}
+	}
+	s.waitIdle()
+	if n := upstreamCalls(host); n != 0 {
+		t.Fatalf("a resting account reached the upstream %d time(s)", n)
+	}
+	_, logs, raw := managementCall(t, s, http.MethodGet, apiBase+"/request-logs", nil, nil)
+	if entries, _ := logs["logs"].([]any); len(entries) != 0 {
+		t.Fatalf("resting refusals were written to the request log: %s", raw)
+	}
+	if got := gateStats(t, s)["rejected_at_rest"]; got != float64(6) {
+		t.Fatalf("rejected_at_rest = %v, want 6", got)
+	}
+	if got := modelTestErrorMessage(concurrencyRestingKind); !strings.Contains(got, "resting") || !strings.Contains(got, "nothing was sent upstream") {
+		t.Fatalf("model test message = %q", got)
+	}
+	if !safeDiagnosticKind(concurrencyRestingKind, nil) {
+		t.Fatal("the resting kind is not a reportable diagnostic kind")
+	}
+}
+
+// End to end through the real executor: a completed request (buffered) and a
+// completed stream both start the rest, and the next request never leaves.
+func TestExecutorStartsTheRestWhenARequestCompletes(t *testing.T) {
+	completion := []byte(`{"id":"c","object":"chat.completion","model":"opendesign-large","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	t.Run("buffered", func(t *testing.T) {
+		s, host, id, clock := restFixture(t)
+		host.doResponses = append(host.doResponses, fakeHTTPResponse{Status: http.StatusOK, Body: completion}, fakeHTTPResponse{Status: http.StatusOK, Body: completion})
+		if _, err := execute(t, s, executorPayload{AuthID: id, Model: "od-large", Payload: body}); err != nil {
+			t.Fatalf("first request: %v", err)
+		}
+		if _, err := execute(t, s, executorPayload{AuthID: id, Model: "od-large", Payload: body}); streamErrorCode(err) != concurrencyRestingKind {
+			t.Fatalf("second request = %v, want resting", err)
+		}
+		clock.advance(65 * time.Second)
+		if _, err := execute(t, s, executorPayload{AuthID: id, Model: "od-large", Payload: body}); err != nil {
+			t.Fatalf("request after the rest: %v", err)
+		}
+		if n := host.countMethod("host.http.do"); n != 2 {
+			t.Fatalf("the upstream was called %d times, want 2", n)
+		}
+	})
+	t.Run("stream", func(t *testing.T) {
+		s, host, id, _ := restFixture(t)
+		host.doStreams = append(host.doStreams, scriptedStream{
+			status: http.StatusOK,
+			chunks: [][]byte{[]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")},
+		})
+		if _, err := executeStream(t, s, executorPayload{AuthID: id, Model: "od-large", Payload: body, Stream: true, StreamID: "client-1"}); err != nil {
+			t.Fatalf("stream: %v", err)
+		}
+		s.waitIdle()
+		if _, err := executeStream(t, s, executorPayload{AuthID: id, Model: "od-large", Payload: body, Stream: true, StreamID: "client-2"}); streamErrorCode(err) != concurrencyRestingKind {
+			t.Fatalf("second stream = %v, want resting", err)
+		}
+		s.waitIdle()
+		if n := host.countMethod("host.http.do_stream"); n != 1 {
+			t.Fatalf("the upstream was called %d times, want 1", n)
+		}
+	})
+}
+
+// While a stream is still running nothing has ended, so more requests may start
+// up to the limit; the rest begins when the stream ends.
+func TestRestBeginsWhenAStreamEndsNotWhenItOpens(t *testing.T) {
+	s, host, id, _ := restFixture(t)
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	host.readHook = func(int) { <-release }
+	host.doStreams = append(host.doStreams, scriptedStream{
+		status: http.StatusOK,
+		chunks: [][]byte{[]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")},
+	})
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	if _, err := executeStream(t, s, executorPayload{AuthID: id, Model: "od-large", Payload: body, Stream: true, StreamID: "client-1"}); err != nil {
+		t.Fatalf("stream open: %v", err)
+	}
+	// The stream is open and has not ended: the account is not resting.
+	others := []*quotaInFlightLease{gateAdmit(t, s, id), gateAdmit(t, s, id), gateAdmit(t, s, id)}
+	unblock()
+	s.waitIdle()
+	// Now it has ended.
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind {
+		t.Fatalf("after the stream ended with three requests running: %s, want resting", got.Kind)
+	}
+	for _, lease := range others {
+		gateAccept(s, lease)
+	}
+	if n := inFlightTotal(s); n != 0 {
+		t.Fatalf("%d in-flight counters leaked", n)
+	}
+}
+
+// Switching the protection off and back on with no request in between: the hold
+// bookkeeping is gone for good, and when the last request ended is still known.
+// Nothing else re-creates either here, so this pins the switch itself.
+func TestSwitchingTheProtectionOffKeepsOnlyTheLastEnd(t *testing.T) {
+	s, _, id, clock := restFixture(t)
+	gateAccept(s, gateAdmit(t, s, id)) // ended: the account rests for 65 s
+	clock.advance(70 * time.Second)
+	gateReject(s, gateAdmit(t, s, id)) // rejected: held for 60 s, one strike
+	stateOf := func() (concurrencyState, bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		state := s.concurrencyStates[quotaPauseKeyHash("sk-amr-exec-0001")]
+		if state == nil {
+			return concurrencyState{}, false
+		}
+		return *state, true
+	}
+	before, ok := stateOf()
+	if !ok || before.strikes != 1 || !before.holdUntil.After(clock.Now()) || before.lastEnded.IsZero() {
+		t.Fatalf("fixture state = %+v (present %v), want a running hold with one strike and a known last end", before, ok)
+	}
+	setConcurrency(t, s, map[string]any{"enabled": false})
+	off, ok := stateOf()
+	if !ok {
+		t.Fatal("switching the protection off forgot when the account's last request ended")
+	}
+	if off.strikes != 0 || off.probe != 0 || !off.holdUntil.IsZero() || off.rejectSeq != 0 || off.strikeSeq != 0 {
+		t.Fatalf("switching the protection off kept hold bookkeeping: %+v", off)
+	}
+	if !off.lastEnded.Equal(before.lastEnded) {
+		t.Fatalf("last end changed from %v to %v", before.lastEnded, off.lastEnded)
+	}
+	setConcurrency(t, s, map[string]any{"enabled": true})
+	// 70 s after the request ended the rest (65 s) is over, and the hold is gone:
+	// the account is simply usable, with no probe.
+	lease := gateAdmit(t, s, id)
+	if lease.gate.probe != 0 {
+		t.Fatal("after switching the protection off and on the first request is a probe")
+	}
+	gateAccept(s, lease)
+
+	// The same for the rest: switched off right after a request ended and back
+	// on a moment later, the account is still resting.
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind {
+		t.Fatalf("fixture: %s, want resting", got.Kind)
+	}
+	setConcurrency(t, s, map[string]any{"enabled": false})
+	setConcurrency(t, s, map[string]any{"enabled": true})
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind || HostRetryAfterSeconds(got) != 65 {
+		t.Fatalf("after off and on with no request in between: %s wait %d s, want resting 65", got.Kind, HostRetryAfterSeconds(got))
+	}
+	// Switching only the hold off behaves the same way.
+	setConcurrency(t, s, map[string]any{"hold_seconds": 0, "max_hold_seconds": 0})
+	if got := refusalOf(t, s, id); got.Kind != concurrencyRestingKind {
+		t.Fatalf("after switching the hold off: %s, want resting", got.Kind)
+	}
+	// An account that never finished a request leaves nothing behind.
+	s2, _, id2, _ := gateFixture(t)
+	gateReject(s2, gateAdmit(t, s2, id2))
+	setConcurrency(t, s2, map[string]any{"enabled": false})
+	s2.mu.Lock()
+	left := len(s2.concurrencyStates)
+	s2.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d entries left for an account with a hold and no finished request", left)
+	}
 }

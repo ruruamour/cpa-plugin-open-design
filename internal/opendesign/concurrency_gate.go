@@ -32,6 +32,35 @@ import (
 // also handed to the host as retry_after_seconds, which the host uses verbatim
 // instead of its own exponential backoff.
 //
+// 0.6.0 shipped only those two and did not restore service: with a concurrency
+// limit of four, an account that recovered was refilled to four within five
+// seconds and rejected again about ten seconds later. Three captures taken with
+// the gate active (limit 4, limit 1, limit 4 again) agree on what the upstream
+// actually does: once an accepted request has ended, the account takes nothing
+// new for about a minute, counted from the last request that ended.
+//
+//	seconds since the last accepted request ended     0-60        60-70
+//	limit 1                                           7/171       90/90
+//	limit 4                                           14/189      42/49
+//	limit 4 again                                     9/138       42/44
+//
+// Requests started together are all taken, because none of them has ended yet:
+// with a request already running and none ended in the prior minute, 129 of 136
+// were accepted. A rejection does not restart the minute ("time since the last
+// rejection" predicts no better than chance). That also explains the hold: it
+// is timed from the first rejection, which comes when the first request of a
+// burst ends, while the upstream counts from the last one to end, so a 60 s
+// probe was regularly a few seconds early and doubled the hold.
+//
+// Hence (3): after an accepted request ends, nothing is started for that
+// account for a rest period. With it an account is no longer rejected at all in
+// the normal case, and the hold only covers what the plugin cannot see.
+//
+// A refusal whose wait is known (a held or resting account) also tells the host
+// how long to stay away, with a second marker and a "continue-and-cooldown"
+// rule. Without that the host offered every refusing account to every request:
+// one client request became up to 28 plugin calls, several thousand a minute.
+//
 // Everything here is keyed by the inference-key fingerprint, the same identity
 // quotaInflight uses, so several credential records that carry one upstream key
 // share one budget. All state is guarded by Service.mu.
@@ -45,10 +74,26 @@ const (
 	// distinct for the counters and for the explicit model test.
 	concurrencyLimitKind = "account_busy"
 	concurrencyHeldKind  = "account_held"
+	// concurrencyRestingKind is a request refused because an accepted request
+	// of the account ended less than the rest period ago.
+	concurrencyRestingKind = "account_resting"
+
+	// concurrencyWaitMarker is put on a refusal whose wait is known and long
+	// enough to be worth a host cooldown. The built-in rule for it is
+	// "continue-and-cooldown", and the refusal carries the wait as
+	// retry_after_seconds, so the host skips the account for exactly that long.
+	concurrencyWaitMarker = "[upstream:account_wait]"
+	// The host never cools for less than this (minQuotaCooldownFloor). A
+	// shorter wait is answered with the plain busy marker instead, so the host
+	// does not stay away longer than the plugin needs.
+	concurrencyHostCooldownFloor = 10 * time.Second
 
 	concurrencyDefaultMaxInFlight = 4
 	concurrencyDefaultHold        = 60 * time.Second
 	concurrencyDefaultMaxHold     = 5 * time.Minute
+	// The upstream's own minute plus a margin: the plugin sees a request end a
+	// moment after the upstream does, and a start that is early is rejected.
+	concurrencyDefaultRest = 65 * time.Second
 
 	concurrencyMaxInFlightLimit = 64
 	concurrencyHoldLimitSeconds = 3600
@@ -67,6 +112,10 @@ type ConcurrencyConfig struct {
 	MaxInFlight    int   `json:"max_in_flight,omitempty" yaml:"max_in_flight,omitempty"`
 	HoldSeconds    *int  `json:"hold_seconds,omitempty" yaml:"hold_seconds,omitempty"`
 	MaxHoldSeconds *int  `json:"max_hold_seconds,omitempty" yaml:"max_hold_seconds,omitempty"`
+	// RestSeconds is how long nothing is started for an account after one of
+	// its accepted requests ended. It is a pointer because 0 is a real choice:
+	// it turns the rest off and leaves the concurrency limit and the hold.
+	RestSeconds *int `json:"rest_seconds,omitempty" yaml:"rest_seconds,omitempty"`
 }
 
 // concurrencySettings is the resolved, always-valid policy.
@@ -75,6 +124,8 @@ type concurrencySettings struct {
 	maxInFlight int
 	hold        time.Duration
 	maxHold     time.Duration
+	// rest is 0 when resting is off.
+	rest time.Duration
 }
 
 // concurrencySettings resolves the persisted policy. The result never has a
@@ -85,6 +136,7 @@ func (c Config) concurrencySettings() concurrencySettings {
 		maxInFlight: concurrencyDefaultMaxInFlight,
 		hold:        concurrencyDefaultHold,
 		maxHold:     concurrencyDefaultMaxHold,
+		rest:        concurrencyDefaultRest,
 	}
 	policy := c.Concurrency
 	if policy == nil {
@@ -107,6 +159,9 @@ func (c Config) concurrencySettings() concurrencySettings {
 	}
 	if settings.maxHold < settings.hold {
 		settings.maxHold = settings.hold
+	}
+	if policy.RestSeconds != nil {
+		settings.rest = boundedConcurrencySeconds(*policy.RestSeconds)
 	}
 	return settings
 }
@@ -139,6 +194,9 @@ func validateConcurrencyConfig(policy *ConcurrencyConfig) error {
 	}
 	if policy.HoldSeconds != nil && policy.MaxHoldSeconds != nil && *policy.MaxHoldSeconds < *policy.HoldSeconds {
 		return fail(http.StatusBadRequest, "concurrency.max_hold_seconds must not be below concurrency.hold_seconds")
+	}
+	if policy.RestSeconds != nil && (*policy.RestSeconds < 0 || *policy.RestSeconds > concurrencyHoldLimitSeconds) {
+		return fail(http.StatusBadRequest, "concurrency.rest_seconds must be between 0 and 3600")
 	}
 	return nil
 }
@@ -179,12 +237,16 @@ type concurrencyState struct {
 	// probe is the token of the single request admitted after a hold expired;
 	// zero when no probe is outstanding.
 	probe uint64
+	// lastEnded is when the most recent accepted request of the account ended.
+	// The rest period is counted from it. Zero means none ended yet.
+	lastEnded time.Time
 }
 
 // concurrencyStats are cumulative since this plugin instance was created.
 type concurrencyStats struct {
 	rejectedAtLimit     int64
 	rejectedWhileHeld   int64
+	rejectedAtRest      int64
 	upstreamRateLimited int64
 	holdsStarted        int64
 }
@@ -213,12 +275,22 @@ func (s *Service) concurrencyAdmitLocked(keyHash string, inFlight int, now time.
 	if !settings.enabled || keyHash == "" {
 		return lease, nil
 	}
-	if state != nil && settings.hold > 0 {
-		if state.holdUntil.After(now) {
-			s.concurrencyStats.rejectedWhileHeld++
-			return lease, localFail(http.StatusTooManyRequests, concurrencyHeldKind,
-				concurrencyBusyMarker+" upstream account is temporarily held after a rate limit")
+	if state != nil && settings.hold > 0 && state.holdUntil.After(now) {
+		s.concurrencyStats.rejectedWhileHeld++
+		return lease, concurrencyRefusal(concurrencyHeldKind,
+			"upstream account is temporarily held after a rate limit", state.holdUntil.Sub(now))
+	}
+	// Before the probe: a resting account rejects everything, so probing it
+	// would only be rejected and escalate the hold.
+	// A rest of 0 (off) can never leave a positive wait, so it needs no branch.
+	if state != nil && !state.lastEnded.IsZero() {
+		if wait := state.lastEnded.Add(settings.rest).Sub(now); wait > 0 {
+			s.concurrencyStats.rejectedAtRest++
+			return lease, concurrencyRefusal(concurrencyRestingKind,
+				"upstream account is resting after a finished request", wait)
 		}
+	}
+	if state != nil && settings.hold > 0 {
 		if state.strikes > 0 {
 			// The hold expired but nothing has been accepted since. Send one
 			// request to find out instead of the whole limit at once.
@@ -229,8 +301,9 @@ func (s *Service) concurrencyAdmitLocked(keyHash string, inFlight int, now time.
 			}
 			if state.probe != 0 {
 				s.concurrencyStats.rejectedWhileHeld++
-				return lease, localFail(http.StatusTooManyRequests, concurrencyHeldKind,
-					concurrencyBusyMarker+" upstream account is being probed after a rate limit")
+				// How long the probe will run is not known, so no cooldown.
+				return lease, concurrencyRefusal(concurrencyHeldKind,
+					"upstream account is being probed after a rate limit", 0)
 			}
 			s.concurrencySeq++
 			state.probe = s.concurrencySeq
@@ -240,10 +313,26 @@ func (s *Service) concurrencyAdmitLocked(keyHash string, inFlight int, now time.
 	}
 	if inFlight >= settings.maxInFlight {
 		s.concurrencyStats.rejectedAtLimit++
-		return lease, localFail(http.StatusTooManyRequests, concurrencyLimitKind,
-			concurrencyBusyMarker+" upstream account is at its concurrency limit")
+		// A slot can free at any moment, so the host must not stay away.
+		return lease, concurrencyRefusal(concurrencyLimitKind,
+			"upstream account is at its concurrency limit", 0)
 	}
 	return lease, nil
+}
+
+// concurrencyRefusal builds a local refusal. A wait the host can honour (at
+// least its own minimum cooldown) is attached as the cooldown and announced
+// with the wait marker; anything else carries the plain busy marker, which the
+// built-in rule answers with "continue" and no cooldown.
+func concurrencyRefusal(kind, text string, wait time.Duration) error {
+	if wait < concurrencyHostCooldownFloor {
+		return localFail(http.StatusTooManyRequests, kind, concurrencyBusyMarker+" "+text)
+	}
+	return &APIError{
+		Status: http.StatusTooManyRequests, Kind: kind,
+		Message:        concurrencyWaitMarker + " " + text,
+		hostRetryAfter: wait,
+	}
 }
 
 // concurrencyAccepted records that the upstream took the request. It clears the
@@ -338,6 +427,25 @@ func (s *Service) concurrencyRejected(lease *quotaInFlightLease, hint time.Durat
 func (s *Service) concurrencyReleasedLocked(lease *quotaInFlightLease, now time.Time) {
 	keyHash := lease.key.keyHash
 	state := s.concurrencyStates[keyHash]
+	// The upstream counts its minute from the end of a request it had taken.
+	// However the request ended (completed, failed mid-stream, cancelled by the
+	// client), the upstream served it. A request it rejected does not count.
+	//
+	// It is recorded whatever the policy says right now: the upstream counts
+	// from it regardless, so switching the rest back on must still know about
+	// a request that ended while it was off. Only admission reads the policy.
+	if lease.gate.accepted && keyHash != "" {
+		if state == nil {
+			state = &concurrencyState{}
+			if s.concurrencyStates == nil {
+				s.concurrencyStates = map[string]*concurrencyState{}
+			}
+			s.concurrencyStates[keyHash] = state
+		}
+		if now.After(state.lastEnded) {
+			state.lastEnded = now
+		}
+	}
 	if state == nil {
 		return
 	}
@@ -354,9 +462,12 @@ func (s *Service) concurrencyPruneLocked(keyHash string, now time.Time) {
 	if state == nil || state.probe != 0 || s.quotaInFlightHashCountLocked(keyHash) > 0 {
 		return
 	}
+	// When the last request ended stays known for as long as any rest setting
+	// could still need it, whatever the setting is right now.
+	rested := state.lastEnded.IsZero() || now.Sub(state.lastEnded) > concurrencyHoldLimitSeconds*time.Second
 	recovered := state.strikes == 0 && !state.holdUntil.After(now)
 	abandoned := now.Sub(state.holdUntil) > concurrencyStateRetention
-	if recovered || abandoned {
+	if rested && (recovered || abandoned) {
 		delete(s.concurrencyStates, keyHash)
 	}
 }
@@ -432,7 +543,12 @@ func isConcurrencyRefusal(err error) bool {
 	if !errors.As(err, &apiErr) || apiErr == nil || apiErr.upstreamAttempted {
 		return false
 	}
-	return apiErr.Kind == concurrencyLimitKind || apiErr.Kind == concurrencyHeldKind
+	return isConcurrencyKind(apiErr.Kind)
+}
+
+// isConcurrencyKind reports the kinds of the gate's own local refusals.
+func isConcurrencyKind(kind string) bool {
+	return kind == concurrencyLimitKind || kind == concurrencyHeldKind || kind == concurrencyRestingKind
 }
 
 // HostRetryAfterFor returns the cooldown to send to the host next to
@@ -480,6 +596,7 @@ func (s *Service) concurrencyConfigView() map[string]any {
 		"max_in_flight":    settings.maxInFlight,
 		"hold_seconds":     int64(settings.hold / time.Second),
 		"max_hold_seconds": int64(settings.maxHold / time.Second),
+		"rest_seconds":     int64(settings.rest / time.Second),
 		// Like the quota pause, this only decides what the plugin sends for its
 		// own accounts. Selection, rotation and cooldown stay with CPA.
 		"owner": "plugin",
@@ -487,12 +604,14 @@ func (s *Service) concurrencyConfigView() map[string]any {
 			"max_in_flight":    []int{1, concurrencyMaxInFlightLimit},
 			"hold_seconds":     []int{0, concurrencyHoldLimitSeconds},
 			"max_hold_seconds": []int{0, concurrencyHoldLimitSeconds},
+			"rest_seconds":     []int{0, concurrencyHoldLimitSeconds},
 		},
 		"stats": map[string]any{
 			"since":                 s.concurrencySince.UTC(),
 			"held_now":              held,
 			"rejected_at_limit":     s.concurrencyStats.rejectedAtLimit,
 			"rejected_while_held":   s.concurrencyStats.rejectedWhileHeld,
+			"rejected_at_rest":      s.concurrencyStats.rejectedAtRest,
 			"upstream_rate_limited": s.concurrencyStats.upstreamRateLimited,
 			"holds_started":         s.concurrencyStats.holdsStarted,
 		},
@@ -501,8 +620,11 @@ func (s *Service) concurrencyConfigView() map[string]any {
 
 // concurrencyAccountView is one account's live gate state for /runtime.
 type concurrencyAccountView struct {
-	InFlight              int        `json:"in_flight"`
-	PeakInFlight          int        `json:"peak_in_flight"`
+	InFlight     int `json:"in_flight"`
+	PeakInFlight int `json:"peak_in_flight"`
+	// RestingUntil is when the account may be used again after its last
+	// accepted request ended; null when it is not resting.
+	RestingUntil          *time.Time `json:"resting_until"`
 	HeldUntil             *time.Time `json:"held_until"`
 	Probing               bool       `json:"probing"`
 	ConsecutiveRejections int        `json:"consecutive_rejections"`
@@ -540,14 +662,22 @@ func (s *Service) concurrencyRuntimeView(creds []Credential) (map[string]any, ma
 			delete(s.concurrencyStates, keyHash)
 		}
 	}
+
 	rows := make(map[string]concurrencyAccountView, len(hashes))
 	for id, keyHash := range hashes {
 		row := concurrencyAccountView{
 			InFlight:     s.quotaInFlightHashCountLocked(keyHash),
 			PeakInFlight: s.concurrencyPeak[keyHash],
 		}
+
 		if state := s.concurrencyStates[keyHash]; state != nil {
 			row.ConsecutiveRejections = state.strikes
+			if settings.enabled && !state.lastEnded.IsZero() {
+				if until := state.lastEnded.Add(settings.rest); until.After(now) {
+					until = until.UTC()
+					row.RestingUntil = &until
+				}
+			}
 			if state.holdUntil.After(now) {
 				until := state.holdUntil.UTC()
 				row.HeldUntil = &until
@@ -557,7 +687,10 @@ func (s *Service) concurrencyRuntimeView(creds []Credential) (map[string]any, ma
 		}
 		rows[id] = row
 	}
-	return map[string]any{"enabled": settings.enabled, "max_in_flight": settings.maxInFlight}, rows
+	return map[string]any{
+		"enabled": settings.enabled, "max_in_flight": settings.maxInFlight,
+		"rest_seconds": int64(settings.rest / time.Second),
+	}, rows
 }
 
 // concurrencyNow is the gate's clock; a test replaces Service.concurrencyClock.

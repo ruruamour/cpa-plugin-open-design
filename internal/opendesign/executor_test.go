@@ -8,7 +8,24 @@ import (
 )
 
 // seedModels installs a mapping and returns the credential id.
+//
+// It also switches the per-account concurrency protection off. The tests that
+// use it are about the executor, the logs or the quota pause, and send several
+// requests to their single account one right after the other, which is exactly
+// what the protection refuses. concurrency_gate_test.go uses seedGatedModels and
+// tests the protection with its defaults in place.
 func seedModels(t *testing.T, s *Service, host *fakeHost) string {
+	t.Helper()
+	id := seedGatedModels(t, s, host)
+	status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/config", nil, map[string]any{"concurrency": map[string]any{"enabled": false}})
+	if status != http.StatusOK {
+		t.Fatalf("switch the concurrency protection off: %d %s", status, raw)
+	}
+	return id
+}
+
+// seedGatedModels is seedModels with the concurrency protection untouched.
+func seedGatedModels(t *testing.T, s *Service, host *fakeHost) string {
 	t.Helper()
 	id := addCredential(t, s, host, "primary", "sk-amr-exec-0001")
 	status, _, raw := managementCall(t, s, http.MethodPost, apiBase+"/models", nil, map[string]any{"models": []map[string]string{

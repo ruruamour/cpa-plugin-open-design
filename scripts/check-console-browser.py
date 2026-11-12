@@ -121,20 +121,22 @@ def main():
             fulfill(route, {'logs': {'enabled': True, 'retention_days': 7, 'max_entries': 500, 'entries': 4},
                             'pause': {'enabled': True, 'max_seconds': 86400, 'owner': 'plugin'},
                             'concurrency': {'enabled': True, 'max_in_flight': 4, 'hold_seconds': 60, 'max_hold_seconds': 300,
-                                            'owner': 'plugin',
-                                            'limits': {'max_in_flight': [1, 64], 'hold_seconds': [0, 3600], 'max_hold_seconds': [0, 3600]},
+                                            'rest_seconds': 65, 'owner': 'plugin',
+                                            'limits': {'max_in_flight': [1, 64], 'hold_seconds': [0, 3600], 'max_hold_seconds': [0, 3600],
+                                                       'rest_seconds': [0, 3600]},
                                             'stats': {'since': stamp(-7200), 'held_now': 1, 'rejected_at_limit': 1234,
-                                                      'rejected_while_held': 56, 'upstream_rate_limited': 9, 'holds_started': 7}},
+                                                      'rejected_while_held': 56, 'rejected_at_rest': 7890,
+                                                      'upstream_rate_limited': 9, 'holds_started': 7}},
                             'proxy': {'mode': 'host_managed', 'owner': 'CPA', 'read_only': True},
                             'routing': {'mode': 'host_managed', 'owner': 'CPA', 'read_only': True},
                             'upstream': {'fixed': True, 'origin': 'https://amr-link.open-design.ai/v1'}})
         elif parsed.path == base + '/runtime':
-            gate = {'fixture-01': {'in_flight': 3, 'peak_in_flight': 4, 'held_until': None, 'probing': False, 'consecutive_rejections': 0},
-                    'fixture-02': {'in_flight': 0, 'peak_in_flight': 0, 'held_until': None, 'probing': False, 'consecutive_rejections': 0},
-                    'fixture-03': {'in_flight': 0, 'peak_in_flight': 4, 'held_until': stamp(45), 'probing': False, 'consecutive_rejections': 2}}
+            gate = {'fixture-01': {'in_flight': 3, 'peak_in_flight': 4, 'held_until': None, 'resting_until': stamp(40), 'probing': False, 'consecutive_rejections': 0},
+                    'fixture-02': {'in_flight': 0, 'peak_in_flight': 0, 'held_until': None, 'resting_until': None, 'probing': False, 'consecutive_rejections': 0},
+                    'fixture-03': {'in_flight': 0, 'peak_in_flight': 4, 'held_until': stamp(45), 'resting_until': None, 'probing': False, 'consecutive_rejections': 2}}
             fulfill(route, {'loaded': True, 'stopped': False, 'active_requests': 3, 'pending_operations': 0, 'model_count': 2,
                             'host': {'available': True}, 'observed_at': stamp(0),
-                            'concurrency': {'enabled': True, 'max_in_flight': 4},
+                            'concurrency': {'enabled': True, 'max_in_flight': 4, 'rest_seconds': 65},
                             'credentials': [{'id': c['id'], 'label': c['label'], 'disabled': False, 'model_count': 2,
                                              'models_scope': 'shared', 'host': {'status': 'active'},
                                              'concurrency': gate[c['id']]} for c in credentials[:3]]})
@@ -218,23 +220,27 @@ def main():
         assert page.locator('#configPauseEnabled').is_checked()
         # ---- concurrency protection: settings, counters, runtime state ----
         assert page.locator('#configConcurrencyEnabled').is_checked()
+        assert page.locator('#configConcurrencyRestSeconds').input_value() == '65'
         assert page.locator('#configConcurrencyMaxInFlight').input_value() == '4'
         assert page.locator('#configConcurrencyHoldSeconds').input_value() == '60'
         assert page.locator('#configConcurrencyMaxHoldSeconds').input_value() == '300'
         assert page.locator('#saveConcurrencyConfig').is_enabled()
         gate_facts = page.locator('#concurrencyFacts').inner_text().replace('\n', ' ')
-        for expected in ('当前挂起账号 1', '达到上限被本地拒绝 1234', '挂起期间被本地拒绝 56', '上游限流次数 9', '触发挂起次数 7'):
+        for expected in ('当前挂起账号 1', '休息期间被本地拒绝 7890', '达到上限被本地拒绝 1234', '挂起期间被本地拒绝 56', '上游限流次数 9', '触发挂起次数 7'):
             assert expected in gate_facts, f'concurrency facts miss {expected!r}: {gate_facts}'
         busy_row = page.locator('[data-runtime-credential="fixture-01"]').inner_text().replace('\n', ' ')
         assert '在途 3 / 上限 4（峰值 4）' in busy_row and '限流挂起中' not in busy_row
+        assert '休息中' in busy_row and '休息到' in busy_row, busy_row
         held_row = page.locator('[data-runtime-credential="fixture-03"]').inner_text().replace('\n', ' ')
-        assert '限流挂起中' in held_row and '挂起到' in held_row
-        assert '账号并发上限 4' in page.locator('#runtimeFacts').inner_text().replace('\n', ' ')
+        assert '限流挂起中' in held_row and '挂起到' in held_row and '休息中' not in held_row
+        runtime_facts = page.locator('#runtimeFacts').inner_text().replace('\n', ' ')
+        assert '账号并发上限 4' in runtime_facts and '请求完成后休息 65 秒' in runtime_facts, runtime_facts
         panel = page.locator('#concurrencySettingsForm')
         pause_panel = page.locator('#pauseSettingsForm')
         assert panel.bounding_box()['y'] > pause_panel.bounding_box()['y'], 'the concurrency panel follows the quota-pause panel'
         field_widths = [page.locator('#' + name).bounding_box()['width'] for name in
-                        ('configConcurrencyMaxInFlight', 'configConcurrencyHoldSeconds', 'configConcurrencyMaxHoldSeconds', 'configPauseMaxSeconds')]
+                        ('configConcurrencyRestSeconds', 'configConcurrencyMaxInFlight', 'configConcurrencyHoldSeconds',
+                         'configConcurrencyMaxHoldSeconds', 'configPauseMaxSeconds')]
         assert max(field_widths) - min(field_widths) < 2, f'the new fields must line up with the existing ones: {field_widths}'
         # An out-of-range number never reaches the handler: the browser's own
         # constraint validation stops the submit first.
@@ -383,7 +389,7 @@ def main():
                              'logs landing read', 'latency tones and usage details', 'local rejection reason',
                              'statistics cards and range', 'models side by side', 'runtime pause badge',
                              'key dialog and account dialog dismissal',
-                             'concurrency settings and counters', 'runtime in-flight and hold badge',
+                             'concurrency settings and counters', 'runtime in-flight, rest and hold badges',
                              'negative wallet balance shown with the danger colour'],
                   'screenshots': str(args.out), 'production_requests': 0}
         (args.out / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
