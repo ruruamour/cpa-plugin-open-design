@@ -690,6 +690,9 @@ def run_cpa(artifact, binary, version):
         require(status == 201, "real host credential create returned %s: %s" % (status, raw))
         require(FIXTURE_KEY not in raw.decode(), "credential response leaked the key")
         credential_id = json.loads(raw)["id"]
+        status, raw, _ = request(API + "/config", CONCURRENCY_OFF)
+        require(status == 200 and json.loads(raw)["concurrency"]["enabled"] is False,
+                "could not switch the concurrency protection off: %s %s" % (status, raw[:200]))
         saved = list((work / "auths").glob("*.json"))
         require(saved, "host.auth.save did not write into auth-dir")
         require(any(FIXTURE_KEY in f.read_text() for f in saved),
@@ -857,6 +860,12 @@ class TlsFakeOrigin:
         # with the given status/body, so a test can hold one request open while
         # another one on the same inference key completes.
         self.hold_chat = None
+        # park_chat(bearer) may return an Event the handler waits on before it
+        # answers normally; rate_limit(bearer) returning True answers 429. Both
+        # are per attempt, so one account can be made busy or limited while the
+        # other keeps serving.
+        self.park_chat = None
+        self.rate_limit = None
 
     def start(self):
         outer = self
@@ -960,6 +969,20 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
                                "limit exceeded: 11/10 resets 2026-11-03T16:32:30Z",
                     "type": "invalid_request_error"}).encode())
                 return
+        rate_limit = getattr(self.owner, "rate_limit", None)
+        if rate_limit is not None and self.path.endswith("/chat/completions"):
+            if rate_limit(self.headers.get("Authorization")):
+                # The production shape of a rate limit: 429 with the code field.
+                self._send(429, json.dumps({"error": {
+                    "code": "rate_limit_exceeded", "message": "too many requests",
+                    "type": "rate_limit_error"}}).encode())
+                return
+        park = getattr(self.owner, "park_chat", None)
+        if park is not None and self.path.endswith("/chat/completions"):
+            gate = park(self.headers.get("Authorization"))
+            if gate is not None:
+                # Bounded only so a broken case cannot hang the suite forever.
+                gate.wait(150)
         hold = getattr(self.owner, "hold_chat", None)
         if hold is not None and self.path.endswith("/chat/completions"):
             try:
@@ -1210,6 +1233,9 @@ def run_cpa_live(artifact, binary, version):
         require(status == 201, "credential create returned %s: %s" % (status, raw))
         credential_id = json.loads(raw)["id"]
         require(FIXTURE_KEY not in raw.decode(), "credential response leaked the key")
+        status, raw, _ = request(API + "/config", CONCURRENCY_OFF)
+        require(status == 200 and json.loads(raw)["concurrency"]["enabled"] is False,
+                "could not switch the concurrency protection off: %s %s" % (status, raw[:200]))
         evidence["ui_flow"] = {"credential_create": {"status": status,
                                                      "leaked_key": False}}
 
@@ -1503,6 +1529,12 @@ def run_cpa_live(artifact, binary, version):
         # succeeds: the client must still get 200 and the fake origin must show
         # exactly two attempts, on different bearer keys. Runs before the
         # credential is deleted because it needs a healthy primary account.
+        # ---- 5b. per-account concurrency protection ----
+        # Needs the healthy primary account too, and leaves the protection off
+        # again for the retry-scheduling leg below.
+        evidence["host_concurrency_protection"] = run_concurrency_protection(
+            request, origin, credential_id)
+
         evidence["host_retry_scheduling"] = run_retry_scheduling(
             request, origin, credential_id)
 
@@ -1559,6 +1591,8 @@ def run_cpa_live(artifact, binary, version):
             blockers.append("host_http_redirect")
         if evidence.get("host_retry_scheduling", {}).get("status") != "PASS":
             blockers.append("host_retry_scheduling")
+        if evidence.get("host_concurrency_protection", {}).get("status") != "PASS":
+            blockers.append("host_concurrency_protection")
         if evidence.get("host_quota_manual_disable", {}).get("status") != "PASS":
             blockers.append("host_quota_manual_disable")
         if evidence.get("host_quota_recovery", {}).get("status") != "PASS":
@@ -1589,6 +1623,222 @@ def run_cpa_live(artifact, binary, version):
                 final.kill()
                 final.wait(timeout=10)
         shutil.rmtree(work, ignore_errors=True)
+
+
+# The scenarios in this file were written before the per-account concurrency
+# protection existed: they count upstream attempts for a single account that is
+# rate limited on purpose, which the protection would now answer by holding the
+# account. They therefore turn it off explicitly and state so, and
+# run_concurrency_protection turns it on again to prove the new behaviour.
+CONCURRENCY_OFF = {"concurrency": {"enabled": False}}
+
+
+def run_concurrency_protection(request, origin, primary_id):
+    """The per-account concurrency protection, observed through the live host.
+
+    Two things only the real host can show:
+
+      1. An account at its limit refuses locally and the host just uses another
+         account: the caller still gets 200, the busy account sees no further
+         upstream request, and it is not cooled down afterwards.
+      2. After an upstream 429 the host is told how long to stay away
+         (retry_after_seconds). With the plugin's own hold switched off again,
+         the host alone must still leave that account alone, well past the one
+         second its own backoff would have used.
+    """
+    result = {"status": "FAIL"}
+
+    def call(path, body=None, method=None, timeout=90):
+        try:
+            return request(path, body=body, method=method, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read(), dict(exc.headers or {})
+
+    def config(body=None):
+        status, raw, _ = call(API + "/config", body)
+        require(status == 200, "config returned %s: %s" % (status, raw[:300]))
+        return json.loads(raw)["concurrency"]
+
+    def chat(stream=False, timeout=120):
+        return call("/v1/chat/completions", {
+            "model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}],
+            "stream": stream}, timeout=timeout)
+
+    def attempts_since(mark):
+        return [r["authorization"] for r in origin.requests[mark:]
+                if r["path"].endswith("/chat/completions") and r.get("authorization")]
+
+    first_key = "Bearer " + FIXTURE_KEY
+    second_secret = FIXTURE_KEY + "-gate"
+    second_key = "Bearer " + second_secret
+    second_id = None
+    parked = None
+    try:
+        status, raw, _ = call(API + "/credentials", {"label": "fixture-gate", "api_key": second_secret})
+        require(status == 201, "second credential create returned %s: %s" % (status, raw[:200]))
+        second_id = json.loads(raw)["id"]
+        require(second_secret not in raw.decode(), "credential response leaked a key")
+
+        defaults = config()
+        assert_keys(defaults, ["enabled", "max_in_flight", "hold_seconds", "max_hold_seconds",
+                               "owner", "limits", "stats"], "concurrency config")
+        assert_keys(defaults["stats"], ["since", "held_now", "rejected_at_limit", "rejected_while_held",
+                                        "upstream_rate_limited", "holds_started"], "concurrency stats")
+        require(defaults["owner"] == "plugin", defaults)
+        policy = config({"concurrency": {"enabled": True, "max_in_flight": 1,
+                                         "hold_seconds": 60, "max_hold_seconds": 300}})
+        require(policy["enabled"] is True and policy["max_in_flight"] == 1 and policy["hold_seconds"] == 60, policy)
+        status, raw, _ = call(API + "/config", {"concurrency": {"max_in_flight": 0}})
+        require(status == 400, "a zero limit was accepted: %s %s" % (status, raw[:200]))
+
+        # Both accounts must be schedulable before anything is measured: a
+        # freshly created credential reaches the host asynchronously.
+        deadline = time.monotonic() + 60
+        seen = set()
+        while time.monotonic() < deadline and len(seen) < 2:
+            mark = len(origin.requests)
+            status, raw, _ = chat()
+            require(status == 200, "warm-up request failed: %s %s" % (status, raw[:200]))
+            seen.update(attempts_since(mark))
+        require(seen == {first_key, second_key}, "both accounts never became schedulable: %s" % sorted(seen))
+
+        # ---- 1. at the limit: rotate, do not cool down --------------------
+        arrived, release = threading.Event(), threading.Event()
+        holder = {"key": None}
+
+        def park_first(key):
+            if holder["key"] is None:
+                holder["key"] = key
+                arrived.set()
+                return release
+            return None
+
+        origin.park_chat = park_first
+        parked = {}
+
+        def run_parked():
+            parked["answer"] = chat(timeout=150)
+
+        worker = threading.Thread(target=run_parked, daemon=True)
+        worker.start()
+        require(arrived.wait(30), "the parked request never reached the upstream")
+        busy_key = holder["key"]
+        free_key = second_key if busy_key == first_key else first_key
+        before = config()["stats"]
+        mark = len(origin.requests)
+        for index in range(6):
+            status, raw, _ = chat()
+            require(status == 200, "request %d failed while one account was busy: %s %s"
+                    % (index, status, raw[:300]))
+        during = attempts_since(mark)
+        require(during == [free_key] * 6,
+                "with one account at its limit the upstream saw %s, want six on the free account"
+                % during)
+        after = config()["stats"]
+        refused = after["rejected_at_limit"] - before["rejected_at_limit"]
+        # Weighted round-robin must have offered the busy account at least once
+        # in six requests; each such offer is a local refusal, not an upstream call.
+        require(refused >= 1, "no request was refused at the limit: %s -> %s" % (before, after))
+        require(after["upstream_rate_limited"] == before["upstream_rate_limited"]
+                and after["holds_started"] == before["holds_started"], (before, after))
+        result["refused_at_limit"] = refused
+        status, raw, _ = call(API + "/runtime")
+        require(status == 200, "runtime returned %s" % status)
+        runtime = json.loads(raw)
+        require(runtime["concurrency"] == {"enabled": True, "max_in_flight": 1}, runtime["concurrency"])
+        rows = {row["id"]: row for row in runtime["credentials"]}
+        for row in rows.values():
+            assert_keys(row["concurrency"], ["in_flight", "peak_in_flight", "held_until", "probing",
+                                             "consecutive_rejections"], "runtime concurrency row")
+        busy_id = primary_id if busy_key == first_key else second_id
+        require(rows[busy_id]["concurrency"]["in_flight"] == 1 and rows[busy_id]["concurrency"]["held_until"] is None,
+                rows[busy_id]["concurrency"])
+        # The refusals are counted, not listed in the request log.
+        status, raw, _ = call(API + "/request-logs?limit=50")
+        require(status == 200, "request-logs returned %s" % status)
+        kinds = {entry.get("error_kind") for entry in json.loads(raw)["logs"]}
+        require("account_busy" not in kinds and "account_held" not in kinds,
+                "local refusals were written to the request log: %s" % sorted(k for k in kinds if k))
+        release.set()
+        worker.join(60)
+        require(not worker.is_alive(), "the parked request never finished")
+        require(parked["answer"][0] == 200, "the parked request failed: %s" % (parked["answer"][0],))
+        origin.park_chat = None
+        # Not cooled: the account that was only busy is used again right away.
+        mark = len(origin.requests)
+        for _ in range(6):
+            status, raw, _ = chat()
+            require(status == 200, "request after the busy period failed: %s %s" % (status, raw[:200]))
+        again = attempts_since(mark)
+        require(busy_key in again, "the account that was only busy was not used again: %s" % again)
+        result["busy_account_not_cooled"] = True
+
+        # ---- 2. upstream 429: hold, and tell the host how long ------------
+        failed = {"key": None, "count": 0}
+
+        def reject_first(key):
+            if failed["key"] is None:
+                failed["key"] = key
+            if key == failed["key"] and failed["count"] < 1:
+                failed["count"] += 1
+                return True
+            return False
+
+        origin.rate_limit = reject_first
+        before = config()["stats"]
+        mark = len(origin.requests)
+        status, raw, headers = chat()
+        require(status == 200, "the request that met a 429 did not recover on the other account: %s %s"
+                % (status, raw[:300]))
+        tried = attempts_since(mark)
+        held_key = failed["key"]
+        other_key = second_key if held_key == first_key else first_key
+        require(tried == [held_key, other_key], "expected the 429 then the other account, got %s" % tried)
+        after = config()["stats"]
+        require(after["upstream_rate_limited"] - before["upstream_rate_limited"] == 1
+                and after["holds_started"] - before["holds_started"] == 1 and after["held_now"] == 1,
+                "the 429 did not start exactly one hold: %s -> %s" % (before, after))
+        status, raw, _ = call(API + "/runtime")
+        rows = {row["id"]: row for row in json.loads(raw)["credentials"]}
+        held_id = primary_id if held_key == first_key else second_id
+        held_row = rows[held_id]["concurrency"]
+        require(held_row["held_until"] and held_row["consecutive_rejections"] == 1, held_row)
+        remaining = (parse_rfc3339(held_row["held_until"]) - dt.datetime.now(dt.timezone.utc)).total_seconds()
+        require(40 < remaining <= 61, "the hold has %.1f s left, want about 60" % remaining)
+        result["hold_seconds_left"] = round(remaining, 1)
+
+        # Now take the plugin's own hold away. From here on only the host can be
+        # keeping traffic off the held account. Its own backoff for a first 429
+        # is one second; three seconds later it would be using the account again
+        # unless it honoured the 61 seconds it was given.
+        off = config({"concurrency": {"enabled": False}})
+        require(off["enabled"] is False and off["stats"]["held_now"] == 0, off)
+        origin.rate_limit = None
+        time.sleep(3)
+        mark = len(origin.requests)
+        for index in range(8):
+            status, raw, _ = chat()
+            require(status == 200, "request %d after the 429 failed: %s %s" % (index, status, raw[:200]))
+        later = attempts_since(mark)
+        require(later == [other_key] * 8,
+                "three seconds after the 429 the host used the limited account again (%s); "
+                "it did not apply the cooldown it was given" % later)
+        result["host_honoured_retry_after"] = True
+        result["status"] = "PASS"
+    except AssertionError as exc:
+        result["failure"] = str(exc)[:400]
+    finally:
+        origin.park_chat = None
+        origin.rate_limit = None
+        try:
+            release.set()
+        except NameError:
+            pass
+        # Leave the instance as the following scenarios expect it.
+        call(API + "/config", CONCURRENCY_OFF)
+        if second_id:
+            call(API + "/credentials?id=" + second_id, method="DELETE")
+    return result
 
 
 def run_retry_scheduling(request, origin, primary_id):
@@ -2451,6 +2701,9 @@ def _live_case(binary, artifact, version, fail_status=None, quota_manual=False, 
         if quota_snapshot_replay:
             require(FIXTURE_KEY.encode() not in raw, "credential create response leaked a key")
         credential_id = json.loads(raw)["id"]
+        status, raw, _ = request(API + "/config", CONCURRENCY_OFF)
+        require(status == 200 and json.loads(raw)["concurrency"]["enabled"] is False,
+                "could not switch the concurrency protection off: %s %s" % (status, raw[:200]))
         mappings = [{"id": "deepseek-flash", "upstream_id": "deepseek-v4.1-flash"}]
         if quota_concurrent:
             # Two aliases on two upstream models so one inference key can have
@@ -3105,6 +3358,9 @@ def run(artifact, version):
         require(FIXTURE_KEY not in raw.decode(), "credential response leaked the key")
         evidence["credential"] = created
         credential_id = created["id"]
+        status, raw, _ = plugin.management(API + "/config", method="POST", body=CONCURRENCY_OFF)
+        require(status == 200 and json.loads(raw)["concurrency"]["enabled"] is False,
+                "could not switch the concurrency protection off: %s %s" % (status, raw[:200]))
 
         # P3: key never leaves through status either.
         status, raw, _ = plugin.management(API + "/status")
@@ -3260,6 +3516,57 @@ def run(artifact, version):
                                    "code": detail.get("code")}
         upstream.fail.clear()
         evidence["http_status"] = statuses
+        # With the protection off (as above) a 429 carries no cooldown.
+        require("retry_after_seconds" not in (envelope.get("error") or {}),
+                "a 429 carries a cooldown although the protection is off: %s" % envelope.get("error"))
+
+        # ---- the cooldown the host is given, on the wire ----
+        # retry_after_seconds is an optional field of the public plugin ABI. It is
+        # set in the cgo shell, which no Go test reaches, so it is asserted here
+        # against the built library.
+        def gate_execute():
+            return plugin.raw_call("executor.execute", {
+                "AuthID": credential_id, "AuthProvider": PLUGIN_ID,
+                "Model": "deepseek-flash", "Format": "chat-completions",
+                "Payload": base64.b64encode(json.dumps({
+                    "model": "deepseek-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }).encode()).decode(),
+                "StorageJSON": storage, "host_callback_id": "gate-cb"})
+
+        status, raw, _ = plugin.management(API + "/config", method="POST", body={"concurrency": {
+            "enabled": True, "max_in_flight": 4, "hold_seconds": 60, "max_hold_seconds": 300}})
+        require(status == 200, "could not switch the concurrency protection on: %s" % status)
+        upstream.fail["/chat/completions"] = (
+            429, json.dumps({"error": {"code": "rate_limit_exceeded", "message": "slow down"}}))
+        sent_before = len(upstream.requests)
+        _, envelope = gate_execute()
+        wire = envelope.get("error") or {}
+        require(not envelope.get("ok") and wire.get("http_status") == 429
+                and wire.get("code") == "rate_limit_exceeded", "unexpected 429 envelope: %s" % wire)
+        require("[upstream:rate_limit_exceeded]" in wire.get("message", ""), wire)
+        require(wire.get("retry_after_seconds") == 61,
+                "the 429 envelope carries retry_after_seconds=%r, want 61" % wire.get("retry_after_seconds"))
+        upstream.fail.clear()
+        # The account is now held: the next request is refused inside the
+        # library and never reaches the upstream.
+        _, envelope = gate_execute()
+        refused = envelope.get("error") or {}
+        require(not envelope.get("ok") and refused.get("http_status") == 429
+                and refused.get("code") == "account_held"
+                and "[upstream:account_busy]" in refused.get("message", ""),
+                "a held account was not refused locally: %s" % refused)
+        require("retry_after_seconds" not in refused, "a local refusal carries a cooldown: %s" % refused)
+        require(len(upstream.requests) == sent_before + 1,
+                "a held account reached the upstream: %d requests" % (len(upstream.requests) - sent_before))
+        evidence["concurrency_wire"] = {"retry_after_seconds": wire["retry_after_seconds"],
+                                        "held_refusal_code": refused["code"]}
+        status, raw, _ = plugin.management(API + "/config", method="POST", body=CONCURRENCY_OFF)
+        require(status == 200 and json.loads(raw)["concurrency"]["stats"]["held_now"] == 0,
+                "could not switch the concurrency protection off again: %s" % status)
+        _, envelope = gate_execute()
+        require(envelope.get("ok"), "the account stayed shut after the protection was switched off: %s"
+                % envelope.get("error"))
 
         # ---- management quota through the fake ctypes host ----
         evidence["quota_host"] = run_quota_ctypes(plugin, host, upstream, credential_id)

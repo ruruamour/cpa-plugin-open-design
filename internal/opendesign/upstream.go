@@ -283,11 +283,21 @@ func upstreamErrorFromResponseObserved(status, observedStatus int, headers http.
 	}
 	// Account-wide quota suspension uses a narrower, structured signal than
 	// general error classification. It never trusts a message marker alone.
-	resetAt, exhausted := quotaPauseSignal(observedStatus, headers, body, time.Now())
+	now := time.Now()
+	resetAt, exhausted := quotaPauseSignal(observedStatus, headers, body, now)
+	var retryAfter time.Duration
+	if observedStatus == http.StatusTooManyRequests {
+		// Bounded by the same parser the quota pause uses; the concurrency gate
+		// caps it again at its own maximum hold.
+		if at := quotaResetTimeFromHeaders(headers, now); !at.IsZero() {
+			retryAfter = at.Sub(now)
+		}
+	}
 	return &APIError{
 		Status: status, Kind: kind, Message: message,
 		upstreamAttempted: true, upstreamStatus: observedStatus,
 		quotaExhausted: exhausted, quotaResetAt: resetAt,
+		upstreamRetryAfter: retryAfter,
 	}
 }
 

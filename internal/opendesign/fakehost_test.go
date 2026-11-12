@@ -32,6 +32,11 @@ type fakeHost struct {
 	// zero-based index of that read. A test uses it to space frames in time.
 	readHook func(read int)
 	reads    int
+	// doHook runs while a host.http.do is "at the upstream", outside the
+	// host mutex, so a test can park several requests in flight at once.
+	doHook func()
+	// doDefault answers a host.http.do when the scripted queue is empty.
+	doDefault *fakeHTTPResponse
 
 	emitPayloads    [][]byte
 	streamCloseErrs []string
@@ -205,17 +210,26 @@ func (h *fakeHost) call(method string, in, out any) error {
 
 func (h *fakeHost) handleDo(in any, out any) error {
 	h.mu.Lock()
-	if len(h.doResponses) == 0 {
+	var resp fakeHTTPResponse
+	switch {
+	case len(h.doResponses) > 0:
+		resp = h.doResponses[0]
+		h.doResponses = h.doResponses[1:]
+	case h.doDefault != nil:
+		resp = *h.doDefault
+	default:
 		h.mu.Unlock()
 		return errors.New("fakeHost: unexpected host.http.do")
 	}
-	resp := h.doResponses[0]
-	h.doResponses = h.doResponses[1:]
 	opID := stringField(in, "operation_id")
 	op := h.ops[opID]
+	hook := h.doHook
 	h.mu.Unlock()
 	if err := h.waitBlocked(op); err != nil {
 		return err
+	}
+	if hook != nil {
+		hook()
 	}
 	if resp.Err != nil {
 		return resp.Err

@@ -103,6 +103,19 @@ type Service struct {
 	// quotaInFlightTestHook is nil in production. It is per instance so a test
 	// can observe admission/release interleaving without any global state.
 	quotaInFlightTestHook atomic.Pointer[quotaInFlightTestHook]
+
+	// Per-account concurrency protection (concurrency_gate.go). Unlike
+	// quotaInflight above, this *is* a limit: a request over the per-account
+	// limit, or for an account held after an upstream rate limit, is refused
+	// locally. Every field is guarded by mu and keyed by the inference-key
+	// fingerprint, never by a key.
+	concurrencyStates map[string]*concurrencyState
+	concurrencyPeak   map[string]int
+	concurrencyStats  concurrencyStats
+	concurrencySeq    uint64
+	concurrencySince  time.Time
+	// concurrencyClock is nil in production; a test installs a fake clock.
+	concurrencyClock func() time.Time
 }
 
 // NewService returns an unconfigured plugin instance.
@@ -131,6 +144,9 @@ func NewService() *Service {
 		quotaRecheckRetryAt:  map[string]time.Time{},
 		quotaRecheckFailures: map[string]int{},
 		quotaInflight:        map[quotaInFlightKey]int{},
+		concurrencyStates:    map[string]*concurrencyState{},
+		concurrencyPeak:      map[string]int{},
+		concurrencySince:     time.Now(),
 		quotaRecoveryGate:    make(chan struct{}, 1),
 		quotaCommitGate:      make(chan struct{}, 1),
 		quotaRecoveryBudget:  quotaRecoveryBudget,

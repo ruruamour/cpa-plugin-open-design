@@ -686,7 +686,9 @@ func safeDiagnosticKind(kind string, keys []string) bool {
 		// A fixed plugin code for a request refused locally because its account
 		// is quota-paused. Without it the log and the model test relabelled that
 		// refusal "upstream_error" although nothing was sent upstream.
-		"quota_blocked":
+		"quota_blocked",
+		// Fixed plugin codes for a request the concurrency protection refused.
+		concurrencyLimitKind, concurrencyHeldKind:
 		return true
 	default:
 		return false

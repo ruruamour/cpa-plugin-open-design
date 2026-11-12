@@ -210,6 +210,9 @@ func (s *Service) executePinnedWithReasoning(raw json.RawMessage, upstreamModel 
 	// cannot leave an in-flight counter that would fence recovery forever.
 	defer func() { lease.release(s) }()
 	defer func() {
+		// First, because a new hold is attached to err as the cooldown the host
+		// should apply, and err is what this function is about to return.
+		s.settleConcurrency(lease, err)
 		s.observeQuotaBlockAfterAdmission(c, lease, draft.upstreamModel, err)
 		s.recordRequestLog(draft, err)
 		// The counter drops only after the quota observation above completed, so
@@ -324,6 +327,10 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 	}()
 	defer func() {
 		if !finished {
+			// Before the error is returned: see the buffered path.
+			if err != nil {
+				s.settleConcurrency(lease, err)
+			}
 			s.observeQuotaBlockAfterAdmission(c, lease, draft.upstreamModel, err)
 			s.recordRequestLog(draft, err)
 			lease.release(s)
@@ -385,6 +392,10 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 		failure := s.readStreamError(r.HostCallbackID, stream, s.redactionKeys(c.APIKey, c.ControlKey)...)
 		return nil, failure
 	}
+	// The upstream took the request. A stream can run for minutes, so the gate
+	// learns this now rather than at the end: a probe that was accepted reopens
+	// the account while it is still streaming.
+	s.concurrencyAccepted(lease)
 	// CPA owns the downstream envelope: emit raw JSON frames, and only wrap them
 	// in `data:` for the Claude route, which expects pre-framed SSE.
 	wrapData := strings.TrimSpace(stringValue(r.Metadata["request_path"])) == "/v1/messages"
@@ -413,6 +424,11 @@ func (s *Service) executeStream(raw json.RawMessage) (result any, err error) {
 				streamErr = upstreamProtocolError("upstream stream processing failed")
 			}
 			draft.usage = *usage
+			// A rate limit that arrived as a stream event still holds the
+			// account; this runs before finishOutputStream reports the error.
+			if streamErr != nil {
+				s.settleConcurrency(lease, streamErr)
+			}
 			// Publish the local guard before notifying the host of a terminal
 			// quota error, so an immediate retry cannot reach the exhausted key.
 			s.observeQuotaBlockAfterAdmission(c, lease, draft.upstreamModel, streamErr)
@@ -681,6 +697,9 @@ func (s *Service) finishOutputStream(streamID string, err error, keys ...string)
 		}
 		if retryable, ok := err.(interface{ Retryable() bool }); ok && retryable.Retryable() {
 			detail["retryable"] = true
+		}
+		if seconds := HostRetryAfterFor(err, status); seconds > 0 {
+			detail["retry_after_seconds"] = seconds
 		}
 		payload["error_detail"] = detail
 	}

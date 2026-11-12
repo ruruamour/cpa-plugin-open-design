@@ -28,15 +28,27 @@ type configPauseUpdate struct {
 	MaxSeconds *int  `json:"max_seconds"`
 }
 
-type configUpdateInput struct {
-	Logs  *configLogUpdate   `json:"logs"`
-	Pause *configPauseUpdate `json:"pause"`
+// configConcurrencyUpdate is the plugin-owned per-account concurrency
+// protection. Like the pause it only decides what this plugin sends for its own
+// accounts; which account a request goes to stays with CPA.
+type configConcurrencyUpdate struct {
+	Enabled        *bool `json:"enabled"`
+	MaxInFlight    *int  `json:"max_in_flight"`
+	HoldSeconds    *int  `json:"hold_seconds"`
+	MaxHoldSeconds *int  `json:"max_hold_seconds"`
 }
 
-func configView(cfg Config, logView map[string]any) map[string]any {
+type configUpdateInput struct {
+	Logs        *configLogUpdate         `json:"logs"`
+	Pause       *configPauseUpdate       `json:"pause"`
+	Concurrency *configConcurrencyUpdate `json:"concurrency"`
+}
+
+func configView(cfg Config, logView, concurrencyView map[string]any) map[string]any {
 	settings := cfg.pauseSettings()
 	return map[string]any{
-		"logs": logView,
+		"logs":        logView,
+		"concurrency": concurrencyView,
 		"pause": map[string]any{
 			"enabled":     settings.enabled,
 			"max_seconds": int64(settings.maxWindow / time.Second),
@@ -68,7 +80,7 @@ func (s *Service) configRequest() (any, error) {
 	}
 	defer s.done()
 	cfg := s.config()
-	return managementJSON(http.StatusOK, configView(cfg, s.requestLogs.settingsView()))
+	return managementJSON(http.StatusOK, configView(cfg, s.requestLogs.settingsView(), s.concurrencyConfigView()))
 }
 
 // updateConfigRequest changes only plugin-owned settings. Upstream origin,
@@ -85,8 +97,18 @@ func (s *Service) updateConfigRequest(r ManagementRequest) (any, error) {
 	if err := jsonUnmarshalObject(r.Body, &in); err != nil {
 		return managementError(http.StatusBadRequest, "invalid config JSON")
 	}
-	if in.Logs == nil && in.Pause == nil {
+	if in.Logs == nil && in.Pause == nil && in.Concurrency == nil {
 		return managementError(http.StatusBadRequest, "no plugin-owned config fields supplied")
+	}
+	if update := in.Concurrency; update != nil {
+		if update.MaxInFlight != nil && (*update.MaxInFlight < 1 || *update.MaxInFlight > concurrencyMaxInFlightLimit) {
+			return managementError(http.StatusBadRequest, "concurrency.max_in_flight must be between 1 and 64")
+		}
+		for _, value := range []*int{update.HoldSeconds, update.MaxHoldSeconds} {
+			if value != nil && (*value < 0 || *value > concurrencyHoldLimitSeconds) {
+				return managementError(http.StatusBadRequest, "concurrency hold seconds must be between 0 and 3600")
+			}
+		}
 	}
 	if in.Logs != nil && in.Logs.RetentionDays != nil && (*in.Logs.RetentionDays < 1 || *in.Logs.RetentionDays > maxRequestLogRetentionDays) {
 		return managementError(http.StatusBadRequest, "logs.retention_days must be between 1 and 90")
@@ -127,6 +149,48 @@ func (s *Service) updateConfigRequest(r ManagementRequest) (any, error) {
 			cfg.Pause.MaxSeconds = *in.Pause.MaxSeconds
 		}
 	}
+	if update := in.Concurrency; update != nil {
+		// Start from a copy: cfg.Concurrency aliases the published policy, and a
+		// rejected update must leave it untouched.
+		policy := ConcurrencyConfig{}
+		if cfg.Concurrency != nil {
+			policy = *cfg.Concurrency
+		}
+		if update.Enabled != nil {
+			value := *update.Enabled
+			policy.Enabled = &value
+		}
+		if update.MaxInFlight != nil {
+			policy.MaxInFlight = *update.MaxInFlight
+		}
+		if update.HoldSeconds != nil {
+			value := *update.HoldSeconds
+			policy.HoldSeconds = &value
+		}
+		if update.MaxHoldSeconds != nil {
+			value := *update.MaxHoldSeconds
+			policy.MaxHoldSeconds = &value
+		}
+		// A partial update is checked against what it resolves to, so raising
+		// only the base hold above a previously stored maximum is refused
+		// instead of being silently widened.
+		resolvedHold, resolvedMax := int(concurrencyDefaultHold/time.Second), int(concurrencyDefaultMaxHold/time.Second)
+		if policy.HoldSeconds != nil {
+			resolvedHold = *policy.HoldSeconds
+		}
+		if policy.MaxHoldSeconds != nil {
+			resolvedMax = *policy.MaxHoldSeconds
+		}
+		if resolvedMax < resolvedHold {
+			return managementError(http.StatusBadRequest, "concurrency.max_hold_seconds must not be below concurrency.hold_seconds")
+		}
+		// The merged policy, not just the supplied fields: a value already on
+		// disk that is out of range must not be re-saved unnoticed.
+		if err := validateConcurrencyConfig(&policy); err != nil {
+			return managementError(statusOf(err), err.Error())
+		}
+		cfg.Concurrency = &policy
+	}
 	if err := cfg.validate(); err != nil {
 		return managementError(statusOf(err), err.Error())
 	}
@@ -148,10 +212,16 @@ func (s *Service) updateConfigRequest(r ManagementRequest) (any, error) {
 	}
 	s.cfg.Logs = cfg.Logs
 	s.cfg.Pause = cfg.Pause
+	s.cfg.Concurrency = cfg.Concurrency
+	if !cfg.concurrencySettings().enabled || cfg.concurrencySettings().hold <= 0 {
+		// Turning the protection or the hold off releases every held account at
+		// once; turning it back on starts from a clean slate.
+		s.concurrencyStates = map[string]*concurrencyState{}
+	}
 	s.mu.Unlock()
 	s.requestLogs.setSettings(cfg.logSettings())
 	s.wakeQuotaPauseWorker()
-	return managementJSON(http.StatusOK, configView(cfg, s.requestLogs.settingsView()))
+	return managementJSON(http.StatusOK, configView(cfg, s.requestLogs.settingsView(), s.concurrencyConfigView()))
 }
 
 // jsonUnmarshalObject rejects unknown fields so an operator cannot mistake a
@@ -231,6 +301,7 @@ func (s *Service) runtimeRequest() (any, error) {
 		}
 		return creds[i].ID < creds[j].ID
 	})
+	concurrency, concurrencyRows := s.concurrencyRuntimeView(creds)
 	accounts := make([]map[string]any, 0, len(creds))
 	for _, credential := range creds {
 		row := map[string]any{
@@ -242,6 +313,10 @@ func (s *Service) runtimeRequest() (any, error) {
 			"testing":      false,
 			"last_test":    nil,
 			"host":         nil,
+			"concurrency":  nil,
+		}
+		if view, ok := concurrencyRows[credential.ID]; ok {
+			row["concurrency"] = view
 		}
 		for _, model := range cfg.Models {
 			if running[credential.ID+"\x00"+model.ID] > 0 {
@@ -295,6 +370,7 @@ func (s *Service) runtimeRequest() (any, error) {
 		"pending_operations": s.ops.pendingCount(),
 		"model_count":        len(cfg.Models),
 		"credentials":        accounts,
+		"concurrency":        concurrency,
 		"host":               hostView,
 		"capabilities": map[string]any{
 			"proxy":    map[string]any{"read_only": true, "owner": "CPA"},

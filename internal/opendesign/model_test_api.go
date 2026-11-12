@@ -494,6 +494,10 @@ func modelTestErrorMessage(kind string) string {
 		return "OpenDesign credential is unavailable"
 	case "quota_blocked":
 		return "OpenDesign credential is paused for quota; nothing was sent upstream"
+	case concurrencyLimitKind:
+		return "OpenDesign credential is at its concurrency limit; nothing was sent upstream"
+	case concurrencyHeldKind:
+		return "OpenDesign credential is held after an upstream rate limit; nothing was sent upstream"
 	case "plugin_unavailable":
 		return "OpenDesign plugin is shutting down"
 	case "host_contract_error":

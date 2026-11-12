@@ -5,11 +5,13 @@ import (
 	"sync"
 )
 
-// Non-throttling inference in-flight tracking.
+// Inference in-flight tracking.
 //
-// There is no inference concurrency cap or queue: this bookkeeping lets a
-// recovery decision prove that no inference admitted for the same key is still
-// running before it clears a quota block. During the short recovery commit, a
+// This bookkeeping lets a recovery decision prove that no inference admitted
+// for the same key is still running before it clears a quota block. The same
+// counter is what the per-account concurrency protection reads (see
+// concurrency_gate.go); there is still no queue, a request is either admitted
+// or refused at once. During the short recovery commit, a
 // same-key admission is refused so it cannot race that final check. Every
 // inference adds one counter after the live credential was re-verified, and
 // drops it exactly once when the request
@@ -52,6 +54,9 @@ type quotaInFlightLease struct {
 	key           quotaInFlightKey
 	admittedEpoch uint64
 	once          sync.Once
+	// gate is the concurrency protection's view of this request. It is written
+	// only under Service.mu.
+	gate concurrencyLease
 }
 
 // quotaInFlightTestHook lets tests observe the exact admission/release
@@ -84,8 +89,9 @@ type quotaInFlightTestHook struct {
 // counted under its key, so a credential record for the same key that appears
 // later is fenced too.
 //
-// No concurrency cap, queue or deadline is added here. The same-key recovery
-// commit fence may refuse an admission before the counter is incremented.
+// No queue or deadline is added here. The same-key recovery commit fence and
+// the per-account concurrency protection may refuse an admission before the
+// counter is incremented; nothing is sent upstream for a refused request.
 func (s *Service) admitQuotaInFlight(source Credential, requestAuthID string) (*quotaInFlightLease, error) {
 	if hook := s.quotaInFlightTestHook.Load(); hook != nil && hook.beforeAdmit != nil {
 		hook.beforeAdmit()
@@ -151,10 +157,24 @@ func (s *Service) admitQuotaInFlight(source Credential, requestAuthID string) (*
 	if key.keyHash != "" && key.keyHash == s.quotaRecoveryCommitKey {
 		return nil, localFail(http.StatusTooManyRequests, "quota_blocked", quotaBlockMarker+" upstream account quota recovery is being committed")
 	}
+	// Last, because every check above is a reason the account cannot serve at
+	// all, while this one only says "not right now".
+	running := s.quotaInFlightHashCountLocked(key.keyHash)
+	gate, err := s.concurrencyAdmitLocked(key.keyHash, running, s.concurrencyNow())
+	if err != nil {
+		return nil, err
+	}
+	lease.gate = gate
 	if s.quotaInflight == nil {
 		s.quotaInflight = map[quotaInFlightKey]int{}
 	}
 	s.quotaInflight[key]++
+	if key.keyHash != "" && running+1 > s.concurrencyPeak[key.keyHash] {
+		if s.concurrencyPeak == nil {
+			s.concurrencyPeak = map[string]int{}
+		}
+		s.concurrencyPeak[key.keyHash] = running + 1
+	}
 	return lease, nil
 }
 
@@ -183,6 +203,7 @@ func (l *quotaInFlightLease) release(s *Service) {
 		} else {
 			delete(s.quotaInflight, l.key)
 		}
+		s.concurrencyReleasedLocked(l, s.concurrencyNow())
 		idle := true
 		for key, count := range s.quotaInflight {
 			// The fence is key-wide: another record reusing the same inference key

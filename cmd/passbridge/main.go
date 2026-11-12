@@ -87,6 +87,9 @@ type rpcError struct {
 	Message    string `json:"message"`
 	Retry      bool   `json:"retryable,omitempty"`
 	HTTPStatus int    `json:"http_status,omitempty"`
+	// RetryAfterSeconds is the optional cooldown hint of the public plugin ABI.
+	// A host that predates the field ignores it, so nothing depends on it.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 func (e *rpcError) Error() string {
@@ -251,6 +254,7 @@ func errorDetails(err error) *rpcError {
 	if errors.As(err, &retry) {
 		details.Retry = retry.Retryable()
 	}
+	details.RetryAfterSeconds = opendesign.HostRetryAfterFor(err, status)
 	return details
 }
 

@@ -57,6 +57,12 @@ type APIError struct {
 	// quota signal. They are never serialized into the client-facing error.
 	quotaExhausted bool
 	quotaResetAt   time.Time
+	// upstreamRetryAfter is the delay the upstream itself asked for on a
+	// rejection. hostRetryAfter is the cooldown the concurrency gate decided
+	// the host should apply to the account; it leaves the plugin only as
+	// retry_after_seconds, never as text.
+	upstreamRetryAfter time.Duration
+	hostRetryAfter     time.Duration
 }
 
 func (e *APIError) Error() string { return e.Message }
@@ -125,6 +131,10 @@ type Config struct {
 	// operator made no explicit choice and resolves to on (see pauseSettings),
 	// so an older settings.json without this object gets the reviewed default.
 	Pause PauseConfig `json:"pause,omitempty" yaml:"pause,omitempty"`
+	// Concurrency is the plugin-owned per-account concurrency protection. It is
+	// a pointer so a settings.json that never set it stays byte-identical and
+	// resolves to the defaults (see concurrencySettings).
+	Concurrency *ConcurrencyConfig `json:"concurrency,omitempty" yaml:"concurrency,omitempty"`
 }
 
 // PauseConfig bounds the plugin-owned quota pause. MaxSeconds caps any single
@@ -197,6 +207,11 @@ func (c *Config) validate() error {
 	if c.Logs.MaxEntries != 0 && (c.Logs.MaxEntries < 1 || c.Logs.MaxEntries > maxRequestLogMaxEntries) {
 		return fail(http.StatusBadRequest, "logs.max_entries must be between 1 and 500")
 	}
+	// The concurrency policy is deliberately not validated here. validate() also
+	// runs when the plugin loads, and refusing to load over one out-of-range
+	// number in a hand-edited settings.json would take every account offline.
+	// concurrencySettings clamps whatever it reads; only a save through the
+	// management API is refused (see updateConfigRequest).
 	return nil
 }
 

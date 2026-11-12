@@ -127,6 +127,10 @@ func defaultErrorRules() []RequestErrorRule {
 		// auth-file watcher catches up. This local marker permits another account
 		// without attributing a new upstream failure or changing host cooldowns.
 		{Status: http.StatusTooManyRequests, Match: []string{quotaBlockMarker}, Action: "continue"},
+		// The account is at its concurrency limit or held after a rate limit
+		// (concurrency_gate.go). Nothing was sent upstream, so the host should
+		// simply use another account and must not cool this one down.
+		{Status: http.StatusTooManyRequests, Match: []string{concurrencyBusyMarker}, Action: "continue"},
 		{Status: http.StatusPaymentRequired, Match: []string{upstreamErrorMarkerFor("insufficient_quota")}, Action: "continue-and-cooldown"},
 		// OpenDesign reports a spent coding plan (with a reset time) or an
 		// uncovered wallet as 402 with its own insufficient_balance code. The
@@ -202,6 +206,13 @@ const hostTransportHint = "server misbehaving"
 func hostSchedulingClass(rules []RequestErrorRule, status int, message, kind string) int {
 	if matchedErrorRule(rules, status, message) {
 		return hostScheduleRule
+	}
+	if kind == concurrencyLimitKind || kind == concurrencyHeldKind {
+		// A local refusal whose "continue" rule an operator removed. Its real
+		// status is 429, which the host would answer with a quota cooldown on an
+		// account that did nothing wrong, so it falls back to the neutral form:
+		// the host rotates and does not cool the account.
+		return hostScheduleNeutral
 	}
 	switch kind {
 	case "invalid_api_key", "rate_limit_exceeded", "insufficient_quota", "insufficient_balance",

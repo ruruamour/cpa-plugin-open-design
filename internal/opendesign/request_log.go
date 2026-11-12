@@ -1353,6 +1353,13 @@ func (s *Service) recordRequestLog(draft *requestLogDraft, requestErr error) {
 	if draft == nil || s.requestLogs == nil {
 		return
 	}
+	if isConcurrencyRefusal(requestErr) {
+		// The host tries the next account at once, so one client request can be
+		// refused by many accounts in a row. Listing each refusal would push the
+		// requests that were actually sent out of a 500-row log; the config view
+		// reports them as counters instead.
+		return
+	}
 	defer func() {
 		// Logging must never change the inference result, even if storage panics.
 		_ = recover()
