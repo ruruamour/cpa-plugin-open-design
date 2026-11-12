@@ -104,7 +104,24 @@ OpenDesign 生产接口：
 - 匹配对象是**插件生成的错误 Message**，不是上游响应体。插件给上游错误、协议错误、传输错误、插件不可用和响应过大分别加上稳定的 `[upstream:<kind>]` 前缀；marker 只由封闭白名单拼出，上游文本无法伪造规则。
 - 同步是覆盖式逐账号推送：`host.auth.save` 只重写每个凭据的 `request_scoped_errors` 一个键，保留宿主或运维写入的未知字段。每个账号独立报告结果，失败的账号列在响应中，可再次同步恢复。
 - 空规则数组表示该账号不写插件自有规则，由 CPA 配置决定行为。
-- 插件**不做并发限制、不做请求排队**：是否换号与是否冷却全部由宿主按规则决定。
+- 插件**不做请求排队**：是否换号与是否冷却由宿主按规则决定。`0.6.0` 起有按账号的并发保护（见下一节），它只决定插件自己发不发请求。
+
+## 并发保护（`0.6.0`）
+
+选哪个账号由宿主决定，请求到达插件时账号已经选好。插件能做的只有两件事：放行，或在发给上游之前在本地拒绝。
+
+- **并发上限**：同一个上游密钥同时在途的请求数达到 `max_in_flight`（默认 4）时，新请求被本地拒绝，状态 429，错误类型 `account_busy`，消息带 `[upstream:account_busy]`。多个凭据记录使用同一个上游密钥时共用一个额度。
+- **限流后挂起**：上游返回限流（HTTP 429，或响应体／流事件里的 `rate_limit_exceeded`、`tier_limit_exceeded`）后，该账号挂起 `hold_seconds`（默认 60）。挂起期间的请求被本地拒绝，错误类型 `account_held`，消息带同一个 marker。
+  - 到期后只放行一个请求作为试探；它被上游接受（流式为流打开时）才恢复到完整上限，再次被限流则挂起时长翻倍，直到 `max_hold_seconds`（默认 300）。
+  - 同一批在途请求一起被拒只算一次；账号被拒之前就在途的请求后来成功，不解除挂起。
+  - 上游自己给出的 `Retry-After` 只会延长挂起，且不超过最长挂起。
+  - 额度耗尽（402、`insufficient_quota`、`insufficient_balance`）不触发挂起，仍由额度暂停处理。
+- **交给宿主的冷却时长**：触发挂起的那个 429 带公开插件接口的可选字段 `retry_after_seconds`，值为挂起时长加 1 秒。宿主按它冷却这个账号，而不是用自己的指数退避（从 1 秒起步）。只有交给宿主的状态是 429 时才带这个字段；旧宿主忽略它。
+- **默认规则**：内置策略里 `429` + `[upstream:account_busy]` → `continue`，宿主换下一个账号且不冷却。这条规则被删掉时，本地拒绝改用中性形式交出（状态缺省加瞬时传输提示），宿主同样换号且不冷却。
+- **设置**：`GET /config` 的 `concurrency` 对象含 `enabled`、`max_in_flight`、`hold_seconds`、`max_hold_seconds` 与累计计数 `stats`；`POST /config` 接受 `{"concurrency": {...}}`，四个字段都可选。`hold_seconds` 为 0 只关挂起、保留上限；`enabled` 为 false 两者都关，并立即释放所有被挂起的账号。
+  - 保存时校验范围；`settings.json` 里手工写入的越界值在加载时被收回到安全范围，不会让插件拒绝加载。
+- **观察**：`GET /runtime` 每个账号带 `concurrency`（在途数、峰值、挂起到期时间、是否等待试探、连续被拒次数）。本地拒绝只计入 `stats`，不写请求日志：一次客户端请求可能被多个账号依次拒绝。
+- **不做的事**：不排队、不等待；不替宿主选账号；在途数不跨热加载保留。
 
 ## 额度耗尽自动暂停（默认开启）
 
@@ -266,7 +283,7 @@ plugins:
 ## 发布 tag
 
 - 发布 tag 使用 `open-design-vX.Y.Z` 形式，不创建或覆盖上游 `v*` tag；不使用或复用不安全的 `open-design-v0.4.6`。
-- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对，三者必须同步（当前源码 `0.5.0`，已在 LA 热加载，尚未发布 Release）。
+- 工作流触发 `open-design-v*`，去掉前缀后与 `internal/opendesign` 的 `Version` 和 registry 版本比对，三者必须同步（当前源码 `0.6.0`）。
 - CPA 插件商店解析 GitHub latest release 时要求 tag 以数字开头，因此从自有源安装时需显式指定已发布且适合当前环境的 tag/版本。
 - `open-design-v0.4.11` 已发布并标记 Latest，五平台构建全绿（[release run 42341153176](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42341153176)），首次运行即完成。`open-design-v0.4.10` 已发布并标记 Latest，五平台构建全绿（[release run 42273570550](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42273570550)）；前三次运行因 GitHub 未分配 `macos-15` arm64 runner 被取消（各排队约 15 分钟），第四次重跑取得 runner 后完成。`open-design-v0.4.9` 已发布并标记 Latest，五平台构建全绿（[release run 42206328455](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42206328455)）；首次运行因 GitHub 未分配 `macos-15` arm64 runner 被取消两次（各排队 15 分钟），第三次重跑取得 runner 后完成。`open-design-v0.4.7` 已发布并标记 Latest，五平台构建全绿（[release run 42167937013](https://github.com/ruruamour/cpa-plugin-open-design/actions/runs/42167937013)）；`open-design-v0.4.4` 已从 draft 转为正式 Release。`0.4.5` 与 `0.4.6` 的发布运行未产出可用资产，`0.4.6` 禁止使用；`0.4.0` 的 tag 因 Windows 平台构建失败未产出 Release。分支与生产交付状态见验证记录。
 
