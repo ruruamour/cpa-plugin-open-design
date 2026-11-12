@@ -53,8 +53,25 @@ import (
 // probe was regularly a few seconds early and doubled the hold.
 //
 // Hence (3): after an accepted request ends, nothing is started for that
-// account for a rest period. With it an account is no longer rejected at all in
-// the normal case, and the hold only covers what the plugin cannot see.
+// account for a rest period.
+//
+// CORRECTION, measured after (3) went live: the "minute" above is not the
+// upstream's rule. It was an artefact of the 60 s hold, which left almost no
+// attempts between 10 and 60 s after a request ended. What the upstream meters
+// is usage: about 20,000 tokens per account per minute (input plus output),
+// charged when a request completes, and an account with usage still owed takes
+// nothing. On a capture that was not used for fitting, "accept iff nothing is
+// owed" predicts 94.7% of outcomes (nothing owed: 296/322 accepted; 3,000 or
+// more owed: 0/203), while 65-90 s after the last request ended only 123/339
+// were accepted. So the wait after a batch is proportional to the tokens it
+// used (one 14k-token request: about 42 s; four: about 170 s), and a fixed
+// rest is only an approximation: roughly
+//
+//	limit x average tokens per request / 20000 x 60 seconds.
+//
+// Production runs with rest_seconds = 180 for a limit of four. The default
+// below was left as deployed; it is known to be too short for that limit and
+// should be replaced by pacing on the usage each request reports.
 //
 // A refusal whose wait is known (a held or resting account) also tells the host
 // how long to stay away, with a second marker and a "continue-and-cooldown"
@@ -91,8 +108,9 @@ const (
 	concurrencyDefaultMaxInFlight = 4
 	concurrencyDefaultHold        = 60 * time.Second
 	concurrencyDefaultMaxHold     = 5 * time.Minute
-	// The upstream's own minute plus a margin: the plugin sees a request end a
-	// moment after the upstream does, and a start that is early is rejected.
+	// Chosen when the upstream was believed to want a minute after a request
+	// ended. See the correction in the file comment: it suits a single request,
+	// not a batch.
 	concurrencyDefaultRest = 65 * time.Second
 
 	concurrencyMaxInFlightLimit = 64
