@@ -1785,25 +1785,33 @@ def run_concurrency_protection(request, origin, primary_id):
         result["busy_account_not_cooled"] = True
 
         # ---- 2. upstream 429: hold, and tell the host how long ------------
-        failed = {"key": None, "count": 0}
+        # Always the throwaway account: the host will stay away from the limited
+        # account for a minute, and the scenario after this one needs the
+        # primary account available. (Letting the host's rotation decide which
+        # account met the 429 left the primary cooled in about half the runs.)
+        failed = {"count": 0}
 
-        def reject_first(key):
-            if failed["key"] is None:
-                failed["key"] = key
-            if key == failed["key"] and failed["count"] < 1:
+        def reject_second_once(key):
+            if key == second_key and failed["count"] < 1:
                 failed["count"] += 1
                 return True
             return False
 
-        origin.rate_limit = reject_first
+        origin.rate_limit = reject_second_once
         before = config()["stats"]
-        mark = len(origin.requests)
-        status, raw, headers = chat()
-        require(status == 200, "the request that met a 429 did not recover on the other account: %s %s"
-                % (status, raw[:300]))
-        tried = attempts_since(mark)
-        held_key = failed["key"]
-        other_key = second_key if held_key == first_key else first_key
+        held_key, other_key = second_key, first_key
+        tried = None
+        for _ in range(8):
+            mark = len(origin.requests)
+            status, raw, headers = chat()
+            require(status == 200, "a request failed while one account was rate limited: %s %s"
+                    % (status, raw[:300]))
+            tried = attempts_since(mark)
+            if failed["count"]:
+                break
+            # The rotation offered the primary first: a plain success, try again.
+            require(tried == [first_key], "unexpected attempts before the 429: %s" % tried)
+        require(failed["count"] == 1, "the host never offered the second account in eight requests")
         require(tried == [held_key, other_key], "expected the 429 then the other account, got %s" % tried)
         after = config()["stats"]
         require(after["upstream_rate_limited"] - before["upstream_rate_limited"] == 1
@@ -1907,9 +1915,22 @@ def run_concurrency_protection(request, origin, primary_id):
                 "the rest scenario caused an upstream rejection: %s -> %s" % (after, final))
         result["served_again_after_rest"] = True
         call(API + "/credentials?id=" + third_id, method="DELETE")
-        for account in (primary_id, second_id):
-            status, raw, _ = call(API + "/credentials", {"id": account, "disabled": False})
-            require(status == 200, "re-enable returned %s: %s" % (status, raw[:200]))
+        # Hand the primary account back the way it was found: enabled, the
+        # protection off, and demonstrably serving. The second account stays
+        # disabled; it is deleted below.
+        status, raw, _ = call(API + "/credentials", {"id": primary_id, "disabled": False})
+        require(status == 200, "re-enable returned %s: %s" % (status, raw[:200]))
+        status, raw, _ = call(API + "/config", CONCURRENCY_OFF)
+        require(status == 200, "could not switch the concurrency protection off: %s" % status)
+        deadline = time.monotonic() + 60
+        served = False
+        while time.monotonic() < deadline and not served:
+            mark = len(origin.requests)
+            status, raw, _ = chat()
+            served = status == 200 and attempts_since(mark) == [first_key]
+            if not served:
+                time.sleep(0.5)
+        require(served, "the primary account did not serve again after the scenario: %s" % status)
         result["status"] = "PASS"
     except AssertionError as exc:
         result["failure"] = str(exc)[:400]
@@ -1962,6 +1983,24 @@ def run_retry_scheduling(request, origin, primary_id):
         return json.loads(raw)
 
     try:
+        # Both accounts must be schedulable before a failure is injected. The
+        # host cools the account that fails for about a minute, longer than the
+        # rounds below can wait, so a failure injected while the freshly created
+        # second account is not registered yet can never recover: the first
+        # account is cooled alone, then the second one is.
+        deadline = time.monotonic() + 60
+        ready = set()
+        while time.monotonic() < deadline and len(ready) < 2:
+            mark = len(inference_attempts())
+            status, raw, _ = call("/v1/chat/completions", {
+                "model": "deepseek-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False}, timeout=120)
+            require(status == 200, "warm-up request failed: %s %s" % (status, raw[:200]))
+            ready.update(a["authorization"] for a in inference_attempts()[mark:])
+        require(ready == {"Bearer " + FIXTURE_KEY, "Bearer " + second_key},
+                "both accounts never became schedulable: %s" % sorted(ready))
+
         # The production failure: 400 with a bracketed code in the message and a
         # generic type, exactly what OpenDesign returned for 11/10 concurrency.
         # Only the first attempt of a run fails, so a request that rotates
